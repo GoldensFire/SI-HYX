@@ -192,6 +192,18 @@ def download_cdn_direct(url: str, out_dir: str, log_fn=None) -> str:
     return out_path
 
 
+def default_download_dir() -> str:
+    """Папка загрузок пользователя по умолчанию (… \\Downloads).
+    Если её нет — домашняя папка."""
+    try:
+        d = os.path.join(os.path.expanduser("~"), "Downloads")
+        if os.path.isdir(d):
+            return d
+    except Exception:
+        pass
+    return os.path.expanduser("~")
+
+
 def clean_url(url: str) -> str:
     if 'tiktok.com' in url and '?' in url:
         return url.split('?')[0]
@@ -207,7 +219,8 @@ def clean_url(url: str) -> str:
 
 def check_ffmpeg():
     try:
-        subprocess.run([FFMPEG, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([FFMPEG, "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       creationflags=CREATE_NO_WINDOW)
         return True
     except Exception:
         return False

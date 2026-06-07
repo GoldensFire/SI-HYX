@@ -14,6 +14,8 @@ class UnifiedWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
+        if APP_ICON:
+            self.setWindowIcon(QIcon(APP_ICON))
         screen = QApplication.primaryScreen()
         try: geom = screen.availableGeometry(); max_h = geom.height() - 80
         except Exception: geom = screen.geometry(); max_h = geom.height() - 80
@@ -45,13 +47,17 @@ class UnifiedWindow(QMainWindow):
         # Кнопки в строке вкладок — corner widget подгоняется под высоту таббара
         self.btn_top_restart = QPushButton("↻  Перезапустить GUI")
         self.btn_top_restart.setObjectName("b_restart")
+        self.btn_top_restart.setStyleSheet("QPushButton#b_restart{min-height:0px; padding:2px 10px;}")
+        self.btn_top_restart.setFixedHeight(26)
         self.btn_top_restart.clicked.connect(lambda: self.tab_media.restart_gui())
         self.btn_settings = QToolButton()
         self.btn_settings.setText("⚙")
         self.btn_settings.setToolTip("Настройки")
+        self.btn_settings.setStyleSheet("QToolButton{min-height:0px; padding:2px 8px;}")
+        self.btn_settings.setFixedHeight(26)
         self.btn_settings.clicked.connect(self._open_settings_dialog)
         corner = QWidget()
-        ch = QHBoxLayout(corner); ch.setContentsMargins(0, 0, 4, 0); ch.setSpacing(4)
+        ch = QHBoxLayout(corner); ch.setContentsMargins(0, 2, 6, 2); ch.setSpacing(4)
         ch.addWidget(self.btn_settings); ch.addWidget(self.btn_top_restart)
         self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
 
@@ -88,8 +94,6 @@ class UnifiedWindow(QMainWindow):
         self.url_from_browser.connect(self._on_url_from_browser)
         if self._server_enabled:
             self._start_browser_http_server()
-        else:
-            self.log("Сервер для расширения выключен (включить можно в ⚙ Настройки).")
 
     def add_paths(self, paths):
         """Роутит файлы из общего стрипа в активную вкладку."""
@@ -125,7 +129,7 @@ class UnifiedWindow(QMainWindow):
             tm.s_spd.setValue(v.get("speed", 100))
             tm.s_crf.setValue(v.get("crf", 35))
             tm.s_pre.setValue(v.get("pre", 8))
-            tm.c_res.setCurrentText(v.get("res", "Исходное"))
+            combo_set_value(tm.c_res, v.get("res", "Исходное"))
             tm.c_fps.setCurrentText(v.get("fps", "Исходный"))
             tm._set_preset_mode(v.get("preset_mode", "std"))
 
@@ -151,7 +155,7 @@ class UnifiedWindow(QMainWindow):
             tm.s_dim.setEnabled(tm.ck_dim.isChecked())
             tm.sl_aspd.setValue(av.get("aspd", tm.sl_aspd.value()))
             tm.ck_arec.setChecked(av.get("arec", tm.ck_arec.isChecked()))
-            tm.c_img_fmt.setCurrentText(av.get("img_fmt", "avif"))
+            combo_set_value(tm.c_img_fmt, av.get("img_fmt", "avif"))
 
             # Обновляем стрип последних файлов по восстановленной папке
             try:
@@ -387,19 +391,6 @@ class UnifiedWindow(QMainWindow):
         title.setStyleSheet("font-size:17px; font-weight:bold; color:#89b4fa;")
         lay.addWidget(title)
 
-        # --- Discord ---
-        grp_dc = QGroupBox("Сообщество")
-        vdc = QVBoxLayout(grp_dc)
-        btn_dc = QPushButton("💬  Открыть Discord-канал")
-        btn_dc.clicked.connect(lambda: self._open_url(DISCORD_URL))
-        vdc.addWidget(btn_dc)
-        lbl_dc = QLabel(f'<a href="{DISCORD_URL}" style="color:#89b4fa;">{DISCORD_URL}</a>')
-        lbl_dc.setOpenExternalLinks(True)
-        lbl_dc.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        lbl_dc.setWordWrap(True)
-        vdc.addWidget(lbl_dc)
-        lay.addWidget(grp_dc)
-
         # --- Сервер расширения ---
         grp_sv = QGroupBox("Браузерное расширение")
         vsv = QVBoxLayout(grp_sv)
@@ -431,6 +422,18 @@ class UnifiedWindow(QMainWindow):
         btn_close = QPushButton("Закрыть")
         btn_close.clicked.connect(dlg.accept)
         lay.addWidget(btn_close)
+
+        # --- Сообщество: чистые ссылки в самом низу (без кнопок) ---
+        lay.addStretch()
+        links = QLabel(
+            f'Discord: <a href="{DISCORD_URL}" style="color:#89b4fa;">{DISCORD_URL}</a><br>'
+            f'GitHub: <a href="{GITHUB_URL}" style="color:#89b4fa;">{GITHUB_URL}</a>'
+        )
+        links.setOpenExternalLinks(True)
+        links.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        links.setWordWrap(True)
+        links.setStyleSheet("color:#a6adc8; font-size:11px;")
+        lay.addWidget(links)
         dlg.exec()
 
     def _collect_settings(self):
@@ -447,7 +450,7 @@ class UnifiedWindow(QMainWindow):
                     },
                     'video': {
                         'enabled': bool(tm.chk_enable_video.isChecked()), 'speed': int(tm.s_spd.value()), 'crf': int(tm.s_crf.value()),
-                        'pre': int(tm.s_pre.value()), 'res': tm.c_res.currentText(), 'fps': tm.c_fps.currentText(),
+                        'pre': int(tm.s_pre.value()), 'res': strip_default_tag(tm.c_res.currentText()), 'fps': tm.c_fps.currentText(),
                         'preset_mode': 'dark' if tm.btn_mode_dark.isChecked() else 'std'
                     }
                 },
@@ -460,7 +463,7 @@ class UnifiedWindow(QMainWindow):
                     'limit': int(tm.s_lim.value()), 'limit_on': bool(tm.ck_lim.isChecked()),
                     'adim': int(tm.s_dim.value()), 'adim_on': bool(tm.ck_dim.isChecked()),
                     'aspd': int(tm.sl_aspd.value()), 'arec': bool(tm.ck_arec.isChecked()),
-                    'img_fmt': tm.c_img_fmt.currentText()
+                    'img_fmt': strip_default_tag(tm.c_img_fmt.currentText())
                 },
                 'server_enabled': bool(getattr(self, '_server_enabled', False)),
             }
@@ -588,9 +591,20 @@ def main():
         except Exception: pass
         # Сервер не найден — запускаем нормально и загружаем файлы
 
+    # На Windows задаём AppUserModelID, иначе на панели задач показывается
+    # стандартная иконка Python, а не иконка программы.
+    if IS_WIN:
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GoldensFire.SI-HYX")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setStyleSheet(STYLESHEET)
+    if APP_ICON:
+        app.setWindowIcon(QIcon(APP_ICON))
 
     w = UnifiedWindow()
 

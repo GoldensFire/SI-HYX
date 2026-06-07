@@ -103,20 +103,56 @@ class SpeedSpinBox(QSpinBox):
 
 
 # --- Информационные подсказки "ⓘ" для пунктов настроек ---
-def info_badge(tip: str) -> QLabel:
+class _InfoBadge(QLabel):
     """Маленький значок ⓘ. При наведении показывает описание (tooltip).
 
-    Фиксированный размер + центрирование дают стабильную область наведения —
-    иначе на крошечном (в один символ) лейбле курсор постоянно входит/выходит
-    из :hover и значок «мерцает».
+    Стандартный QToolTip иногда не успевает показаться на крошечном виджете,
+    поэтому при входе курсора и по клику принудительно вызываем QToolTip.showText —
+    подсказка появляется мгновенно и стабильно.
+    Чтобы изменить текст подсказки — правьте строку, передаваемую в info_badge()
+    (или label_with_info / row_with_info) в файле tabs.py.
     """
-    b = QLabel("ⓘ")
-    b.setObjectName("infoBadge")
-    b.setToolTip(tip)
-    b.setCursor(Qt.CursorShape.WhatsThisCursor)
-    b.setFixedSize(18, 18)
-    b.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    return b
+    def __init__(self, tip: str):
+        super().__init__("ⓘ")
+        self._tip = tip
+        self.setObjectName("infoBadge")
+        self.setToolTip(tip)
+        self.setCursor(Qt.CursorShape.WhatsThisCursor)
+        self.setFixedSize(20, 20)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def enterEvent(self, e):
+        try: QToolTip.showText(QCursor.pos(), self._tip, self)
+        except Exception: pass
+        super().enterEvent(e)
+
+    def mousePressEvent(self, e):
+        try: QToolTip.showText(QCursor.pos(), self._tip, self)
+        except Exception: pass
+        super().mousePressEvent(e)
+
+
+def info_badge(tip: str) -> QLabel:
+    """Возвращает значок-подсказку ⓘ. Текст подсказки = аргумент tip.
+
+    Чтобы УБРАТЬ значок где-то — удалите вызов info_badge(...) в tabs.py
+    (а для label_with_info/row_with_info — замените их на обычный QLabel/виджет)."""
+    return _InfoBadge(tip)
+
+
+def combo_set_value(combo, value):
+    """Выбирает в QComboBox пункт по «чистому» значению, даже если в списке
+    он помечен как ' (по умолчанию)'. Используется при загрузке настроек."""
+    try:
+        idx = combo.findText(value)
+        if idx < 0:
+            idx = combo.findText(value + DEFAULT_TAG)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        else:
+            combo.setCurrentText(value)
+    except Exception:
+        pass
 
 
 def label_with_info(text: str, tip: str) -> QWidget:

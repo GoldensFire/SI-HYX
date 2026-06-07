@@ -72,14 +72,14 @@ try:
         QMessageBox, QTextEdit, QPlainTextEdit, QSlider, QGroupBox, QFormLayout, QComboBox,
         QLineEdit, QMenu, QScrollArea, QAbstractSpinBox, QAbstractItemView,
         QTreeWidgetItemIterator, QHeaderView, QToolButton, QDialog,
-        QStyledItemDelegate, QStyle, QSplashScreen
+        QStyledItemDelegate, QStyle, QSplashScreen, QToolTip
     )
     from PyQt6.QtCore import (
         Qt, QThread, pyqtSignal, QSize, QRunnable, QThreadPool, QByteArray, QTimer
     )
     from PyQt6.QtGui import (
         QAction, QColor, QFont, QIcon, QPixmap, QBrush, QImage as QtGuiImage,
-        QKeySequence, QShortcut, QPainter, QPen
+        QKeySequence, QShortcut, QPainter, QPen, QCursor
     )
     from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 except Exception as e:
@@ -162,6 +162,26 @@ FFMPEG = _resolve_tool("ffmpeg")
 FFPROBE = _resolve_tool("ffprobe")
 
 
+def _resolve_asset(name):
+    """Ищет файл-ресурс (иконку и т.п.) рядом с программой.
+    Порядок: _MEIPASS (PyInstaller) → папка exe/скрипта → их подпапка bin.
+    Возвращает абсолютный путь или None, если не найден."""
+    roots = []
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        roots.append(base)
+    roots.append(os.path.dirname(os.path.abspath(sys.argv[0] or ".")))
+    roots.append(os.path.dirname(os.path.abspath(__file__)))
+    for r in roots:
+        for cand in (os.path.join(r, name), os.path.join(r, "bin", name)):
+            if os.path.isfile(cand):
+                return cand
+    return None
+
+
+APP_ICON = _resolve_asset("icon.ico")
+
+
 def ytdlp_base_cmd():
     """База для запуска yt-dlp как процесса.
     Приоритет: bin/yt-dlp.exe (bundled, обновляемый) → системный yt-dlp в PATH →
@@ -230,7 +250,19 @@ APP_NAME = "SI-HYX"
 APP_VERSION = "0.1 BETA"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 DISCORD_URL = "https://discord.gg/EPCE3rMfFa"
+GITHUB_URL = "https://github.com/GoldensFire/SI-HYX"
 HTTP_PORT = 7432  # порт локального сервера для браузерного расширения
+
+# Метка для пунктов выпадающих списков, которые являются значением по умолчанию.
+# В UI показывается " (по умолчанию)", но в логику (ffmpeg и т.п.) уходит чистое значение.
+DEFAULT_TAG = " (по умолчанию)"
+
+
+def strip_default_tag(s):
+    """Убирает пометку ' (по умолчанию)' из текста пункта списка."""
+    if isinstance(s, str):
+        return s.replace(DEFAULT_TAG, "").strip()
+    return s
 
 
 # --- Modern Dark Stylesheet (Catppuccin Mocha inspired) ---

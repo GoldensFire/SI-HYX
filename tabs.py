@@ -45,7 +45,7 @@ class YtdlpTab(QWidget):
         
         h.addWidget(self.url_edit); h.addWidget(self.btn_check); h.addWidget(btn_v); h.addWidget(btn_a); h.addWidget(btn_stop)
         
-        self.out = QLineEdit(os.path.expanduser("~"))
+        self.out = QLineEdit(default_download_dir())
         btn_p = QPushButton("📂"); btn_p.clicked.connect(self.ch_dir); btn_p.setFixedWidth(36)
         ho = QHBoxLayout(); ho.addWidget(self.out); ho.addWidget(btn_p)
 
@@ -68,13 +68,13 @@ class YtdlpTab(QWidget):
         ho.addWidget(QLabel("Кач-во:")); ho.addWidget(self.c_q)
         ho.addWidget(info_badge("Максимальная высота видео. Качается лучшее видео до выбранной высоты + лучшее аудио, затем склейка."))
         ho.addWidget(QLabel("Конт.:")); ho.addWidget(self.c_c)
-        ho.addWidget(info_badge("Контейнер для склейки: mp4 — макс. совместимость, mkv — любые кодеки, webm — для VP9/Opus."))
+        ho.addWidget(info_badge("Контейнер для склейки: mp4 — макс. совместимость, mkv — SiQuester не поддерживает, webm — для VP9/Opus."))
         ho.addWidget(QLabel("Суб.:")); ho.addWidget(self.c_s)
         ho.addWidget(info_badge("Скачивать субтитры выбранного языка. all — все доступные дорожки субтитров."))
         ho.addWidget(QLabel("Язык:")); ho.addWidget(self.c_a)
         ho.addWidget(info_badge("Предпочитаемая аудиодорожка — для видео с несколькими озвучками."))
         ho.addWidget(self.chk_k)
-        ho.addWidget(info_badge("Force KF — точная нарезка по таймингам: вставляет ключевые кадры в точках реза. Точнее, но медленнее."))
+        ho.addWidget(info_badge("Force KF — точная нарезка по таймингам: вставляет ключевые кадры в точках реза. Точнее, но медленнее(понятия не имею, зачем оно)"))
         v = QVBoxLayout(); v.addLayout(ho)
 
         ht = QHBoxLayout()
@@ -304,7 +304,7 @@ class YtdlpTab(QWidget):
             if not outdir:
                 outdir = self.out.text()
             if not outdir or not os.path.exists(outdir):
-                outdir = os.getcwd()
+                outdir = default_download_dir()
 
             iid = uuid.uuid4().hex
             it = QTreeWidgetItem(self.tree)
@@ -476,22 +476,16 @@ class MediaTab(QWidget):
         self.s_lp = QSpinBox(); self.s_lp.setRange(0, 24000); self.s_lp.setValue(3000)
         self.s_hp = QSpinBox(); self.s_hp.setRange(0, 24000); self.s_hp.setValue(200)
         self.s_deg_gain = QDoubleSpinBox(); self.s_deg_gain.setRange(-60, 0); self.s_deg_gain.setValue(0.0)
-        fa.addRow(row_with_info(self.ck_norm, "Loudnorm — нормализация громкости по стандарту EBU R128. Приводит ролики к одной воспринимаемой громкости."))
+        fa.addRow(row_with_info(self.ck_norm, "Нормализация уровня громкости, рекомендуется все видео/аудио кодировать с этой опцией"))
         hn = QHBoxLayout()
-        hn.addWidget(QLabel("LUFS:")); hn.addWidget(self.s_tgt)
-        hn.addWidget(info_badge("Целевая интегральная громкость (I). -16 LUFS — типично для соцсетей, -14 — стриминг."))
-        hn.addWidget(QLabel("LRA:")); hn.addWidget(self.s_lra)
-        hn.addWidget(info_badge("Loudness Range — допустимый разброс громкости (динамика). Меньше = ровнее звук."))
-        hn.addWidget(QLabel("TP:")); hn.addWidget(self.s_tp)
-        hn.addWidget(info_badge("True Peak (dBTP) — максимальный пик. -1.5 защищает от клиппинга при кодировании."))
         fa.addRow(hn)
-        fa.addRow(row_with_info(self.ck_fade, "Плавное затухание звука в конце ролика. Поле справа — длительность затухания в секундах."), self.s_fade)
+        fa.addRow(row_with_info(self.ck_fade, "Плавное затухание звука в конце ролика в секундах"), self.s_fade)
 
         # Битрейт аудио — ПЕРЕД секцией degrade
         hbr = QHBoxLayout(); hbr.addWidget(QLabel("Битрейт аудио:"))
         self.c_abitrate = InvertedWheelComboBox(); self.c_abitrate.addItems(AUDIO_BITRATES); self.c_abitrate.setCurrentText("128")
         hbr.addWidget(self.c_abitrate)
-        hbr.addWidget(info_badge("Битрейт выходного аудио (кбит/с). auto — взять близкий к исходному. Колесо мыши инвертировано."))
+        hbr.addWidget(info_badge("128 кбит - стандартное качество аудио в Youtube"))
         hbr.addStretch()
         fa.addRow(hbr)
 
@@ -535,6 +529,17 @@ class MediaTab(QWidget):
 
         ga.setLayout(fa); rv_inner.addWidget(ga)
 
+        # --- Скорость: отдельный блок между аудио и видео (без названия группы) ---
+        self.s_spd = SpeedSpinBox(); self.s_spd.setValue(100); self.s_spd.setSuffix("%")
+        self.s_spd.setMaximumWidth(110)
+        speed_w = QWidget(); speed_h = QHBoxLayout(speed_w)
+        speed_h.setContentsMargins(8, 2, 8, 2); speed_h.setSpacing(6)
+        speed_h.addWidget(QLabel("Скорость:"))
+        speed_h.addWidget(self.s_spd)
+        speed_h.addWidget(info_badge("Изменение скорости видео и звука. 100% = без изменений"))
+        speed_h.addStretch()
+        rv_inner.addWidget(speed_w)
+
         gv = QGroupBox("Перекодирование видео"); fv = QFormLayout()
         self.chk_enable_video = QCheckBox("Включить перекодирование"); self.chk_enable_video.setChecked(True)
 
@@ -547,28 +552,27 @@ class MediaTab(QWidget):
         self.btn_mode_dark.clicked.connect(lambda: self._set_preset_mode("dark"))
         mode_h = QHBoxLayout(); mode_h.addWidget(self.btn_mode_std); mode_h.addWidget(self.btn_mode_dark)
 
-        self.s_spd = SpeedSpinBox(); self.s_spd.setValue(100); self.s_spd.setSuffix("%")
-        self.s_spd.setMaximumWidth(110)
         self.s_crf = QSpinBox(); self.s_crf.setRange(0, 63); self.s_crf.setValue(35)
         self.s_pre = QSpinBox(); self.s_pre.setRange(0, 13); self.s_pre.setValue(8)
-        self.c_res = QComboBox(); self.c_res.addItems(["Исходное", "1920x1080", "1280x720", "854x480", "144x72"])
-        self.c_res.setMaximumWidth(180)
+        self.c_res = QComboBox(); self.c_res.addItems(["Исходное", "1920x1080", "1280x720" + DEFAULT_TAG, "854x480", "144x72"])
+        self.c_res.setCurrentText("1280x720" + DEFAULT_TAG)
+        self.c_res.setMinimumWidth(210); self.c_res.setMaximumWidth(240)
+        self.c_res.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.c_fps = QComboBox(); self.c_fps.addItems(["Исходный", "Исходный (max 30)", "5", "12", "23.976", "24", "30", "60"])
         self.c_fps.setMaximumWidth(200)
         fv.addRow(row_with_info(self.chk_enable_video, "Если выключено — видео не трогается, меняется только звук. Включено — перекодирование в AV1 (SVT-AV1)."))
-        fv.addRow(label_with_info("Профиль:", "Стандарт: yuv420p, 1 проход. Тёмные сцены: 10-бит + tune=ssim + 2 прохода — меньше «бандинга» в тёмных кадрах."), mode_h)
-        fv.addRow(label_with_info("Скорость:", "Изменение скорости видео и звука. 100% = без изменений. Меняет PTS видео и atempo звука."), self.s_spd)
+        fv.addRow(label_with_info("Профиль:", "Стандарт: Использовать по умолчанию. Тёмные сцены: Только в темных сценах."), mode_h)
         henc = QHBoxLayout(); henc.addWidget(self.s_crf); henc.addWidget(self.s_pre)
-        self._badge_crf = info_badge("CRF — качество AV1 (меньше = качественее, но больше файл; 45 ≈ баланс). Preset — скорость кодирования (0 медленно/качественно … 13 быстро (Рекомендуется 1)).")
+        self._badge_crf = info_badge("Preset — скорость кодирования (0 медленно и качественно … 13 быстро, но страдает качество (Рекомендуется 1, если позволяет процессор)).")
         henc.addWidget(self._badge_crf)
         henc.addStretch()
-        fv.addRow(label_with_info("CRF / Preset:", "CRF — качество (меньше = лучше). Preset — скорость кодирования AV1."), henc)
+        fv.addRow(label_with_info("CRF / Preset:", "CRF — качество (меньше = качественнее, но больше файл. Рекомендуется 40-45. Может принимать значения от 0 до 63)"), henc)
         fv.addRow(label_with_info("Разрешение:", "Масштаб выходного видео. «Исходное» — без изменений. Уменьшение сохраняет пропорции (без растяжения)."), self.c_res)
         fv.addRow(label_with_info("FPS:", "Частота кадров на выходе. «Исходный (max 30)» — снижает только если выше 30."), self.c_fps)
         gv.setLayout(fv); rv_inner.addWidget(gv)
         # Скрываем строки видео если перекодирование выключено
         self._video_enc_rows = [self.btn_mode_std, self.btn_mode_dark,
-                                 self.s_spd, self.s_crf, self.s_pre, self.c_res, self.c_fps,
+                                 self.s_crf, self.s_pre, self.c_res, self.c_fps,
                                  self._badge_crf]
         def _update_video_enc(checked):
             for w in self._video_enc_rows:
@@ -596,10 +600,11 @@ class MediaTab(QWidget):
         gavi = QGroupBox("Изображения"); favi = QFormLayout()
         # Выбор выходного формата
         self.c_img_fmt = InvertedWheelComboBox()
-        self.c_img_fmt.addItems(["avif", "webp", "png", "jpg", "ico"])
-        self.c_img_fmt.setCurrentText("avif")
-        self.c_img_fmt.setMaximumWidth(150)
-        favi.addRow(label_with_info("Формат:", "Выходной формат изображений. avif/webp — лучшее сжатие, png — без потерь, jpg — совместимость, ico — иконка Windows (до 256px)."), self.c_img_fmt)
+        self.c_img_fmt.addItems(["avif" + DEFAULT_TAG, "webp", "png", "jpg", "ico"])
+        self.c_img_fmt.setCurrentText("avif" + DEFAULT_TAG)
+        self.c_img_fmt.setMinimumWidth(190); self.c_img_fmt.setMaximumWidth(220)
+        self.c_img_fmt.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        favi.addRow(label_with_info("Формат:", "Выходной формат изображений. avif — лучшее сжатие, webp — запасной вариант + используется для картинок с прозрачностью"), self.c_img_fmt)
 
         # ── Лимит размера файла ──────────────────────────────────────────────
         hlim = QHBoxLayout()
@@ -609,7 +614,7 @@ class MediaTab(QWidget):
         self.s_lim.setRange(0, 50000); self.s_lim.setSuffix(" КБ")
         self.s_lim.setSingleStep(50); self.s_lim.setValue(100)
         hlim.addWidget(self.ck_lim); hlim.addWidget(self.s_lim)
-        hlim.addWidget(info_badge("Подбирает качество так, чтобы файл не превышал указанный размер (КБ)."))
+        hlim.addWidget(info_badge("Подбирает качество так, чтобы файл не превышал указанный размер (КБ). 100 для AVIF - достаточное для SiGame"))
         hlim.addStretch()
         # Привязка: спинбокс активен только если галочка включена
         self.ck_lim.toggled.connect(self.s_lim.setEnabled)
@@ -631,8 +636,8 @@ class MediaTab(QWidget):
 
         self.sl_aspd = QSlider(Qt.Orientation.Horizontal); self.sl_aspd.setRange(0, 8); self.sl_aspd.setValue(0)
         self.ck_arec = QCheckBox("Перезаписывать"); self.ck_arec.setChecked(True)
-        favi.addRow(label_with_info("Скорость:", "Усилие кодирования изображения: левее — быстрее и больше файл, правее — медленнее и компактнее."), self.sl_aspd)
-        favi.addRow(row_with_info(self.ck_arec, "Сохранять результат поверх исходного файла вместо создания копии."))
+        favi.addRow(label_with_info("Скорость:", "левее — медленнее и компактнее файл, правее — быстрее, но больше"), self.sl_aspd)
+        favi.addRow(row_with_info(self.ck_arec, "(Перекодируешь 2-ой раз одно и то же изображение? Включи эту опцию, чтобы перезаписать старый файл(не исходный) вместо создания ещё 1 копии)"))
         gavi.setLayout(favi); rv_inner.addWidget(gavi)
 
         rv_inner.addStretch(); w.setLayout(rv_inner); rw.setWidget(w); right_layout.addWidget(rw)
@@ -704,8 +709,8 @@ class MediaTab(QWidget):
 
         try:
             dl_path = self.main.tab_ytdlp.out.text()
-            if not dl_path or not os.path.exists(dl_path): dl_path = os.getcwd()
-        except Exception: dl_path = os.getcwd()
+            if not dl_path or not os.path.exists(dl_path): dl_path = default_download_dir()
+        except Exception: dl_path = default_download_dir()
 
         self.main.tab_ytdlp.add_dl_direct(url, audio_only=audio_only, outdir=dl_path)
 
@@ -895,14 +900,14 @@ class MediaTab(QWidget):
             },
             'video': {
                 'enabled': bool(self.chk_enable_video.isChecked()), 'speed': int(spd), 'crf': int(self.s_crf.value()),
-                'pre': int(self.s_pre.value()), 'res': self.c_res.currentText(), 'fps': self.c_fps.currentText(),
+                'pre': int(self.s_pre.value()), 'res': strip_default_tag(self.c_res.currentText()), 'fps': self.c_fps.currentText(),
                 'preset_mode': 'dark' if self.btn_mode_dark.isChecked() else 'std'
             },
             'avif': {
                 'limit': int(self.s_lim.value()) if self.ck_lim.isChecked() else 0,
                 'adim': int(self.s_dim.value()) if self.ck_dim.isChecked() else 0,
                 'aspd': int(self.sl_aspd.value()), 'arec': bool(self.ck_arec.isChecked()),
-                'img_fmt': self.c_img_fmt.currentText() if hasattr(self, 'c_img_fmt') else 'avif'
+                'img_fmt': strip_default_tag(self.c_img_fmt.currentText()) if hasattr(self, 'c_img_fmt') else 'avif'
             }
         }
         self.worker = ProcessWorker(self.items, s)
