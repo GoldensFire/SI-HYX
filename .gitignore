@@ -1,0 +1,18 @@
+# Сборка PyInstaller
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# Внешние бинарники (большие, кладутся в релиз-архив, не в репозиторий)
+bin/
+
+# Локальные/служебные файлы
+settings.json
+*.log
+*_original_backup.py
+YouTubecookies.txt
+*cookies*.txt

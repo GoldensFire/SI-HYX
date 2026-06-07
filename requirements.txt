@@ -1,0 +1,4 @@
+PyQt6
+yt-dlp
+Pillow
+pillow-heif

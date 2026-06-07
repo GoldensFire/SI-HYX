@@ -1,0 +1,1674 @@
+# -*- coding: utf-8 -*-
+# tabs.py — вкладки интерфейса
+from config import *
+from utils import *
+from widgets import *
+from workers import *
+
+
+class YtdlpTab(QWidget):
+    thumb_sig = pyqtSignal(str, QIcon)
+    def __init__(self, main_win):
+        super().__init__()
+        self.main = main_win
+        self.items = {}
+        self.pool = QThreadPool()
+        self.active_workers: dict = {}  # iid → YtdlpWorker, O(1) поиск
+        
+        self.fetch_timer = QTimer()
+        self.fetch_timer.setSingleShot(True)
+        self.fetch_timer.setInterval(800)
+        self.fetch_timer.timeout.connect(self._start_fetch)
+        self.info_worker = None
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6); layout.setSpacing(6)
+        grp = QGroupBox("Источник"); fl = QFormLayout()
+        fl.setSpacing(6)
+        
+        self.url_edit = QLineEdit(); self.url_edit.setPlaceholderText("Вставьте ссылку.")
+        self.url_edit.setClearButtonEnabled(True)
+        self.url_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.url_edit.customContextMenuRequested.connect(self.on_url_ctx)
+        
+        self.btn_check = QToolButton(); self.btn_check.setText("🔍"); self.btn_check.setToolTip("Проверить ссылку и получить длительность")
+        self.btn_check.clicked.connect(self._start_fetch)
+
+        self.url_edit.textChanged.connect(lambda: self.fetch_timer.start())
+
+        h = QHBoxLayout()
+        btn_v = QPushButton("⬇  Скачать"); btn_v.clicked.connect(lambda: self.add_dl(False))
+        btn_a = QPushButton("🎵  Скачать (Audio)"); btn_a.clicked.connect(lambda: self.add_dl(True))
+        btn_stop = QPushButton("■  СТОП"); btn_stop.clicked.connect(self.stop_all_dl)
+        
+        h.addWidget(self.url_edit); h.addWidget(self.btn_check); h.addWidget(btn_v); h.addWidget(btn_a); h.addWidget(btn_stop)
+        
+        self.out = QLineEdit(os.path.expanduser("~"))
+        btn_p = QPushButton("📂"); btn_p.clicked.connect(self.ch_dir); btn_p.setFixedWidth(36)
+        ho = QHBoxLayout(); ho.addWidget(self.out); ho.addWidget(btn_p)
+
+        self.cookie_edit = QLineEdit(); self.cookie_edit.setPlaceholderText("Путь к файлу cookies.txt (необязательно)")
+        self.cookie_edit.setClearButtonEnabled(True)
+        btn_ck = QPushButton("📂"); btn_ck.setFixedWidth(36)
+        btn_ck.clicked.connect(self._choose_cookie)
+        ho_ck = QHBoxLayout(); ho_ck.addWidget(self.cookie_edit); ho_ck.addWidget(btn_ck)
+
+        fl.addRow("URL:", h); fl.addRow("Папка:", ho)
+        fl.addRow(label_with_info("Cookies:", "Файл cookies.txt для приватных/возрастных видео. Для YouTube обычно не требуется (скачивание идёт через клиент tv + Deno)."), ho_ck)
+        grp.setLayout(fl); layout.addWidget(grp)
+
+        opt = QGroupBox("Опции"); ho = QHBoxLayout()
+        self.c_q = QComboBox(); self.c_q.addItems(list(FORMAT_OPTIONS.keys())); self.c_q.setCurrentText("1080p")
+        self.c_c = QComboBox(); self.c_c.addItems(MERGE_OPTIONS)
+        self.c_s = QComboBox(); self.c_s.addItems(SUB_OPTIONS)
+        self.c_a = QComboBox(); self.c_a.addItems(AUDIO_OPTIONS)
+        self.chk_k = QCheckBox("Force KF")
+        ho.addWidget(QLabel("Кач-во:")); ho.addWidget(self.c_q)
+        ho.addWidget(info_badge("Максимальная высота видео. Качается лучшее видео до выбранной высоты + лучшее аудио, затем склейка."))
+        ho.addWidget(QLabel("Конт.:")); ho.addWidget(self.c_c)
+        ho.addWidget(info_badge("Контейнер для склейки: mp4 — макс. совместимость, mkv — любые кодеки, webm — для VP9/Opus."))
+        ho.addWidget(QLabel("Суб.:")); ho.addWidget(self.c_s)
+        ho.addWidget(info_badge("Скачивать субтитры выбранного языка. all — все доступные дорожки субтитров."))
+        ho.addWidget(QLabel("Язык:")); ho.addWidget(self.c_a)
+        ho.addWidget(info_badge("Предпочитаемая аудиодорожка — для видео с несколькими озвучками."))
+        ho.addWidget(self.chk_k)
+        ho.addWidget(info_badge("Force KF — точная нарезка по таймингам: вставляет ключевые кадры в точках реза. Точнее, но медленнее."))
+        v = QVBoxLayout(); v.addLayout(ho)
+
+        ht = QHBoxLayout()
+        start_box = QHBoxLayout()
+        self.ts = [ZeroSpinBox() for _ in range(3)]
+        for s in self.ts:
+            s.setRange(0,59); s.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons); s.setFixedWidth(38)
+            s.valueChanged.connect(self._spin_to_sliders)
+        start_box.addWidget(QLabel("С:"))
+        for w in self.ts: start_box.addWidget(w)
+
+        end_box = QHBoxLayout()
+        self.te = [ZeroSpinBox() for _ in range(3)]
+        for s in self.te:
+            s.setRange(0,59); s.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons); s.setFixedWidth(38)
+            s.valueChanged.connect(self._spin_to_sliders)
+        end_box.addWidget(QLabel("По:"))
+        for w in self.te: end_box.addWidget(w)
+
+        btn_clear_time = QPushButton("✕ Тайминги")
+        btn_clear_time.setFixedHeight(24)
+        btn_clear_time.setToolTip("Сбросить тайминги")
+        btn_clear_time.clicked.connect(self._clear_timings)
+
+        sliders_box = QVBoxLayout()
+        self.slider_start = QSlider(Qt.Orientation.Horizontal)
+        self.slider_end = QSlider(Qt.Orientation.Horizontal)
+        self.slider_start.setRange(0, 36000); self.slider_end.setRange(0, 36000)
+        self.slider_start.valueChanged.connect(self._slider_to_spins)
+        self.slider_end.valueChanged.connect(self._slider_to_spins)
+
+        _time_lbl = QHBoxLayout()
+        _time_lbl.addWidget(QLabel("Start / End (drag to change)"))
+        _time_lbl.addWidget(info_badge("Обрезка: качается только отрезок от Start до End. Пусто = всё видео. Точность нарезки зависит от Force KF."))
+        _time_lbl.addStretch()
+        sliders_box.addLayout(_time_lbl)
+        sliders_box.addWidget(self.slider_start); sliders_box.addWidget(self.slider_end)
+
+        ht.addLayout(start_box); ht.addSpacing(8); ht.addLayout(end_box); ht.addSpacing(8); ht.addWidget(btn_clear_time); ht.addStretch(); ht.addLayout(sliders_box)
+        v.addLayout(ht); opt.setLayout(v); layout.addWidget(opt)
+
+        self.tree = QTreeWidget(); self.tree.setHeaderLabels(["URL", "Размер", "Инфо", "Статус"])
+        self.tree.setColumnWidth(0, 380); self.tree.setColumnWidth(3, 100)
+        self.tree.setIconSize(QSize(160,90)); self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.ctx)
+        layout.addWidget(self.tree)
+
+        hb = QHBoxLayout()
+        b_del = QPushButton("✖  Удалить"); b_del.clicked.connect(self.delete_sel)
+        b_clr = QPushButton("🗑  Очистить"); b_clr.clicked.connect(self.tree.clear)
+        hb.addWidget(b_del); hb.addWidget(b_clr); hb.addStretch(); layout.addLayout(hb)
+
+    def _spin_to_sliders(self):
+        try:
+            start_s = self.ts[0].value()*3600 + self.ts[1].value()*60 + self.ts[2].value()
+            end_s = self.te[0].value()*3600 + self.te[1].value()*60 + self.te[2].value()
+            maxv = max(self.slider_start.maximum(), 1)
+            start_s = max(0, min(start_s, maxv))
+            end_s = max(0, min(end_s, self.slider_end.maximum()))
+            if end_s < start_s: end_s = start_s
+            self.slider_start.blockSignals(True); self.slider_end.blockSignals(True)
+            self.slider_start.setValue(start_s); self.slider_end.setValue(end_s)
+            self.slider_start.blockSignals(False); self.slider_end.blockSignals(False)
+        except Exception: pass
+
+    def _fill_time_boxes(self, sec, boxes):
+        """Заполняет три спинбокса (ч, м, с) из значения в секундах."""
+        h = sec // 3600; m = (sec % 3600) // 60; s = sec % 60
+        for box in boxes: box.blockSignals(True)
+        boxes[0].setValue(h); boxes[1].setValue(m); boxes[2].setValue(s)
+        for box in boxes: box.blockSignals(False)
+
+    def _slider_to_spins(self):
+        try:
+            start_s = self.slider_start.value()
+            end_s = self.slider_end.value()
+            if end_s < start_s:
+                end_s = start_s
+                self.slider_end.blockSignals(True); self.slider_end.setValue(end_s); self.slider_end.blockSignals(False)
+            self._fill_time_boxes(start_s, self.ts)
+            self._fill_time_boxes(end_s, self.te)
+        except Exception: pass
+
+    def _start_fetch(self):
+        url = self.url_edit.text().strip()
+        if not url: return
+        self.main.log(f"Запрос метаданных для: {url[:30]}...")
+        # Отменяем предыдущий воркер через флаг — НЕ terminate(), он вызывает сегфолт в PyQt6
+        if self.info_worker and self.info_worker.isRunning():
+            self.info_worker.cancelled = True
+            # Отключаем сигналы старого воркера чтобы не получить stale callback
+            try: self.info_worker.success.disconnect()
+            except Exception: pass
+            try: self.info_worker.error.disconnect()
+            except Exception: pass
+            # Не ждём завершения — пусть доработает в фоне и тихо умрёт
+        self.info_worker = InfoWorker(url)
+        self.info_worker.success.connect(self._on_info_success)
+        self.info_worker.error.connect(self._on_info_error)
+        self.info_worker.start()
+
+    def _on_info_success(self, duration, thumb_url):
+        self.main.log(f"Длительность получена: {duration} сек.")
+        try:
+            if duration > 0:
+                self.slider_start.setRange(0, duration); self.slider_end.setRange(0, duration)
+                self.slider_start.setValue(0); self.slider_end.setValue(duration)
+                self._slider_to_spins()
+        except Exception: pass
+
+    def _on_info_error(self, err_msg):
+        self.main.log(f"[Ошибка метаданных] {err_msg}")
+
+    def _clear_timings(self):
+        for box in self.ts + self.te:
+            box.blockSignals(True); box.setValue(0); box.blockSignals(False)
+        self.slider_start.blockSignals(True); self.slider_start.setValue(0); self.slider_start.blockSignals(False)
+        self.slider_end.blockSignals(True);   self.slider_end.setValue(self.slider_end.maximum()); self.slider_end.blockSignals(False)
+
+    def on_url_ctx(self, pos):
+        m = QMenu()
+        try: cb = QApplication.clipboard().text().strip()
+        except Exception: cb = ""
+        if cb and cb.startswith("http"):
+            a = QAction("Скачать из буфера", self)
+            a.triggered.connect(lambda checked=False, cbv=cb: (self.url_edit.setText(cbv), self.add_dl(False)))
+            a2 = QAction("Скачать аудио из буфера", self)
+            a2.triggered.connect(lambda checked=False, cbv=cb: (self.url_edit.setText(cbv), self.add_dl(True)))
+            m.addAction(a); m.addAction(a2); m.addSeparator()
+        m.addAction(QAction("Вставить", self, triggered=self.url_edit.paste))
+        m.exec(self.url_edit.mapToGlobal(pos))
+
+    def stop_all_dl(self):
+        for w in list(self.active_workers.values()):
+            try: w.stop()
+            except Exception: pass
+
+    def stop_sel_dl(self):
+        for it in self.tree.selectedItems():
+            iid = it.data(0, Qt.ItemDataRole.UserRole)
+            w = self.active_workers.get(iid)
+            if w:
+                try: w.stop()
+                except Exception: pass
+
+    def ctx(self, pos):
+        m = QMenu()
+        sel = self.tree.itemAt(pos)
+        if sel:
+            m.addAction(QAction("Перейти к URL (копировать в буфер)", self, triggered=lambda checked=False, it=sel: QApplication.clipboard().setText(it.text(0))))
+            m.addAction(QAction("Остановить загрузку", self, triggered=self.stop_sel_dl))
+            m.addSeparator()
+        try: cb = QApplication.clipboard().text().strip()
+        except Exception: cb = ""
+        if cb and cb.startswith('http'):
+            a_cb = QAction('Скачать из буфера', self); 
+            a_cb.triggered.connect(lambda checked=False, cbv=cb: (self.url_edit.setText(cbv), self.add_dl(False)))
+            a_cba = QAction('Скачать аудио из буфера', self); 
+            a_cba.triggered.connect(lambda checked=False, cbv=cb: (self.url_edit.setText(cbv), self.add_dl(True)))
+            m.addAction(a_cb); m.addAction(a_cba); m.addSeparator()
+        m.addAction(QAction('Удалить', self, triggered=self.delete_sel))
+        m.addAction(QAction('Очистить', self, triggered=self.tree.clear))
+        m.exec(self.tree.mapToGlobal(pos))
+
+    def _choose_cookie(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Выбрать файл cookies", "", "Text files (*.txt);;All files (*)")
+        if path:
+            self.cookie_edit.setText(path)
+
+    def ch_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Папка", self.out.text())
+        if d:
+            self.out.setText(d)
+            try: self.main.recent_strip.refresh(d)
+            except Exception: pass
+
+    def get_sec(self, arr):
+        return arr[0].value()*3600 + arr[1].value()*60 + arr[2].value()
+
+    def _connect_worker_signals(self, w: 'YtdlpWorker', iid: str):
+        """Подключает стандартные сигналы воркера к обработчикам дерева."""
+        def on_prog(iid_, p, t):
+            item = self.items.get(iid_, {}).get('item')
+            if item:
+                item.setText(1, f"{p:.1f}%"); item.setText(3, t)
+
+        def on_done(iid_, status, clean_info, file_path):
+            item = self.items.get(iid_, {}).get('item')
+            if item:
+                item.setText(3, "✅ " + status)
+                for col in range(self.tree.columnCount()):
+                    item.setBackground(col, QBrush(COLOR_DONE))
+                self.tree.viewport().update()
+                if file_path and os.path.exists(file_path):
+                    try:
+                        dur, br_str, size, a_br = get_media_info(file_path)
+                        item.setText(1, human_size(size))
+                        item.setText(2, clean_info if clean_info and clean_info != "Unknown" else br_str)
+                        self.main.log(f"Загружено: {file_path} ({human_size(size)}, {a_br})")
+                    except Exception: pass
+
+        def on_err(iid_, msg):
+            try:
+                item = self.items.get(iid_, {}).get('item')
+                if not item: return
+                item.setText(3, "Ошибка"); item.setToolTip(3, msg)
+                for col in range(self.tree.columnCount()):
+                    item.setBackground(col, QBrush(COLOR_ERR))
+            except RuntimeError:
+                pass  # QTreeWidgetItem уже удалён пользователем
+
+        def on_thumb(iid_, thumb_url):
+            if thumb_url:
+                self.pool.start(RemoteThumbnailRunnable(thumb_url, iid_, self.thumb_sig))
+
+        w.progress_sig.connect(on_prog); w.finished_sig.connect(on_done)
+        w.error_sig.connect(on_err); w.thumb_sig.connect(on_thumb)
+        w.log_sig.connect(lambda m: self.main.log(str(m)))
+
+    def add_dl_direct(self, url: str, audio_only: bool = False, outdir: str = ""):
+        """Запускает загрузку с готовым URL — не читает поля UI.
+        Используется при скачивании с вкладки MediaTab, чтобы элемент
+        с прогрессом и миниатюрой появлялся именно здесь.
+        """
+        try:
+            if not url: return
+            if not outdir:
+                outdir = self.out.text()
+            if not outdir or not os.path.exists(outdir):
+                outdir = os.getcwd()
+
+            iid = uuid.uuid4().hex
+            it = QTreeWidgetItem(self.tree)
+            it.setText(0, url); it.setText(1, "-"); it.setText(2, "-"); it.setText(3, "В очереди")
+            it.setData(0, Qt.ItemDataRole.UserRole, iid)
+            self.items[iid] = {'item': it, 'url': url}
+
+            config = {
+                'iid': iid, 'url': url,
+                'fmt': FORMAT_OPTIONS.get("1080p", 'bestvideo[height<=1080]+bestaudio/best'),
+                'outdir': outdir, 'merge': 'mp4', 'sub_lang': 'Выкл',
+                'audio': 'Original', 'force_kf': True,
+                'audio_only': bool(audio_only),
+                'cookie_path': self.cookie_edit.text().strip() if hasattr(self, 'cookie_edit') else '',
+            }
+            w = YtdlpWorker(config)
+            self.active_workers[iid] = w
+            w.finished.connect(lambda _=None, i=iid: self._remove_worker(i))
+            self._connect_worker_signals(w, iid)
+            w.start()
+            self.main.log(f"Загрузка добавлена: {url}")
+        except Exception as e:
+            self.main.log(f"add_dl_direct error: {e}")
+
+    def add_dl(self, audio_only=False):
+        self.fetch_timer.stop()
+        try:
+            url = self.url_edit.text().strip()
+            self.url_edit.clear()
+            if not url: return
+            iid = uuid.uuid4().hex
+            it = QTreeWidgetItem(self.tree)
+            it.setText(0, url); it.setText(1, "-"); it.setText(2, "-"); it.setText(3, "В очереди")
+            it.setData(0, Qt.ItemDataRole.UserRole, iid)
+            self.items[iid] = {'item': it, 'url': url}
+            config = {
+                'iid': iid, 'url': url, 'fmt': FORMAT_OPTIONS.get(self.c_q.currentText(), 'best'),
+                'outdir': self.out.text(), 'merge': self.c_c.currentText(), 'sub_lang': self.c_s.currentText(),
+                'audio': self.c_a.currentText(), 'force_kf': self.chk_k.isChecked(),
+                'start_s': self.get_sec(self.ts) if any(x.value() for x in self.ts) else None,
+                'end_s': self.get_sec(self.te) if any(x.value() for x in self.te) else None,
+                'audio_only': bool(audio_only),
+                'cookie_path': self.cookie_edit.text().strip(),
+            }
+            w = YtdlpWorker(config)
+            self.active_workers[iid] = w
+            w.finished.connect(lambda _=None, i=iid: self._remove_worker(i))
+            self._connect_worker_signals(w, iid)
+            w.start()
+        except Exception as e:
+            self.main.log(f"add_dl error: {e}")
+
+    def _remove_worker(self, iid):
+        self.active_workers.pop(iid, None)
+
+    def delete_sel(self):
+        try:
+            for it in list(self.tree.selectedItems()):
+                iid = it.data(0, Qt.ItemDataRole.UserRole)
+                if iid:
+                    self.active_workers.pop(iid, None)
+                    self.items.pop(iid, None)
+                self.tree.invisibleRootItem().removeChild(it)
+        except Exception: pass
+
+    def stop_all_dl(self):
+        for w in list(self.active_workers.values()):
+            try: w.stop()
+            except Exception: pass
+
+    def stop_sel_dl(self):
+        for it in self.tree.selectedItems():
+            iid = it.data(0, Qt.ItemDataRole.UserRole)
+            w = self.active_workers.get(iid)
+            if w:
+                try: w.stop()
+                except Exception: pass
+
+    def set_thumb(self, iid, icon):
+        try:
+            entry = self.items.get(iid)
+            if entry and isinstance(entry, dict):
+                it = entry.get('item')
+                if it and isinstance(it, QTreeWidgetItem):
+                    it.setIcon(0, icon)
+        except Exception: pass
+
+
+class MediaTab(QWidget):
+    thumb_sig = pyqtSignal(str, QIcon)
+    def __init__(self, main_win):
+        super().__init__()
+        self.main = main_win
+        self.items = []
+        self._item_map: dict = {}
+        self._item_data_map: dict = {}
+        self.pool = QThreadPool()
+        self.setAcceptDrops(True)
+        self.setup_ui()
+        self.thumb_sig.connect(self.set_thumb)
+        self.worker = None
+
+    def _find_item(self, iid) -> 'QTreeWidgetItem | None':
+        """Возвращает QTreeWidgetItem по iid за O(1)."""
+        return self._item_map.get(iid)
+
+    def setup_ui(self):
+        l = QHBoxLayout(self)
+        l.setContentsMargins(6, 6, 6, 6); l.setSpacing(8)
+        lw = QWidget(); lv = QVBoxLayout(lw)
+        lv.setContentsMargins(0, 0, 0, 0); lv.setSpacing(6)
+
+        quick_dl_grp = QGroupBox("Быстрая загрузка")
+        qdl_form = QFormLayout()
+        qdl_h = QHBoxLayout()
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("Вставьте ссылку для скачивания (файлы не добавляются в очередь обработки)...")
+        self.url_edit.setClearButtonEnabled(True)
+        self.url_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.url_edit.customContextMenuRequested.connect(self.on_url_ctx)
+
+        btn_qdl_video = QPushButton("⬇  Скачать"); btn_qdl_video.clicked.connect(lambda: self.download_url(False))
+        btn_qdl_audio = QPushButton("🎵  Скачать (Audio)"); btn_qdl_audio.clicked.connect(lambda: self.download_url(True))
+
+        qdl_h.addWidget(self.url_edit); qdl_h.addWidget(btn_qdl_video); qdl_h.addWidget(btn_qdl_audio)
+        qdl_form.addRow("URL:", qdl_h)
+        quick_dl_grp.setLayout(qdl_form); lv.addWidget(quick_dl_grp)
+
+        self.tree = DraggableTreeWidget()
+        self.tree.setHeaderLabels(["Файл","Размер (Исх)","Размер (Нов)","Битрейт (аудио)","Битрейт (аудио итог)","LUFS до","LUFS после", "Статус"])
+        self.tree.setRootIsDecorated(False)
+        self.tree.setItemDelegate(StatusColorDelegate(self.tree))  # цветовая подсветка строк
+        self.tree.setIconSize(QSize(160,90)); self.tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.ctx)
+        self.tree.setWordWrap(True)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.tree.header().resizeSection(0, 320)
+        for i in range(1,8): self.tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+
+        h = QHBoxLayout()
+        b1 = QPushButton("➕  Добавить файлы"); b1.clicked.connect(self.add)
+        b2 = QPushButton("✖  Удалить"); b2.clicked.connect(self.rem)
+        b3 = QPushButton("🗑  Очистить"); b3.clicked.connect(self.clear)
+        h.addWidget(b1); h.addWidget(b2); h.addWidget(b3)
+
+        if IS_WIN:
+            lv.addWidget(self.tree); lv.addLayout(h); l.addWidget(lw, 3)
+        else:
+            lv.addWidget(self.tree); lv.addLayout(h); l.addWidget(lw, 3)
+
+        right_container = QWidget(); right_layout = QVBoxLayout(right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0); right_layout.setSpacing(6)
+        rw = QScrollArea(); rw.setWidgetResizable(True); rw.setFixedWidth(430)
+        w = QWidget(); rv_inner = QVBoxLayout(w)
+        rv_inner.setContentsMargins(6, 4, 6, 4); rv_inner.setSpacing(8)
+
+        ga = QGroupBox("Аудио эффекты"); fa = QFormLayout()
+        self.ck_norm = QCheckBox("Loudnorm"); self.ck_norm.setChecked(True)
+        self.s_tgt = QDoubleSpinBox(); self.s_tgt.setValue(-16.0); self.s_tgt.setRange(-60.0, 20.0); self.s_tgt.setSingleStep(0.1)
+        self.s_lra = QDoubleSpinBox(); self.s_lra.setValue(20.0); self.s_lra.setRange(0.0, 50.0); self.s_lra.setSingleStep(0.1)
+        self.s_tp = QDoubleSpinBox(); self.s_tp.setValue(-1.5); self.s_tp.setRange(-60.0, 10.0); self.s_tp.setSingleStep(0.1)
+        self.ck_fade = QCheckBox("Затухание (Fade Out)"); self.ck_fade.setChecked(True)
+        self.s_fade = QDoubleSpinBox(); self.s_fade.setValue(1.0); self.s_fade.setRange(0.0, 60.0); self.s_fade.setSingleStep(0.1)
+        self.s_fade.setMaximumWidth(110)
+        self.ck_deg = QCheckBox("Ухудшить звук (Degrade)")
+        self.s_hz = QSpinBox(); self.s_hz.setValue(8000); self.s_hz.setRange(1000, 48000)
+        self.ck_u8 = QCheckBox("8-bit")
+        self.s_lp = QSpinBox(); self.s_lp.setRange(0, 24000); self.s_lp.setValue(3000)
+        self.s_hp = QSpinBox(); self.s_hp.setRange(0, 24000); self.s_hp.setValue(200)
+        self.s_deg_gain = QDoubleSpinBox(); self.s_deg_gain.setRange(-60, 0); self.s_deg_gain.setValue(0.0)
+        fa.addRow(row_with_info(self.ck_norm, "Loudnorm — нормализация громкости по стандарту EBU R128. Приводит ролики к одной воспринимаемой громкости."))
+        hn = QHBoxLayout()
+        hn.addWidget(QLabel("LUFS:")); hn.addWidget(self.s_tgt)
+        hn.addWidget(info_badge("Целевая интегральная громкость (I). -16 LUFS — типично для соцсетей, -14 — стриминг."))
+        hn.addWidget(QLabel("LRA:")); hn.addWidget(self.s_lra)
+        hn.addWidget(info_badge("Loudness Range — допустимый разброс громкости (динамика). Меньше = ровнее звук."))
+        hn.addWidget(QLabel("TP:")); hn.addWidget(self.s_tp)
+        hn.addWidget(info_badge("True Peak (dBTP) — максимальный пик. -1.5 защищает от клиппинга при кодировании."))
+        fa.addRow(hn)
+        fa.addRow(row_with_info(self.ck_fade, "Плавное затухание звука в конце ролика. Поле справа — длительность затухания в секундах."), self.s_fade)
+
+        # Битрейт аудио — ПЕРЕД секцией degrade
+        hbr = QHBoxLayout(); hbr.addWidget(QLabel("Битрейт аудио:"))
+        self.c_abitrate = InvertedWheelComboBox(); self.c_abitrate.addItems(AUDIO_BITRATES); self.c_abitrate.setCurrentText("128")
+        hbr.addWidget(self.c_abitrate)
+        hbr.addWidget(info_badge("Битрейт выходного аудио (кбит/с). auto — взять близкий к исходному. Колесо мыши инвертировано."))
+        hbr.addStretch()
+        fa.addRow(hbr)
+
+        fa.addRow(row_with_info(self.ck_deg, "Намеренное ухудшение звука (эффект «телефон/радио»). Открывает дополнительные параметры ниже."))
+
+        # Degrade-виджеты: скрываются/показываются по галочке
+        self._lbl_samplebit = QLabel("Sample/Bit:")
+        hd = QHBoxLayout(); hd.addWidget(QLabel("Hz:")); hd.addWidget(self.s_hz)
+        hd.addWidget(info_badge("Частота дискретизации (Гц). Ниже = грубее звук. 8000 Гц ≈ телефонное качество."))
+        hd.addWidget(self.ck_u8)
+        hd.addWidget(info_badge("8-битный звук (u8) — сильное огрубление, шумный ретро-эффект."))
+        fa.addRow(self._lbl_samplebit, hd)
+
+        hlp = QHBoxLayout(); hlp.addWidget(QLabel("Lowpass:")); hlp.addWidget(self.s_lp)
+        hlp.addWidget(info_badge("Срезает частоты ВЫШЕ указанной (Гц) — убирает «верха», звук становится глуше."))
+        hlp.addWidget(QLabel("Highpass:")); hlp.addWidget(self.s_hp)
+        hlp.addWidget(info_badge("Срезает частоты НИЖЕ указанной (Гц) — убирает «низы»/гул."))
+        self._lbl_lowpass = QLabel("")
+        fa.addRow(self._lbl_lowpass, hlp)
+
+        self._lbl_degvol = QLabel("Degrade vol (dB):")
+        hdv = QHBoxLayout(); hdv.addWidget(self.s_deg_gain)
+        self._badge_degvol = info_badge("Громкость degrade-звука в дБ. 0 = без изменений, отрицательное значение = тише.")
+        hdv.addWidget(self._badge_degvol); hdv.addStretch()
+        fa.addRow(self._lbl_degvol, hdv)
+
+        self._deg_group = [self._lbl_samplebit, hd.itemAt(0).widget(), self.s_hz, self.ck_u8,
+                           self._lbl_lowpass, self.s_lp, self.s_hp,
+                           self._lbl_degvol, self.s_deg_gain, self._badge_degvol]
+
+        def _update_deg_vis(checked):
+            for w in self._deg_group:
+                w.setVisible(checked)
+            # Скрываем layout-строки полностью через содержимое
+            for layout_item in [hd, hlp]:
+                for i in range(layout_item.count()):
+                    wi = layout_item.itemAt(i).widget()
+                    if wi: wi.setVisible(checked)
+        self.ck_deg.toggled.connect(_update_deg_vis)
+        _update_deg_vis(self.ck_deg.isChecked())
+
+        ga.setLayout(fa); rv_inner.addWidget(ga)
+
+        gv = QGroupBox("Перекодирование видео"); fv = QFormLayout()
+        self.chk_enable_video = QCheckBox("Включить перекодирование"); self.chk_enable_video.setChecked(True)
+
+        # --- Переключатель профиля: две кнопки-тогглы ---
+        self.btn_mode_std  = QPushButton("Стандарт");       self.btn_mode_std.setCheckable(True);  self.btn_mode_std.setChecked(True)
+        self.btn_mode_dark = QPushButton("🌑 Тёмные сцены"); self.btn_mode_dark.setCheckable(True); self.btn_mode_dark.setChecked(False)
+        self.btn_mode_std.setToolTip("yuv420p, 1-pass")
+        self.btn_mode_dark.setToolTip("10-бит (yuv420p10le), tune=ssim, 2-pass AV1\nCRF, preset и разрешение — без изменений")
+        self.btn_mode_std.clicked.connect(lambda: self._set_preset_mode("std"))
+        self.btn_mode_dark.clicked.connect(lambda: self._set_preset_mode("dark"))
+        mode_h = QHBoxLayout(); mode_h.addWidget(self.btn_mode_std); mode_h.addWidget(self.btn_mode_dark)
+
+        self.s_spd = SpeedSpinBox(); self.s_spd.setValue(100); self.s_spd.setSuffix("%")
+        self.s_spd.setMaximumWidth(110)
+        self.s_crf = QSpinBox(); self.s_crf.setRange(0, 63); self.s_crf.setValue(35)
+        self.s_pre = QSpinBox(); self.s_pre.setRange(0, 13); self.s_pre.setValue(8)
+        self.c_res = QComboBox(); self.c_res.addItems(["Исходное", "1920x1080", "1280x720", "854x480", "144x72"])
+        self.c_res.setMaximumWidth(180)
+        self.c_fps = QComboBox(); self.c_fps.addItems(["Исходный", "Исходный (max 30)", "5", "12", "23.976", "24", "30", "60"])
+        self.c_fps.setMaximumWidth(200)
+        fv.addRow(row_with_info(self.chk_enable_video, "Если выключено — видео не трогается, меняется только звук. Включено — перекодирование в AV1 (SVT-AV1)."))
+        fv.addRow(label_with_info("Профиль:", "Стандарт: yuv420p, 1 проход. Тёмные сцены: 10-бит + tune=ssim + 2 прохода — меньше «бандинга» в тёмных кадрах."), mode_h)
+        fv.addRow(label_with_info("Скорость:", "Изменение скорости видео и звука. 100% = без изменений. Меняет PTS видео и atempo звука."), self.s_spd)
+        henc = QHBoxLayout(); henc.addWidget(self.s_crf); henc.addWidget(self.s_pre)
+        self._badge_crf = info_badge("CRF — качество AV1 (меньше = качественее, но больше файл; 45 ≈ баланс). Preset — скорость кодирования (0 медленно/качественно … 13 быстро (Рекомендуется 1)).")
+        henc.addWidget(self._badge_crf)
+        henc.addStretch()
+        fv.addRow(label_with_info("CRF / Preset:", "CRF — качество (меньше = лучше). Preset — скорость кодирования AV1."), henc)
+        fv.addRow(label_with_info("Разрешение:", "Масштаб выходного видео. «Исходное» — без изменений. Уменьшение сохраняет пропорции (без растяжения)."), self.c_res)
+        fv.addRow(label_with_info("FPS:", "Частота кадров на выходе. «Исходный (max 30)» — снижает только если выше 30."), self.c_fps)
+        gv.setLayout(fv); rv_inner.addWidget(gv)
+        # Скрываем строки видео если перекодирование выключено
+        self._video_enc_rows = [self.btn_mode_std, self.btn_mode_dark,
+                                 self.s_spd, self.s_crf, self.s_pre, self.c_res, self.c_fps,
+                                 self._badge_crf]
+        def _update_video_enc(checked):
+            for w in self._video_enc_rows:
+                w.setVisible(checked)
+            # Скрываем лейблы через FormLayout
+            for row_idx in range(fv.rowCount()):
+                lbl = fv.itemAt(row_idx, QFormLayout.ItemRole.LabelRole)
+                fld = fv.itemAt(row_idx, QFormLayout.ItemRole.FieldRole)
+                if fld:
+                    wgt = fld.widget()
+                    if wgt is None and fld.layout():
+                        # layout-строка: проверяем первый виджет
+                        wgt = fld.layout().itemAt(0).widget() if fld.layout().count() else None
+                    if wgt in self._video_enc_rows or (
+                        fld.layout() and any(
+                            fld.layout().itemAt(i).widget() in self._video_enc_rows
+                            for i in range(fld.layout().count())
+                            if fld.layout().itemAt(i).widget()
+                        )
+                    ):
+                        if lbl and lbl.widget(): lbl.widget().setVisible(checked)
+        self.chk_enable_video.toggled.connect(_update_video_enc)
+        _update_video_enc(self.chk_enable_video.isChecked())
+
+        gavi = QGroupBox("Изображения"); favi = QFormLayout()
+        # Выбор выходного формата
+        self.c_img_fmt = InvertedWheelComboBox()
+        self.c_img_fmt.addItems(["avif", "webp", "png", "jpg", "ico"])
+        self.c_img_fmt.setCurrentText("avif")
+        self.c_img_fmt.setMaximumWidth(150)
+        favi.addRow(label_with_info("Формат:", "Выходной формат изображений. avif/webp — лучшее сжатие, png — без потерь, jpg — совместимость, ico — иконка Windows (до 256px)."), self.c_img_fmt)
+
+        # ── Лимит размера файла ──────────────────────────────────────────────
+        hlim = QHBoxLayout()
+        self.ck_lim = QCheckBox("Сжать до")
+        self.ck_lim.setChecked(True)
+        self.s_lim = QSpinBox()
+        self.s_lim.setRange(0, 50000); self.s_lim.setSuffix(" КБ")
+        self.s_lim.setSingleStep(50); self.s_lim.setValue(100)
+        hlim.addWidget(self.ck_lim); hlim.addWidget(self.s_lim)
+        hlim.addWidget(info_badge("Подбирает качество так, чтобы файл не превышал указанный размер (КБ)."))
+        hlim.addStretch()
+        # Привязка: спинбокс активен только если галочка включена
+        self.ck_lim.toggled.connect(self.s_lim.setEnabled)
+        favi.addRow(hlim)
+
+        # ── Лимит разрешения ─────────────────────────────────────────────────
+        hdim = QHBoxLayout()
+        self.ck_dim = QCheckBox("Снизить до")
+        self.ck_dim.setChecked(False)
+        self.s_dim = QSpinBox()
+        self.s_dim.setRange(16, 8000); self.s_dim.setSuffix(" px")
+        self.s_dim.setValue(1280); self.s_dim.setEnabled(False)
+        hdim.addWidget(self.ck_dim); hdim.addWidget(self.s_dim)
+        hdim.addWidget(QLabel("(макс. сторона)"))
+        hdim.addWidget(info_badge("Ограничивает максимальную сторону изображения (px) с сохранением пропорций."))
+        hdim.addStretch()
+        self.ck_dim.toggled.connect(self.s_dim.setEnabled)
+        favi.addRow(hdim)
+
+        self.sl_aspd = QSlider(Qt.Orientation.Horizontal); self.sl_aspd.setRange(0, 8); self.sl_aspd.setValue(0)
+        self.ck_arec = QCheckBox("Перезаписывать"); self.ck_arec.setChecked(True)
+        favi.addRow(label_with_info("Скорость:", "Усилие кодирования изображения: левее — быстрее и больше файл, правее — медленнее и компактнее."), self.sl_aspd)
+        favi.addRow(row_with_info(self.ck_arec, "Сохранять результат поверх исходного файла вместо создания копии."))
+        gavi.setLayout(favi); rv_inner.addWidget(gavi)
+
+        rv_inner.addStretch(); w.setLayout(rv_inner); rw.setWidget(w); right_layout.addWidget(rw)
+
+        btn_box = QWidget(); btn_layout = QHBoxLayout(btn_box)
+        btn_layout.setContentsMargins(0, 6, 0, 6)
+        self.b_run = QPushButton("▶  НАЧАТЬ"); self.b_run.setObjectName("b_run")
+        self.b_stop = QPushButton("■  СТОП"); self.b_stop.setObjectName("b_stop"); self.b_stop.setEnabled(False)
+        self.b_run.clicked.connect(self.run); self.b_stop.clicked.connect(self.stop)
+        btn_layout.addWidget(self.b_run); btn_layout.addWidget(self.b_stop)
+
+        right_layout.addWidget(btn_box); right_container.setLayout(right_layout); l.addWidget(right_container, 1)
+
+        self.shortcut_paste = QShortcut(QKeySequence("Ctrl+V"), self.tree)
+        self.shortcut_paste.activated.connect(self.paste_files)
+        self.tree.itemDoubleClicked.connect(self.on_double_click)
+
+    def _set_preset_mode(self, mode):
+        """Переключает профиль кодирования без изменения preset и битрейта аудио."""
+        is_dark = (mode == "dark")
+        self.btn_mode_std.blockSignals(True);  self.btn_mode_dark.blockSignals(True)
+        self.btn_mode_std.setChecked(not is_dark); self.btn_mode_dark.setChecked(is_dark)
+        self.btn_mode_std.blockSignals(False); self.btn_mode_dark.blockSignals(False)
+        try: self.main._save_settings_now()
+        except Exception: pass
+
+    def on_url_ctx(self, pos):
+        m = QMenu()
+        try: cb = QApplication.clipboard().text().strip()
+        except Exception: cb = ""
+        if cb and cb.startswith("http"):
+            a = QAction("Скачать из буфера", self)
+            a.triggered.connect(lambda checked=False, cbv=cb: (self.url_edit.setText(cbv), self.download_url(False)))
+            a2 = QAction("Скачать аудио из буфера", self)
+            a2.triggered.connect(lambda checked=False, cbv=cb: (self.url_edit.setText(cbv), self.download_url(True)))
+            m.addAction(a); m.addAction(a2); m.addSeparator()
+        m.addAction(QAction("Вставить", self, triggered=self.url_edit.paste))
+        m.exec(self.url_edit.mapToGlobal(pos))
+
+    def on_double_click(self, item, column):
+        """Двойной клик по обработанному файлу — открывает результат в плеере."""
+        try:
+            iid = item.data(0, Qt.ItemDataRole.UserRole)
+            entry = self._item_data_map.get(iid)
+            if entry and entry.get('is_done'):
+                out_path = entry.get('out_path')
+                if out_path and os.path.exists(out_path):
+                    self.open_output_file(out_path)
+                else:
+                    self.open_file_location(item)
+        except Exception: pass
+
+    def open_output_file(self, path):
+        """Открывает файл в ассоциированном приложении (плеер, просмотрщик)."""
+        try:
+            if IS_WIN:
+                os.startfile(path)
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', path])
+            else:
+                subprocess.Popen(['xdg-open', path])
+        except Exception as e:
+            self.main.log(f"Не удалось открыть файл: {e}")
+
+    def download_url(self, audio_only=False):
+        url = self.url_edit.text().strip()
+        if not url: return
+        self.url_edit.clear()
+
+        try:
+            dl_path = self.main.tab_ytdlp.out.text()
+            if not dl_path or not os.path.exists(dl_path): dl_path = os.getcwd()
+        except Exception: dl_path = os.getcwd()
+
+        self.main.tab_ytdlp.add_dl_direct(url, audio_only=audio_only, outdir=dl_path)
+
+    def reset_status(self):
+        for i in self.tree.selectedItems():
+            iid = i.data(0, Qt.ItemDataRole.UserRole)
+            entry = self._item_data_map.get(iid)
+            if entry:
+                entry['is_done'] = False
+            i.setText(7, "Ожидание")
+            i.setData(0, ITEM_STATUS_ROLE, None)
+        self.tree.viewport().update()
+
+    def dragEnterEvent(self, event):
+        try:
+            mime = event.mimeData()
+            if mime and mime.hasUrls(): event.acceptProposedAction()
+            else: event.ignore()
+        except Exception: event.ignore()
+
+    def dropEvent(self, event):
+        try:
+            self.window().raise_(); self.window().activateWindow()
+            mime = event.mimeData()
+            if not mime: return
+            if mime.hasUrls():
+                paths = [u.toLocalFile() for u in mime.urls() if u.toLocalFile()]
+                if paths: self.add_paths(paths)
+                event.acceptProposedAction()
+            else: event.ignore()
+        except Exception as e:
+            self.main.log(f"dropEvent error: {e}")
+            event.ignore()
+
+    def ctx(self, pos):
+        m = QMenu()
+        sel = self.tree.itemAt(pos)
+        if sel:
+            iid = sel.data(0, Qt.ItemDataRole.UserRole)
+            entry = self._item_data_map.get(iid, {})
+            out_path = entry.get('out_path', '')
+            if out_path and os.path.exists(out_path):
+                m.addAction("▶  Открыть файл", lambda checked=False, p=out_path: self.open_output_file(p))
+            m.addAction("📁  Перейти к файлу", lambda checked=False, it=sel: self.open_file_location(it))
+            m.addAction("↺  Сбросить статус", lambda checked=False: self.reset_status())
+            m.addSeparator()
+            m.addAction("✕  Удалить", lambda checked=False: self.rem())
+        m.addAction("📋  Вставить файлы", lambda checked=False: self.paste_files())
+        m.addAction("🗑  Очистить всё", lambda checked=False: self.clear())
+        m.exec(self.tree.mapToGlobal(pos))
+
+    def open_file_location(self, item):
+        try:
+            path = item.toolTip(0) or item.data(0, Qt.ItemDataRole.ToolTipRole)
+            if not path: return
+            path = os.path.abspath(path)
+            if IS_WIN: subprocess.Popen(['explorer', '/select,', path])
+            elif sys.platform == 'darwin': subprocess.Popen(['open', '-R', path])
+            else: subprocess.Popen(['xdg-open', os.path.dirname(path)])
+        except Exception as e:
+            self.main.log(f"open_file_location error: {e}")
+
+    def paste_files(self):
+        try:
+            mime = QApplication.clipboard().mimeData()
+            if mime.hasUrls():
+                self.add_paths([u.toLocalFile() for u in mime.urls() if u.toLocalFile()])
+        except Exception as e:
+            self.main.log(f"paste_files error: {e}")
+
+    def add(self):
+        p, _ = QFileDialog.getOpenFileNames(self, "Файлы")
+        if p: self.add_paths(p)
+
+    def add_paths(self, paths):
+        for p in paths:
+            try:
+                if not os.path.exists(p): continue
+
+                # Не добавляем файлы, которые сами являются результатом обработки
+                stem = Path(p).stem
+                if stem.endswith("_Сжатый") or stem.endswith("_Compressed"):
+                    continue
+
+                ext = Path(p).suffix.lower()
+                if ext in ALLOWED_MEDIA: ft = "MEDIA"
+                elif ext in ALLOWED_IMG: ft = "IMG"
+                else: continue
+
+                iid = uuid.uuid4().hex
+                # Только быстрый getsize — ffprobe уйдёт в фоновый поток
+                try: size = os.path.getsize(p)
+                except Exception: size = 0
+
+                item_data = {'iid': iid, 'path': p, 'type': ft, 'dur': 0, 'is_done': False}
+                self.items.append(item_data)
+                self._item_data_map[iid] = item_data
+
+                it = QTreeWidgetItem(self.tree)
+                it.setText(0, os.path.basename(p)); it.setToolTip(0, p)
+                it.setText(1, human_size(size)); it.setText(2, "-"); it.setText(3, "-")
+                it.setText(4, "-"); it.setText(5, "-"); it.setText(6, "-"); it.setText(7, "Ожидание")
+                it.setData(0, Qt.ItemDataRole.UserRole, iid)
+                self._item_map[iid] = it
+                self.tree.scrollToItem(it)
+                self.pool.start(LocalThumbnailRunnable(p, iid, self.thumb_sig))
+
+                if ft == "MEDIA":
+                    def _bg(path_local, iid_local):
+                        # ffprobe + loudness — всё в фоне, UI не блокируем
+                        try:
+                            dur_r, br_r, size_r, a_br_r = get_media_info(path_local)
+                            def _apply_info():
+                                d = self._item_data_map.get(iid_local)
+                                if d: d['dur'] = dur_r
+                                item = self._find_item(iid_local)
+                                if item:
+                                    item.setText(1, human_size(size_r))
+                                    item.setText(3, a_br_r or br_r or "-")
+                            QTimer.singleShot(0, _apply_info)
+                        except Exception: pass
+                        try:
+                            val = measure_loudness(path_local)
+                        except Exception: val = None
+                        QTimer.singleShot(0, lambda: self.update_lufs_columns(iid_local, val, None))
+                    threading.Thread(target=_bg, args=(p, iid), daemon=True).start()
+
+            except Exception as e:
+                self.main.log(f"add_paths error: {e}")
+
+    def set_thumb(self, iid, icon):
+        try:
+            item = self._find_item(iid)
+            if item:
+                item.setIcon(0, icon)
+        except Exception: pass
+
+    def update_item_info(self, iid, size_new, bitrate_result):
+        try:
+            item = self._find_item(iid)
+            if item:
+                item.setText(2, size_new); item.setText(4, bitrate_result)
+                item.setData(0, ITEM_STATUS_ROLE, 'done')
+                self.tree.viewport().update()
+        except Exception: pass
+
+    def update_lufs_columns(self, iid, before, after):
+        try:
+            item = self._find_item(iid)
+            if item:
+                item.setText(5, "-" if before is None else f"{before:.2f} LUFS")
+                item.setText(6, "-" if after is None else f"{after:.2f} LUFS")
+        except Exception: pass
+
+    def rem(self):
+        try:
+            for i in self.tree.selectedItems():
+                iid = i.data(0, Qt.ItemDataRole.UserRole)
+                self.items = [x for x in self.items if x['iid'] != iid]
+                self._item_map.pop(iid, None)
+                self._item_data_map.pop(iid, None)
+                self.tree.invisibleRootItem().removeChild(i)
+        except Exception: pass
+
+    def clear(self):
+        try:
+            self.items.clear()
+            self._item_map.clear()
+            self._item_data_map.clear()
+            self.tree.clear()
+        except Exception: pass
+
+    def run(self):
+        if not self.items: return
+        try: ab = self.c_abitrate.currentText() or "128"
+        except Exception: ab = "128"
+        try: spd = self.s_spd.value()
+        except Exception: spd = 100
+        s = {
+            'audio': {
+                'norm': bool(self.ck_norm.isChecked()),
+                'tgt': float(self.s_tgt.value()), 'lra': float(self.s_lra.value()), 'tp': float(self.s_tp.value()),
+                'fade': bool(self.ck_fade.isChecked()), 'fade_d': float(self.s_fade.value()),
+                'deg': bool(self.ck_deg.isChecked()), 'hz': int(self.s_hz.value()), 'u8': bool(self.ck_u8.isChecked()),
+                'lp': int(self.s_lp.value()), 'hp': int(self.s_hp.value()), 'deg_gain_db': float(self.s_deg_gain.value()),
+                'bitrate': ab
+            },
+            'video': {
+                'enabled': bool(self.chk_enable_video.isChecked()), 'speed': int(spd), 'crf': int(self.s_crf.value()),
+                'pre': int(self.s_pre.value()), 'res': self.c_res.currentText(), 'fps': self.c_fps.currentText(),
+                'preset_mode': 'dark' if self.btn_mode_dark.isChecked() else 'std'
+            },
+            'avif': {
+                'limit': int(self.s_lim.value()) if self.ck_lim.isChecked() else 0,
+                'adim': int(self.s_dim.value()) if self.ck_dim.isChecked() else 0,
+                'aspd': int(self.sl_aspd.value()), 'arec': bool(self.ck_arec.isChecked()),
+                'img_fmt': self.c_img_fmt.currentText() if hasattr(self, 'c_img_fmt') else 'avif'
+            }
+        }
+        self.worker = ProcessWorker(self.items, s)
+        self.worker.status.connect(self.on_stat); self.worker.progress.connect(self.on_prog)
+        self.worker.log.connect(self.main.log); self.worker.finished_all.connect(self.done)
+        self.worker.global_progress.connect(self.main.update_global_progress)
+        self.worker.update_item_sig.connect(self.update_item_info); self.worker.update_lufs_sig.connect(self.update_lufs_columns)
+
+        try:
+            for itdata in self.items:
+                if itdata.get('is_done'): continue
+                iid = itdata.get('iid')
+                item = self._find_item(iid)
+                if item:
+                    item.setData(0, ITEM_STATUS_ROLE, 'proc')
+            self.tree.viewport().update()
+        except Exception: pass
+
+        self.b_run.setEnabled(False); self.b_stop.setEnabled(True)
+        self.worker.start()
+
+    def stop(self):
+        if self.worker:
+            try: self.worker.stop()
+            except Exception: pass
+
+    def on_stat(self, iid, txt, code):
+        try:
+            i = self._find_item(iid)
+            if i:
+                i.setData(0, ITEM_STATUS_ROLE, code)
+                i.setText(7, txt)
+                self.tree.viewport().update()
+        except Exception: pass
+
+    def on_prog(self, iid, val):
+        try:
+            i = self._find_item(iid)
+            if i:
+                i.setText(7, f"{val}%")
+        except Exception: pass
+
+    def done(self):
+        self.b_run.setEnabled(True); self.b_stop.setEnabled(False)
+        self.main.log("Готово")
+        try: play_done_sound()
+        except Exception: pass
+
+    def restart_gui(self):
+        try:
+            python = sys.executable; script = os.path.abspath(sys.argv[0])
+            subprocess.Popen([python, script], cwd=os.getcwd())
+        except Exception as e:
+            self.main.log(f"Не удалось запустить новый процесс: {e}")
+            return
+        try:
+            self.main.close()
+            QTimer.singleShot(200, QApplication.quit)
+        except Exception:
+            try:
+                QApplication.quit()
+            except Exception:
+                os._exit(0)
+
+
+class Base64Tab(QWidget):
+    """Вкладка кодирования любого файла в Base64."""
+    _sig_done     = pyqtSignal(str, str, str)   # b64, size_str, txt_path
+    _sig_error    = pyqtSignal(str)
+    _sig_progress = pyqtSignal(int)             # 0-100, только из фонового потока
+
+    # Расширения и их иконки
+    _ICON_MAP = {
+        # Видео
+        '.mp4': '🎬', '.mkv': '🎬', '.avi': '🎬', '.mov': '🎬', '.webm': '🎬',
+        '.flv': '🎬', '.wmv': '🎬', '.m4v': '🎬', '.ts': '🎬', '.mts': '🎬',
+        '.m2ts': '🎬', '.vob': '🎬', '.ogv': '🎬', '.3gp': '🎬', '.3g2': '🎬',
+        '.divx': '🎬', '.f4v': '🎬', '.mxf': '🎬', '.rm': '🎬', '.rmvb': '🎬',
+        # Аудио
+        '.mp3': '🎵', '.opus': '🎵', '.wav': '🎵', '.flac': '🎵', '.ogg': '🎵',
+        '.aac': '🎵', '.m4a': '🎵', '.wma': '🎵', '.aiff': '🎵', '.aif': '🎵',
+        '.ape': '🎵', '.mka': '🎵', '.mid': '🎵', '.midi': '🎵', '.amr': '🎵',
+        '.ac3': '🎵', '.dts': '🎵', '.ra': '🎵', '.au': '🎵',
+        # 3D / Игровые ассеты
+        '.glb': '🧊', '.gltf': '🧊', '.obj': '🧊', '.fbx': '🧊', '.dae': '🧊',
+        '.3ds': '🧊', '.stl': '🧊', '.ply': '🧊', '.blend': '🧊', '.usdz': '🧊',
+        '.usd': '🧊', '.abc': '🧊', '.x3d': '🧊', '.vrml': '🧊', '.wrl': '🧊',
+        # Изображения (будут показываться как превью)
+        '.jpg': None, '.jpeg': None, '.png': None, '.gif': None, '.webp': None,
+        '.bmp': None, '.tiff': None, '.tif': None, '.avif': None, '.heic': None,
+        '.heif': None, '.ico': None, '.svg': '🖼',
+        # Документы
+        '.pdf': '📄', '.doc': '📄', '.docx': '📄', '.xls': '📄', '.xlsx': '📄',
+        '.ppt': '📄', '.pptx': '📄', '.txt': '📄', '.rtf': '📄', '.odt': '📄',
+        '.ods': '📄', '.odp': '📄', '.csv': '📄', '.md': '📄',
+        # Архивы
+        '.zip': '🗜', '.rar': '🗜', '.7z': '🗜', '.tar': '🗜', '.gz': '🗜',
+        '.bz2': '🗜', '.xz': '🗜', '.zst': '🗜', '.lz4': '🗜',
+        # Шрифты
+        '.ttf': '🔤', '.otf': '🔤', '.woff': '🔤', '.woff2': '🔤', '.eot': '🔤',
+        # Код / данные
+        '.json': '💾', '.xml': '💾', '.yaml': '💾', '.yml': '💾', '.toml': '💾',
+        '.bin': '💾', '.dat': '💾', '.db': '💾', '.sqlite': '💾', '.proto': '💾',
+        # Игровые / движковые форматы
+        '.pak': '🎮', '.vpk': '🎮', '.bsp': '🎮', '.mdl': '🎮', '.vtf': '🎮',
+        '.vmt': '🎮', '.prefab': '🎮', '.asset': '🎮', '.unity': '🎮',
+        # Прочее
+        '.iso': '💿', '.img': '💿', '.dmg': '💿',
+    }
+
+    def __init__(self, main_window):
+        super().__init__()
+        self.main = main_window
+        self._stop_flag = threading.Event()
+        self._sig_done.connect(self._on_done)
+        self._sig_error.connect(self._on_error)
+        self._sig_progress.connect(self.progress_update)
+        self._current_path = ""
+        self._build_ui()
+
+    def progress_update(self, pct: int):
+        self.progress.setValue(pct)
+
+    def add_paths(self, paths):
+        """Совместимость с RecentFileThumb — устанавливает первый файл."""
+        if paths:
+            self._set_path(paths[0])
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        # ── Верхний блок: миниатюра + кнопки ────────────────────────────────
+        top = QHBoxLayout()
+
+        # Миниатюра — принимает дроп
+        self.lbl_thumb = QLabel()
+        self.lbl_thumb.setFixedSize(120, 90)
+        self.lbl_thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_thumb.setStyleSheet(
+            "background:#1e1e2e; border:1px solid #45475a; border-radius:6px; color:#6c7086; font-size:11px;")
+        self.lbl_thumb.setText("нет\nфайла")
+        top.addWidget(self.lbl_thumb)
+
+        top.addSpacing(12)
+
+        # Правая колонка: имя файла + кнопки
+        right = QVBoxLayout()
+        self.lbl_fname = QLabel("Файл не выбран")
+        self.lbl_fname.setStyleSheet("color:#cdd6f4; font-size:12px;")
+        self.lbl_fname.setWordWrap(True)
+        right.addWidget(self.lbl_fname)
+
+        self.lbl_hint = QLabel("💡 Перетащите файл из любой вкладки или с рабочего стола")
+        self.lbl_hint.setStyleSheet("color:#6c7086; font-size:10px;")
+        right.addWidget(self.lbl_hint)
+        right.addStretch()
+
+        btn_row = QHBoxLayout()
+        btn_browse = QPushButton("📂  Выбрать файл")
+        btn_browse.clicked.connect(self._browse)
+
+        self.btn_encode = QPushButton("⚙  Кодировать")
+        self.btn_encode.setFixedHeight(32)
+        self.btn_encode.clicked.connect(self._start_encode)
+
+        self.btn_stop = QPushButton("🗑  Очистить")
+        self.btn_stop.setFixedHeight(32)
+        self.btn_stop.setEnabled(True)
+        self.btn_stop.clicked.connect(self._clear_result)
+
+        btn_row.addWidget(btn_browse)
+        btn_row.addWidget(self.btn_encode)
+        btn_row.addWidget(self.btn_stop)
+        right.addLayout(btn_row)
+
+        top.addLayout(right, 1)
+        root.addLayout(top)
+
+        # ── Прогресс-бар ─────────────────────────────────────────────────────
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setFixedHeight(8)
+        self.progress.hide()
+        root.addWidget(self.progress)
+
+        # ── Результат ─────────────────────────────────────────────────────────
+        grp_out = QGroupBox("Результат (Base64)")
+        vl = QVBoxLayout(grp_out)
+
+        self.txt_out = QPlainTextEdit()
+        self.txt_out.setReadOnly(True)
+        self.txt_out.setPlaceholderText("Здесь появится Base64-строка после кодирования…")
+        self.txt_out.setFont(QFont("Courier New", 9))
+        self.txt_out.setMinimumHeight(80)
+        self.txt_out.setMaximumHeight(260)
+        vl.addWidget(self.txt_out)
+
+        h_btns = QHBoxLayout()
+        self.lbl_size = QLabel("")
+        self.lbl_size.setStyleSheet("color:#6c7086; font-size:11px;")
+        btn_copy = QPushButton("📋  Копировать")
+        btn_copy.setFixedWidth(130)
+        btn_copy.clicked.connect(self._copy)
+        h_btns.addWidget(self.lbl_size)
+        h_btns.addStretch()
+        h_btns.addWidget(btn_copy)
+        vl.addLayout(h_btns)
+
+        root.addWidget(grp_out, 1)
+        self.setAcceptDrops(True)
+
+    # ── Drag & drop ───────────────────────────────────────────────────────────
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls(): e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls(): e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        urls = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        if urls: self._set_path(urls[0])
+
+    # ── Вспомогательные ──────────────────────────────────────────────────────
+    def _browse(self):
+        # Строим фильтры: популярные группы + «Все файлы»
+        media   = "Медиафайлы (*.mp4 *.mkv *.avi *.mov *.webm *.flv *.wmv *.m4v *.ts *.3gp *.mp3 *.opus *.wav *.flac *.ogg *.aac *.m4a *.wma *.aiff)"
+        images  = "Изображения (*.jpg *.jpeg *.png *.gif *.webp *.bmp *.tiff *.avif *.heic *.heif *.ico *.svg)"
+        model3d = "3D / Игровые ассеты (*.glb *.gltf *.obj *.fbx *.dae *.3ds *.stl *.ply *.blend *.usdz *.usd *.abc *.pak *.vpk *.bsp *.mdl *.vtf *.prefab *.asset)"
+        docs    = "Документы (*.pdf *.doc *.docx *.xls *.xlsx *.ppt *.pptx *.txt *.rtf *.odt *.csv *.md *.json *.xml *.yaml *.yml *.toml)"
+        fonts   = "Шрифты (*.ttf *.otf *.woff *.woff2 *.eot)"
+        archives= "Архивы (*.zip *.rar *.7z *.tar *.gz *.bz2 *.xz *.zst)"
+        other   = "Прочее (*.bin *.dat *.db *.sqlite *.iso *.img *.dmg)"
+        all_f   = "Все файлы (*)"
+        flt = ";;".join([media, images, model3d, docs, fonts, archives, other, all_f])
+        path, _ = QFileDialog.getOpenFileName(self, "Выбрать файл для кодирования в Base64", "", flt)
+        if path: self._set_path(path)
+
+    def _set_path(self, path):
+        self._current_path = path
+        self.lbl_fname.setText(os.path.basename(path))
+        self.lbl_hint.hide()
+        self.txt_out.clear()
+        self.lbl_size.setText("")
+        self._load_thumb(path)
+        # Автоматически запускаем кодирование сразу после выбора файла
+        QTimer.singleShot(80, self._start_encode)
+
+    def _load_thumb(self, path):
+        ext = os.path.splitext(path)[1].lower()
+        icon_val = self._ICON_MAP.get(ext, '📦')  # 📦 для неизвестных
+
+        # Изображения — показываем превью
+        img_exts = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp',
+                    '.tiff', '.tif', '.avif', '.heic', '.heif', '.ico'}
+        if ext in img_exts:
+            pix = QPixmap()
+            if Image:
+                try:
+                    with Image.open(path) as im:
+                        if ImageOps: im = ImageOps.exif_transpose(im)
+                        im.thumbnail((240, 180))
+                        bio = io.BytesIO()
+                        im.convert("RGBA").save(bio, "PNG")
+                        pix.loadFromData(QByteArray(bio.getvalue()))
+                except Exception:
+                    pass
+            if pix.isNull():
+                pix = QPixmap(path)
+            if not pix.isNull():
+                self.lbl_thumb.setPixmap(
+                    pix.scaled(120, 90, Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation))
+                return
+
+        # Видео — пытаемся вытащить кадр через ffmpeg
+        video_exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv',
+                      '.m4v', '.ts', '.mts', '.m2ts', '.vob', '.ogv', '.3gp',
+                      '.3g2', '.divx', '.f4v', '.mxf', '.rm', '.rmvb'}
+        if ext in video_exts:
+            pix = QPixmap()
+            try:
+                tmp = os.path.join(tempfile.gettempdir(), f"ym_b64_thumb_{uuid.uuid4().hex}.jpg")
+                subprocess.run([FFMPEG, "-y", "-i", path, "-vframes", "1", "-q:v", "5", tmp],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               creationflags=CREATE_NO_WINDOW, timeout=8)
+                if os.path.exists(tmp):
+                    pix = QPixmap(tmp)
+                    try: os.remove(tmp)
+                    except Exception: pass
+            except Exception:
+                pass
+            if not pix.isNull():
+                self.lbl_thumb.setPixmap(
+                    pix.scaled(120, 90, Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation))
+                return
+
+        # Для всего остального — большой эмодзи-значок
+        icon_chr = icon_val if icon_val else '📦'
+        ext_upper = ext.upper().lstrip('.') if ext else '??'
+        self.lbl_thumb.setText(f"{icon_chr}\n{ext_upper}")
+        self.lbl_thumb.setStyleSheet(
+            "background:#1e1e2e; border:1px solid #45475a; border-radius:6px; "
+            "color:#89b4fa; font-size:22px; qproperty-alignment: AlignCenter;")
+
+    def _copy(self):
+        text = self.txt_out.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.main.log("Base64 скопирован в буфер обмена")
+
+    # ── Кодирование ──────────────────────────────────────────────────────────
+    def _start_encode(self):
+        path = self._current_path
+        if not path or not os.path.isfile(path):
+            self.main.log("Base64: файл не выбран или не существует")
+            return
+        self._stop_flag.clear()
+        self.btn_encode.setEnabled(False)
+        self.txt_out.clear()
+        self.lbl_size.setText("Чтение файла…")
+        self.progress.setValue(0)
+        self.progress.show()
+
+        def _worker():
+            try:
+                total = os.path.getsize(path)
+                CHUNK = 256 * 1024  # 256 КБ
+                chunks = []
+                read = 0
+                with open(path, "rb") as f:
+                    while True:
+                        if self._stop_flag.is_set():
+                            self._sig_error.emit("Отменено пользователем")
+                            return
+                        chunk = f.read(CHUNK)
+                        if not chunk: break
+                        chunks.append(chunk)
+                        read += len(chunk)
+                        pct = int(read * 100 / total) if total else 0
+                        self._sig_progress.emit(pct)
+
+                raw = b"".join(chunks)
+                if self._stop_flag.is_set():
+                    self._sig_error.emit("Отменено пользователем")
+                    return
+
+                b64 = base64.b64encode(raw).decode("ascii")
+
+                base_name = os.path.splitext(os.path.basename(path))[0]
+                txt_path = os.path.join(os.path.dirname(path), base_name + "_base64.txt")
+                with open(txt_path, "w", encoding="ascii") as f:
+                    f.write(b64)
+
+                size_kb = len(b64) / 1024
+                size_str = (f"{size_kb/1024:.2f} МБ" if size_kb >= 1024 else f"{size_kb:.1f} КБ")
+                self._sig_done.emit(b64, size_str, txt_path)
+            except Exception as ex:
+                self._sig_error.emit(str(ex))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _stop_encode(self):
+        self._stop_flag.set()
+
+    def _clear_result(self):
+        """Очищает поле результата, сбрасывает превью и прогресс."""
+        self._stop_flag.set()  # останавливает фоновый поток если идёт кодирование
+        self.txt_out.clear()
+        self.lbl_size.setText("")
+        self.lbl_fname.setText("Файл не выбран")
+        self.lbl_thumb.setPixmap(QPixmap())
+        self.lbl_thumb.setText("нет\nфайла")
+        self.lbl_thumb.setStyleSheet(
+            "background:#1e1e2e; border:1px solid #45475a; border-radius:6px; color:#6c7086; font-size:11px;")
+        self.lbl_hint.show()
+        self.progress.hide()
+        self.progress.setValue(0)
+        self._current_path = ""
+        self.btn_encode.setEnabled(True)
+
+    def _on_done(self, b64: str, size_str: str, txt_path: str):
+        self.txt_out.setPlainText(b64)
+        self.progress.setValue(100)
+        self.progress.hide()
+        self.btn_encode.setEnabled(True)
+        # Автокопирование в буфер обмена
+        QApplication.clipboard().setText(b64)
+        self.lbl_size.setText(f"✅ Скопировано! Размер: {size_str}  •  {os.path.basename(txt_path)}")
+        self.main.log(f"Base64 готов ({size_str}), скопирован в буфер, сохранён: {txt_path}")
+
+    def _on_error(self, msg: str):
+        self.lbl_size.setText(f"❌ {msg}")
+        self.progress.hide()
+        self.btn_encode.setEnabled(True)
+        self.main.log(f"Base64: {msg}")
+
+
+class PhotoMergerTab(QWidget):
+    # Форматы сохранения: (расширение, PIL-формат, параметры сохранения)
+    _FMT_MAP = [
+        ("tiff", "TIFF",  {"compression": "tiff_deflate"}),
+        ("jpg",  "JPEG",  {"quality": 95}),
+        ("png",  "PNG",   {}),
+        ("webp", "WEBP",  {"quality": 90}),
+    ]
+
+    def __init__(self, main_window):
+        super().__init__()
+        self.main = main_window
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        # ── Status bar ─────────────────────────────────────
+        top = QHBoxLayout()
+        self.lbl_status = QLabel("Перетащите фотографии или нажмите «Добавить»")
+        self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 13px;")
+
+        btn_open = QPushButton("📂  Добавить файлы")
+        btn_open.setFixedWidth(150)
+        btn_open.clicked.connect(self._open_files)
+
+        btn_clear_sel = QPushButton("✂  Удалить выбранные")
+        btn_clear_sel.setFixedWidth(160)
+        btn_clear_sel.clicked.connect(self._remove_selected)
+
+        btn_clear_all = QPushButton("🗑  Очистить всё")
+        btn_clear_all.setFixedWidth(130)
+        btn_clear_all.setObjectName("b_stop")
+        btn_clear_all.clicked.connect(self._clear_all)
+
+        top.addWidget(self.lbl_status, 1)
+        top.addWidget(btn_open)
+        top.addWidget(btn_clear_sel)
+        top.addWidget(btn_clear_all)
+        root.addLayout(top)
+
+        # ── File list ───────────────────────────────────────
+        self.file_list = PhotoDragList()
+        root.addWidget(self.file_list, 3)
+
+        # ── Одна строка: режим + формат + кнопки ──────────────
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+
+        self.rb_horiz = QPushButton("➡  Горизонт.")
+        self.rb_vert  = QPushButton("⬇  Вертикал.")
+        self.rb_horiz.setCheckable(True); self.rb_horiz.setChecked(True)
+        self.rb_vert.setCheckable(True)
+        self.rb_horiz.clicked.connect(lambda: self.rb_vert.setChecked(False))
+        self.rb_vert.clicked.connect(lambda: self.rb_horiz.setChecked(False))
+
+        toolbar.addWidget(QLabel("Режим:"))
+        toolbar.addWidget(self.rb_horiz)
+        toolbar.addWidget(self.rb_vert)
+        toolbar.addSpacing(12)
+
+        toolbar.addWidget(QLabel("Формат:"))
+        self.cmb_fmt = QComboBox()
+        self.cmb_fmt.addItems(["TIFF", "JPEG", "PNG", "WEBP"])
+        self.cmb_fmt.setFixedWidth(90)
+        toolbar.addWidget(self.cmb_fmt)
+        toolbar.addStretch()
+
+        self.btn_merge_new = QPushButton("▶  Объединить новые")
+        self.btn_merge_new.setObjectName("b_run")
+        self.btn_merge_new.clicked.connect(lambda: self._do_merge(force_all=False))
+        self.btn_merge_all = QPushButton("⟳  Переобъединить всё")
+        self.btn_merge_all.setObjectName("b_restart")
+        self.btn_merge_all.clicked.connect(lambda: self._do_merge(force_all=True))
+
+        toolbar.addWidget(self.btn_merge_new)
+        toolbar.addWidget(self.btn_merge_all)
+        root.addLayout(toolbar)
+
+        # ── Preview ─────────────────────────────────────────
+        grp_prev = QGroupBox("Результат последнего объединения")
+        prev_l = QVBoxLayout(grp_prev)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFixedHeight(220)
+        scroll.setStyleSheet("background-color: #181825; border: 1px solid #45475a; border-radius:4px;")
+        self.lbl_preview = QLabel("Здесь появится результат")
+        self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_preview.setStyleSheet("color: #585b70; font-size: 13px;")
+        scroll.setWidget(self.lbl_preview)
+        prev_l.addWidget(scroll)
+        root.addWidget(grp_prev, 2)
+
+        # ── Accept drops on the whole widget ───────────────
+        self.setAcceptDrops(True)
+
+    # ── Drag-and-drop forwarding ────────────────────────────
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls(): event.accept()
+        else: event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls(): event.accept()
+        else: event.ignore()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.accept()
+            links = [str(u.toLocalFile()) for u in event.mimeData().urls()]
+            self.file_list.add_files(links)
+
+    # ── Helpers ─────────────────────────────────────────────
+    def add_paths(self, paths):
+        _img = {'.png','.jpg','.jpeg','.bmp','.gif','.tiff','.tif',
+                '.webp','.avif','.heic','.heif','.ico'}
+        valid = [p for p in paths if os.path.splitext(p)[1].lower() in _img]
+        if valid:
+            self.file_list.add_files(valid)
+
+    def _open_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Выбрать изображения", "",
+            "Изображения (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp *.avif *.heic *.heif *.ico)"
+        )
+        if files:
+            self.file_list.add_files(files)
+
+    def _remove_selected(self):
+        for it in self.file_list.selectedItems():
+            idx = self.file_list.indexOfTopLevelItem(it)
+            if idx >= 0:
+                self.file_list.takeTopLevelItem(idx)
+
+    def _clear_all(self):
+        self.file_list.clear()
+        self.lbl_preview.clear()
+        self.lbl_preview.setText("Здесь появится результат")
+        self.lbl_status.setText("Список очищен")
+
+    # ── Core merge ──────────────────────────────────────────
+    def _do_merge(self, force_all: bool):
+        if not Image:
+            self.lbl_status.setText("❌ Pillow не установлен (pip install Pillow)")
+            return
+
+        items = self.file_list.get_all_items() if force_all else self.file_list.get_new_items()
+
+        if not items:
+            if force_all:
+                self.lbl_status.setText("Список пуст!")
+            else:
+                self.lbl_status.setText("Нет новых файлов. Нажмите «Переобъединить всё».")
+            return
+
+        try:
+            paths = [it.data(0, Qt.ItemDataRole.UserRole) for it in items]
+            imgs = [Image.open(p) for p in paths]
+
+            vertical = self.rb_vert.isChecked()
+
+            if vertical:
+                max_w = max(im.width for im in imgs)
+                processed = []
+                total_h = 0
+                for im in imgs:
+                    r = max_w / im.width
+                    new_h = int(im.height * r)
+                    processed.append(im.resize((max_w, new_h), Image.Resampling.LANCZOS))
+                    total_h += new_h
+                canvas = Image.new('RGB', (max_w, total_h), (0, 0, 0))
+                y = 0
+                for im in processed:
+                    if im.mode != 'RGB': im = im.convert('RGB')
+                    canvas.paste(im, (0, y)); y += im.height
+            else:
+                max_h = max(im.height for im in imgs)
+                processed = []
+                total_w = 0
+                for im in imgs:
+                    r = max_h / im.height
+                    new_w = int(im.width * r)
+                    processed.append(im.resize((new_w, max_h), Image.Resampling.LANCZOS))
+                    total_w += new_w
+                canvas = Image.new('RGB', (total_w, max_h), (0, 0, 0))
+                x = 0
+                for im in processed:
+                    if im.mode != 'RGB': im = im.convert('RGB')
+                    canvas.paste(im, (x, 0)); x += im.width
+
+            # ── Output path: всегда рядом с исходными файлами ──
+            out_dir = os.path.dirname(paths[0]) or "."
+
+            ext, pil_fmt, save_kwargs = self._FMT_MAP[self.cmb_fmt.currentIndex()]
+            out_path = os.path.join(out_dir, f"merged_{random.randint(1000, 9999)}.{ext}")
+            canvas.save(out_path, format=pil_fmt, **save_kwargs)
+
+            # ── Mark items ─────────────────────────────────
+            r = random.randint(30, 90); g = random.randint(30, 90); b = random.randint(30, 90)
+            self.file_list.mark_processed(items, QColor(r, g, b))
+
+            # ── Preview ────────────────────────────────────
+            pix = QPixmap(out_path)
+            prev_w = self.lbl_preview.parent().width() - 30
+            if prev_w < 80: prev_w = 80
+            self.lbl_preview.setPixmap(
+                pix.scaledToWidth(prev_w, Qt.TransformationMode.SmoothTransformation))
+
+            self.lbl_status.setText(
+                f"✅ Готово! {len(imgs)} фото → {os.path.basename(out_path)}")
+            self.main.log(f"[Фото] Объединено {len(imgs)} файлов → {out_path}")
+
+            # ── Отправить результат в очередь первой вкладки ──
+            try:
+                self.main.tab_media.add_paths([out_path])
+                self.main.tabs.setCurrentWidget(self.main.tab_media)
+                self.main.log(f"[Фото] Файл добавлен в очередь обработки: {os.path.basename(out_path)}")
+            except Exception as send_exc:
+                self.main.log(f"[Фото] Не удалось добавить в очередь: {send_exc}")
+
+            try: play_done_sound()
+            except Exception: pass
+
+        except Exception as exc:
+            self.lbl_status.setText(f"❌ Ошибка: {exc}")
+            self.main.log(f"[Фото] Ошибка объединения: {exc}")
+        finally:
+            # Закрываем все PIL-изображения, чтобы избежать утечки памяти
+            for im in imgs if 'imgs' in dir() else []:
+                try: im.close()
+                except Exception: pass
+
+
+class PromptTab(QWidget):
+    """Вкладка с промптами из Промпт.txt, лежащего рядом со скриптом."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Промпт.txt")
+        self._checkboxes = []  # list of QCheckBox, each has ._full_text attribute
+        self._build_ui()
+        self._load_prompts()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        top = QHBoxLayout()
+        lbl = QLabel("Промпты для SiGame-игр:")
+        lbl.setStyleSheet("font-weight:bold; color:#89b4fa; font-size:14px;")
+        top.addWidget(lbl)
+        top.addStretch()
+
+        btn_all = QPushButton("✓ Все")
+        btn_all.setFixedWidth(72)
+        btn_all.clicked.connect(self._select_all)
+        btn_none = QPushButton("✗ Снять")
+        btn_none.setFixedWidth(72)
+        btn_none.clicked.connect(self._select_none)
+        self.btn_copy_sel = QPushButton("📋  Копировать выбранные")
+        self.btn_copy_sel.clicked.connect(self._copy_selected)
+        btn_pick = QPushButton("📂  Выбрать файл")
+        btn_pick.setToolTip("Загрузить промпты из другого .txt файла")
+        btn_pick.clicked.connect(self._choose_prompt_file)
+        btn_reload = QPushButton("↺  Обновить")
+        btn_reload.clicked.connect(self._load_prompts)
+
+        top.addWidget(btn_all)
+        top.addWidget(btn_none)
+        top.addWidget(self.btn_copy_sel)
+        top.addWidget(btn_pick)
+        top.addWidget(btn_reload)
+        root.addLayout(top)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._cb_widget = QWidget()
+        self._cb_layout = QVBoxLayout(self._cb_widget)
+        self._cb_layout.setContentsMargins(4, 4, 4, 4)
+        self._cb_layout.setSpacing(2)
+        self._cb_layout.addStretch()
+        scroll.setWidget(self._cb_widget)
+        root.addWidget(scroll)
+
+        self._status = QLabel("")
+        self._status.setStyleSheet("color:#585b70; font-size:11px;")
+        root.addWidget(self._status)
+
+    def _load_prompts(self):
+        while self._cb_layout.count() > 1:
+            item = self._cb_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._checkboxes.clear()
+
+        if not os.path.exists(self._prompt_path):
+            self._status.setText(f"Файл не найден: {self._prompt_path}")
+            return
+        try:
+            with open(self._prompt_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            self._status.setText(f"Ошибка чтения: {e}")
+            return
+
+        sections = self._parse_sections(content)
+        # Файл без нумерованных секций (N)) — показываем как один цельный промпт
+        if not sections and content.strip():
+            sections = [(os.path.basename(self._prompt_path), content.strip())]
+
+        for title, body in sections:
+            cb = QCheckBox(title)
+            cb.setStyleSheet("font-size:13px; padding:5px 2px;")
+            cb._full_text = title + "\n" + body  # type: ignore[attr-defined]
+            self._checkboxes.append(cb)
+            self._cb_layout.insertWidget(self._cb_layout.count() - 1, cb)
+
+        self._status.setText(f"{len(self._checkboxes)} промптов  ·  {os.path.basename(self._prompt_path)}")
+
+    def _choose_prompt_file(self):
+        start_dir = os.path.dirname(self._prompt_path) if self._prompt_path else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выбрать файл с промптами", start_dir,
+            "Текстовые файлы (*.txt);;Все файлы (*.*)")
+        if path:
+            self._prompt_path = path
+            self._load_prompts()
+
+    def _parse_sections(self, text):
+        sections = []
+        current_title = None
+        current_lines = []
+        for line in text.splitlines():
+            if re.match(r'^\d+\)', line.strip()):
+                if current_title is not None:
+                    sections.append((current_title, "\n".join(current_lines).strip()))
+                current_title = line.strip()
+                current_lines = []
+            else:
+                if current_title is not None:
+                    current_lines.append(line)
+        if current_title is not None:
+            sections.append((current_title, "\n".join(current_lines).strip()))
+        return sections
+
+    def _select_all(self):
+        for cb in self._checkboxes:
+            cb.setChecked(True)
+
+    def _select_none(self):
+        for cb in self._checkboxes:
+            cb.setChecked(False)
+
+    def _copy_selected(self):
+        parts = [cb._full_text for cb in self._checkboxes if cb.isChecked()]  # type: ignore[attr-defined]
+        if not parts:
+            self._status.setText("Ничего не выбрано")
+            return
+        QApplication.clipboard().setText("\n\n".join(parts))
+        n = len(parts)
+        suffix = "а" if n in (2, 3, 4) else "ов" if n != 1 else ""
+        orig = self.btn_copy_sel.text()
+        self.btn_copy_sel.setText(f"✓  Скопировано {n} пункт{suffix}!")
+        QTimer.singleShot(2000, lambda: self.btn_copy_sel.setText(orig))
+        self._status.setText(f"Скопировано {n} пункт{suffix} в буфер")
