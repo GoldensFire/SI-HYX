@@ -72,10 +72,11 @@ try:
         QMessageBox, QTextEdit, QPlainTextEdit, QSlider, QGroupBox, QFormLayout, QComboBox,
         QLineEdit, QMenu, QScrollArea, QAbstractSpinBox, QAbstractItemView,
         QTreeWidgetItemIterator, QHeaderView, QToolButton, QDialog,
-        QStyledItemDelegate, QStyle, QSplashScreen, QToolTip
+        QStyledItemDelegate, QStyle, QSplashScreen, QToolTip, QFrame
     )
     from PyQt6.QtCore import (
-        Qt, QThread, pyqtSignal, QSize, QRunnable, QThreadPool, QByteArray, QTimer
+        Qt, QThread, pyqtSignal, QSize, QRunnable, QThreadPool, QByteArray, QTimer,
+        QObject, QEvent
     )
     from PyQt6.QtGui import (
         QAction, QColor, QFont, QIcon, QPixmap, QBrush, QImage as QtGuiImage,
@@ -247,8 +248,11 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.1 BETA"
+APP_VERSION = "0.2 BETA"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
+# Репозиторий для автообновления (GitHub Releases)
+GITHUB_OWNER = "GoldensFire"
+GITHUB_REPO = "SI-HYX"
 DISCORD_URL = "https://discord.gg/EPCE3rMfFa"
 GITHUB_URL = "https://github.com/GoldensFire/SI-HYX"
 HTTP_PORT = 7432  # порт локального сервера для браузерного расширения

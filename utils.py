@@ -192,6 +192,13 @@ def download_cdn_direct(url: str, out_dir: str, log_fn=None) -> str:
     return out_path
 
 
+def parse_version(s):
+    """Извлекает кортеж чисел из строки версии/тега для сравнения.
+    'v0.2-beta' → (0, 2);  '0.10 BETA' → (0, 10);  '' → (0,)."""
+    nums = re.findall(r'\d+', s or '')
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
 def default_download_dir() -> str:
     """Папка загрузок пользователя по умолчанию (… \\Downloads).
     Если её нет — домашняя папка."""

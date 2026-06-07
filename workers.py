@@ -579,9 +579,11 @@ class ProcessWorker(QThread):
                             vf_list.append(
                                 f"scale=w='min(iw,{w})':h='min(ih,{h})'"
                                 f":force_original_aspect_ratio=decrease"
+                                f":force_divisible_by=2"   # SVT-AV1 требует чётные размеры
                             )
-                        except Exception: vf_list.append(f"scale={res_sel}")
-                    else: vf_list.append(f"scale={res_sel}")
+                        except Exception:
+                            vf_list.append(f"scale={res_sel}:force_divisible_by=2")
+                    else: vf_list.append(f"scale={res_sel}:force_divisible_by=2")
 
                 fps_sel = sv.get('fps', 'Исходный') or 'Исходный'
                 if fps_sel == "Исходный (max 30)":

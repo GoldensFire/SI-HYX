@@ -10,6 +10,8 @@ from tabs import *
 class UnifiedWindow(QMainWindow):
     url_from_browser = pyqtSignal(str, bool)  # URL + audio_only из браузерного расширения (HTTP-сервер → Qt)
     log_signal = pyqtSignal(str)              # потокобезопасный лог (из фоновых потоков → GUI)
+    update_available_sig = pyqtSignal(str, str, int)  # версия, ссылка на zip, размер (байт)
+    update_ready_sig = pyqtSignal(str)        # путь к распакованной новой версии (готово к установке)
 
     def __init__(self):
         super().__init__()
@@ -19,17 +21,48 @@ class UnifiedWindow(QMainWindow):
         screen = QApplication.primaryScreen()
         try: geom = screen.availableGeometry(); max_h = geom.height() - 80
         except Exception: geom = screen.geometry(); max_h = geom.height() - 80
-        init_h = min(900, max_h); init_w = 1280
+        # Подгоняем стартовый размер под экран пользователя (не больше доступной области)
+        try: avail_w = geom.width() - 40
+        except Exception: avail_w = 1280
+        init_h = min(900, max_h); init_w = min(1280, max(800, avail_w))
+        self.setMinimumSize(720, 480)
         self.resize(init_w, init_h)
         try: center_x = geom.x() + (geom.width() - init_w)//2; center_y = geom.y() + (geom.height() - init_h)//2; self.move(center_x, center_y)
         except Exception: pass
 
         self.setAcceptDrops(True)
         self.log_signal.connect(self.log)
+        self.update_available_sig.connect(self._on_update_available)
+        self.update_ready_sig.connect(self._apply_update)
+
+        # Колёсико мыши: меняет ли значения в полях (по умолчанию — нет, только прокрутка)
+        self._wheel_changes_values = False
+        self._wheel_filter = WheelBlocker(self, lambda: self._wheel_changes_values)
+        QApplication.instance().installEventFilter(self._wheel_filter)
         if not check_ffmpeg(): QMessageBox.critical(self, "Error", "FFmpeg not found!")
 
         c = QWidget(); self.setCentralWidget(c); l = QVBoxLayout(c)
         l.setContentsMargins(8, 8, 8, 8); l.setSpacing(6)
+
+        # --- Плашка обновления (скрыта по умолчанию) ---
+        self._pending_update_url = ""
+        self.update_banner = QWidget()
+        self.update_banner.setObjectName("updateBanner")
+        self.update_banner.setStyleSheet(
+            "#updateBanner{background:#313244; border:1px solid #89b4fa; border-radius:6px;}")
+        self.update_banner.setVisible(False)
+        bl = QHBoxLayout(self.update_banner)
+        bl.setContentsMargins(12, 6, 12, 6); bl.setSpacing(8)
+        self.update_banner_lbl = QLabel("Доступно обновление")
+        self.update_banner_lbl.setStyleSheet("color:#cdd6f4; font-weight:bold; background:transparent;")
+        btn_up_now = QPushButton("⬇  Обновить")
+        btn_up_now.setObjectName("b_run")
+        btn_up_now.clicked.connect(self._on_banner_update)
+        btn_later = QPushButton("Позже")
+        btn_later.clicked.connect(lambda: self.update_banner.setVisible(False))
+        bl.addWidget(self.update_banner_lbl); bl.addStretch()
+        bl.addWidget(btn_up_now); bl.addWidget(btn_later)
+        l.addWidget(self.update_banner)
 
         self.tabs = QTabWidget()
         self.tab_media = MediaTab(self); self.tab_ytdlp = YtdlpTab(self)
@@ -95,6 +128,10 @@ class UnifiedWindow(QMainWindow):
         if self._server_enabled:
             self._start_browser_http_server()
 
+        # Тихая проверка обновлений при запуске (молча, если версия актуальна)
+        self._updating = False
+        QTimer.singleShot(2500, lambda: self._check_updates(silent=True))
+
     def add_paths(self, paths):
         """Роутит файлы из общего стрипа в активную вкладку."""
         current = self.tabs.currentWidget()
@@ -108,6 +145,7 @@ class UnifiedWindow(QMainWindow):
         tm = self.tab_media
         ty = self.tab_ytdlp
         self._server_enabled = bool(s.get("server_enabled", False))
+        self._wheel_changes_values = bool(s.get("wheel_changes_values", False))
         try:
             m = s.get("media", {}); a = m.get("audio", {})
             tm.ck_norm.setChecked(a.get("norm", True))
@@ -347,6 +385,11 @@ class UnifiedWindow(QMainWindow):
         try: self._save_settings_now()
         except Exception: pass
 
+    def _set_wheel_changes_values(self, checked: bool):
+        self._wheel_changes_values = bool(checked)
+        try: self._save_settings_now()
+        except Exception: pass
+
     def _open_url(self, url: str):
         try:
             import webbrowser
@@ -381,6 +424,170 @@ class UnifiedWindow(QMainWindow):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    # ------------------------------------------------------------------
+    # Автообновление через GitHub Releases
+    # ------------------------------------------------------------------
+    def _check_updates(self, silent: bool = True):
+        """Опрашивает GitHub API о последнем релизе. Если он новее текущей
+        версии — эмитит update_available_sig (показ диалога на GUI-потоке)."""
+        def _run():
+            try:
+                # Берём СПИСОК релизов (а не /latest), чтобы учитывать и
+                # pre-release (beta), которые /latest пропускает.
+                api = (f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+                       f"/releases?per_page=10")
+                req = urllib.request.Request(api, headers={
+                    "User-Agent": APP_NAME,
+                    "Accept": "application/vnd.github+json",
+                })
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    releases = json.loads(r.read().decode("utf-8", "replace"))
+                if not isinstance(releases, list):
+                    releases = []
+
+                # Выбираем самый свежий не-черновик с zip-ассетом и наибольшей версией
+                best_tag, best_url, best_size, best_ver = "", "", 0, (0,)
+                for rel in releases:
+                    if rel.get("draft"):
+                        continue
+                    tag = rel.get("tag_name") or rel.get("name") or ""
+                    ver = parse_version(tag)
+                    zip_asset = next(
+                        (a for a in rel.get("assets", [])
+                         if str(a.get("name", "")).lower().endswith(".zip")), None)
+                    if zip_asset and ver > best_ver:
+                        best_ver = ver
+                        best_tag = tag
+                        best_url = zip_asset.get("browser_download_url", "")
+                        best_size = int(zip_asset.get("size", 0) or 0)
+
+                if best_url and best_ver > parse_version(APP_VERSION):
+                    self.update_available_sig.emit(best_tag, best_url, best_size)
+                elif not silent:
+                    self.log_signal.emit(
+                        f"Обновлений нет. Текущая версия: {APP_VERSION}"
+                        f" (последняя: {best_tag or '—'}).")
+            except Exception as e:
+                if not silent:
+                    self.log_signal.emit(f"Не удалось проверить обновления: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_update_available(self, version: str, url: str, size: int):
+        if getattr(self, "_updating", False):
+            return
+        if not getattr(sys, "frozen", False):
+            self.log(f"Доступна новая версия {version}, но автоустановка работает "
+                     f"только в собранной программе (.exe). Скачайте вручную.")
+            return
+        sz = f"~{size/1024/1024:.0f} МБ" if size else "размер неизвестен"
+        self._pending_update_url = url
+        self.update_banner_lbl.setText(
+            f"Доступна новая версия {version} ({sz}). "
+            f"Программа обновится и перезапустится.")
+        self.update_banner.setVisible(True)
+
+    def _on_banner_update(self):
+        self.update_banner.setVisible(False)
+        if self._pending_update_url:
+            self._start_update_download(self._pending_update_url)
+
+    def _start_update_download(self, url: str):
+        if getattr(self, "_updating", False):
+            return
+        self._updating = True
+        self.log("Скачивание обновления…")
+
+        def _run():
+            try:
+                tmp = os.path.join(tempfile.gettempdir(), "sihyx_update")
+                shutil.rmtree(tmp, ignore_errors=True)
+                os.makedirs(tmp, exist_ok=True)
+                zip_path = os.path.join(tmp, "update.zip")
+
+                req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    total = int(r.headers.get("Content-Length", 0) or 0)
+                    done = 0
+                    last_pct = -1
+                    with open(zip_path, "wb") as f:
+                        while True:
+                            chunk = r.read(262144)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            done += len(chunk)
+                            if total:
+                                pct = done * 100 // total
+                                if pct != last_pct and pct % 5 == 0:
+                                    last_pct = pct
+                                    self.log_signal.emit(f"Загрузка обновления: {pct}%")
+
+                self.log_signal.emit("Распаковка обновления…")
+                extract_dir = os.path.join(tmp, "extracted")
+                import zipfile
+                with zipfile.ZipFile(zip_path) as z:
+                    z.extractall(extract_dir)
+
+                src_root = self._find_exe_root(extract_dir)
+                if not src_root:
+                    self.log_signal.emit("Ошибка обновления: в архиве не найден "
+                                         f"{APP_NAME}.exe.")
+                    self._updating = False
+                    return
+                self.update_ready_sig.emit(src_root)
+            except Exception as e:
+                self.log_signal.emit(f"Ошибка обновления: {e}")
+                self._updating = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    @staticmethod
+    def _find_exe_root(root: str):
+        """Ищет каталог, в котором лежит SI-HYX.exe, внутри распакованного архива."""
+        target = APP_NAME + ".exe"
+        for dirpath, _dirs, files in os.walk(root):
+            if target in files:
+                return dirpath
+        return None
+
+    def _apply_update(self, src_root: str):
+        """Готовит PowerShell-апдейтер, запускает его и закрывает программу.
+        Апдейтер дождётся выхода, заменит файлы и запустит новую версию."""
+        try:
+            app_dir = os.path.dirname(os.path.abspath(sys.executable))
+            exe_path = os.path.abspath(sys.executable)
+            ps_path = os.path.join(tempfile.gettempdir(), "sihyx_update", "apply_update.ps1")
+            script = (
+                "param([int]$AppPid,[string]$Src,[string]$Dst,[string]$Exe)\n"
+                "$ErrorActionPreference='SilentlyContinue'\n"
+                "Write-Host 'Ожидание закрытия программы...'\n"
+                "try { Wait-Process -Id $AppPid -Timeout 30 } catch {}\n"
+                "Start-Sleep -Seconds 1\n"
+                "Write-Host 'Установка обновления...'\n"
+                "robocopy $Src $Dst /E /IS /IT /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null\n"
+                "Write-Host 'Запуск новой версии...'\n"
+                "Start-Process -FilePath $Exe\n"
+            )
+            with open(ps_path, "w", encoding="utf-8-sig") as f:
+                f.write(script)
+
+            DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0)
+            NEWGRP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", ps_path,
+                 "-AppPid", str(os.getpid()),
+                 "-Src", src_root, "-Dst", app_dir, "-Exe", exe_path],
+                creationflags=DETACHED | NEWGRP,
+                close_fds=True,
+            )
+            self.log("Обновление готово. Перезапуск…")
+            QTimer.singleShot(600, QApplication.quit)
+        except Exception as e:
+            self._updating = False
+            self.log(f"Ошибка применения обновления: {e}")
+
     def _open_settings_dialog(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("Настройки — " + APP_TITLE)
@@ -405,9 +612,34 @@ class UnifiedWindow(QMainWindow):
         vsv.addWidget(hint)
         lay.addWidget(grp_sv)
 
+        # --- Интерфейс ---
+        grp_ui = QGroupBox("Интерфейс")
+        vui = QVBoxLayout(grp_ui)
+        chk_wheel = QCheckBox("Колёсико мыши меняет значения в полях")
+        chk_wheel.setChecked(bool(self._wheel_changes_values))
+        chk_wheel.toggled.connect(self._set_wheel_changes_values)
+        vui.addWidget(chk_wheel)
+        hint_w = QLabel("Если выключено — колёсико над полями (битрейт, ползунки, "
+                        "числа) ничего не меняет, а просто прокручивает панель.")
+        hint_w.setStyleSheet("color:#a6adc8; font-size:11px;")
+        hint_w.setWordWrap(True)
+        vui.addWidget(hint_w)
+        lay.addWidget(grp_ui)
+
         # --- Обновления ---
         grp_up = QGroupBox("Обновления")
         vup = QVBoxLayout(grp_up)
+
+        btn_app_up = QPushButton("🔄  Проверить обновления программы")
+        btn_app_up.setToolTip("Проверяет последнюю версию на GitHub и предлагает обновиться")
+        btn_app_up.clicked.connect(lambda: self._check_updates(silent=False))
+        vup.addWidget(btn_app_up)
+        hint_app = QLabel(f"Текущая версия: {APP_VERSION}. При наличии новой версии "
+                          "программа сама скачает её и перезапустится.")
+        hint_app.setStyleSheet("color:#a6adc8; font-size:11px;")
+        hint_app.setWordWrap(True)
+        vup.addWidget(hint_app)
+
         btn_up = QPushButton("⬇  Обновить yt-dlp")
         btn_up.setToolTip("Скачивает свежую версию yt-dlp (исправляет загрузку, когда YouTube/TikTok ломают старую)")
         btn_up.clicked.connect(self._update_ytdlp)
@@ -466,6 +698,7 @@ class UnifiedWindow(QMainWindow):
                     'img_fmt': strip_default_tag(tm.c_img_fmt.currentText())
                 },
                 'server_enabled': bool(getattr(self, '_server_enabled', False)),
+                'wheel_changes_values': bool(getattr(self, '_wheel_changes_values', False)),
             }
             return s
         except Exception: return {}

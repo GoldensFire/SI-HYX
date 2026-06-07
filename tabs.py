@@ -451,14 +451,21 @@ class MediaTab(QWidget):
         b3 = QPushButton("🗑  Очистить"); b3.clicked.connect(self.clear)
         h.addWidget(b1); h.addWidget(b2); h.addWidget(b3)
 
-        if IS_WIN:
-            lv.addWidget(self.tree); lv.addLayout(h); l.addWidget(lw, 3)
-        else:
-            lv.addWidget(self.tree); lv.addLayout(h); l.addWidget(lw, 3)
+        # Левая часть может ужиматься (растяжимая, маленький минимум),
+        # чтобы правая панель всегда полностью помещалась по горизонтали.
+        lw.setMinimumWidth(140)
+        lv.addWidget(self.tree); lv.addLayout(h)
+        l.addWidget(lw, 1)
 
+        RIGHT_W = 460  # фиксированная ширина правой панели — всегда видна целиком
         right_container = QWidget(); right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(0, 0, 0, 0); right_layout.setSpacing(6)
-        rw = QScrollArea(); rw.setWidgetResizable(True); rw.setFixedWidth(430)
+        right_container.setFixedWidth(RIGHT_W)
+        rw = QScrollArea(); rw.setWidgetResizable(True)
+        rw.setFrameShape(QFrame.Shape.NoFrame)
+        # Горизонтальная скрыта (панель фикс. ширины), вертикальная — по необходимости
+        rw.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        rw.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         w = QWidget(); rv_inner = QVBoxLayout(w)
         rv_inner.setContentsMargins(6, 4, 6, 4); rv_inner.setSpacing(8)
 
@@ -476,8 +483,14 @@ class MediaTab(QWidget):
         self.s_lp = QSpinBox(); self.s_lp.setRange(0, 24000); self.s_lp.setValue(3000)
         self.s_hp = QSpinBox(); self.s_hp.setRange(0, 24000); self.s_hp.setValue(200)
         self.s_deg_gain = QDoubleSpinBox(); self.s_deg_gain.setRange(-60, 0); self.s_deg_gain.setValue(0.0)
+        for _sb in (self.s_tgt, self.s_lra, self.s_tp):
+            _sb.setMaximumWidth(70)
         fa.addRow(row_with_info(self.ck_norm, "Нормализация уровня громкости, рекомендуется все видео/аудио кодировать с этой опцией"))
         hn = QHBoxLayout()
+        hn.addWidget(QLabel("LUFS:")); hn.addWidget(self.s_tgt)
+        hn.addWidget(QLabel("LRA:")); hn.addWidget(self.s_lra)
+        hn.addWidget(QLabel("TP:")); hn.addWidget(self.s_tp)
+        hn.addStretch()
         fa.addRow(hn)
         fa.addRow(row_with_info(self.ck_fade, "Плавное затухание звука в конце ролика в секундах"), self.s_fade)
 
@@ -492,19 +505,28 @@ class MediaTab(QWidget):
         fa.addRow(row_with_info(self.ck_deg, "Намеренное ухудшение звука (эффект «телефон/радио»). Открывает дополнительные параметры ниже."))
 
         # Degrade-виджеты: скрываются/показываются по галочке
+        for _sb in (self.s_hz, self.s_lp, self.s_hp):
+            _sb.setMaximumWidth(95)
         self._lbl_samplebit = QLabel("Sample/Bit:")
         hd = QHBoxLayout(); hd.addWidget(QLabel("Hz:")); hd.addWidget(self.s_hz)
         hd.addWidget(info_badge("Частота дискретизации (Гц). Ниже = грубее звук. 8000 Гц ≈ телефонное качество."))
         hd.addWidget(self.ck_u8)
         hd.addWidget(info_badge("8-битный звук (u8) — сильное огрубление, шумный ретро-эффект."))
+        hd.addStretch()
         fa.addRow(self._lbl_samplebit, hd)
 
+        # Lowpass и Highpass — отдельными строками, чтобы умещались на узких экранах
         hlp = QHBoxLayout(); hlp.addWidget(QLabel("Lowpass:")); hlp.addWidget(self.s_lp)
         hlp.addWidget(info_badge("Срезает частоты ВЫШЕ указанной (Гц) — убирает «верха», звук становится глуше."))
-        hlp.addWidget(QLabel("Highpass:")); hlp.addWidget(self.s_hp)
-        hlp.addWidget(info_badge("Срезает частоты НИЖЕ указанной (Гц) — убирает «низы»/гул."))
+        hlp.addStretch()
         self._lbl_lowpass = QLabel("")
         fa.addRow(self._lbl_lowpass, hlp)
+
+        hhp = QHBoxLayout(); hhp.addWidget(QLabel("Highpass:")); hhp.addWidget(self.s_hp)
+        hhp.addWidget(info_badge("Срезает частоты НИЖЕ указанной (Гц) — убирает «низы»/гул."))
+        hhp.addStretch()
+        self._lbl_highpass = QLabel("")
+        fa.addRow(self._lbl_highpass, hhp)
 
         self._lbl_degvol = QLabel("Degrade vol (dB):")
         hdv = QHBoxLayout(); hdv.addWidget(self.s_deg_gain)
@@ -512,15 +534,16 @@ class MediaTab(QWidget):
         hdv.addWidget(self._badge_degvol); hdv.addStretch()
         fa.addRow(self._lbl_degvol, hdv)
 
-        self._deg_group = [self._lbl_samplebit, hd.itemAt(0).widget(), self.s_hz, self.ck_u8,
-                           self._lbl_lowpass, self.s_lp, self.s_hp,
+        self._deg_group = [self._lbl_samplebit, self.s_hz, self.ck_u8,
+                           self._lbl_lowpass, self.s_lp,
+                           self._lbl_highpass, self.s_hp,
                            self._lbl_degvol, self.s_deg_gain, self._badge_degvol]
 
         def _update_deg_vis(checked):
             for w in self._deg_group:
                 w.setVisible(checked)
             # Скрываем layout-строки полностью через содержимое
-            for layout_item in [hd, hlp]:
+            for layout_item in [hd, hlp, hhp]:
                 for i in range(layout_item.count()):
                     wi = layout_item.itemAt(i).widget()
                     if wi: wi.setVisible(checked)
@@ -559,7 +582,11 @@ class MediaTab(QWidget):
         self.c_res.setMinimumWidth(210); self.c_res.setMaximumWidth(240)
         self.c_res.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.c_fps = QComboBox(); self.c_fps.addItems(["Исходный", "Исходный (max 30)", "5", "12", "23.976", "24", "30", "60"])
-        self.c_fps.setMaximumWidth(200)
+        self.c_fps.setEditable(True)   # можно вводить своё число FPS, а пресеты — из выпадашки
+        self.c_fps.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        try: self.c_fps.lineEdit().setPlaceholderText("напр. 48")
+        except Exception: pass
+        self.c_fps.setMinimumWidth(150); self.c_fps.setMaximumWidth(200)
         fv.addRow(row_with_info(self.chk_enable_video, "Если выключено — видео не трогается, меняется только звук. Включено — перекодирование в AV1 (SVT-AV1)."))
         fv.addRow(label_with_info("Профиль:", "Стандарт: Использовать по умолчанию. Тёмные сцены: Только в темных сценах."), mode_h)
         henc = QHBoxLayout(); henc.addWidget(self.s_crf); henc.addWidget(self.s_pre)
@@ -649,7 +676,7 @@ class MediaTab(QWidget):
         self.b_run.clicked.connect(self.run); self.b_stop.clicked.connect(self.stop)
         btn_layout.addWidget(self.b_run); btn_layout.addWidget(self.b_stop)
 
-        right_layout.addWidget(btn_box); right_container.setLayout(right_layout); l.addWidget(right_container, 1)
+        right_layout.addWidget(btn_box); right_container.setLayout(right_layout); l.addWidget(right_container, 0)
 
         self.shortcut_paste = QShortcut(QKeySequence("Ctrl+V"), self.tree)
         self.shortcut_paste.activated.connect(self.paste_files)
@@ -900,7 +927,7 @@ class MediaTab(QWidget):
             },
             'video': {
                 'enabled': bool(self.chk_enable_video.isChecked()), 'speed': int(spd), 'crf': int(self.s_crf.value()),
-                'pre': int(self.s_pre.value()), 'res': strip_default_tag(self.c_res.currentText()), 'fps': self.c_fps.currentText(),
+                'pre': int(self.s_pre.value()), 'res': strip_default_tag(self.c_res.currentText()), 'fps': self.c_fps.currentText().strip().replace(',', '.'),
                 'preset_mode': 'dark' if self.btn_mode_dark.isChecked() else 'std'
             },
             'avif': {

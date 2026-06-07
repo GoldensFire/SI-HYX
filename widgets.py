@@ -140,6 +140,41 @@ def info_badge(tip: str) -> QLabel:
     return _InfoBadge(tip)
 
 
+class WheelBlocker(QObject):
+    """Глобальный фильтр событий: когда колёсико «выключено», прокрутка над
+    полями (спинбоксы, выпадающие списки, ползунки) НЕ меняет их значения,
+    а прокручивает ближайшую область прокрутки. Когда «включено» — обычное
+    поведение (колесо меняет значение).
+    `is_on` — функция без аргументов, возвращающая True, если колесо разрешено."""
+    def __init__(self, parent, is_on):
+        super().__init__(parent)
+        self._is_on = is_on
+
+    def eventFilter(self, obj, ev):
+        try:
+            if ev.type() == QEvent.Type.Wheel and not self._is_on():
+                # Поднимаемся к виджету-значению (событие может прийти в дочерний)
+                target = None
+                p = obj
+                depth = 0
+                while p is not None and depth < 4:
+                    if isinstance(p, (QAbstractSpinBox, QComboBox, QSlider)):
+                        target = p
+                        break
+                    p = p.parent() if hasattr(p, "parent") else None
+                    depth += 1
+                if target is not None:
+                    sa = target.parent()
+                    while sa is not None and not isinstance(sa, QScrollArea):
+                        sa = sa.parent()
+                    if isinstance(sa, QScrollArea):
+                        QApplication.sendEvent(sa.viewport(), ev)
+                    return True  # блокируем изменение значения колесом
+        except Exception:
+            pass
+        return False
+
+
 def combo_set_value(combo, value):
     """Выбирает в QComboBox пункт по «чистому» значению, даже если в списке
     он помечен как ' (по умолчанию)'. Используется при загрузке настроек."""
