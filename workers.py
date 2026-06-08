@@ -326,6 +326,24 @@ def _build_atempo_chain(speed_factor: float) -> list:
     return chain
 
 
+class _ImgRunnable(QRunnable):
+    """Обёртка для параллельной обработки одного изображения в QThreadPool.
+    Потоки QThreadPool — настоящие потоки Qt: эмит сигналов из них безопасен,
+    а очистка корректна (в отличие от обычных threading.Thread)."""
+    def __init__(self, worker, item, total, start):
+        super().__init__()
+        self.worker = worker
+        self.item = item
+        self.total = total
+        self.start = start
+
+    def run(self):
+        try:
+            self.worker._process_item(self.item, False, self.total, self.start)
+        except Exception:
+            pass
+
+
 class ProcessWorker(QThread):
     progress = pyqtSignal(str, int)
     status = pyqtSignal(str, str, str)
@@ -341,6 +359,7 @@ class ProcessWorker(QThread):
         self.settings = settings
         self.stop_flag = False
         self.svt_available = require_svt()
+        self._img_pool = None  # QThreadPool для параллельной обработки изображений
 
     _AI_BRANDS = ('gemini', 'chatgpt')
     _RAND_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789'
@@ -354,6 +373,14 @@ class ProcessWorker(QThread):
 
     def stop(self): self.stop_flag = True
     def measure_loudness(self, path): return measure_loudness(path)
+
+    def _out_dir_for(self, path):
+        """Каталог экспорта: выбранная пользователем папка (если задана и
+        существует), иначе — рядом с исходным файлом."""
+        d = self.settings.get('export_dir') or ''
+        if d and os.path.isdir(d):
+            return d
+        return os.path.dirname(path) or "."
 
     @staticmethod
     def _source_has_alpha(path: str) -> bool:
@@ -417,6 +444,7 @@ class ProcessWorker(QThread):
         except Exception as e:
             raise Exception(f"Не удалось запустить ffmpeg: {e}")
         start = time.time()
+        last_pct = -1
         try:
             while True:
                 if self.stop_flag:
@@ -431,13 +459,16 @@ class ProcessWorker(QThread):
                 if line: buf.append(line)
                 elapsed = time.time() - start
                 pct = int(min(99, (elapsed / total_est_sec) * 99)) if total_est_sec and total_est_sec > 0 else int(min(98, elapsed * 15))
-                try:
-                    percent_callback(pct, label)
-                except Exception:
+                # Шлём колбэк только при смене целого процента — не флудим сигналами
+                if pct != last_pct:
+                    last_pct = pct
                     try:
-                        percent_callback(pct)
+                        percent_callback(pct, label)
                     except Exception:
-                        pass
+                        try:
+                            percent_callback(pct)
+                        except Exception:
+                            pass
                 if not line and p.poll() is not None: break
         except Exception:
             try: p.kill()
@@ -464,7 +495,7 @@ class ProcessWorker(QThread):
     def process_media(self, item, cb):
         path = item['path']
         base, ext = os.path.splitext(path)
-        out_dir = os.path.dirname(path) or "."
+        out_dir = self._out_dir_for(path)
         sv = self.settings.get('video', {})
         sa = self.settings.get('audio', {})
         crf = sv.get('crf', 35)
@@ -719,24 +750,28 @@ class ProcessWorker(QThread):
                     except Exception: pass
 
     def _convert_simple_image(self, item, src_path, out_dir, sanitized, adim, av, fmt, cb):
-        """Конвертация изображения в png / jpg / ico через Pillow (без ffmpeg).
-        Учитывает лимит разрешения (adim) и для jpg — лимит размера файла.
+        """Конвертация изображения в png / jpg / ico / webp через Pillow (без ffmpeg).
+        Учитывает лимит разрешения (adim) и для jpg/webp — лимит размера файла.
         """
         if not Image:
             raise Exception("Pillow (PIL) не установлен — конвертация в этот формат недоступна.")
         fmt = fmt.lower()
-        ext = {'jpeg': 'jpg', 'jpg': 'jpg', 'png': 'png', 'ico': 'ico'}.get(fmt, fmt)
+        ext = {'jpeg': 'jpg', 'jpg': 'jpg', 'png': 'png', 'ico': 'ico', 'webp': 'webp'}.get(fmt, fmt)
         out_path = os.path.join(out_dir, f"{sanitized}_Сжатый.{ext}")
         cb(10, ext.upper())
 
         with Image.open(src_path) as im:
             if ImageOps:
                 im = ImageOps.exif_transpose(im)
+            had_alpha = im.mode in ('RGBA', 'LA', 'PA', 'La', 'RGBa') or \
+                        (im.mode == 'P' and 'transparency' in im.info)
             # JPEG не поддерживает альфу
             if ext == 'jpg':
                 im = im.convert('RGB')
             elif ext == 'ico':
                 im = im.convert('RGBA')
+            elif ext == 'webp':  # WebP умеет прозрачность — сохраняем альфу, если была
+                im = im.convert('RGBA') if had_alpha else im.convert('RGB')
             else:  # png
                 im = im.convert('RGBA') if im.mode in ('RGBA', 'LA', 'P', 'PA') else im.convert('RGB')
 
@@ -778,6 +813,25 @@ class ProcessWorker(QThread):
                     im.save(out_path, format='JPEG', quality=chosen, optimize=True)
                 else:
                     im.save(out_path, format='JPEG', quality=92, optimize=True)
+            elif ext == 'webp':
+                # method=6 обязателен: с method по умолчанию libwebp нестабилен
+                # при сохранении RGBA из рабочего потока.
+                if limit_kb > 0:
+                    chosen = 20
+                    for q in (95, 90, 85, 80, 70, 60, 50, 40, 30, 20):
+                        tmp = os.path.join(TEMP_DIR, f"webp_{uuid.uuid4().hex}.webp")
+                        try:
+                            im.save(tmp, format='WEBP', quality=q, method=6)
+                            fits = os.path.getsize(tmp) // 1024 <= limit_kb
+                        finally:
+                            try: os.remove(tmp)
+                            except Exception: pass
+                        chosen = q
+                        if fits:
+                            break
+                    im.save(out_path, format='WEBP', quality=chosen, method=6)
+                else:
+                    im.save(out_path, format='WEBP', quality=90, method=6)
             else:  # png
                 im.save(out_path, format='PNG', optimize=True)
 
@@ -797,7 +851,7 @@ class ProcessWorker(QThread):
             self.log.emit(f"Пропущен уже обработанный файл: {os.path.basename(path)}")
             cb(100, "Пропущен")
             return path
-        out_dir = os.path.dirname(path) or "."
+        out_dir = self._out_dir_for(path)
         av = self.settings.get('avif', {})
         adim = av.get('adim', 0) or 0
         aspd = av.get('aspd', 0)
@@ -811,7 +865,7 @@ class ProcessWorker(QThread):
         # Выбранный пользователем формат: png/jpg/ico обрабатываем через Pillow
         # (без ffmpeg), avif/webp — основной конвейер ниже.
         img_fmt = (av.get('img_fmt') or 'avif').lower()
-        if img_fmt in ('png', 'jpg', 'jpeg', 'ico'):
+        if img_fmt in ('png', 'jpg', 'jpeg', 'ico', 'webp'):
             self.log.emit(f"Формат изображения: {img_fmt.upper()}")
             return self._convert_simple_image(item, path, out_dir, sanitized, adim, av, img_fmt, cb)
 
@@ -1110,103 +1164,137 @@ class ProcessWorker(QThread):
                 except Exception: pass
             raise
 
+    def _fmt_eta(self, fraction, start):
+        """Строка ETA по доле выполнения (0..1) и времени старта."""
+        fraction = min(1.0, max(0.0, fraction))
+        elapsed = time.time() - start
+        if fraction >= 1.0:
+            return "00:00:00"
+        if elapsed < 1.0 or fraction <= 0.0:
+            return "..."
+        rem = max(0, elapsed * (1.0 / fraction - 1.0))
+        rh = int(rem // 3600); rm = int((rem % 3600) // 60); rs = int(rem % 60)
+        return f"{rh:02}:{rm:02}:{rs:02}"
+
+    def _guess_out_path(self, item, path):
+        """Восстанавливает путь к выходному файлу (для кнопки «Открыть»)."""
+        try:
+            sv2 = self.settings.get('video', {})
+            sa2 = self.settings.get('audio', {})
+            crf2 = sv2.get('crf', 35); spd2 = sv2.get('speed', 100)
+            ve2 = sv2.get('enabled', True)
+            base2, ext2 = os.path.splitext(path)
+            out_dir2 = self._out_dir_for(path)
+            vcodec2 = get_video_codec(path)
+            is_vid2 = (vcodec2 is not None)
+            out_ext2 = ".mp4" if is_vid2 else ".opus"
+            sfx2 = ""
+            if is_vid2 and ve2: sfx2 += f"_crf{crf2}_speed{spd2}"
+            if sa2.get('norm'): sfx2 += "_norm"
+            if sa2.get('fade'): sfx2 += "_fade"
+            out_name2 = self._sanitize_name(os.path.basename(base2))
+            guessed = os.path.join(out_dir2, out_name2 + sfx2 + out_ext2)
+            if os.path.exists(guessed): item['out_path'] = guessed
+        except Exception: pass
+
+    def _process_item(self, item, smooth, total, start):
+        """Обрабатывает один элемент очереди.
+        smooth=True — глобальный прогресс плавно отражает прогресс файла
+        (видео/аудио идут по одному). smooth=False — прогресс по факту
+        завершения (изображения идут параллельно через QThreadPool)."""
+        if self.stop_flag:
+            return
+        iid = item['iid']; path = item['path']
+        self.status.emit(iid, "Обработка.", "proc")
+        max_frac_seen = [0.0]
+
+        def item_prog(pct, pass_label=None):
+            try:
+                if not smooth:
+                    # Параллельная обработка изображений: НЕ шлём частые сигналы
+                    # из множества потоков (строка покажет «Обработка.» → «Готово»,
+                    # общий прогресс обновляется по факту завершения файла).
+                    return
+                if pass_label and "Pass 1" in pass_label:
+                    display_pct = int(pct * 0.5)
+                elif pass_label and "Pass 2" in pass_label:
+                    display_pct = int(50 + pct * 0.5)
+                else:
+                    display_pct = pct
+                self.progress.emit(iid, display_pct)
+                if pass_label and pct < 100:
+                    self.status.emit(iid, pass_label, "proc")
+                with self._prog_lock:
+                    base = self._done_count
+                fraction = (base + display_pct / 100.0) / total
+                fraction = max(min(1.0, fraction), max_frac_seen[0])
+                max_frac_seen[0] = fraction
+                gl_pct = int(min(100, fraction * 100))
+                label = pass_label if pass_label else "Processing"
+                self.global_progress.emit(gl_pct, f"{label} ETA: {self._fmt_eta(fraction, start)}")
+            except Exception:
+                pass
+
+        try:
+            if item.get('type') == 'IMG':
+                self.process_avif(item, item_prog)
+            else:
+                self.process_media(item, item_prog)
+            item['is_done'] = True
+            self._guess_out_path(item, path)
+            self.status.emit(iid, "Готово", "done")
+            self.progress.emit(iid, 100)
+        except Exception as e:
+            tb = str(e)
+            if "StoppedByUser" in tb:
+                self.log.emit(f"Остановка {os.path.basename(path)} выполнена.")
+                self.status.emit(iid, "Остановлено", "err")
+            else:
+                self.log.emit(f"Ошибка {os.path.basename(path)}: {tb}")
+                self.status.emit(iid, "Ошибка", "err")
+            item['is_done'] = True
+        finally:
+            with self._prog_lock:
+                self._done_count += 1
+                done = self._done_count
+            frac = done / total
+            self.global_progress.emit(int(min(100, frac * 100)),
+                                      f"Готово {done}/{total} ETA: {self._fmt_eta(frac, start)}")
+
     def run(self):
         start = time.time()
-        idx = 0
-        cur_total = max(1, len(self.queue))
-        
-        while not self.stop_flag:
-            if idx >= len(self.queue):
-                break 
-            
-            item = self.queue[idx]
-            iid = item['iid']
-            path = item['path']
+        pending = [it for it in self.queue if not it.get('is_done', False)]
+        total = max(1, len(pending))
+        self._done_count = 0
+        self._prog_lock = threading.Lock()
 
-            if item.get('is_done', False):
-                idx += 1
-                continue
+        # Видео/аудио — по одному: каждый файл сам грузит все ядра кодеком (SVT-AV1).
+        # Изображения — параллельно по числу ядер через QThreadPool: одиночный кадр
+        # CPU не насыщает, а потоки Qt безопасны для сигналов и корректно очищаются.
+        images = [it for it in pending if it.get('type') == 'IMG']
+        others = [it for it in pending if it.get('type') != 'IMG']
 
-            self.status.emit(iid, "Обработка.", "proc")
-            
-            max_frac_seen = [0.0]
-            def item_prog(pct, pass_label=None):
-                try:
-                    # Маппинг прогресса для видео: Pass 1 → 0-50%, Pass 2 → 50-100%
-                    if pass_label and "Pass 1" in pass_label:
-                        display_pct = int(pct * 0.5)
-                    elif pass_label and "Pass 2" in pass_label:
-                        display_pct = int(50 + pct * 0.5)
-                    else:
-                        display_pct = pct
+        for it in others:
+            if self.stop_flag:
+                break
+            self._process_item(it, True, total, start)
 
-                    self.progress.emit(iid, display_pct)
-                    fraction = ((idx) + (display_pct / 100.0)) / cur_total
-                    # Монотонно возрастающая fraction — ETA не скачет при итерациях AVIF
-                    fraction = max(fraction, max_frac_seen[0])
-                    max_frac_seen[0] = fraction
-                    if fraction <= 0.0001: fraction = 0.0001
-                    
-                    gl_pct = int(min(100, fraction * 100))
-                    elapsed = time.time() - start
-                    
-                    if gl_pct >= 100 or (idx == cur_total - 1 and pct >= 100):
-                        eta = "00:00:00"
-                    elif elapsed < 1.0:
-                        eta = "..."
-                    elif fraction > 0:
-                        rem = max(0, elapsed * (1.0 / fraction - 1.0))
-                        rh = int(rem // 3600); rm = int((rem % 3600) // 60); rs = int(rem % 60)
-                        eta = f"{rh:02}:{rm:02}:{rs:02}"
-                    else:
-                        eta = "--:--"
-                    
-                    label = pass_label if pass_label else "Processing"
-                    if pass_label and pct < 100:
-                        self.status.emit(iid, pass_label, "proc")
-                    self.global_progress.emit(gl_pct, f"{label} ETA: {eta}")
-                except Exception:
-                    try: self.global_progress.emit(0, "ETA: --:--")
-                    except Exception: pass
-            try:
-                if item.get('type') == 'MEDIA': self.process_media(item, item_prog)
-                elif item.get('type') == 'IMG': self.process_avif(item, item_prog)
-                else: self.process_media(item, item_prog)
-                
-                item['is_done'] = True
-                # Сохраняем путь к выходному файлу — нужен для кнопки "Открыть"
-                try:
-                    sv2 = self.settings.get('video', {})
-                    sa2 = self.settings.get('audio', {})
-                    crf2 = sv2.get('crf', 35); spd2 = sv2.get('speed', 100)
-                    ve2 = sv2.get('enabled', True)
-                    base2, ext2 = os.path.splitext(path)
-                    out_dir2 = os.path.dirname(path) or "."
-                    vcodec2 = get_video_codec(path)
-                    is_vid2 = (vcodec2 is not None)
-                    out_ext2 = ".mp4" if is_vid2 else ".opus"
-                    sfx2 = ""
-                    if is_vid2 and ve2: sfx2 += f"_crf{crf2}_speed{spd2}"
-                    if sa2.get('norm'): sfx2 += "_norm"
-                    if sa2.get('fade'): sfx2 += "_fade"
-                    out_name2 = self._sanitize_name(os.path.basename(base2))
-                    guessed = os.path.join(out_dir2, out_name2 + sfx2 + out_ext2)
-                    if os.path.exists(guessed): item['out_path'] = guessed
-                except Exception: pass
-                self.status.emit(iid, "Готово", "done")
-                self.progress.emit(iid, 100)
-                item_prog(100, "Готово")
-            except Exception as e:
-                tb = str(e)
-                if "StoppedByUser" in tb:
-                     self.log.emit(f"Остановка {os.path.basename(path)} выполнена.")
-                     self.status.emit(iid, "Остановлено", "err")
-                else:
-                     self.log.emit(f"Ошибка {os.path.basename(path)}: {tb}")
-                     self.status.emit(iid, "Ошибка", "err")
-                item['is_done'] = True
-            
-            idx += 1
-            
+        if images and not self.stop_flag:
+            nworkers = min(len(images), max(1, os.cpu_count() or 4))
+            if nworkers > 1:
+                self.log.emit(f"Параллельная обработка изображений: {nworkers} потоков")
+                self._img_pool = QThreadPool()
+                self._img_pool.setMaxThreadCount(nworkers)
+                for itm in images:
+                    if self.stop_flag:
+                        break
+                    self._img_pool.start(_ImgRunnable(self, itm, total, start))
+                self._img_pool.waitForDone()
+            else:
+                for it in images:
+                    if self.stop_flag:
+                        break
+                    self._process_item(it, True, total, start)
+
         self.finished_all.emit()
         self.global_progress.emit(100, "Готово")

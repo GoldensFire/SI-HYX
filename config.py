@@ -248,7 +248,7 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.2 BETA"
+APP_VERSION = "0.2.1"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # Репозиторий для автообновления (GitHub Releases)
 GITHUB_OWNER = "GoldensFire"
@@ -378,6 +378,28 @@ QSpinBox::down-button, QDoubleSpinBox::down-button {
 QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
 QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
     background-color: #585b70;
+}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-bottom: 5px solid #89b4fa;
+    width: 0;
+    height: 0;
+}
+QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {
+    border-bottom-color: #585b70;
+}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #89b4fa;
+    width: 0;
+    height: 0;
+}
+QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {
+    border-top-color: #585b70;
 }
 QComboBox::drop-down {
     border: none;

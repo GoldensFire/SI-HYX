@@ -94,8 +94,9 @@ class YtdlpTab(QWidget):
         end_box.addWidget(QLabel("По:"))
         for w in self.te: end_box.addWidget(w)
 
-        btn_clear_time = QPushButton("✕ Тайминги")
-        btn_clear_time.setFixedHeight(24)
+        btn_clear_time = QPushButton("✕  Сбросить")
+        # Равная высота с полями-циферками слева (С: / По:), чтобы стоять с ними в одну строку
+        btn_clear_time.setFixedHeight(self.ts[0].sizeHint().height())
         btn_clear_time.setToolTip("Сбросить тайминги")
         btn_clear_time.clicked.connect(self._clear_timings)
 
@@ -113,7 +114,8 @@ class YtdlpTab(QWidget):
         sliders_box.addLayout(_time_lbl)
         sliders_box.addWidget(self.slider_start); sliders_box.addWidget(self.slider_end)
 
-        ht.addLayout(start_box); ht.addSpacing(8); ht.addLayout(end_box); ht.addSpacing(8); ht.addWidget(btn_clear_time); ht.addStretch(); ht.addLayout(sliders_box)
+        ht.addLayout(start_box); ht.addSpacing(8); ht.addLayout(end_box); ht.addSpacing(8)
+        ht.addWidget(btn_clear_time, 0, Qt.AlignmentFlag.AlignVCenter); ht.addStretch(); ht.addLayout(sliders_box)
         v.addLayout(ht); opt.setLayout(v); layout.addWidget(opt)
 
         self.tree = QTreeWidget(); self.tree.setHeaderLabels(["URL", "Размер", "Инфо", "Статус"])
@@ -121,6 +123,10 @@ class YtdlpTab(QWidget):
         self.tree.setIconSize(QSize(160,90)); self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.ctx)
         layout.addWidget(self.tree)
+        # Клавиша Delete — удалить выделенные загрузки из списка
+        self._sc_delete = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.tree)
+        self._sc_delete.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._sc_delete.activated.connect(self.delete_sel)
 
         hb = QHBoxLayout()
         b_del = QPushButton("✖  Удалить"); b_del.clicked.connect(self.delete_sel)
@@ -370,19 +376,6 @@ class YtdlpTab(QWidget):
                 self.tree.invisibleRootItem().removeChild(it)
         except Exception: pass
 
-    def stop_all_dl(self):
-        for w in list(self.active_workers.values()):
-            try: w.stop()
-            except Exception: pass
-
-    def stop_sel_dl(self):
-        for it in self.tree.selectedItems():
-            iid = it.data(0, Qt.ItemDataRole.UserRole)
-            w = self.active_workers.get(iid)
-            if w:
-                try: w.stop()
-                except Exception: pass
-
     def set_thumb(self, iid, icon):
         try:
             entry = self.items.get(iid)
@@ -402,6 +395,7 @@ class MediaTab(QWidget):
         self._item_map: dict = {}
         self._item_data_map: dict = {}
         self.pool = QThreadPool()
+        self.export_dir = ""  # пусто = экспортировать рядом с исходником
         self.setAcceptDrops(True)
         self.setup_ui()
         self.thumb_sig.connect(self.set_thumb)
@@ -434,6 +428,7 @@ class MediaTab(QWidget):
         quick_dl_grp.setLayout(qdl_form); lv.addWidget(quick_dl_grp)
 
         self.tree = DraggableTreeWidget()
+        self.tree.setAcceptDrops(True)
         self.tree.setHeaderLabels(["Файл","Размер (Исх)","Размер (Нов)","Битрейт (аудио)","Битрейт (аудио итог)","LUFS до","LUFS после", "Статус"])
         self.tree.setRootIsDecorated(False)
         self.tree.setItemDelegate(StatusColorDelegate(self.tree))  # цветовая подсветка строк
@@ -449,7 +444,19 @@ class MediaTab(QWidget):
         b1 = QPushButton("➕  Добавить файлы"); b1.clicked.connect(self.add)
         b2 = QPushButton("✖  Удалить"); b2.clicked.connect(self.rem)
         b3 = QPushButton("🗑  Очистить"); b3.clicked.connect(self.clear)
-        h.addWidget(b1); h.addWidget(b2); h.addWidget(b3)
+        self.btn_export_dir = QPushButton("📂")
+        self.btn_export_dir.setFixedWidth(36)
+        self.btn_export_dir.setToolTip("Выбрать папку экспорта. По умолчанию — рядом с исходным файлом.")
+        self.btn_export_dir.clicked.connect(self._choose_export_dir)
+        self.btn_export_reset = QPushButton("↺")
+        self.btn_export_reset.setFixedWidth(36)
+        self.btn_export_reset.setToolTip("Сбросить — экспортировать в папку исходника")
+        self.btn_export_reset.clicked.connect(self._reset_export_dir)
+        self.btn_export_reset.setEnabled(False)
+        self.lbl_export_dir = QLabel("По умолчанию экспорт в папку исходника")
+        self.lbl_export_dir.setStyleSheet("color:#a6adc8; font-size:11px;")
+        h.addWidget(b1); h.addWidget(b2); h.addWidget(b3); h.addWidget(self.btn_export_dir); h.addWidget(self.btn_export_reset); h.addWidget(self.lbl_export_dir)
+        h.addStretch()
 
         # Левая часть может ужиматься (растяжимая, маленький минимум),
         # чтобы правая панель всегда полностью помещалась по горизонтали.
@@ -581,7 +588,7 @@ class MediaTab(QWidget):
         self.c_res.setCurrentText("1280x720" + DEFAULT_TAG)
         self.c_res.setMinimumWidth(210); self.c_res.setMaximumWidth(240)
         self.c_res.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.c_fps = QComboBox(); self.c_fps.addItems(["Исходный", "Исходный (max 30)", "5", "12", "23.976", "24", "30", "60"])
+        self.c_fps = InvertedWheelComboBox(); self.c_fps.addItems(["Исходный", "Исходный (max 30)", "5", "12", "23.976", "24", "30", "60"])
         self.c_fps.setEditable(True)   # можно вводить своё число FPS, а пресеты — из выпадашки
         self.c_fps.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         try: self.c_fps.lineEdit().setPlaceholderText("напр. 48")
@@ -680,6 +687,10 @@ class MediaTab(QWidget):
 
         self.shortcut_paste = QShortcut(QKeySequence("Ctrl+V"), self.tree)
         self.shortcut_paste.activated.connect(self.paste_files)
+        # Клавиша Delete — удалить выделенные файлы из очереди
+        self.shortcut_delete = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.tree)
+        self.shortcut_delete.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self.shortcut_delete.activated.connect(self.rem)
         self.tree.itemDoubleClicked.connect(self.on_double_click)
 
     def _set_preset_mode(self, mode):
@@ -728,6 +739,33 @@ class MediaTab(QWidget):
                 subprocess.Popen(['xdg-open', path])
         except Exception as e:
             self.main.log(f"Не удалось открыть файл: {e}")
+
+    def _choose_export_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "Папка экспорта", self.export_dir or default_download_dir())
+        if d:
+            self.export_dir = d
+            self._update_export_label()
+            try: self.main._save_settings_now()
+            except Exception: pass
+
+    def _reset_export_dir(self):
+        self.export_dir = ""
+        self._update_export_label()
+        try: self.main._save_settings_now()
+        except Exception: pass
+
+    def _update_export_label(self):
+        """Обновляет подпись пути экспорта и видимость кнопки сброса."""
+        try:
+            if self.export_dir and os.path.isdir(self.export_dir):
+                self.lbl_export_dir.setText(self.export_dir)
+                self.lbl_export_dir.setToolTip(self.export_dir)
+                self.btn_export_reset.setEnabled(True)
+            else:
+                self.lbl_export_dir.setText("По умолчанию экспорт в папку исходника")
+                self.lbl_export_dir.setToolTip("")
+                self.btn_export_reset.setEnabled(False)
+        except Exception: pass
 
     def download_url(self, audio_only=False):
         url = self.url_edit.text().strip()
@@ -935,7 +973,8 @@ class MediaTab(QWidget):
                 'adim': int(self.s_dim.value()) if self.ck_dim.isChecked() else 0,
                 'aspd': int(self.sl_aspd.value()), 'arec': bool(self.ck_arec.isChecked()),
                 'img_fmt': strip_default_tag(self.c_img_fmt.currentText()) if hasattr(self, 'c_img_fmt') else 'avif'
-            }
+            },
+            'export_dir': self.export_dir or ''
         }
         self.worker = ProcessWorker(self.items, s)
         self.worker.status.connect(self.on_stat); self.worker.progress.connect(self.on_prog)
@@ -1382,6 +1421,10 @@ class PhotoMergerTab(QWidget):
         # ── File list ───────────────────────────────────────
         self.file_list = PhotoDragList()
         root.addWidget(self.file_list, 3)
+        # Клавиша Delete — удалить выделенные фото из списка
+        self._sc_delete = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.file_list)
+        self._sc_delete.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._sc_delete.activated.connect(self._remove_selected)
 
         # ── Одна строка: режим + формат + кнопки ──────────────
         toolbar = QHBoxLayout()

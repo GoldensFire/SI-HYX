@@ -286,7 +286,7 @@ class RemoteThumbnailRunnable(QRunnable):
 
 class _RecentThumbWorker(QRunnable):
     """Готовит миниатюру в фоне (ffmpeg/ffprobe/PIL) и отдаёт БАЙТЫ изображения
-    в GUI-поток через сигнал. QPixmap нельзя создавать вне主-потока, поэтому
+    в GUI-поток через сигнал. QPixmap нельзя создавать вне главного потока, поэтому
     из воркера возвращаются именно байты, а пиксмап строится в слоте."""
     def __init__(self, path, signal):
         super().__init__()
@@ -385,11 +385,14 @@ class RecentFileThumb(QWidget):
         tc_layout = QHBoxLayout(thumb_container)
         tc_layout.setContentsMargins(0, 0, 0, 0)
 
+        ext_disp = os.path.splitext(path)[1].lstrip('.').upper() or '—'
+        self._ext_txt = ext_disp
         self._thumb_lbl = QLabel()
         self._thumb_lbl.setFixedSize(96, 72)
         self._thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._thumb_lbl.setStyleSheet("background:#1e1e1e;border-radius:3px;font-size:28px;")
-        self._thumb_lbl.setText(self._type_icon)  # пока миниатюра не загружена
+        self._thumb_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._thumb_lbl.setStyleSheet("background:#1e1e1e;border-radius:3px;")
+        self._thumb_lbl.setText(self._placeholder_html())  # значок типа + расширение, пока нет превью
         tc_layout.addWidget(self._thumb_lbl)
 
         # Имя файла
@@ -411,10 +414,16 @@ class RecentFileThumb(QWidget):
         self._thumb_ready.connect(self._apply_thumb)
         QThreadPool.globalInstance().start(_RecentThumbWorker(self.path, self._thumb_ready))
 
+    def _placeholder_html(self):
+        """HTML-заглушка превью: крупный значок типа + расширение файла снизу."""
+        return (f"<div style='font-size:26px; line-height:28px;'>{self._type_icon}</div>"
+                f"<div style='font-size:9px; color:#9399b2;'>{self._ext_txt}</div>")
+
     def _apply_thumb(self, data, dur_str):
         """Слот в GUI-потоке: строит QPixmap из байтов и рисует длительность."""
         try:
             if not data:
+                self._thumb_lbl.setText(self._placeholder_html())
                 return
             pix = QPixmap()
             if not pix.loadFromData(QByteArray(data)):
@@ -687,6 +696,31 @@ class DraggableTreeWidget(QTreeWidget):
         md.setUrls(urls)
         drag.setMimeData(md)
         drag.exec(Qt.DropAction.CopyAction)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            paths = [u.toLocalFile() for u in event.mimeData().urls() if u.toLocalFile()]
+            if paths:
+                p = self.parent()
+                while p and not hasattr(p, 'add_paths'):
+                    p = p.parent()
+                if p:
+                    p.add_paths(paths)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
 
 
 # ─────────────────────────────────────────────────────────────

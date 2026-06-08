@@ -94,8 +94,8 @@ class UnifiedWindow(QMainWindow):
         ch.addWidget(self.btn_settings); ch.addWidget(self.btn_top_restart)
         self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
 
-        # Единый стрип файлов — общий для всех вкладок
-        self.recent_strip = RecentFilesStrip(self, mode='all')
+        # Единый стрип файлов — общий для всех вкладок (только медиа: видео/аудио/изображения)
+        self.recent_strip = RecentFilesStrip(self, mode='media')
         l.addWidget(self.recent_strip)
         l.addWidget(self.tabs)
 
@@ -115,6 +115,16 @@ class UnifiedWindow(QMainWindow):
         except Exception: pass
 
         self._attach_save_handlers()
+
+        # Колёсико над полями не должно «активировать» их визуально (фокус по скроллу):
+        # убираем WheelFocus у всех числовых полей/списков/ползунков во всех вкладках.
+        try:
+            for _w in (self.findChildren(QAbstractSpinBox)
+                       + self.findChildren(QComboBox)
+                       + self.findChildren(QSlider)):
+                _w.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        except Exception:
+            pass
 
         # IPC-сервер: принимает файлы от нового запуска через ПКМ проводника
         self._ipc_server = QLocalServer(self)
@@ -170,6 +180,11 @@ class UnifiedWindow(QMainWindow):
             combo_set_value(tm.c_res, v.get("res", "Исходное"))
             tm.c_fps.setCurrentText(v.get("fps", "Исходный"))
             tm._set_preset_mode(v.get("preset_mode", "std"))
+
+            # Папка экспорта (пусто = рядом с исходником)
+            tm.export_dir = m.get("export_dir", "") or ""
+            try: tm._update_export_label()
+            except Exception: pass
 
             y = s.get("ytdlp", {})
             saved_outdir = y.get("outdir", "")
@@ -684,7 +699,8 @@ class UnifiedWindow(QMainWindow):
                         'enabled': bool(tm.chk_enable_video.isChecked()), 'speed': int(tm.s_spd.value()), 'crf': int(tm.s_crf.value()),
                         'pre': int(tm.s_pre.value()), 'res': strip_default_tag(tm.c_res.currentText()), 'fps': tm.c_fps.currentText(),
                         'preset_mode': 'dark' if tm.btn_mode_dark.isChecked() else 'std'
-                    }
+                    },
+                    'export_dir': getattr(tm, 'export_dir', '') or ''
                 },
                 'ytdlp': {
                     'outdir': ty.out.text(), 'quality': ty.c_q.currentText(), 'merge': ty.c_c.currentText(),
@@ -732,10 +748,6 @@ class UnifiedWindow(QMainWindow):
             ]
             # Виджет с сигналом textChanged (QLineEdit)
             text_widgets = [ty.out, ty.cookie_edit]
-            # Сохраняем outdir MediaTab тоже
-            try:
-                if hasattr(tm, 'out_edit'): text_widgets.append(tm.out_edit)
-            except Exception: pass
 
             for w in toggle_widgets:
                 w.toggled.connect(self._save_settings_now)
