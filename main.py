@@ -593,26 +593,42 @@ class UnifiedWindow(QMainWindow):
                 "function W($m){ \"$([DateTime]::Now.ToString('HH:mm:ss')) $m\" | "
                 "Out-File -FilePath $Log -Append -Encoding utf8 }\n"
                 "W 'Updater started.'\n"
+                "W \"AppPid=$AppPid\"\n"
                 "W \"Src=$Src\"\n"
                 "W \"Dst=$Dst\"\n"
-                "# Ждём полного закрытия программы (до ~60 сек), иначе файлы залочены\n"
-                "for($i=0; $i -lt 60; $i++){\n"
-                "  $p = Get-Process -Id $AppPid -ErrorAction SilentlyContinue\n"
-                "  if(-not $p){ break }\n"
+                "W \"Exe=$Exe\"\n"
+                "# 1) Ждём выхода процесса программы (до ~30 сек)\n"
+                "for($i=0; $i -lt 30; $i++){\n"
+                "  if(-not (Get-Process -Id $AppPid -ErrorAction SilentlyContinue)){ break }\n"
                 "  Start-Sleep -Milliseconds 1000\n"
                 "}\n"
-                "Start-Sleep -Seconds 1\n"
-                "W 'Process closed, copying files...'\n"
-                "# Несколько попыток: exe может быть ещё занят\n"
-                "$ok = $false\n"
-                "for($try=1; $try -le 10; $try++){\n"
-                "  robocopy $Src $Dst /E /IS /IT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null\n"
-                "  $rc = $LASTEXITCODE\n"
-                "  W \"robocopy attempt $try exit=$rc\"\n"
-                "  if($rc -lt 8){ $ok = $true; break }\n"
+                "# 2) Ждём, пока сам .exe реально освободится (эксклюзивное открытие)\n"
+                "$free=$false\n"
+                "if(-not (Test-Path $Exe)){ $free=$true }\n"
+                "for($i=0; ($i -lt 60) -and (-not $free); $i++){\n"
+                "  try { $fs=[System.IO.File]::Open($Exe,'Open','ReadWrite','None'); "
+                "$fs.Close(); $free=$true; break }\n"
+                "  catch { Start-Sleep -Milliseconds 500 }\n"
+                "}\n"
+                "W \"Exe free=$free\"\n"
+                "Start-Sleep -Milliseconds 500\n"
+                "# 3) Копируем новую версию поверх старой (с ретраями)\n"
+                "$ok=$false\n"
+                "for($try=1; $try -le 12; $try++){\n"
+                "  robocopy $Src $Dst /E /IS /IT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null\n"
+                "  $rc=$LASTEXITCODE\n"
+                "  W \"robocopy try $try rc=$rc\"\n"
+                "  if($rc -lt 8){ $ok=$true; break }\n"
                 "  Start-Sleep -Seconds 2\n"
                 "}\n"
-                "if($ok){ W 'Copy OK.' } else { W 'Copy FAILED (см. коды robocopy выше).' }\n"
+                "# 4) Проверка: совпал ли размер обновлённого exe\n"
+                "try {\n"
+                "  $leaf=Split-Path $Exe -Leaf\n"
+                "  $s=(Get-Item (Join-Path $Src $leaf)).Length\n"
+                "  $d=(Get-Item $Exe).Length\n"
+                "  W \"exe size src=$s dst=$d match=$($s -eq $d)\"\n"
+                "} catch { W 'verify: не удалось сравнить exe' }\n"
+                "if($ok){ W 'Copy OK.' } else { W 'Copy FAILED (robocopy rc>=8).' }\n"
                 "W 'Launching new version...'\n"
                 "Start-Process -FilePath $Exe -WorkingDirectory $Dst\n"
                 "W 'Done.'\n"
@@ -632,7 +648,14 @@ class UnifiedWindow(QMainWindow):
                 close_fds=True,
             )
             self.log(f"Обновление готово. Перезапуск… (лог: {log_path})")
-            QTimer.singleShot(600, QApplication.quit)
+            # Сохраняем настройки и ЖЁСТКО завершаем процесс: QApplication.quit()
+            # не всегда освобождает файлы (живут Qt-потоки/серверы), и тогда
+            # robocopy не может перезаписать залоченный exe → оставалась старая версия.
+            try: self._save_settings_now()
+            except Exception: pass
+            try: self._stop_browser_http_server()
+            except Exception: pass
+            QTimer.singleShot(400, lambda: os._exit(0))
         except Exception as e:
             self._updating = False
             self.log(f"Ошибка применения обновления: {e}")
@@ -699,10 +722,6 @@ class UnifiedWindow(QMainWindow):
         hint_up.setWordWrap(True)
         vup.addWidget(hint_up)
         lay.addWidget(grp_up)
-
-        btn_close = QPushButton("Закрыть")
-        btn_close.clicked.connect(dlg.accept)
-        lay.addWidget(btn_close)
 
         # --- Сообщество: чистые ссылки в самом низу (без кнопок) ---
         lay.addStretch()
