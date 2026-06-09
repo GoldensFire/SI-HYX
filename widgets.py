@@ -265,8 +265,7 @@ class RemoteThumbnailRunnable(QRunnable):
         if not self.url: return
         try:
             tmp = os.path.join(TEMP_DIR, f"yt_thumb_{self.iid}.tmp")
-            req = urllib.request.Request(self.url, headers={'User-Agent': USER_AGENT})
-            with urllib.request.urlopen(req) as r, open(tmp, 'wb') as f:
+            with http_get(self.url, headers={'User-Agent': USER_AGENT}, timeout=20) as r, open(tmp, 'wb') as f:
                 f.write(r.read())
 
             if Image:
@@ -309,9 +308,10 @@ class _RecentThumbWorker(QRunnable):
                     pass
             if data is None:
                 tmp = os.path.join(TEMP_DIR, f"rft_{uuid.uuid4().hex}.jpg")
-                for extra in ([], ["-vcodec", "libaom-av1"], ["-vcodec", "av1"]):
-                    cmd = [FFMPEG, "-y", "-ss", "00:00:02"] + extra + [
-                        "-i", self.path, "-vframes", "1", "-vf", "scale=96:-1", tmp]
+                # Пробуем несколько позиций: 1с → 0с (для коротких клипов)
+                for seek in ("00:00:01", "00:00:00"):
+                    cmd = [FFMPEG, "-y", "-ss", seek, "-i", self.path,
+                           "-vframes", "1", "-vf", "scale=96:-2", "-q:v", "3", tmp]
                     try:
                         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                        creationflags=CREATE_NO_WINDOW, timeout=8)
@@ -452,17 +452,23 @@ class RecentFileThumb(QWidget):
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self._drag_start = e.pos()
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_start = None
+        super().mouseReleaseEvent(e)
 
     def mouseMoveEvent(self, e):
-        if self._drag_start and (e.pos() - self._drag_start).manhattanLength() > 8:
+        if self._drag_start is not None and (e.pos() - self._drag_start).manhattanLength() > 6:
+            self._drag_start = None
             from PyQt6.QtCore import QMimeData, QUrl
             from PyQt6.QtGui import QDrag
             drag = QDrag(self)
             md = QMimeData()
             md.setUrls([QUrl.fromLocalFile(self.path)])
             drag.setMimeData(md)
-            drag.exec(Qt.DropAction.CopyAction)
-            self._drag_start = None
+            drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction)
+        super().mouseMoveEvent(e)
 
     def mouseDoubleClickEvent(self, e):
         try:

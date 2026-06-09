@@ -26,7 +26,7 @@ import uuid
 import tempfile
 
 
-import urllib.request
+import urllib.parse
 
 
 import io
@@ -48,6 +48,9 @@ import random
 
 
 import functools
+
+
+import requests
 
 
 from pathlib import Path
@@ -109,6 +112,61 @@ try:
         pillow_heif.register_avif_opener()
 except Exception:
     pillow_heif = None
+
+
+# requests сам поставляет certifi-бандл и проверяет сертификаты — это решает
+# CERTIFICATE_VERIFY_FAILED в собранном .exe / Windows Sandbox без системных CA.
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
+
+class _Resp:
+    """Минимальная обёртка над requests.Response для совместимости с кодом,
+    который раньше работал с urllib: .read() / .read(n), .headers.get(),
+    статус, и работа как контекст-менеджер (`with ... as r:`)."""
+    def __init__(self, r):
+        self._r = r
+        self._it = None
+        self.headers = r.headers
+        self.status = r.status_code
+
+    def read(self, amt=None):
+        if amt is None:
+            return self._r.content
+        if self._it is None:
+            self._it = self._r.iter_content(chunk_size=amt)
+        try:
+            return next(self._it)
+        except StopIteration:
+            return b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        try: self._r.close()
+        except Exception: pass
+
+
+def http_get(url, headers=None, timeout=30, stream=True):
+    """GET через requests с проверкой сертификата; при SSL-ошибке —
+    повтор без проверки (verify=False), чтобы работать и без системных CA.
+    Возвращает _Resp (совместим со старым urllib-кодом)."""
+    h = headers or {}
+    try:
+        r = requests.get(url, headers=h, timeout=timeout, stream=stream)
+        r.raise_for_status()
+        return _Resp(r)
+    except requests.exceptions.SSLError:
+        r = requests.get(url, headers=h, timeout=timeout, stream=stream, verify=False)
+        r.raise_for_status()
+        return _Resp(r)
 
 
 # Config
@@ -200,6 +258,42 @@ def ytdlp_base_cmd():
     return None
 
 
+def _bin_dirs():
+    """Каталоги, где лежат bundled-бинарники (ffmpeg/yt-dlp/deno)."""
+    dirs = []
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        dirs += [base, os.path.join(base, "bin")]
+    d1 = os.path.dirname(os.path.abspath(sys.argv[0] or "."))
+    dirs += [d1, os.path.join(d1, "bin")]
+    d2 = os.path.dirname(os.path.abspath(__file__))
+    dirs += [d2, os.path.join(d2, "bin")]
+    # Уникальные существующие каталоги, порядок сохраняется
+    seen, out = set(), []
+    for d in dirs:
+        if d and d not in seen and os.path.isdir(d):
+            seen.add(d); out.append(d)
+    return out
+
+
+def subprocess_env():
+    """os.environ с добавленными в PATH каталогами bin — чтобы yt-dlp находил
+    deno (нужен для n-challenge YouTube, иначе отдаёт только 360p) и ffmpeg."""
+    env = os.environ.copy()
+    extra = _bin_dirs()
+    if extra:
+        env["PATH"] = os.pathsep.join(extra) + os.pathsep + env.get("PATH", "")
+    return env
+
+
+def deno_available():
+    """True, если deno найден (в bin рядом с программой или в системном PATH)."""
+    exe = _resolve_tool("deno")
+    if os.path.isfile(exe):
+        return True
+    return shutil.which("deno") is not None
+
+
 TEMP_DIR = tempfile.gettempdir()
 
 
@@ -248,7 +342,7 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # Репозиторий для автообновления (GitHub Releases)
 GITHUB_OWNER = "GoldensFire"
@@ -354,6 +448,21 @@ QToolButton {
 QToolButton:hover {
     background-color: #45475a;
     border-color: #89b4fa;
+}
+/* Встроенная кнопка очистки (✕) внутри QLineEdit/QComboBox — без рамки,
+   паддинга и min-height, иначе она наследует стиль QToolButton и смещается. */
+QLineEdit QToolButton, QComboBox QToolButton {
+    background: transparent;
+    border: none;
+    border-radius: 0px;
+    padding: 0px;
+    margin: 0px;
+    min-width: 0px;
+    min-height: 0px;
+}
+QLineEdit QToolButton:hover, QComboBox QToolButton:hover {
+    background: transparent;
+    border: none;
 }
 QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background-color: #313244;

@@ -148,7 +148,7 @@ def is_direct_cdn_video(url: str) -> bool:
 
 
 def download_cdn_direct(url: str, out_dir: str, log_fn=None) -> str:
-    """Скачивает прямую CDN-ссылку через urllib с нужными заголовками.
+    """Скачивает прямую CDN-ссылку через requests с нужными заголовками.
     Возвращает путь к сохранённому файлу или бросает исключение.
     """
     from urllib.parse import urlparse, unquote
@@ -174,9 +174,8 @@ def download_cdn_direct(url: str, out_dir: str, log_fn=None) -> str:
         "Accept-Language": "en-US,en;q=0.9",
     }
     if log_fn: log_fn(f"Прямое скачивание CDN: {url[:60]}...")
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        total = int(resp.headers.get("Content-Length", 0))
+    with http_get(url, headers=headers, timeout=60) as resp:
+        total = int(resp.headers.get("Content-Length", 0) or 0)
         downloaded = 0
         with open(out_path, "wb") as f:
             while True:
@@ -190,6 +189,261 @@ def download_cdn_direct(url: str, out_dir: str, log_fn=None) -> str:
                     log_fn(f"CDN загрузка: {pct}%")
     if log_fn: log_fn(f"CDN загрузка завершена: {out_path}")
     return out_path
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Kodik resolver — извлечение прямого m3u8 из встроенного плеера Kodik.
+#  Работает для animego.online и других сайтов, использующих Kodik
+#  (yt-dlp его не поддерживает напрямую).
+# ──────────────────────────────────────────────────────────────────────────
+
+# Сайты, которые yt-dlp и так качает напрямую — для них Kodik-резолвер не нужен.
+KNOWN_DIRECT_SITES = (
+    "youtube.com", "youtu.be", "tiktok.com", "instagram.com", "vk.com", "vk.ru",
+    "vkvideo.ru", "vimeo.com", "twitch.tv", "twitter.com", "x.com", "dailymotion.com",
+    "reddit.com", "soundcloud.com", "facebook.com", "fb.watch", "ok.ru", "rutube.ru",
+    "bilibili.com", "coub.com", "yandex.ru", "pinterest.",
+)
+
+# Домены плеера Kodik (меняются со временем — список основных)
+_KODIK_HOST_RE = re.compile(
+    r'(?:https?:)?//[\w.-]*(?:kodik|aniqit|anivod|kodikplayer)[\w.-]*'
+    r'/(?:seria|serial|video|episode)/[^\s"\'<>\\]+', re.I)
+
+
+def _kodik_decode(src: str) -> str:
+    """Декодирует src ссылки Kodik: шифр ROT18 по буквам + base64."""
+    out = []
+    for ch in src:
+        c = ord(ch)
+        if 65 <= c <= 90:          # A-Z
+            c += 18; c = c if c <= 90 else c - 26
+            out.append(chr(c))
+        elif 97 <= c <= 122:       # a-z
+            c += 18; c = c if c <= 122 else c - 26
+            out.append(chr(c))
+        else:
+            out.append(ch)
+    b = "".join(out)
+    b += "=" * (-len(b) % 4)       # дополняем паддинг base64
+    return base64.b64decode(b).decode("utf-8", "replace")
+
+
+def is_embed_candidate(url: str) -> bool:
+    """True, если для URL имеет смысл пробовать Kodik-резолвер
+    (это http(s)-страница не из списка напрямую поддерживаемых сайтов)."""
+    u = (url or "").lower()
+    return u.startswith("http") and not any(d in u for d in KNOWN_DIRECT_SITES)
+
+
+def _find_kodik_iframe(page_url: str, session) -> str:
+    """Ищет URL Kodik-iframe на странице: прямой iframe/ссылка либо через
+    DLE-контроллер (data-params=mod=kodik-player...). Возвращает URL или ''."""
+    from urllib.parse import urlparse
+    try:
+        html = session.get(page_url, timeout=30).text
+    except Exception:
+        return ""
+
+    # 1) Прямая ссылка/iframe на kodik
+    m = _KODIK_HOST_RE.search(html.replace("&amp;", "&"))
+    if m:
+        u = m.group(0)
+        return ("https:" + u) if u.startswith("//") else u
+
+    # 2) DLE XFPlayer: data-params="mod=kodik-player&...&id=N" → controller.php
+    m = re.search(r'data-params=["\']([^"\']*mod=kodik-player[^"\']*)["\']', html, re.I)
+    if m:
+        params = m.group(1).replace("&amp;", "&")
+        pu = urlparse(page_url)
+        ctl = f"{pu.scheme}://{pu.netloc}/engine/ajax/controller.php?{params}"
+        try:
+            d = session.get(ctl, headers={"Referer": page_url,
+                                          "X-Requested-With": "XMLHttpRequest"},
+                            timeout=30).json()
+            data = (d.get("data") or "").replace("&amp;", "&")
+            if data:
+                return ("https:" + data) if data.startswith("//") else data
+        except Exception:
+            pass
+    return ""
+
+
+def _attr(s: str, name: str) -> str:
+    m = re.search(name + r'="([^"]*)"', s)
+    return m.group(1) if m else ""
+
+
+def _parse_kodik_selects(html: str):
+    """Разбирает <select>-блоки сериального плеера Kodik.
+    Возвращает (translations, episodes):
+      translations = [(media_id, media_hash, title), ...]  — озвучки
+      episodes     = [(value, data_id, data_hash, title), ...] — серии
+    """
+    translations, episodes = [], []
+    for block in re.findall(r"<select\b[^>]*>(.*?)</select>", html, re.S):
+        if "data-media-id" in block:               # озвучки
+            for o in re.findall(r"<option\b([^>]*)>", block):
+                mid, mh = _attr(o, "data-media-id"), _attr(o, "data-media-hash")
+                if mid and mh:
+                    translations.append((mid, mh, _attr(o, "data-title")))
+        elif "data-serial-id" in block:            # сезоны — пропускаем
+            continue
+        else:                                       # серии
+            for o in re.findall(r"<option\b([^>]*)>", block):
+                did, dh = _attr(o, "data-id"), _attr(o, "data-hash")
+                if did and dh:
+                    episodes.append((_attr(o, "value"), did, dh, _attr(o, "data-title")))
+    return translations, episodes
+
+
+def _selected_option(html: str, kind: str):
+    """Возвращает атрибуты выбранного (<option ... selected>) в нужном <select>.
+    kind: 'translation' (data-media-id), 'episode' (серии)."""
+    for block in re.findall(r"<select\b[^>]*>(.*?)</select>", html, re.S):
+        is_tr = "data-media-id" in block
+        is_season = (not is_tr) and ("data-serial-id" in block)
+        if is_season:
+            continue
+        if (kind == "translation") != is_tr:
+            continue
+        m = re.search(r"<option\b([^>]*\bselected\b[^>]*)>", block)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def kodik_get_info(page_url: str, proxy: str = "") -> dict:
+    """Возвращает данные Kodik-страницы для выпадашек:
+    {'translations': [названия], 'episodes': N,
+     'cur_translation': название, 'cur_episode': номер}."""
+    from urllib.parse import urlparse
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT})
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
+    iframe = _find_kodik_iframe(page_url, s)
+    if not iframe:
+        return {}
+    try:
+        html = s.get(iframe, headers={"Referer": page_url}, timeout=30).text
+    except Exception:
+        return {}
+    translations, episodes = _parse_kodik_selects(html)
+    cur_tr = _attr(_selected_option(html, "translation"), "data-title")
+    cur_ep_str = _attr(_selected_option(html, "episode"), "value")
+    try: cur_ep = int(cur_ep_str)
+    except Exception: cur_ep = 0
+    return {"translations": [t[2] for t in translations if t[2]],
+            "episodes": len(episodes),
+            "cur_translation": cur_tr,
+            "cur_episode": cur_ep}
+
+
+def resolve_kodik(page_url: str, want_height: int = 720, proxy: str = "",
+                  episode=None, translation: str = "", log_fn=None) -> dict:
+    """Полный резолв страницы с плеером Kodik в прямой m3u8.
+    episode — номер серии (int) или None = серия по умолчанию.
+    translation — подстрока названия озвучки или '' = озвучка по умолчанию.
+    Возвращает {'url','referer','height'} или {} если Kodik не найден.
+    """
+    from urllib.parse import urlparse
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT})
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
+
+    iframe = _find_kodik_iframe(page_url, s)
+    if not iframe:
+        return {}
+    if log_fn: log_fn(f"Kodik iframe: {iframe[:80]}")
+
+    base = "https://" + urlparse(iframe).netloc
+    referer = base + "/"
+    try:
+        h = s.get(iframe, headers={"Referer": page_url}, timeout=30).text
+    except Exception as e:
+        if log_fn: log_fn(f"Kodik: не удалось открыть iframe ({e})")
+        return {}
+
+    translations, episodes = _parse_kodik_selects(h)
+
+    # Выбор озвучки: перезагружаем сериал нужного перевода
+    if translation and translations:
+        tl = translation.strip().lower()
+        match = next((t for t in translations if tl in (t[2] or "").lower()), None)
+        if match:
+            if log_fn: log_fn(f"Kodik: озвучка «{match[2]}»")
+            iframe = f"{base}/serial/{match[0]}/{match[1]}/720p"
+            try:
+                h = s.get(iframe, headers={"Referer": page_url}, timeout=30).text
+                _, episodes = _parse_kodik_selects(h)
+            except Exception:
+                pass
+        elif log_fn:
+            avail = ", ".join(t[2] for t in translations if t[2])
+            log_fn(f"Kodik: озвучка «{translation}» не найдена. Доступны: {avail}")
+
+    def _var(v):
+        m = re.search(r'var\s+' + v + r'\s*=\s*"([^"]*)"', h)
+        return m.group(1) if m else ""
+
+    def _vinfo(k):
+        m = re.search(r"vInfo\." + k + r"\s*=\s*'([^']+)'", h)
+        return m.group(1) if m else ""
+
+    vtype, vhash, vid = _vinfo("type"), _vinfo("hash"), _vinfo("id")
+
+    # Выбор серии
+    if episode is not None and episodes:
+        want = str(int(episode))
+        m = (next((e for e in episodes if e[0] == want), None) or
+             next((e for e in episodes if (e[3] or "").strip().startswith(want + " ")), None))
+        if m:
+            vtype, vid, vhash = "seria", m[1], m[2]
+            if log_fn: log_fn(f"Kodik: серия {want}")
+        elif log_fn:
+            log_fn(f"Kodik: серия {want} не найдена (всего {len(episodes)})")
+
+    if not (vtype and vhash and vid):
+        if log_fn: log_fn("Kodik: не найдены параметры видео (type/hash/id)")
+        return {}
+
+    post = {
+        "d": _var("domain"), "d_sign": _var("d_sign"),
+        "pd": _var("pd"), "pd_sign": _var("pd_sign"),
+        "ref": _var("ref"), "ref_sign": _var("ref_sign"),
+        "bad_user": "true", "cdn_is_working": "true",
+        "type": vtype, "hash": vhash, "id": vid,
+    }
+    try:
+        j = s.post(base + "/ftor", data=post,
+                   headers={"Referer": iframe, "Origin": base,
+                            "X-Requested-With": "XMLHttpRequest"},
+                   timeout=30).json()
+    except Exception as e:
+        if log_fn: log_fn(f"Kodik: запрос ссылок не удался ({e})")
+        return {}
+
+    qmap = {}
+    for q, arr in (j.get("links") or {}).items():
+        try:
+            src = arr[0]["src"]
+            u = src if "//" in src else _kodik_decode(src)
+            if u.startswith("//"): u = "https:" + u
+            qmap[int(re.sub(r"\D", "", str(q)) or 0)] = u
+        except Exception:
+            pass
+    if not qmap:
+        if log_fn: log_fn("Kodik: ссылки не получены")
+        return {}
+
+    heights = sorted(qmap)
+    fitting = [hh for hh in heights if hh <= want_height]
+    chosen = max(fitting) if fitting else max(heights)
+    if log_fn:
+        log_fn(f"Kodik: качества {heights}, выбрано {chosen}p")
+    return {"url": qmap[chosen], "referer": referer, "height": chosen}
 
 
 def parse_version(s):

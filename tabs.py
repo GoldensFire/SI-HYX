@@ -8,19 +8,22 @@ from workers import *
 
 class YtdlpTab(QWidget):
     thumb_sig = pyqtSignal(str, QIcon)
+    kodik_info_sig = pyqtSignal(object, int, str, int)  # (озвучки, число серий, тек.озвучка, тек.серия)
     def __init__(self, main_win):
         super().__init__()
         self.main = main_win
         self.items = {}
         self.pool = QThreadPool()
         self.active_workers: dict = {}  # iid → YtdlpWorker, O(1) поиск
-        
+        self._kodik_last_url = ""       # для какой ссылки уже подгружены списки
+
         self.fetch_timer = QTimer()
         self.fetch_timer.setSingleShot(True)
         self.fetch_timer.setInterval(800)
         self.fetch_timer.timeout.connect(self._start_fetch)
         self.info_worker = None
         self.setup_ui()
+        self.kodik_info_sig.connect(self._populate_kodik)
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -55,8 +58,33 @@ class YtdlpTab(QWidget):
         btn_ck.clicked.connect(self._choose_cookie)
         ho_ck = QHBoxLayout(); ho_ck.addWidget(self.cookie_edit); ho_ck.addWidget(btn_ck)
 
+        self.proxy_edit = QLineEdit()
+        self.proxy_edit.setPlaceholderText("http://host:port  •  socks5://host:port  •  http://user:pass@host:port")
+        self.proxy_edit.setClearButtonEnabled(True)
+        ho_px = QHBoxLayout(); ho_px.addWidget(self.proxy_edit)
+
+        # Аниме-сайты с плеером Kodik (animego и т.п.): выбор серии и озвучки.
+        # Списки заполняются автоматически после вставки ссылки. Только выбор.
+        self.kodik_ep = QComboBox()
+        self.kodik_ep.addItem("—")              # пока ссылка не вставлена
+        self.kodik_ep.setFixedWidth(80)
+        self.kodik_trans = QComboBox()
+        self.kodik_trans.addItem("—")
+        self.kodik_trans.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.kodik_trans.setMinimumWidth(150)
+        self.kodik_trans.setMaximumWidth(260)
+        ho_kd = QHBoxLayout()
+        ho_kd.addWidget(QLabel("Серия:")); ho_kd.addWidget(self.kodik_ep)
+        ho_kd.addWidget(QLabel("Озвучка:")); ho_kd.addWidget(self.kodik_trans)
+        ho_kd.addStretch()
+
         fl.addRow("URL:", h); fl.addRow("Папка:", ho)
         fl.addRow(label_with_info("Cookies:", "Файл cookies.txt для приватных/возрастных видео. Для YouTube обычно не требуется (скачивание идёт через клиент tv + Deno)."), ho_ck)
+        fl.addRow(label_with_info("Прокси:", "Прокси для скачивания (yt-dlp). Помогает при блокировке YouTube провайдером. "
+                                  "Браузерный VPN тут не работает — нужен именно прокси. Примеры: http://127.0.0.1:8080, socks5://127.0.0.1:1080"), ho_px)
+        fl.addRow(label_with_info("Аниме (Kodik):", "Для сайтов с плеером Kodik (animego и т.п.): номер серии и название озвучки. "
+                                  "Нажмите 🔍 на ссылке — в лог выведется список доступных озвучек и число серий. "
+                                  "«тек.»/пусто = серия и озвучка по умолчанию. Примечание: 1080p на таких сайтах обычно апскейл, реальный максимум — 720p."), ho_kd)
         grp.setLayout(fl); layout.addWidget(grp)
 
         opt = QGroupBox("Опции"); ho = QHBoxLayout()
@@ -168,6 +196,23 @@ class YtdlpTab(QWidget):
         url = self.url_edit.text().strip()
         if not url: return
         self.main.log(f"Запрос метаданных для: {url[:30]}...")
+
+        # Для Kodik-сайтов (animego и т.п.) — подгружаем списки озвучек и серий
+        # в выпадашки (один раз на ссылку).
+        if is_embed_candidate(url) and url != self._kodik_last_url:
+            self._kodik_last_url = url
+            def _kinfo(u=url, px=self.proxy_edit.text().strip()):
+                try:
+                    info = kodik_get_info(u, proxy=px)
+                    tr = info.get("translations") or []
+                    if tr:
+                        self.kodik_info_sig.emit(
+                            tr, int(info.get("episodes", 0)),
+                            info.get("cur_translation", "") or "",
+                            int(info.get("cur_episode", 0) or 0))
+                except Exception:
+                    pass
+            threading.Thread(target=_kinfo, daemon=True).start()
         # Отменяем предыдущий воркер через флаг — НЕ terminate(), он вызывает сегфолт в PyQt6
         if self.info_worker and self.info_worker.isRunning():
             self.info_worker.cancelled = True
@@ -177,10 +222,43 @@ class YtdlpTab(QWidget):
             try: self.info_worker.error.disconnect()
             except Exception: pass
             # Не ждём завершения — пусть доработает в фоне и тихо умрёт
-        self.info_worker = InfoWorker(url)
+        self.info_worker = InfoWorker(url, proxy=self.proxy_edit.text().strip())
         self.info_worker.success.connect(self._on_info_success)
         self.info_worker.error.connect(self._on_info_error)
         self.info_worker.start()
+
+    def _kodik_episode_value(self):
+        """Номер выбранной серии (int) или None, если список ещё не заполнен."""
+        txt = self.kodik_ep.currentText().strip()
+        return int(txt) if txt.isdigit() else None
+
+    def _populate_kodik(self, translations, episodes, cur_translation, cur_episode):
+        """Заполняет выпадашки серий и озвучек (только выбор, не ввод).
+        По умолчанию выбирает то, что отмечено в плеере; иначе — первый пункт."""
+        try:
+            self.kodik_trans.blockSignals(True)
+            self.kodik_trans.clear()
+            for t in translations:
+                self.kodik_trans.addItem(t)
+            idx = self.kodik_trans.findText(cur_translation) if cur_translation else -1
+            self.kodik_trans.setCurrentIndex(idx if idx >= 0 else 0)
+            self.kodik_trans.blockSignals(False)
+
+            self.kodik_ep.blockSignals(True)
+            self.kodik_ep.clear()
+            for i in range(1, int(episodes) + 1):
+                self.kodik_ep.addItem(str(i))
+            if episodes <= 0:
+                self.kodik_ep.addItem("—")
+            ep_idx = self.kodik_ep.findText(str(cur_episode)) if cur_episode else -1
+            self.kodik_ep.setCurrentIndex(ep_idx if ep_idx >= 0 else 0)
+            self.kodik_ep.blockSignals(False)
+
+            self.main.log(f"Kodik: озвучек {len(translations)}, серий {episodes}. "
+                          f"Выбрано: серия {self.kodik_ep.currentText()}, "
+                          f"озвучка «{self.kodik_trans.currentText()}».")
+        except Exception as e:
+            self.main.log(f"_populate_kodik error: {e}")
 
     def _on_info_success(self, duration, thumb_url):
         self.main.log(f"Длительность получена: {duration} сек.")
@@ -325,6 +403,7 @@ class YtdlpTab(QWidget):
                 'audio': 'Original', 'force_kf': True,
                 'audio_only': bool(audio_only),
                 'cookie_path': self.cookie_edit.text().strip() if hasattr(self, 'cookie_edit') else '',
+                'proxy': self.proxy_edit.text().strip() if hasattr(self, 'proxy_edit') else '',
             }
             w = YtdlpWorker(config)
             self.active_workers[iid] = w
@@ -354,6 +433,9 @@ class YtdlpTab(QWidget):
                 'end_s': self.get_sec(self.te) if any(x.value() for x in self.te) else None,
                 'audio_only': bool(audio_only),
                 'cookie_path': self.cookie_edit.text().strip(),
+                'proxy': self.proxy_edit.text().strip(),
+                'kodik_episode': self._kodik_episode_value(),
+                'kodik_translation': (lambda t: "" if t in ("", "—") else t)(self.kodik_trans.currentText().strip()),
             }
             w = YtdlpWorker(config)
             self.active_workers[iid] = w
@@ -484,6 +566,9 @@ class MediaTab(QWidget):
         self.ck_fade = QCheckBox("Затухание (Fade Out)"); self.ck_fade.setChecked(True)
         self.s_fade = QDoubleSpinBox(); self.s_fade.setValue(1.0); self.s_fade.setRange(0.0, 60.0); self.s_fade.setSingleStep(0.1)
         self.s_fade.setMaximumWidth(110)
+        self.ck_fade_in = QCheckBox("Нарастание (Fade In)"); self.ck_fade_in.setChecked(False)
+        self.s_fade_in = QDoubleSpinBox(); self.s_fade_in.setValue(1.0); self.s_fade_in.setRange(0.0, 60.0); self.s_fade_in.setSingleStep(0.1)
+        self.s_fade_in.setMaximumWidth(110)
         self.ck_deg = QCheckBox("Ухудшить звук (Degrade)")
         self.s_hz = QSpinBox(); self.s_hz.setValue(8000); self.s_hz.setRange(1000, 48000)
         self.ck_u8 = QCheckBox("8-bit")
@@ -499,6 +584,7 @@ class MediaTab(QWidget):
         hn.addWidget(QLabel("TP:")); hn.addWidget(self.s_tp)
         hn.addStretch()
         fa.addRow(hn)
+        fa.addRow(row_with_info(self.ck_fade_in, "Плавное нарастание звука в начале ролика (секунды)"), self.s_fade_in)
         fa.addRow(row_with_info(self.ck_fade, "Плавное затухание звука в конце ролика в секундах"), self.s_fade)
 
         # Битрейт аудио — ПЕРЕД секцией degrade
@@ -603,11 +689,23 @@ class MediaTab(QWidget):
         fv.addRow(label_with_info("CRF / Preset:", "CRF — качество (меньше = качественнее, но больше файл. Рекомендуется 40-45. Может принимать значения от 0 до 63)"), henc)
         fv.addRow(label_with_info("Разрешение:", "Масштаб выходного видео. «Исходное» — без изменений. Уменьшение сохраняет пропорции (без растяжения)."), self.c_res)
         fv.addRow(label_with_info("FPS:", "Частота кадров на выходе. «Исходный (max 30)» — снижает только если выше 30."), self.c_fps)
+
+        # Видео fade in / fade out (через чёрный экран)
+        self.ck_vfade_in = QCheckBox("Fade In (из чёрного)"); self.ck_vfade_in.setChecked(False)
+        self.s_vfade_in = QDoubleSpinBox(); self.s_vfade_in.setValue(1.0); self.s_vfade_in.setRange(0.0, 60.0); self.s_vfade_in.setSingleStep(0.1)
+        self.s_vfade_in.setMaximumWidth(110)
+        self.ck_vfade_out = QCheckBox("Fade Out (в чёрный)"); self.ck_vfade_out.setChecked(False)
+        self.s_vfade_out = QDoubleSpinBox(); self.s_vfade_out.setValue(1.0); self.s_vfade_out.setRange(0.0, 60.0); self.s_vfade_out.setSingleStep(0.1)
+        self.s_vfade_out.setMaximumWidth(110)
+        fv.addRow(row_with_info(self.ck_vfade_in, "Плавное появление картинки из чёрного экрана в начале (секунды)"), self.s_vfade_in)
+        fv.addRow(row_with_info(self.ck_vfade_out, "Плавный уход картинки в чёрный экран в конце (секунды)"), self.s_vfade_out)
+
         gv.setLayout(fv); rv_inner.addWidget(gv)
         # Скрываем строки видео если перекодирование выключено
         self._video_enc_rows = [self.btn_mode_std, self.btn_mode_dark,
                                  self.s_crf, self.s_pre, self.c_res, self.c_fps,
-                                 self._badge_crf]
+                                 self._badge_crf,
+                                 self.s_vfade_in, self.s_vfade_out]
         def _update_video_enc(checked):
             for w in self._video_enc_rows:
                 w.setVisible(checked)
@@ -959,6 +1057,7 @@ class MediaTab(QWidget):
                 'norm': bool(self.ck_norm.isChecked()),
                 'tgt': float(self.s_tgt.value()), 'lra': float(self.s_lra.value()), 'tp': float(self.s_tp.value()),
                 'fade': bool(self.ck_fade.isChecked()), 'fade_d': float(self.s_fade.value()),
+                'fade_in': bool(self.ck_fade_in.isChecked()), 'fade_in_d': float(self.s_fade_in.value()),
                 'deg': bool(self.ck_deg.isChecked()), 'hz': int(self.s_hz.value()), 'u8': bool(self.ck_u8.isChecked()),
                 'lp': int(self.s_lp.value()), 'hp': int(self.s_hp.value()), 'deg_gain_db': float(self.s_deg_gain.value()),
                 'bitrate': ab
@@ -966,7 +1065,9 @@ class MediaTab(QWidget):
             'video': {
                 'enabled': bool(self.chk_enable_video.isChecked()), 'speed': int(spd), 'crf': int(self.s_crf.value()),
                 'pre': int(self.s_pre.value()), 'res': strip_default_tag(self.c_res.currentText()), 'fps': self.c_fps.currentText().strip().replace(',', '.'),
-                'preset_mode': 'dark' if self.btn_mode_dark.isChecked() else 'std'
+                'preset_mode': 'dark' if self.btn_mode_dark.isChecked() else 'std',
+                'vfade_in': bool(self.ck_vfade_in.isChecked()), 'vfade_in_d': float(self.s_vfade_in.value()),
+                'vfade_out': bool(self.ck_vfade_out.isChecked()), 'vfade_out_d': float(self.s_vfade_out.value())
             },
             'avif': {
                 'limit': int(self.s_lim.value()) if self.ck_lim.isChecked() else 0,

@@ -164,6 +164,8 @@ class UnifiedWindow(QMainWindow):
             tm.s_tp.setValue(a.get("tp", -1.5))
             tm.ck_fade.setChecked(a.get("fade", True))
             tm.s_fade.setValue(a.get("fade_d", 1.0))
+            tm.ck_fade_in.setChecked(a.get("fade_in", False))
+            tm.s_fade_in.setValue(a.get("fade_in_d", 1.0))
             tm.ck_deg.setChecked(a.get("deg", False))
             tm.s_hz.setValue(a.get("hz", 8000))
             tm.ck_u8.setChecked(a.get("u8", False))
@@ -180,6 +182,10 @@ class UnifiedWindow(QMainWindow):
             combo_set_value(tm.c_res, v.get("res", "Исходное"))
             tm.c_fps.setCurrentText(v.get("fps", "Исходный"))
             tm._set_preset_mode(v.get("preset_mode", "std"))
+            tm.ck_vfade_in.setChecked(v.get("vfade_in", False))
+            tm.s_vfade_in.setValue(v.get("vfade_in_d", 1.0))
+            tm.ck_vfade_out.setChecked(v.get("vfade_out", False))
+            tm.s_vfade_out.setValue(v.get("vfade_out_d", 1.0))
 
             # Папка экспорта (пусто = рядом с исходником)
             tm.export_dir = m.get("export_dir", "") or ""
@@ -198,6 +204,9 @@ class UnifiedWindow(QMainWindow):
             saved_cookie = y.get("cookie_path", "")
             if saved_cookie:
                 ty.cookie_edit.setText(saved_cookie)
+            saved_proxy = y.get("proxy", "")
+            if saved_proxy:
+                ty.proxy_edit.setText(saved_proxy)
 
             av = s.get("avif", {})
             tm.s_lim.setValue(av.get("limit", tm.s_lim.value()))
@@ -328,8 +337,7 @@ class UnifiedWindow(QMainWindow):
                         if os.path.exists(out_path):
                             base_n, ext_n = os.path.splitext(filename)
                             out_path = os.path.join(out_dir, f"{base_n}_{int(time.time())}{ext_n}")
-                        req = urllib.request.Request(img_url, headers={"User-Agent": USER_AGENT, "Referer": img_url})
-                        with urllib.request.urlopen(req, timeout=30) as resp:
+                        with http_get(img_url, headers={"User-Agent": USER_AGENT, "Referer": img_url}, timeout=30) as resp:
                             img_bytes = resp.read()
                         with open(out_path, "wb") as fout:
                             fout.write(img_bytes)
@@ -451,11 +459,10 @@ class UnifiedWindow(QMainWindow):
                 # pre-release (beta), которые /latest пропускает.
                 api = (f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
                        f"/releases?per_page=10")
-                req = urllib.request.Request(api, headers={
+                with http_get(api, headers={
                     "User-Agent": APP_NAME,
                     "Accept": "application/vnd.github+json",
-                })
-                with urllib.request.urlopen(req, timeout=15) as r:
+                }, timeout=15) as r:
                     releases = json.loads(r.read().decode("utf-8", "replace"))
                 if not isinstance(releases, list):
                     releases = []
@@ -520,8 +527,7 @@ class UnifiedWindow(QMainWindow):
                 os.makedirs(tmp, exist_ok=True)
                 zip_path = os.path.join(tmp, "update.zip")
 
-                req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
-                with urllib.request.urlopen(req, timeout=60) as r:
+                with http_get(url, headers={"User-Agent": APP_NAME}, timeout=60) as r:
                     total = int(r.headers.get("Content-Length", 0) or 0)
                     done = 0
                     last_pct = -1
@@ -568,21 +574,48 @@ class UnifiedWindow(QMainWindow):
 
     def _apply_update(self, src_root: str):
         """Готовит PowerShell-апдейтер, запускает его и закрывает программу.
-        Апдейтер дождётся выхода, заменит файлы и запустит новую версию."""
+        Апдейтер дождётся выхода, заменит файлы (с ретраями, пока exe залочен)
+        и запустит новую версию. Пишет лог в %TEMP%\\sihyx_update\\update_log.txt."""
         try:
             app_dir = os.path.dirname(os.path.abspath(sys.executable))
             exe_path = os.path.abspath(sys.executable)
-            ps_path = os.path.join(tempfile.gettempdir(), "sihyx_update", "apply_update.ps1")
+            upd_dir = os.path.join(tempfile.gettempdir(), "sihyx_update")
+            os.makedirs(upd_dir, exist_ok=True)
+            ps_path = os.path.join(upd_dir, "apply_update.ps1")
+            log_path = os.path.join(upd_dir, "update_log.txt")
+            try:
+                if os.path.exists(log_path): os.remove(log_path)
+            except Exception: pass
+
             script = (
-                "param([int]$AppPid,[string]$Src,[string]$Dst,[string]$Exe)\n"
+                "param([int]$AppPid,[string]$Src,[string]$Dst,[string]$Exe,[string]$Log)\n"
                 "$ErrorActionPreference='SilentlyContinue'\n"
-                "Write-Host 'Ожидание закрытия программы...'\n"
-                "try { Wait-Process -Id $AppPid -Timeout 30 } catch {}\n"
+                "function W($m){ \"$([DateTime]::Now.ToString('HH:mm:ss')) $m\" | "
+                "Out-File -FilePath $Log -Append -Encoding utf8 }\n"
+                "W 'Updater started.'\n"
+                "W \"Src=$Src\"\n"
+                "W \"Dst=$Dst\"\n"
+                "# Ждём полного закрытия программы (до ~60 сек), иначе файлы залочены\n"
+                "for($i=0; $i -lt 60; $i++){\n"
+                "  $p = Get-Process -Id $AppPid -ErrorAction SilentlyContinue\n"
+                "  if(-not $p){ break }\n"
+                "  Start-Sleep -Milliseconds 1000\n"
+                "}\n"
                 "Start-Sleep -Seconds 1\n"
-                "Write-Host 'Установка обновления...'\n"
-                "robocopy $Src $Dst /E /IS /IT /R:3 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null\n"
-                "Write-Host 'Запуск новой версии...'\n"
-                "Start-Process -FilePath $Exe\n"
+                "W 'Process closed, copying files...'\n"
+                "# Несколько попыток: exe может быть ещё занят\n"
+                "$ok = $false\n"
+                "for($try=1; $try -le 10; $try++){\n"
+                "  robocopy $Src $Dst /E /IS /IT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null\n"
+                "  $rc = $LASTEXITCODE\n"
+                "  W \"robocopy attempt $try exit=$rc\"\n"
+                "  if($rc -lt 8){ $ok = $true; break }\n"
+                "  Start-Sleep -Seconds 2\n"
+                "}\n"
+                "if($ok){ W 'Copy OK.' } else { W 'Copy FAILED (см. коды robocopy выше).' }\n"
+                "W 'Launching new version...'\n"
+                "Start-Process -FilePath $Exe -WorkingDirectory $Dst\n"
+                "W 'Done.'\n"
             )
             with open(ps_path, "w", encoding="utf-8-sig") as f:
                 f.write(script)
@@ -593,11 +626,12 @@ class UnifiedWindow(QMainWindow):
                 ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                  "-File", ps_path,
                  "-AppPid", str(os.getpid()),
-                 "-Src", src_root, "-Dst", app_dir, "-Exe", exe_path],
+                 "-Src", src_root, "-Dst", app_dir, "-Exe", exe_path,
+                 "-Log", log_path],
                 creationflags=DETACHED | NEWGRP,
                 close_fds=True,
             )
-            self.log("Обновление готово. Перезапуск…")
+            self.log(f"Обновление готово. Перезапуск… (лог: {log_path})")
             QTimer.singleShot(600, QApplication.quit)
         except Exception as e:
             self._updating = False
@@ -691,6 +725,7 @@ class UnifiedWindow(QMainWindow):
                     'audio': {
                         'norm': bool(tm.ck_norm.isChecked()), 'tgt': float(tm.s_tgt.value()), 'lra': float(tm.s_lra.value()),
                         'tp': float(tm.s_tp.value()), 'fade': bool(tm.ck_fade.isChecked()), 'fade_d': float(tm.s_fade.value()),
+                        'fade_in': bool(tm.ck_fade_in.isChecked()), 'fade_in_d': float(tm.s_fade_in.value()),
                         'deg': bool(tm.ck_deg.isChecked()), 'hz': int(tm.s_hz.value()), 'u8': bool(tm.ck_u8.isChecked()),
                         'lp': int(tm.s_lp.value()), 'hp': int(tm.s_hp.value()), 'deg_gain_db': float(tm.s_deg_gain.value()),
                         'bitrate': tm.c_abitrate.currentText()
@@ -698,7 +733,9 @@ class UnifiedWindow(QMainWindow):
                     'video': {
                         'enabled': bool(tm.chk_enable_video.isChecked()), 'speed': int(tm.s_spd.value()), 'crf': int(tm.s_crf.value()),
                         'pre': int(tm.s_pre.value()), 'res': strip_default_tag(tm.c_res.currentText()), 'fps': tm.c_fps.currentText(),
-                        'preset_mode': 'dark' if tm.btn_mode_dark.isChecked() else 'std'
+                        'preset_mode': 'dark' if tm.btn_mode_dark.isChecked() else 'std',
+                        'vfade_in': bool(tm.ck_vfade_in.isChecked()), 'vfade_in_d': float(tm.s_vfade_in.value()),
+                        'vfade_out': bool(tm.ck_vfade_out.isChecked()), 'vfade_out_d': float(tm.s_vfade_out.value())
                     },
                     'export_dir': getattr(tm, 'export_dir', '') or ''
                 },
@@ -706,6 +743,7 @@ class UnifiedWindow(QMainWindow):
                     'outdir': ty.out.text(), 'quality': ty.c_q.currentText(), 'merge': ty.c_c.currentText(),
                     'sub_lang': ty.c_s.currentText(), 'audio': ty.c_a.currentText(), 'force_kf': bool(ty.chk_k.isChecked()),
                     'cookie_path': ty.cookie_edit.text().strip(),
+                    'proxy': ty.proxy_edit.text().strip(),
                 },
                 'avif': {
                     'limit': int(tm.s_lim.value()), 'limit_on': bool(tm.ck_lim.isChecked()),
@@ -729,17 +767,19 @@ class UnifiedWindow(QMainWindow):
             ty = self.tab_ytdlp
             # Виджеты с сигналом toggled (QCheckBox, QPushButton checkable)
             toggle_widgets = [
-                tm.ck_norm, tm.ck_fade, tm.ck_deg, tm.ck_u8,
+                tm.ck_norm, tm.ck_fade, tm.ck_fade_in, tm.ck_deg, tm.ck_u8,
                 tm.chk_enable_video, tm.btn_mode_dark, tm.ck_arec,
                 tm.ck_lim, tm.ck_dim,
+                tm.ck_vfade_in, tm.ck_vfade_out,
                 ty.chk_k,
             ]
             # Виджеты с сигналом valueChanged (QSpinBox, QDoubleSpinBox, QSlider)
             value_widgets = [
-                tm.s_tgt, tm.s_lra, tm.s_tp, tm.s_fade,
+                tm.s_tgt, tm.s_lra, tm.s_tp, tm.s_fade, tm.s_fade_in,
                 tm.s_hz, tm.s_lp, tm.s_hp, tm.s_deg_gain,
                 tm.s_spd, tm.s_crf, tm.s_pre,
                 tm.s_lim, tm.s_dim, tm.sl_aspd,
+                tm.s_vfade_in, tm.s_vfade_out,
             ]
             # Виджеты с сигналом currentTextChanged (QComboBox)
             combo_widgets = [
@@ -747,7 +787,7 @@ class UnifiedWindow(QMainWindow):
                 ty.c_q, ty.c_c, ty.c_s, ty.c_a,
             ]
             # Виджет с сигналом textChanged (QLineEdit)
-            text_widgets = [ty.out, ty.cookie_edit]
+            text_widgets = [ty.out, ty.cookie_edit, ty.proxy_edit]
 
             for w in toggle_widgets:
                 w.toggled.connect(self._save_settings_now)

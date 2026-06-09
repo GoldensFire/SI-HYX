@@ -9,9 +9,10 @@ class InfoWorker(QThread):
     success = pyqtSignal(int, str)
     error = pyqtSignal(str)
 
-    def __init__(self, url):
+    def __init__(self, url, proxy=""):
         super().__init__()
         self.url = url
+        self.proxy = (proxy or "").strip()
         self.cancelled = False
         self._proc = None
 
@@ -29,15 +30,17 @@ class InfoWorker(QThread):
             c_path = get_cookies_path(self.url)
             if os.path.exists(c_path):
                 cmd += ["--cookies", c_path]
+            if self.proxy:
+                cmd += ["--proxy", self.proxy]
             if 'youtube.com' in self.url.lower() or 'youtu.be' in self.url.lower():
-                cmd += ["--extractor-args", "youtube:player_client=tv,web"]
+                cmd += ["--extractor-args", "youtube:player_client=default,web_safari"]
             cmd += [self.url]
 
             if self.cancelled: return
             self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, encoding="utf-8", errors="replace",
-                creationflags=CREATE_NO_WINDOW)
+                creationflags=CREATE_NO_WINDOW, env=subprocess_env())
             out, _err = self._proc.communicate(timeout=60)
             if self.cancelled: return
 
@@ -83,6 +86,12 @@ class YtdlpWorker(QThread):
             try: p.kill()
             except Exception: pass
 
+    @staticmethod
+    def _height_from_fmt(fmt: str) -> int:
+        """Желаемая высота из строки формата yt-dlp (height<=1080 → 1080)."""
+        m = re.search(r"height<=?(\d+)", fmt or "")
+        return int(m.group(1)) if m else 720
+
     def run(self):
         iid = self.c.get('iid', '')
         self._iid = iid
@@ -111,6 +120,25 @@ class YtdlpWorker(QThread):
             is_audio_only = self.c.get('audio_only', False)
             force_kf = False if (is_audio_only or not self.c.get('force_kf', True)) else True
             merge = self.c.get('merge') or 'mp4'
+            proxy = (self.c.get('proxy') or '').strip()
+
+            # Встроенный плеер Kodik (animego и др. — yt-dlp их не поддерживает):
+            # резолвим страницу в прямой m3u8 и качаем уже его.
+            kodik = {}
+            if not is_audio_only and is_embed_candidate(url):
+                try:
+                    want_h = self._height_from_fmt(self.c.get('fmt', ''))
+                    ep = self.c.get('kodik_episode')
+                    ep = int(ep) if ep else None
+                    kodik = resolve_kodik(url, want_height=want_h, proxy=proxy,
+                                          episode=ep,
+                                          translation=self.c.get('kodik_translation', ''),
+                                          log_fn=self.log_sig.emit)
+                except Exception as e:
+                    self.log_sig.emit(f"Kodik resolve error: {e}")
+            if kodik:
+                self.log_sig.emit(f"Встроенный плеер Kodik → качаю {kodik['height']}p (m3u8)")
+                url = kodik['url']
 
             outtmpl = os.path.join(out_dir, '%(title)s [%(id)s].%(ext)s')
 
@@ -127,9 +155,18 @@ class YtdlpWorker(QThread):
                     e_tag = f"{e_val}s" if e_val else "end"
                     outtmpl = os.path.join(out_dir, f'%(title)s [{s_tag}-{e_tag}] [%(id)s].%(ext)s')
 
+            # Для Kodik имя из URL-страницы (иначе yt-dlp возьмёт «720.mp4:hls:manifest»)
+            if kodik:
+                from urllib.parse import urlparse as _urlparse
+                slug = os.path.splitext(os.path.basename(_urlparse(raw_url).path))[0] or "video"
+                outtmpl = os.path.join(out_dir, f"{slug} [{kodik['height']}p].%(ext)s")
+
             cmd = base + [
                 "--newline", "--no-playlist", "--no-mtime", "--progress",
                 "--socket-timeout", "30", "--no-check-certificate", "--windows-filenames",
+                # Устойчивость к обрывам соединения (DPI/блокировки провайдера, ошибка 10054)
+                "--retries", "10", "--fragment-retries", "20",
+                "--extractor-retries", "5", "--retry-sleep", "3",
                 "-o", outtmpl,
                 "--progress-template",
                 "download:@@@%(progress._percent_str)s|%(progress._speed_str)s|"
@@ -144,8 +181,19 @@ class YtdlpWorker(QThread):
             if os.path.isabs(FFMPEG) and os.path.isfile(FFMPEG):
                 cmd += ["--ffmpeg-location", os.path.dirname(FFMPEG)]
 
+            # Прокси (если задан в настройках вкладки загрузок)
+            if proxy:
+                cmd += ["--proxy", proxy]
+
+            # Kodik m3u8 требует Referer на домен плеера
+            if kodik and kodik.get('referer'):
+                cmd += ["--add-header", f"Referer:{kodik['referer']}"]
+
             if is_audio_only:
                 cmd += ["-f", "bestaudio/best", "-x", "--audio-format", "m4a", "--audio-quality", "0"]
+            elif kodik:
+                # одиночный m3u8 — берём лучшее из манифеста (качество уже выбрано)
+                cmd += ["-f", "best", "--merge-output-format", merge]
             else:
                 cmd += ["-f", self.c.get('fmt') or "bestvideo+bestaudio/best",
                         "--merge-output-format", merge]
@@ -158,10 +206,10 @@ class YtdlpWorker(QThread):
                         "com.zhiliaoapp.musically/2022600030 (Linux; U; Android 7.1.2; es_ES; SM-G988N; Build/NRD90M; Cronet/58.0.2991.0)"]
 
             if 'youtube.com' in url.lower() or 'youtu.be' in url.lower():
-                self.log_sig.emit("YouTube: клиент tv + web (n-challenge через Deno)...")
-                if not shutil.which("deno"):
-                    self.log_sig.emit("ВНИМАНИЕ: Deno не найден — YouTube может отдать только превью. Положите deno.exe в bin.")
-                cmd += ["--extractor-args", "youtube:player_client=tv,web"]
+                self.log_sig.emit("YouTube: клиенты default + web_safari (n-challenge через Deno)...")
+                if not deno_available():
+                    self.log_sig.emit("ВНИМАНИЕ: Deno не найден — YouTube может отдать только 360p. Положите deno.exe в bin.")
+                cmd += ["--extractor-args", "youtube:player_client=default,web_safari"]
 
             # Куки: domain-specific имеет приоритет над общим UI-полем
             ui_cookie = self.c.get('cookie_path', '').strip()
@@ -198,7 +246,7 @@ class YtdlpWorker(QThread):
             self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
-                creationflags=CREATE_NO_WINDOW, bufsize=1)
+                creationflags=CREATE_NO_WINDOW, bufsize=1, env=subprocess_env())
 
             out_fullpath = ""
             clean_res_str = ""
@@ -295,6 +343,14 @@ class YtdlpWorker(QThread):
         return ""
 
     def _emit_hints(self, err_msg):
+        low = err_msg.lower()
+        if ("10054" in err_msg or "connection aborted" in low
+                or "connection reset" in low or "connectionreseterror" in low):
+            self.log_sig.emit("СОВЕТ: Соединение принудительно разорвано (10054). Обычно это "
+                              "блокировка/замедление YouTube провайдером.")
+            self.log_sig.emit("  Попробуйте: включить VPN, либо повторить позже. Ретраи уже "
+                              "увеличены, но против DPI-блокировки помогает только VPN/прокси.")
+            return
         if "Sign in to confirm" in err_msg or "not a bot" in err_msg:
             self.log_sig.emit("СОВЕТ: YouTube требует «не бот» — куки без данных входа.")
             self.log_sig.emit("  Экспортируйте куки залогиненного YouTube (нужны LOGIN_INFO, __Secure-1PSID, SID, SAPISID).")
@@ -537,6 +593,9 @@ class ProcessWorker(QThread):
             lra = float(sa.get('lra', 20.0))
             tp = float(sa.get('tp', -1.5))
             audio_filters.append(f"loudnorm=I={tgt_i}:LRA={lra}:TP={tp}")
+        if sa.get('fade_in'):
+            fade_in_d = sa.get('fade_in_d', 1.0)
+            audio_filters.append(f"afade=t=in:st=0:d={fade_in_d}")
         if sa.get('fade'):
             fade_d = sa.get('fade_d', 1.0)
             item_dur = item.get('dur') or 0.0
@@ -615,6 +674,30 @@ class ProcessWorker(QThread):
                         except Exception:
                             vf_list.append(f"scale={res_sel}:force_divisible_by=2")
                     else: vf_list.append(f"scale={res_sel}:force_divisible_by=2")
+
+                # Видео fade in / out (через чёрный). Тайминги — в выходной
+                # шкале времени (с учётом изменения скорости).
+                if sv.get('vfade_in'):
+                    vfi = float(sv.get('vfade_in_d', 1.0))
+                    if vfi > 0:
+                        vf_list.append(f"fade=t=in:st=0:d={vfi}")
+                if sv.get('vfade_out'):
+                    vfo = float(sv.get('vfade_out_d', 1.0))
+                    if vfo > 0:
+                        src_dur = item.get('dur') or 0.0
+                        if src_dur <= 0.0:
+                            try: src_dur, *_ = get_media_info(current_input)
+                            except Exception: src_dur = 0.0
+                        out_dur = (src_dur / speed_factor) if speed_factor else src_dur
+                        # Фейд должен ЗАВЕРШИТЬСЯ до последнего кадра, иначе кадр
+                        # окажется на ~96% затемнения, а не на 100%. Сдвигаем фейд
+                        # на запас (≥1.5 кадра) — фильтр держит чёрный после конца.
+                        try: _fps = get_fps_float(current_input) or 25.0
+                        except Exception: _fps = 25.0
+                        if _fps <= 0: _fps = 25.0
+                        margin = max(0.08, 1.5 / _fps)
+                        st = max(0.0, out_dur - vfo - margin)
+                        vf_list.append(f"fade=t=out:st={st:.3f}:d={vfo}")
 
                 fps_sel = sv.get('fps', 'Исходный') or 'Исходный'
                 if fps_sel == "Исходный (max 30)":
