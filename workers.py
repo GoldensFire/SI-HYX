@@ -34,6 +34,8 @@ class InfoWorker(QThread):
                 cmd += ["--proxy", self.proxy]
             if 'youtube.com' in self.url.lower() or 'youtu.be' in self.url.lower():
                 cmd += ["--extractor-args", "youtube:player_client=default,web_safari"]
+            if 'bilibili.com' in self.url.lower() or 'b23.tv' in self.url.lower():
+                cmd += ["--referer", "https://www.bilibili.com/", "--user-agent", USER_AGENT]
             cmd += [self.url]
 
             if self.cancelled: return
@@ -78,6 +80,28 @@ class YtdlpWorker(QThread):
         self.c = config
         self.is_running = True
         self._proc = None
+        self._iid = self.c.get('iid', '')
+        self._dl_start_ts = None
+        self._last_real_progress = 0.0
+        self._last_pct = 0.0
+
+    def _watchdog(self):
+        """Пока идёт скачивание, а yt-dlp молчит (например download-sections через
+        ffmpeg даёт 0% и тишину на минуты) — тикаем «Скачивание… mm:ss», чтобы
+        строка не висела на «Подготовка…»/0%. Настоящий прогресс имеет приоритет."""
+        while self.is_running:
+            p = self._proc
+            if p is None or p.poll() is not None:
+                return
+            time.sleep(1.0)
+            if not self.is_running:
+                return
+            now = time.time()
+            if self._dl_start_ts and (now - self._last_real_progress) > 2.0:
+                el = int(now - self._dl_start_ts)
+                # pct=-1 → UI покажет «…» вместо ложного «0.0%»
+                self.progress_sig.emit(self._iid, -1.0,
+                                       f"Скачивание… {el // 60}:{el % 60:02d}")
 
     def stop(self):
         self.is_running = False
@@ -139,8 +163,14 @@ class YtdlpWorker(QThread):
             if kodik:
                 self.log_sig.emit(f"Встроенный плеер Kodik → качаю {kodik['height']}p (m3u8)")
                 url = kodik['url']
+            elif is_animego_site(url):
+                # Аниме-сайт без полученного Kodik-плеера: yt-dlp его не качает.
+                # Не имитируем «скачивание» (раньше падало в generic → Unsupported
+                # URL), а сразу честно сообщаем об ошибке.
+                raise Exception("Не удалось получить видео с аниме-сайта: Kodik-плеер не отдал ссылку. "
+                                "Проверьте выбор серии/озвучки или повторите позже.")
 
-            outtmpl = os.path.join(out_dir, '%(title)s [%(id)s].%(ext)s')
+            outtmpl = os.path.join(out_dir, '%(title)s.%(ext)s')
 
             # download-sections — уникальное имя на каждый отрезок
             section_arg = None
@@ -153,7 +183,7 @@ class YtdlpWorker(QThread):
                     section_arg = f"*{s_val}-{e_val if e_val else 'inf'}"
                     s_tag = f"{s_val}s"
                     e_tag = f"{e_val}s" if e_val else "end"
-                    outtmpl = os.path.join(out_dir, f'%(title)s [{s_tag}-{e_tag}] [%(id)s].%(ext)s')
+                    outtmpl = os.path.join(out_dir, f'%(title)s [{s_tag}-{e_tag}].%(ext)s')
 
             # Для Kodik имя из URL-страницы (иначе yt-dlp возьмёт «720.mp4:hls:manifest»)
             if kodik:
@@ -211,6 +241,10 @@ class YtdlpWorker(QThread):
                     self.log_sig.emit("ВНИМАНИЕ: Deno не найден — YouTube может отдать только 360p. Положите deno.exe в bin.")
                 cmd += ["--extractor-args", "youtube:player_client=default,web_safari"]
 
+            if 'bilibili.com' in url.lower() or 'b23.tv' in url.lower():
+                self.log_sig.emit("BiliBili обнаружен: добавляю Referer + User-Agent (фикс HTTP 412 Precondition Failed).")
+                cmd += ["--referer", "https://www.bilibili.com/", "--user-agent", USER_AGENT]
+
             # Куки: domain-specific имеет приоритет над общим UI-полем
             ui_cookie = self.c.get('cookie_path', '').strip()
             c_path = get_cookies_path(url)
@@ -247,6 +281,11 @@ class YtdlpWorker(QThread):
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=CREATE_NO_WINDOW, bufsize=1, env=subprocess_env())
+
+            # Watchdog: показывает активность, даже когда yt-dlp не шлёт прогресс
+            self._dl_start_ts = time.time()
+            self._last_real_progress = time.time()
+            threading.Thread(target=self._watchdog, daemon=True).start()
 
             out_fullpath = ""
             clean_res_str = ""
@@ -288,7 +327,10 @@ class YtdlpWorker(QThread):
             if not self.is_running:
                 raise Exception("Загрузка остановлена пользователем")
 
-            if not out_fullpath or not os.path.exists(out_fullpath):
+            # Фолбэк-поиск файла — ТОЛЬКО при успешном завершении (rc==0).
+            # Иначе при ошибке yt-dlp подхватил бы случайный свежий файл из
+            # папки загрузок (напр. чужой .siq) и выдал бы его за «скачанное».
+            if (not out_fullpath or not os.path.exists(out_fullpath)) and rc in (0, None):
                 out_fullpath = self._find_recent_output(out_dir)
 
             if not out_fullpath or not os.path.exists(out_fullpath):
@@ -296,6 +338,8 @@ class YtdlpWorker(QThread):
                     raise Exception("\n".join(tail) or f"yt-dlp завершился с кодом {rc}")
                 raise Exception("yt-dlp завершил работу, но файл не найден (ошибка скачивания)")
 
+            try: self._cleanup_partials(out_dir, out_fullpath)
+            except Exception: pass
             self.progress_sig.emit(iid, 100.0, "Готово")
             self.finished_sig.emit(iid, "Готово", clean_res_str or "", out_fullpath)
 
@@ -308,6 +352,27 @@ class YtdlpWorker(QThread):
                 self.error_sig.emit(iid, err_msg[:200])
                 self.log_sig.emit(f"Ошибка: {err_msg}")
             self._emit_hints(err_msg)
+
+    def _cleanup_partials(self, out_dir, final_path):
+        """Удаляет осиротевшие промежуточные файлы (.part/.ytdl/.fdash/.fhls) от
+        неудачных попыток формата (напр. DASH-таймаут на VK), чтобы рядом с
+        итоговым видео не оставался .part. Скоупится по префиксу имени файла."""
+        try:
+            final = os.path.basename(final_path)
+            prefix = (final.split(" [")[0] or final)[:24]
+            if not prefix:
+                return
+            for name in os.listdir(out_dir):
+                if name == final:
+                    continue
+                low = name.lower()
+                is_partial = (low.endswith(".part") or low.endswith(".ytdl")
+                              or ".fdash" in low or ".fhls" in low)
+                if is_partial and name.startswith(prefix):
+                    try: os.remove(os.path.join(out_dir, name))
+                    except Exception: pass
+        except Exception:
+            pass
 
     def _parse_progress(self, payload):
         try:
@@ -323,18 +388,26 @@ class YtdlpWorker(QThread):
                 except Exception: msg = speed
             else:
                 msg = f"{speed} ETA: {eta}"
+            self._last_real_progress = time.time()
+            self._last_pct = pct
             self.progress_sig.emit(self._iid, pct, msg)
         except Exception:
             pass
 
+    _MEDIA_EXTS = (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv",
+                   ".ts", ".m4a", ".mp3", ".opus", ".ogg", ".aac", ".wav", ".3gp")
+
     def _find_recent_output(self, out_dir):
+        """Фолбэк, когда yt-dlp не напечатал итоговый путь. Берём ТОЛЬКО
+        медиафайл, изменённый в ходе этой загрузки (mtime ≥ старта), чтобы не
+        подхватить чужой файл из папки (напр. .siq) и не выдать его за скачанное."""
         try:
-            now = time.time()
+            floor = getattr(self, "_dl_start_ts", 0) - 2
             cands = [
                 os.path.join(out_dir, fn) for fn in os.listdir(out_dir)
                 if os.path.isfile(os.path.join(out_dir, fn))
-                and not fn.endswith((".part", ".ytdl", ".temp", ".part-Frag"))
-                and (now - os.path.getmtime(os.path.join(out_dir, fn))) < 300
+                and fn.lower().endswith(self._MEDIA_EXTS)
+                and os.path.getmtime(os.path.join(out_dir, fn)) >= floor
             ]
             if cands:
                 return max(cands, key=os.path.getmtime)
@@ -362,6 +435,14 @@ class YtdlpWorker(QThread):
                 self.log_sig.emit("СОВЕТ: 403 на Instagram CDN. Ссылка устарела — откройте видео заново.")
             else:
                 self.log_sig.emit("СОВЕТ: 403 Forbidden. Возможно, нужны куки или ссылка устарела.")
+        elif "412" in err_msg or "Precondition Failed" in err_msg:
+            u = self.c.get("url", "").lower()
+            if "bilibili.com" in u or "b23.tv" in u:
+                self.log_sig.emit("СОВЕТ: 412 на BiliBili — их анти-бот (риск-контроль) режет playurl для гостей.")
+                self.log_sig.emit("  Нужны cookies залогиненного аккаунта (SESSDATA). Войдите на bilibili.com в браузере, "
+                                  "экспортируйте cookies.txt и укажите его в поле «Cookies» (или положите cookies_bilibili.txt в папку настроек).")
+            else:
+                self.log_sig.emit("СОВЕТ: 412 Precondition Failed — сайт отклонил запрос. Часто помогают cookies залогиненного аккаунта.")
 
 
 def _build_atempo_chain(speed_factor: float) -> list:
@@ -408,6 +489,7 @@ class ProcessWorker(QThread):
     finished_all = pyqtSignal()
     update_item_sig = pyqtSignal(str, str, str)
     update_lufs_sig = pyqtSignal(str, object, object)
+    active_threads = pyqtSignal(int, int)  # (активных воркеров, максимум) — счётчик в UI
 
     def __init__(self, queue_ref, settings):
         super().__init__()
@@ -416,6 +498,10 @@ class ProcessWorker(QThread):
         self.stop_flag = False
         self.svt_available = require_svt()
         self._img_pool = None  # QThreadPool для параллельной обработки изображений
+        self._active_count = 0
+        self._active_lock = threading.Lock()
+        self._max_threads = 1
+        self._priority_flag = self._priority_creationflag(settings.get('priority', 'normal'))
 
     _AI_BRANDS = ('gemini', 'chatgpt')
     _RAND_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789'
@@ -429,6 +515,32 @@ class ProcessWorker(QThread):
 
     def stop(self): self.stop_flag = True
     def measure_loudness(self, path): return measure_loudness(path)
+
+    @staticmethod
+    def _priority_creationflag(priority):
+        """Windows priority-class флаг для creationflags по выбору пользователя.
+        Низкий = Low (IDLE), Обычный = Normal, Высокий = High — как в Диспетчере задач.
+        На не-Windows возвращает 0."""
+        if not IS_WIN:
+            return 0
+        p = (priority or 'normal').lower()
+        if p in ('low', 'низкий', 'idle'):
+            return getattr(subprocess, 'IDLE_PRIORITY_CLASS', 0)
+        if p in ('high', 'высокий'):
+            return getattr(subprocess, 'HIGH_PRIORITY_CLASS', 0)
+        return getattr(subprocess, 'NORMAL_PRIORITY_CLASS', 0)
+
+    def _inc_active(self):
+        with self._active_lock:
+            self._active_count += 1
+            n = self._active_count
+        self.active_threads.emit(n, max(1, self._max_threads))
+
+    def _dec_active(self):
+        with self._active_lock:
+            self._active_count = max(0, self._active_count - 1)
+            n = self._active_count
+        self.active_threads.emit(n, max(1, self._max_threads))
 
     def _out_dir_for(self, path):
         """Каталог экспорта: выбранная пользователем папка (если задана и
@@ -496,7 +608,7 @@ class ProcessWorker(QThread):
         if IS_WIN and si is not None: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         buf = deque(maxlen=8000)
         try:
-            p = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW, startupinfo=si)
+            p = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW | getattr(self, '_priority_flag', 0), startupinfo=si)
         except Exception as e:
             raise Exception(f"Не удалось запустить ffmpeg: {e}")
         start = time.time()
@@ -589,7 +701,7 @@ class ProcessWorker(QThread):
 
         audio_filters = []
         if sa.get('norm'):
-            tgt_i = float(sa.get('tgt', -16.0))
+            tgt_i = float(sa.get('tgt', -20.0))
             lra = float(sa.get('lra', 20.0))
             tp = float(sa.get('tp', -1.5))
             audio_filters.append(f"loudnorm=I={tgt_i}:LRA={lra}:TP={tp}")
@@ -832,6 +944,29 @@ class ProcessWorker(QThread):
                     try: os.remove(t)
                     except Exception: pass
 
+    def _search_quality_under_limit(self, save_to_tmp, limit_kb, passes, q_lo=10, q_hi=95):
+        """Бинарный поиск макс. quality (q_lo..q_hi), при котором размер файла ≤ limit_kb.
+        save_to_tmp(q) -> путь к временному файлу (удаляется здесь же).
+        passes — число проб (1..8). Возвращает выбранное quality:
+        максимальное влезающее, а если ничего не влезло — q_lo (минимальный размер)."""
+        passes = max(1, min(8, int(passes or 4)))
+        lo, hi = int(q_lo), int(q_hi)
+        chosen, found, n = q_lo, False, 0
+        while lo <= hi and n < passes:
+            mid = (lo + hi) // 2
+            tmp = save_to_tmp(mid)
+            try:
+                fits = (os.path.getsize(tmp) // 1024) <= limit_kb
+            finally:
+                try: os.remove(tmp)
+                except Exception: pass
+            if fits:
+                chosen, found, lo = mid, True, mid + 1
+            else:
+                hi = mid - 1
+            n += 1
+        return chosen if found else q_lo
+
     def _convert_simple_image(self, item, src_path, out_dir, sanitized, adim, av, fmt, cb):
         """Конвертация изображения в png / jpg / ico / webp через Pillow (без ffmpeg).
         Учитывает лимит разрешения (adim) и для jpg/webp — лимит размера файла.
@@ -881,18 +1016,12 @@ class ProcessWorker(QThread):
                 im.save(out_path, format='ICO', sizes=sizes)
             elif ext == 'jpg':
                 if limit_kb > 0:
-                    chosen = 30
-                    for q in (95, 90, 85, 80, 70, 60, 50, 40, 30):
-                        tmp = os.path.join(TEMP_DIR, f"jpg_{uuid.uuid4().hex}.jpg")
-                        try:
-                            im.save(tmp, format='JPEG', quality=q, optimize=True)
-                            fits = os.path.getsize(tmp) // 1024 <= limit_kb
-                        finally:
-                            try: os.remove(tmp)
-                            except Exception: pass
-                        chosen = q
-                        if fits:
-                            break
+                    def _save_jpg(q):
+                        t = os.path.join(TEMP_DIR, f"jpg_{uuid.uuid4().hex}.jpg")
+                        im.save(t, format='JPEG', quality=q, optimize=True)
+                        return t
+                    chosen = self._search_quality_under_limit(
+                        _save_jpg, limit_kb, av.get('fit_passes', 4), q_lo=10, q_hi=95)
                     im.save(out_path, format='JPEG', quality=chosen, optimize=True)
                 else:
                     im.save(out_path, format='JPEG', quality=92, optimize=True)
@@ -900,18 +1029,12 @@ class ProcessWorker(QThread):
                 # method=6 обязателен: с method по умолчанию libwebp нестабилен
                 # при сохранении RGBA из рабочего потока.
                 if limit_kb > 0:
-                    chosen = 20
-                    for q in (95, 90, 85, 80, 70, 60, 50, 40, 30, 20):
-                        tmp = os.path.join(TEMP_DIR, f"webp_{uuid.uuid4().hex}.webp")
-                        try:
-                            im.save(tmp, format='WEBP', quality=q, method=6)
-                            fits = os.path.getsize(tmp) // 1024 <= limit_kb
-                        finally:
-                            try: os.remove(tmp)
-                            except Exception: pass
-                        chosen = q
-                        if fits:
-                            break
+                    def _save_webp(q):
+                        t = os.path.join(TEMP_DIR, f"webp_{uuid.uuid4().hex}.webp")
+                        im.save(t, format='WEBP', quality=q, method=6)
+                        return t
+                    chosen = self._search_quality_under_limit(
+                        _save_webp, limit_kb, av.get('fit_passes', 4), q_lo=10, q_hi=95)
                     im.save(out_path, format='WEBP', quality=chosen, method=6)
                 else:
                     im.save(out_path, format='WEBP', quality=90, method=6)
@@ -1018,17 +1141,12 @@ class ProcessWorker(QThread):
                     limit_kb = int(av.get('limit', 0) or 0)
 
                     if limit_kb > 0:
-                        chosen_quality = 10  # минимум на случай если ничего не подошло
-                        for q in (85, 70, 55, 40, 25, 10):
-                            tmp_w = os.path.join(TEMP_DIR, f"wp_{uuid.uuid4().hex}.webp")
-                            tried_tmp_files.append(tmp_w)
-                            im.save(tmp_w, format="WEBP", quality=q, lossless=False)
-                            fits = os.path.getsize(tmp_w) // 1024 <= limit_kb
-                            try: os.remove(tmp_w); tried_tmp_files.remove(tmp_w)
-                            except Exception: pass
-                            if fits:
-                                chosen_quality = q
-                                break
+                        def _save_webp_a(q):
+                            t = os.path.join(TEMP_DIR, f"wp_{uuid.uuid4().hex}.webp")
+                            im.save(t, format="WEBP", quality=q, lossless=False)
+                            return t
+                        chosen_quality = self._search_quality_under_limit(
+                            _save_webp_a, limit_kb, av.get('fit_passes', 4), q_lo=10, q_hi=85)
                         im.save(out_webp, format="WEBP", quality=chosen_quality, lossless=False)
                     else:
                         im.save(out_webp, format="WEBP", quality=85, lossless=False)
@@ -1109,7 +1227,7 @@ class ProcessWorker(QThread):
 
         try:
             iterations = 0
-            max_iterations = 8
+            max_iterations = max(1, min(8, int(av.get('fit_passes', 4))))
             tmp63 = os.path.join(TEMP_DIR, f"avif_{uuid.uuid4().hex}_63.avif")
             tried_tmp_files.append(tmp63)
             ok, err = _encode_to(tmp63, 63)
@@ -1289,6 +1407,7 @@ class ProcessWorker(QThread):
             return
         iid = item['iid']; path = item['path']
         self.status.emit(iid, "Обработка.", "proc")
+        self._inc_active()
         max_frac_seen = [0.0]
 
         def item_prog(pct, pass_label=None):
@@ -1337,6 +1456,7 @@ class ProcessWorker(QThread):
                 self.status.emit(iid, "Ошибка", "err")
             item['is_done'] = True
         finally:
+            self._dec_active()
             with self._prog_lock:
                 self._done_count += 1
                 done = self._done_count
@@ -1357,6 +1477,7 @@ class ProcessWorker(QThread):
         images = [it for it in pending if it.get('type') == 'IMG']
         others = [it for it in pending if it.get('type') != 'IMG']
 
+        self._max_threads = 1
         for it in others:
             if self.stop_flag:
                 break
@@ -1365,6 +1486,7 @@ class ProcessWorker(QThread):
         if images and not self.stop_flag:
             nworkers = min(len(images), max(1, os.cpu_count() or 4))
             if nworkers > 1:
+                self._max_threads = nworkers
                 self.log.emit(f"Параллельная обработка изображений: {nworkers} потоков")
                 self._img_pool = QThreadPool()
                 self._img_pool.setMaxThreadCount(nworkers)
@@ -1374,10 +1496,12 @@ class ProcessWorker(QThread):
                     self._img_pool.start(_ImgRunnable(self, itm, total, start))
                 self._img_pool.waitForDone()
             else:
+                self._max_threads = 1
                 for it in images:
                     if self.stop_flag:
                         break
                     self._process_item(it, True, total, start)
 
+        self.active_threads.emit(0, 0)
         self.finished_all.emit()
         self.global_progress.emit(100, "Готово")

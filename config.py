@@ -189,6 +189,7 @@ COOKIE_PATHS = {
     'youtube':   os.path.join(CONFIG_DIR, "cookies_youtube.txt"),
     'instagram': os.path.join(CONFIG_DIR, "cookies_instagram.txt"),
     'tiktok':    os.path.join(CONFIG_DIR, "cookies_tiktok.txt"),
+    'bilibili':  os.path.join(CONFIG_DIR, "cookies_bilibili.txt"),
     'default':   os.path.join(CONFIG_DIR, "cookies.txt"),
 }
 
@@ -342,7 +343,7 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.3.1"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # Репозиторий для автообновления (GitHub Releases)
 GITHUB_OWNER = "GoldensFire"

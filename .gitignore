@@ -16,3 +16,6 @@ settings.json
 *_original_backup.py
 YouTubecookies.txt
 *cookies*.txt
+
+graphify-out/
+GRAPH_REPORT.md

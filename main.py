@@ -46,6 +46,8 @@ class UnifiedWindow(QMainWindow):
 
         # --- Плашка обновления (скрыта по умолчанию) ---
         self._pending_update_url = ""
+        self._pending_update_version = ""
+        self._skipped_update_version = self._load_skipped_version()
         self.update_banner = QWidget()
         self.update_banner.setObjectName("updateBanner")
         self.update_banner.setStyleSheet(
@@ -58,10 +60,13 @@ class UnifiedWindow(QMainWindow):
         btn_up_now = QPushButton("⬇  Обновить")
         btn_up_now.setObjectName("b_run")
         btn_up_now.clicked.connect(self._on_banner_update)
+        btn_skip = QPushButton("Пропустить версию")
+        btn_skip.setToolTip("Больше не предлагать обновиться до этой версии (при выходе следующей — предложу снова)")
+        btn_skip.clicked.connect(self._on_banner_skip)
         btn_later = QPushButton("Позже")
         btn_later.clicked.connect(lambda: self.update_banner.setVisible(False))
         bl.addWidget(self.update_banner_lbl); bl.addStretch()
-        bl.addWidget(btn_up_now); bl.addWidget(btn_later)
+        bl.addWidget(btn_up_now); bl.addWidget(btn_skip); bl.addWidget(btn_later)
         l.addWidget(self.update_banner)
 
         self.tabs = QTabWidget()
@@ -78,11 +83,6 @@ class UnifiedWindow(QMainWindow):
         self.tabs.addTab(self.tab_prompt, "📋  Промпт")
 
         # Кнопки в строке вкладок — corner widget подгоняется под высоту таббара
-        self.btn_top_restart = QPushButton("↻  Перезапустить GUI")
-        self.btn_top_restart.setObjectName("b_restart")
-        self.btn_top_restart.setStyleSheet("QPushButton#b_restart{min-height:0px; padding:2px 10px;}")
-        self.btn_top_restart.setFixedHeight(26)
-        self.btn_top_restart.clicked.connect(lambda: self.tab_media.restart_gui())
         self.btn_settings = QToolButton()
         self.btn_settings.setText("⚙")
         self.btn_settings.setToolTip("Настройки")
@@ -91,7 +91,7 @@ class UnifiedWindow(QMainWindow):
         self.btn_settings.clicked.connect(self._open_settings_dialog)
         corner = QWidget()
         ch = QHBoxLayout(corner); ch.setContentsMargins(0, 2, 6, 2); ch.setSpacing(4)
-        ch.addWidget(self.btn_settings); ch.addWidget(self.btn_top_restart)
+        ch.addWidget(self.btn_settings)
         self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
 
         # Единый стрип файлов — общий для всех вкладок (только медиа: видео/аудио/изображения)
@@ -104,6 +104,8 @@ class UnifiedWindow(QMainWindow):
         l.addWidget(self.pbar)
 
         self.txt_log = QTextEdit(); self.txt_log.setFixedHeight(120); self.txt_log.setReadOnly(True)
+        self.txt_log.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.txt_log.customContextMenuRequested.connect(self._log_context_menu)
         l.addWidget(self.txt_log)
 
         # Состояние локального сервера для расширения (по умолчанию ВЫКЛ)
@@ -159,7 +161,7 @@ class UnifiedWindow(QMainWindow):
         try:
             m = s.get("media", {}); a = m.get("audio", {})
             tm.ck_norm.setChecked(a.get("norm", True))
-            tm.s_tgt.setValue(a.get("tgt", -16.0))
+            tm.s_tgt.setValue(a.get("tgt", -20.0))
             tm.s_lra.setValue(a.get("lra", 20.0))
             tm.s_tp.setValue(a.get("tp", -1.5))
             tm.ck_fade.setChecked(a.get("fade", True))
@@ -216,6 +218,9 @@ class UnifiedWindow(QMainWindow):
             tm.ck_dim.setChecked(av.get("adim_on", False))
             tm.s_dim.setEnabled(tm.ck_dim.isChecked())
             tm.sl_aspd.setValue(av.get("aspd", tm.sl_aspd.value()))
+            tm.s_passes.setValue(av.get("fit_passes", 4))
+            try: tm.c_priority.setCurrentText(s.get("priority", "Обычный"))
+            except Exception: pass
             tm.ck_arec.setChecked(av.get("arec", tm.ck_arec.isChecked()))
             combo_set_value(tm.c_img_fmt, av.get("img_fmt", "avif"))
 
@@ -295,6 +300,7 @@ class UnifiedWindow(QMainWindow):
                         img_bytes = self.rfile.read(length)
                         from urllib.parse import unquote
                         filename = unquote(self.headers.get("X-Filename", "screenshot.png")) or "screenshot.png"
+                        filename = os.path.basename(filename) or "screenshot.png"  # защита от path traversal (CWE-22)
                         if not img_bytes:
                             self.send_response(400); self._send_cors(); self.end_headers()
                             self.wfile.write(b'{"ok":false,"error":"empty body"}'); return
@@ -324,6 +330,7 @@ class UnifiedWindow(QMainWindow):
                     if self.path == "/save_image":
                         img_url  = (data.get("url") or "").strip()
                         filename = (data.get("filename") or "image.jpg").strip()
+                        filename = os.path.basename(filename) or "image.jpg"  # защита от path traversal (CWE-22)
                         if not img_url:
                             self.send_response(400); self._send_cors(); self.end_headers()
                             self.wfile.write(b'{"ok":false,"error":"empty url"}'); return
@@ -484,6 +491,8 @@ class UnifiedWindow(QMainWindow):
                         best_size = int(zip_asset.get("size", 0) or 0)
 
                 if best_url and best_ver > parse_version(APP_VERSION):
+                    # запоминаем, тихая ли это проверка — слот решает, уважать ли «пропуск»
+                    self._check_was_silent = silent
                     self.update_available_sig.emit(best_tag, best_url, best_size)
                 elif not silent:
                     self.log_signal.emit(
@@ -495,8 +504,42 @@ class UnifiedWindow(QMainWindow):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _skip_file(self):
+        return os.path.join(CONFIG_DIR, "skipped_update.txt")
+
+    def _load_skipped_version(self):
+        try:
+            with open(self._skip_file(), encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+
+    def _save_skipped_version(self, version: str):
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(self._skip_file(), "w", encoding="utf-8") as f:
+                f.write(version or "")
+        except Exception:
+            pass
+
+    def _on_banner_skip(self):
+        """«Пропустить версию»: запоминаем версию — авто-проверка её больше не
+        предлагает (ручная «Проверить обновления» всё равно покажет)."""
+        ver = self._pending_update_version
+        self._skipped_update_version = ver
+        self._save_skipped_version(ver)
+        self.update_banner.setVisible(False)
+        if ver:
+            self.log(f"Версия {ver} пропущена. Предложу обновиться при следующем релизе "
+                     f"(или нажмите «Проверить обновления» вручную).")
+
     def _on_update_available(self, version: str, url: str, size: int):
         if getattr(self, "_updating", False):
+            return
+        # Пропущенную версию не показываем при ТИХОЙ (авто) проверке; ручная
+        # проверка («Проверить обновления») показывает баннер всегда.
+        if (version and version == self._skipped_update_version
+                and getattr(self, "_check_was_silent", True)):
             return
         if not getattr(sys, "frozen", False):
             self.log(f"Доступна новая версия {version}, но автоустановка работает "
@@ -504,6 +547,7 @@ class UnifiedWindow(QMainWindow):
             return
         sz = f"~{size/1024/1024:.0f} МБ" if size else "размер неизвестен"
         self._pending_update_url = url
+        self._pending_update_version = version
         self.update_banner_lbl.setText(
             f"Доступна новая версия {version} ({sz}). "
             f"Программа обновится и перезапустится.")
@@ -628,25 +672,38 @@ class UnifiedWindow(QMainWindow):
                 "  $d=(Get-Item $Exe).Length\n"
                 "  W \"exe size src=$s dst=$d match=$($s -eq $d)\"\n"
                 "} catch { W 'verify: не удалось сравнить exe' }\n"
+                "$SrcExe = Join-Path $Src (Split-Path $Exe -Leaf)\n"
                 "if($ok){ W 'Copy OK.' } else { W 'Copy FAILED (robocopy rc>=8).' }\n"
                 "W 'Launching new version...'\n"
-                "Start-Process -FilePath $Exe -WorkingDirectory $Dst\n"
-                "W 'Done.'\n"
+                "$launched=$false\n"
+                "# Запуск обновлённой версии из папки установки; при любом сбое —\n"
+                "# из распакованной папки, чтобы новая версия в любом случае стартовала.\n"
+                "if($ok){ try { Start-Process -FilePath $Exe -WorkingDirectory $Dst; $launched=$true; W 'Launched from Dst.' } catch { W \"Launch Dst failed: $_\" } }\n"
+                "if(-not $launched){ try { Start-Process -FilePath $SrcExe -WorkingDirectory $Src; $launched=$true; W 'Launched from Src (fallback).' } catch { W \"Launch Src failed: $_\" } }\n"
+                "W \"Done. launched=$launched\"\n"
             )
             with open(ps_path, "w", encoding="utf-8-sig") as f:
                 f.write(script)
 
             DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0)
             NEWGRP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            subprocess.Popen(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                 "-File", ps_path,
-                 "-AppPid", str(os.getpid()),
-                 "-Src", src_root, "-Dst", app_dir, "-Exe", exe_path,
-                 "-Log", log_path],
-                creationflags=DETACHED | NEWGRP,
-                close_fds=True,
-            )
+            BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+            ps_args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                       "-File", ps_path,
+                       "-AppPid", str(os.getpid()),
+                       "-Src", src_root, "-Dst", app_dir, "-Exe", exe_path,
+                       "-Log", log_path]
+            # CREATE_BREAKAWAY_FROM_JOB: в песочнице/некоторых лаунчерах программа
+            # живёт в job-объекте, который убивает всех дочерних при выходе
+            # родителя — тогда апдейтер умирал вместе с программой (файлы
+            # оставались в …\extracted, перезапуска не было). Брейкэвей выводит
+            # апдейтер из job. Если job его запрещает — повторяем без флага.
+            try:
+                subprocess.Popen(ps_args, creationflags=DETACHED | NEWGRP | BREAKAWAY,
+                                 close_fds=True)
+            except OSError:
+                subprocess.Popen(ps_args, creationflags=DETACHED | NEWGRP,
+                                 close_fds=True)
             self.log(f"Обновление готово. Перезапуск… (лог: {log_path})")
             # Сохраняем настройки и ЖЁСТКО завершаем процесс: QApplication.quit()
             # не всегда освобождает файлы (живут Qt-потоки/серверы), и тогда
@@ -768,10 +825,12 @@ class UnifiedWindow(QMainWindow):
                     'limit': int(tm.s_lim.value()), 'limit_on': bool(tm.ck_lim.isChecked()),
                     'adim': int(tm.s_dim.value()), 'adim_on': bool(tm.ck_dim.isChecked()),
                     'aspd': int(tm.sl_aspd.value()), 'arec': bool(tm.ck_arec.isChecked()),
+                    'fit_passes': int(tm.s_passes.value()),
                     'img_fmt': strip_default_tag(tm.c_img_fmt.currentText())
                 },
                 'server_enabled': bool(getattr(self, '_server_enabled', False)),
                 'wheel_changes_values': bool(getattr(self, '_wheel_changes_values', False)),
+                'priority': tm.c_priority.currentText() if hasattr(tm, 'c_priority') else 'Обычный',
             }
             return s
         except Exception: return {}
@@ -797,12 +856,12 @@ class UnifiedWindow(QMainWindow):
                 tm.s_tgt, tm.s_lra, tm.s_tp, tm.s_fade, tm.s_fade_in,
                 tm.s_hz, tm.s_lp, tm.s_hp, tm.s_deg_gain,
                 tm.s_spd, tm.s_crf, tm.s_pre,
-                tm.s_lim, tm.s_dim, tm.sl_aspd,
+                tm.s_lim, tm.s_dim, tm.sl_aspd, tm.s_passes,
                 tm.s_vfade_in, tm.s_vfade_out,
             ]
             # Виджеты с сигналом currentTextChanged (QComboBox)
             combo_widgets = [
-                tm.c_abitrate, tm.c_res, tm.c_fps, tm.c_img_fmt,
+                tm.c_abitrate, tm.c_res, tm.c_fps, tm.c_img_fmt, tm.c_priority,
                 ty.c_q, ty.c_c, ty.c_s, ty.c_a,
             ]
             # Виджет с сигналом textChanged (QLineEdit)
@@ -833,6 +892,19 @@ class UnifiedWindow(QMainWindow):
 
     def update_global_progress(self, val, text):
         self.pbar.setValue(val); self.pbar.setFormat(text)
+
+    def _log_context_menu(self, pos):
+        """Русское контекстное меню для лог-консоли (вместо системного англ.)."""
+        m = QMenu(self.txt_log)
+        a_copy = m.addAction("Копировать")
+        a_copy.setEnabled(self.txt_log.textCursor().hasSelection())
+        a_copy.triggered.connect(self.txt_log.copy)
+        a_sel = m.addAction("Выделить всё")
+        a_sel.triggered.connect(self.txt_log.selectAll)
+        m.addSeparator()
+        a_clr = m.addAction("Очистить")
+        a_clr.triggered.connect(self.txt_log.clear)
+        m.exec(self.txt_log.mapToGlobal(pos))
 
     def log(self, txt):
         try: t = time.strftime("%Y-%m-%d %H:%M:%S"); self.txt_log.append(f"[{t}] {txt}")

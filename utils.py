@@ -115,6 +115,7 @@ def get_cookies_path(url: str) -> str:
     if 'instagram.com' in u or 'fbcdn.net' in u or 'cdninstagram.com' in u:
         return COOKIE_PATHS['instagram']
     if 'youtube.com' in u or 'youtu.be' in u: return COOKIE_PATHS['youtube']
+    if 'bilibili.com' in u or 'b23.tv' in u: return COOKIE_PATHS['bilibili']
     return COOKIE_PATHS['default']
 
 
@@ -286,7 +287,10 @@ def _parse_kodik_selects(html: str):
             for o in re.findall(r"<option\b([^>]*)>", block):
                 mid, mh = _attr(o, "data-media-id"), _attr(o, "data-media-hash")
                 if mid and mh:
-                    translations.append((mid, mh, _attr(o, "data-title")))
+                    # data-media-type (season/serial/video) нужен для корректной
+                    # перезагрузки страницы озвучки — раньше был жёстко /serial/.
+                    translations.append((mid, mh, _attr(o, "data-title"),
+                                         _attr(o, "data-media-type") or "serial"))
         elif "data-serial-id" in block:            # сезоны — пропускаем
             continue
         else:                                       # серии
@@ -313,10 +317,145 @@ def _selected_option(html: str, kind: str):
     return ""
 
 
+# ──────────────────────────────────────────────────────────────────────────
+#  animego.* — плеер грузится отдельным AJAX (/player/{id} и
+#  /player/videos/{episode_id}), статический Kodik-резолвер его не видит.
+#  Берём Kodik-провайдера для выбранной серии/озвучки и отдаём в resolve_kodik.
+# ──────────────────────────────────────────────────────────────────────────
+def _is_animego(url: str) -> bool:
+    """True для animego.* (animego.me/.org/.online/.one и т.п.)."""
+    return 'animego.' in (url or '').lower()
+
+
+def is_animego_site(url: str) -> bool:
+    """Публичная обёртка над _is_animego (для `from utils import *` в workers)."""
+    return _is_animego(url)
+
+
+def _animego_base(page_url: str) -> str:
+    from urllib.parse import urlparse
+    pu = urlparse(page_url)
+    return f"{pu.scheme}://{pu.netloc}"
+
+
+def _animego_anime_id(page_url: str, session) -> str:
+    """ID аниме для AJAX: из data-ajax-url='/player/N' на странице либо из слага '-N'."""
+    try:
+        page = session.get(page_url, timeout=30).text
+    except Exception:
+        page = ""
+    m = re.search(r'data-ajax-url="/player/(\d+)"', page)
+    if m:
+        return m.group(1)
+    m = re.search(r'-(\d+)/?(?:[?#].*)?$', page_url)
+    return m.group(1) if m else ""
+
+
+def _animego_player_content(session, base: str, anime_id: str, ref: str,
+                            episode_dataid: str = "") -> str:
+    """HTML плеера (озвучки×провайдеры). episode_dataid='' = текущая/первая серия."""
+    url = (f"{base}/player/videos/{episode_dataid}" if episode_dataid
+           else f"{base}/player/{anime_id}")
+    try:
+        j = session.get(url, headers={"Referer": ref,
+                                      "X-Requested-With": "XMLHttpRequest"},
+                        timeout=30).json()
+        return (j.get("data") or {}).get("content", "") or ""
+    except Exception:
+        return ""
+
+
+def _animego_parse(content: str):
+    """(episodes, players): episodes={номер: data-episode-id},
+    players=[(provider_title, translation_title, player_url), ...]."""
+    eps = {}
+    for m in re.finditer(r'data-episode-number="(\d+)"[\s\S]*?data-episode="(\d+)"', content):
+        eps.setdefault(int(m.group(1)), m.group(2))
+    players = []
+    for tag in re.findall(r'<button[^>]*data-player="[^"]*"[^>]*>', content):
+        u = _attr(tag, "data-player")
+        if u:
+            players.append((_attr(tag, "data-provider-title"),
+                            _attr(tag, "data-translation-title"),
+                            u.replace("&amp;", "&")))
+    return eps, players
+
+
+def _animego_kodik_players(players):
+    """Только Kodik-провайдеры — их умеет resolve_kodik (AniBoom и пр. не поддержаны)."""
+    return [p for p in players if 'kodik' in (p[0] + p[2]).lower()]
+
+
+def animego_get_info(page_url: str, proxy: str = "") -> dict:
+    """Списки озвучек и число серий для animego.* — формат как у kodik_get_info."""
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT})
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
+    aid = _animego_anime_id(page_url, s)
+    if not aid:
+        return {}
+    content = _animego_player_content(s, _animego_base(page_url), aid, page_url)
+    if not content:
+        return {}
+    eps, players = _animego_parse(content)
+    dubs = []
+    for p in _animego_kodik_players(players):
+        if p[1] and p[1] not in dubs:
+            dubs.append(p[1])
+    return {"translations": dubs,
+            "episodes": (max(eps) if eps else 0),
+            "cur_translation": (dubs[0] if dubs else ""),
+            "cur_episode": (min(eps) if eps else 1)}
+
+
+def _animego_resolve_kodik_url(page_url: str, episode=None, translation: str = "",
+                               proxy: str = "", log_fn=None) -> str:
+    """Kodik-embed для выбранной серии и озвучки на animego.* (или '' если нет)."""
+    s = requests.Session()
+    s.headers.update({"User-Agent": USER_AGENT})
+    if proxy:
+        s.proxies = {"http": proxy, "https": proxy}
+    aid = _animego_anime_id(page_url, s)
+    if not aid:
+        return ""
+    base = _animego_base(page_url)
+    eps, players = _animego_parse(_animego_player_content(s, base, aid, page_url))
+    if episode and eps:
+        try:
+            epn = int(episode)
+        except Exception:
+            epn = None
+        if epn and epn in eps:
+            c2 = _animego_player_content(s, base, aid, page_url, episode_dataid=eps[epn])
+            if c2:
+                _, players = _animego_parse(c2)
+                if log_fn: log_fn(f"animego: серия {epn}")
+    kod = _animego_kodik_players(players)
+    if not kod:
+        if log_fn: log_fn("animego: для этой серии нет Kodik-плеера (доступен только AniBoom/др. — они не поддержаны).")
+        return ""
+    if translation:
+        match = [p for p in kod if translation.lower() in (p[1] or "").lower()]
+        if match:
+            kod = match
+        elif log_fn:
+            log_fn(f"animego: озвучка «{translation}» не найдена, беру «{kod[0][1]}».")
+    if log_fn: log_fn(f"animego: озвучка «{kod[0][1]}» через Kodik.")
+    u = kod[0][2]
+    return ("https:" + u) if u.startswith("//") else u
+
+
 def kodik_get_info(page_url: str, proxy: str = "") -> dict:
     """Возвращает данные Kodik-страницы для выпадашек:
     {'translations': [названия], 'episodes': N,
      'cur_translation': название, 'cur_episode': номер}."""
+    if _is_animego(page_url):
+        info = animego_get_info(page_url, proxy)
+        if info:
+            return info
+        # AJAX-плеер не отдал данные (другой клон, напр. DLE-сайт animego.online)
+        # — проваливаемся в общий Kodik-путь ниже (_find_kodik_iframe видит DLE).
     from urllib.parse import urlparse
     s = requests.Session()
     s.headers.update({"User-Agent": USER_AGENT})
@@ -347,6 +486,14 @@ def resolve_kodik(page_url: str, want_height: int = 720, proxy: str = "",
     translation — подстрока названия озвучки или '' = озвучка по умолчанию.
     Возвращает {'url','referer','height'} или {} если Kodik не найден.
     """
+    if _is_animego(page_url):
+        ku = _animego_resolve_kodik_url(page_url, episode=episode,
+                                        translation=translation, proxy=proxy, log_fn=log_fn)
+        if ku:
+            return resolve_kodik(ku, want_height=want_height, proxy=proxy, log_fn=log_fn)
+        # AJAX-плеер не найден (DLE-клон, напр. animego.online) — не сдаёмся,
+        # пробуем универсальный Kodik-резолвер по самой странице (ниже).
+        if log_fn: log_fn("animego: AJAX-плеер не найден — пробую обычный Kodik-резолвер страницы.")
     from urllib.parse import urlparse
     s = requests.Session()
     s.headers.update({"User-Agent": USER_AGENT})
@@ -374,7 +521,9 @@ def resolve_kodik(page_url: str, want_height: int = 720, proxy: str = "",
         match = next((t for t in translations if tl in (t[2] or "").lower()), None)
         if match:
             if log_fn: log_fn(f"Kodik: озвучка «{match[2]}»")
-            iframe = f"{base}/serial/{match[0]}/{match[1]}/720p"
+            # тип медиа из самой опции (season/serial/video), а не жёстко /serial/
+            mtype = (match[3] if len(match) > 3 and match[3] else "serial")
+            iframe = f"{base}/{mtype}/{match[0]}/{match[1]}/720p"
             try:
                 h = s.get(iframe, headers={"Referer": page_url}, timeout=30).text
                 _, episodes = _parse_kodik_selects(h)
@@ -384,13 +533,40 @@ def resolve_kodik(page_url: str, want_height: int = 720, proxy: str = "",
             avail = ", ".join(t[2] for t in translations if t[2])
             log_fn(f"Kodik: озвучка «{translation}» не найдена. Доступны: {avail}")
 
-    def _var(v):
-        m = re.search(r'var\s+' + v + r'\s*=\s*"([^"]*)"', h)
-        return m.group(1) if m else ""
+    def _post_params():
+        """Параметры подписи для POST /ftor. Современный Kodik держит их в
+        urlParams = '{json}' (d/d_sign/pd/pd_sign/ref/ref_sign). ВАЖНО: ref в
+        этом JSON URL-кодирован — раскодируем, иначе requests закодирует его
+        повторно и подпись ref_sign не сойдётся → /ftor 500."""
+        from urllib.parse import unquote
+        m = re.search(r"urlParams\s*=\s*'([^']+)'", h)
+        if m:
+            try:
+                d = json.loads(m.group(1))
+                if d.get("ref"):
+                    d["ref"] = unquote(d["ref"])
+                return {k: d.get(k, "") for k in
+                        ("d", "d_sign", "pd", "pd_sign", "ref", "ref_sign")}
+            except Exception:
+                pass
+        # старый формат: var domain="..."; var d_sign="..."; ...
+        def _v(v):
+            mm = re.search(r'var\s+' + v + r'\s*=\s*"([^"]*)"', h)
+            return mm.group(1) if mm else ""
+        return {"d": _v("domain"), "d_sign": _v("d_sign"),
+                "pd": _v("pd"), "pd_sign": _v("pd_sign"),
+                "ref": _v("ref"), "ref_sign": _v("ref_sign")}
 
     def _vinfo(k):
+        # старый формат: vInfo.type = '...'
         m = re.search(r"vInfo\." + k + r"\s*=\s*'([^']+)'", h)
-        return m.group(1) if m else ""
+        if m: return m.group(1)
+        # новые форматы Kodik: videoInfo.type = "..."  |  "type":"..."
+        for pat in (r"videoInfo\." + k + r"\s*=\s*['\"]([^'\"]+)['\"]",
+                    r'[\'"]' + k + r'[\'"]\s*:\s*[\'"]([^\'"]+)[\'"]'):
+            m = re.search(pat, h)
+            if m: return m.group(1)
+        return ""
 
     vtype, vhash, vid = _vinfo("type"), _vinfo("hash"), _vinfo("id")
 
@@ -409,13 +585,9 @@ def resolve_kodik(page_url: str, want_height: int = 720, proxy: str = "",
         if log_fn: log_fn("Kodik: не найдены параметры видео (type/hash/id)")
         return {}
 
-    post = {
-        "d": _var("domain"), "d_sign": _var("d_sign"),
-        "pd": _var("pd"), "pd_sign": _var("pd_sign"),
-        "ref": _var("ref"), "ref_sign": _var("ref_sign"),
-        "bad_user": "true", "cdn_is_working": "true",
-        "type": vtype, "hash": vhash, "id": vid,
-    }
+    post = dict(_post_params())
+    post.update({"bad_user": "true", "cdn_is_working": "true",
+                 "type": vtype, "hash": vhash, "id": vid})
     try:
         j = s.post(base + "/ftor", data=post,
                    headers={"Referer": iframe, "Origin": base,

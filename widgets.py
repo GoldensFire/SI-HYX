@@ -24,8 +24,9 @@ class StatusColorDelegate(QStyledItemDelegate):
         if color:
             # Цветная строка: всегда показываем статус-цвет
             if is_sel:
-                # Полная непрозрачность при выделении — делаем копию только тогда
-                bg = QColor(color)
+                # Выделение цветной строки: осветляем цвет статуса (мягко,
+                # без резкой белой рамки — она «вырвиглазная»).
+                bg = QColor(color).lighter(135)
                 bg.setAlpha(255)
             else:
                 bg = color  # переиспользуем объект из словаря без копирования
@@ -46,14 +47,8 @@ class StatusColorDelegate(QStyledItemDelegate):
         # Рисуем текст / иконку поверх нашего фона
         super().paint(painter, option, index)
 
-        # Белая рамка = индикатор выделения для цветных строк
-        if color and is_sel:
-            painter.save()
-            pen = QPen(QColor(255, 255, 255, 210))
-            pen.setWidth(2)
-            painter.setPen(pen)
-            painter.drawRect(option.rect.adjusted(1, 1, -2, -2))
-            painter.restore()
+        # Выделение цветной строки показано осветлением фона выше — резкую
+        # белую рамку не рисуем.
 
 
 # --- Custom ComboBox для инвертированного скролла битрейта ---
@@ -116,19 +111,26 @@ class _InfoBadge(QLabel):
         super().__init__("ⓘ")
         self._tip = tip
         self.setObjectName("infoBadge")
-        self.setToolTip(tip)
+        # НЕ ставим setToolTip: нативный тултип + ручной showText дают двойной
+        # показ и мерцание. Используем только ручной QToolTip.showText.
         self.setCursor(Qt.CursorShape.WhatsThisCursor)
         self.setFixedSize(20, 20)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-    def enterEvent(self, e):
-        try: QToolTip.showText(QCursor.pos(), self._tip, self)
+    def _show_tip(self):
+        # Смещаем подсказку вниз-вправо от курсора, чтобы окно тултипа не
+        # перекрывало сам бейдж (иначе leave/enter зацикливаются → мерцание).
+        try:
+            pos = QCursor.pos(); pos.setX(pos.x() + 14); pos.setY(pos.y() + 16)
+            QToolTip.showText(pos, self._tip, self)
         except Exception: pass
+
+    def enterEvent(self, e):
+        self._show_tip()
         super().enterEvent(e)
 
     def mousePressEvent(self, e):
-        try: QToolTip.showText(QCursor.pos(), self._tip, self)
-        except Exception: pass
+        self._show_tip()
         super().mousePressEvent(e)
 
 
@@ -367,6 +369,7 @@ class RecentFileThumb(QWidget):
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.setToolTip(path)
         self._drag_start = None
+        self._thumb_attempts = 0
 
         ext = os.path.splitext(path)[1].lower()
         is_img   = ext in ALLOWED_IMG
@@ -387,6 +390,8 @@ class RecentFileThumb(QWidget):
 
         ext_disp = os.path.splitext(path)[1].lstrip('.').upper() or '—'
         self._ext_txt = ext_disp
+        try: self._size_str = human_size(os.path.getsize(path))
+        except Exception: self._size_str = ""
         self._thumb_lbl = QLabel()
         self._thumb_lbl.setFixedSize(96, 72)
         self._thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -407,6 +412,11 @@ class RecentFileThumb(QWidget):
         layout.addWidget(thumb_container)
         layout.addWidget(name_lbl)
 
+        # Дочерние элементы прозрачны для мыши — чтобы перетаскивание (drag) в очередь
+        # и клики ловила сама карточка, а не QLabel внутри (иначе drag не стартует).
+        for _w in (thumb_container, self._thumb_lbl, name_lbl):
+            _w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
         self.setStyleSheet("RecentFileThumb{background:#2a2a2a;border-radius:5px;}"
                            "RecentFileThumb:hover{background:#363636;border:1px solid #555;}")
 
@@ -416,14 +426,20 @@ class RecentFileThumb(QWidget):
 
     def _placeholder_html(self):
         """HTML-заглушка превью: крупный значок типа + расширение файла снизу."""
-        return (f"<div style='font-size:26px; line-height:28px;'>{self._type_icon}</div>"
-                f"<div style='font-size:9px; color:#9399b2;'>{self._ext_txt}</div>")
+        return (f"<div style='font-size:24px; line-height:25px;'>{self._type_icon}</div>"
+                f"<div style='font-size:9px; color:#9399b2;'>{self._ext_txt}</div>"
+                f"<div style='font-size:9px; color:#7f849c;'>{self._size_str}</div>")
 
     def _apply_thumb(self, data, dur_str):
         """Слот в GUI-потоке: строит QPixmap из байтов и рисует длительность."""
         try:
             if not data:
                 self._thumb_lbl.setText(self._placeholder_html())
+                # Свежий файл мог быть ещё не дописан/занят при первой попытке —
+                # повторяем генерацию миниатюры несколько раз с задержкой.
+                if self._thumb_attempts < 6:
+                    self._thumb_attempts += 1
+                    QTimer.singleShot(1500, self._retry_thumb)
                 return
             pix = QPixmap()
             if not pix.loadFromData(QByteArray(data)):
@@ -444,8 +460,28 @@ class RecentFileThumb(QWidget):
                 painter.setPen(QPen(QColor(255, 255, 255)))
                 painter.drawText(tx + 3, ty + th - 3, dur_str)
                 painter.end()
+            # Бейдж размера файла — верхний левый угол (минимум в КБ)
+            if self._size_str:
+                p2 = QPainter(pix)
+                p2.setRenderHint(QPainter.RenderHint.Antialiasing)
+                f2 = QFont(); f2.setPointSize(7); f2.setBold(True); p2.setFont(f2)
+                fm2 = p2.fontMetrics()
+                sw = fm2.horizontalAdvance(self._size_str) + 6
+                sh = fm2.height() + 1
+                p2.fillRect(2, 2, sw, sh, QColor(0, 0, 0, 160))
+                p2.setPen(QPen(QColor(255, 255, 255)))
+                p2.drawText(2 + 3, 2 + sh - 3, self._size_str)
+                p2.end()
             self._thumb_lbl.setText("")
             self._thumb_lbl.setPixmap(pix)
+        except Exception:
+            pass
+
+    def _retry_thumb(self):
+        """Повторная попытка сделать миниатюру (файл мог быть занят/недописан)."""
+        try:
+            if os.path.exists(self.path):
+                QThreadPool.globalInstance().start(_RecentThumbWorker(self.path, self._thumb_ready))
         except Exception:
             pass
 
