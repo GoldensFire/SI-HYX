@@ -1,10 +1,18 @@
 # -*- coding: utf-8 -*-
+#
+# SI-HYX — медиа-загрузчик и перекодировщик.
+# Copyright (C) 2026 GoldensFire
+#
+# Свободное ПО: распространяется/изменяется на условиях GNU General Public
+# License v3 (или новее) от Free Software Foundation. БЕЗ ВСЯКИХ ГАРАНТИЙ.
+# Полный текст — в файле LICENSE (https://www.gnu.org/licenses/gpl-3.0.txt).
 # main.py — главное окно, HTTP-сервер расширения, точка входа
 from config import *
 from utils import *
 from widgets import *
 from workers import *
 from tabs import *
+from taskbar import TaskbarProgress
 
 
 class UnifiedWindow(QMainWindow):
@@ -31,6 +39,9 @@ class UnifiedWindow(QMainWindow):
         except Exception: pass
 
         self.setAcceptDrops(True)
+        # Прогресс на иконке в панели задач (Windows 11, ITaskbarList3)
+        self._taskbar = TaskbarProgress()
+        self._taskbar_hwnd = 0
         self.log_signal.connect(self.log)
         self.update_available_sig.connect(self._on_update_available)
         self.update_ready_sig.connect(self._apply_update)
@@ -291,16 +302,35 @@ class UnifiedWindow(QMainWindow):
                 self._send_cors()
                 self.end_headers()
 
+            # Лимит тела запроса — защита от исчерпания памяти (DoS): сервер
+            # слушает только 127.0.0.1, но CORS=* => любой сайт может слать POST.
+            _MAX_BODY = 64 * 1024 * 1024
+
+            @staticmethod
+            def _safe_name(name: str, fallback: str) -> str:
+                """Жёсткая очистка имени файла от path traversal и спецсимволов:
+                только basename, без разделителей пути и недопустимых для Windows
+                символов; пустое/«.»/«..» → fallback."""
+                name = os.path.basename((name or "").strip().replace("\\", "/").split("/")[-1])
+                name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+                return name or fallback
+
             def do_POST(self):
                 try:
-                    length = int(self.headers.get("Content-Length", 0))
+                    try:
+                        length = int(self.headers.get("Content-Length", 0))
+                    except (TypeError, ValueError):
+                        length = 0
+                    if length < 0 or length > self._MAX_BODY:
+                        self.send_response(413); self._send_cors(); self.end_headers()
+                        self.wfile.write(b'{"ok":false,"error":"body too large"}'); return
 
                     # ── /screenshot — тело бинарное (PNG), читаем ДО json.loads ──
                     if self.path == "/screenshot":
                         img_bytes = self.rfile.read(length)
                         from urllib.parse import unquote
-                        filename = unquote(self.headers.get("X-Filename", "screenshot.png")) or "screenshot.png"
-                        filename = os.path.basename(filename) or "screenshot.png"  # защита от path traversal (CWE-22)
+                        filename = unquote(self.headers.get("X-Filename", "screenshot.png"))
+                        filename = self._safe_name(filename, "screenshot.png")  # защита от path traversal (CWE-22)
                         if not img_bytes:
                             self.send_response(400); self._send_cors(); self.end_headers()
                             self.wfile.write(b'{"ok":false,"error":"empty body"}'); return
@@ -330,10 +360,15 @@ class UnifiedWindow(QMainWindow):
                     if self.path == "/save_image":
                         img_url  = (data.get("url") or "").strip()
                         filename = (data.get("filename") or "image.jpg").strip()
-                        filename = os.path.basename(filename) or "image.jpg"  # защита от path traversal (CWE-22)
+                        filename = self._safe_name(filename, "image.jpg")  # защита от path traversal (CWE-22)
                         if not img_url:
                             self.send_response(400); self._send_cors(); self.end_headers()
                             self.wfile.write(b'{"ok":false,"error":"empty url"}'); return
+                        # Только http(s): блокируем file://, ftp://, data: и прочие
+                        # схемы (защита от SSRF/чтения локальных файлов через сервер).
+                        if not re.match(r'^https?://', img_url, re.I):
+                            self.send_response(400); self._send_cors(); self.end_headers()
+                            self.wfile.write(b'{"ok":false,"error":"only http(s) urls allowed"}'); return
                         try:
                             out_dir = win.tab_ytdlp.out.text().strip()
                         except Exception:
@@ -345,7 +380,7 @@ class UnifiedWindow(QMainWindow):
                             base_n, ext_n = os.path.splitext(filename)
                             out_path = os.path.join(out_dir, f"{base_n}_{int(time.time())}{ext_n}")
                         with http_get(img_url, headers={"User-Agent": USER_AGENT, "Referer": img_url}, timeout=30) as resp:
-                            img_bytes = resp.read()
+                            img_bytes = resp.read(200 * 1024 * 1024)  # лимит 200 МБ
                         with open(out_path, "wb") as fout:
                             fout.write(img_bytes)
                         win.url_from_browser.emit(f"__screenshot_saved__{out_path}", False)
@@ -469,7 +504,7 @@ class UnifiedWindow(QMainWindow):
                 with http_get(api, headers={
                     "User-Agent": APP_NAME,
                     "Accept": "application/vnd.github+json",
-                }, timeout=15) as r:
+                }, timeout=15, allow_insecure=False) as r:
                     releases = json.loads(r.read().decode("utf-8", "replace"))
                 if not isinstance(releases, list):
                     releases = []
@@ -571,7 +606,8 @@ class UnifiedWindow(QMainWindow):
                 os.makedirs(tmp, exist_ok=True)
                 zip_path = os.path.join(tmp, "update.zip")
 
-                with http_get(url, headers={"User-Agent": APP_NAME}, timeout=60) as r:
+                with http_get(url, headers={"User-Agent": APP_NAME}, timeout=60,
+                              allow_insecure=False) as r:
                     total = int(r.headers.get("Content-Length", 0) or 0)
                     done = 0
                     last_pct = -1
@@ -892,6 +928,27 @@ class UnifiedWindow(QMainWindow):
 
     def update_global_progress(self, val, text):
         self.pbar.setValue(val); self.pbar.setFormat(text)
+        # Зеркалим прогресс перекодирования на иконку в панели задач
+        if val >= 100:
+            self.clear_taskbar_progress()
+        else:
+            self.set_taskbar_progress(val, 100)
+
+    def _tb_hwnd(self):
+        """HWND окна для ITaskbarList3 (кэшируем; winId валиден после создания окна)."""
+        if not self._taskbar_hwnd:
+            try: self._taskbar_hwnd = int(self.winId())
+            except Exception: self._taskbar_hwnd = 0
+        return self._taskbar_hwnd
+
+    def set_taskbar_progress(self, completed, total=100):
+        """Показать прогресс длительной задачи на иконке приложения."""
+        try: self._taskbar.set_value(self._tb_hwnd(), completed, total)
+        except Exception: pass
+
+    def clear_taskbar_progress(self):
+        try: self._taskbar.clear(self._tb_hwnd())
+        except Exception: pass
 
     def _log_context_menu(self, pos):
         """Русское контекстное меню для лог-консоли (вместо системного англ.)."""

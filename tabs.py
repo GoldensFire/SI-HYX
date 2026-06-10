@@ -1,9 +1,17 @@
 # -*- coding: utf-8 -*-
+#
+# SI-HYX — медиа-загрузчик и перекодировщик.
+# Copyright (C) 2026 GoldensFire
+#
+# Свободное ПО: распространяется/изменяется на условиях GNU General Public
+# License v3 (или новее) от Free Software Foundation. БЕЗ ВСЯКИХ ГАРАНТИЙ.
+# Полный текст — в файле LICENSE (https://www.gnu.org/licenses/gpl-3.0.txt).
 # tabs.py — вкладки интерфейса
 from config import *
 from utils import *
 from widgets import *
 from workers import *
+from PyQt6.QtWidgets import QSizePolicy
 
 
 class YtdlpTab(QWidget):
@@ -15,6 +23,7 @@ class YtdlpTab(QWidget):
         self.items = {}
         self.pool = QThreadPool()
         self.active_workers: dict = {}  # iid → YtdlpWorker, O(1) поиск
+        self._dl_pct: dict = {}         # iid → последний % загрузки (для прогресса в таскбаре)
         self._kodik_last_url = ""       # для какой ссылки уже подгружены списки
 
         self.fetch_timer = QTimer()
@@ -53,9 +62,8 @@ class YtdlpTab(QWidget):
         self.url_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.url_edit.customContextMenuRequested.connect(self.on_url_ctx)
         
-        self.btn_check = QToolButton(); self.btn_check.setText("🔍"); self.btn_check.setToolTip("Проверить ссылку и получить длительность")
-        self.btn_check.clicked.connect(self._start_fetch)
-
+        # Отдельной кнопки «Проверить ссылку» нет — длительность/инфо и списки
+        # Kodik подтягиваются автоматически при вставке/изменении ссылки.
         self.url_edit.textChanged.connect(lambda: self.fetch_timer.start())
 
         h = QHBoxLayout()
@@ -65,7 +73,7 @@ class YtdlpTab(QWidget):
         self.btn_stop.clicked.connect(self.stop_all_dl)
         self.btn_stop.setEnabled(False)   # активна только при активных загрузках
         
-        h.addWidget(self.url_edit); h.addWidget(self.btn_check); h.addWidget(btn_v); h.addWidget(btn_a); h.addWidget(self.btn_stop)
+        h.addWidget(self.url_edit); h.addWidget(btn_v); h.addWidget(btn_a); h.addWidget(self.btn_stop)
         
         self.out = QLineEdit(default_download_dir())
         btn_p = QPushButton("📂"); btn_p.clicked.connect(self.ch_dir); btn_p.setFixedWidth(36)
@@ -78,7 +86,7 @@ class YtdlpTab(QWidget):
         ho_ck = QHBoxLayout(); ho_ck.addWidget(self.cookie_edit); ho_ck.addWidget(btn_ck)
 
         self.proxy_edit = QLineEdit()
-        self.proxy_edit.setPlaceholderText("http://host:port  •  socks5://host:port  •  http://user:pass@host:port")
+        self.proxy_edit.setPlaceholderText("http://host:port")
         self.proxy_edit.setClearButtonEnabled(True)
         ho_px = QHBoxLayout(); ho_px.addWidget(self.proxy_edit)
 
@@ -93,6 +101,9 @@ class YtdlpTab(QWidget):
         # распирают правую панель (в выпадающем списке текст эллипсизируется).
         self.kodik_trans.setMinimumWidth(90)
         self.kodik_trans.setMaximumWidth(128)
+        # та же высота, что у строк выше — иначе ряд Kodik «выпадает» из ритма
+        # и отступ от Прокси выглядит неровным.
+        self.kodik_ep.setFixedHeight(26); self.kodik_trans.setFixedHeight(26)
         ho_kd = QHBoxLayout(); ho_kd.setSpacing(4)
         ho_kd.addWidget(QLabel("Сер.:")); ho_kd.addWidget(self.kodik_ep)
         ho_kd.addWidget(QLabel("Озв.:")); ho_kd.addWidget(self.kodik_trans)
@@ -106,7 +117,7 @@ class YtdlpTab(QWidget):
         fl.addRow(label_with_info("Прокси:", "Прокси для скачивания (yt-dlp). Помогает при блокировке YouTube провайдером. "
                                   "Браузерный VPN тут не работает — нужен именно прокси. Примеры: http://127.0.0.1:8080, socks5://127.0.0.1:1080"), ho_px)
         fl.addRow(label_with_info("Kodik:", "Для сайтов с плеером Kodik (animego и т.п.): номер серии и название озвучки. "
-                                  "Нажмите 🔍 на ссылке — в лог выведется список доступных озвучек и число серий. "
+                                  "После вставки ссылки списки заполняются автоматически, в лог выводится число серий и доступные озвучки. "
                                   "«тек.»/пусто = серия и озвучка по умолчанию. Примечание: 1080p на таких сайтах обычно апскейл, реальный максимум — 720p."), ho_kd)
         # Поля Папка/Cookies/Прокси — компактнее по высоте
         for _w in (self.out, btn_p, self.cookie_edit, btn_ck, self.proxy_edit):
@@ -389,8 +400,11 @@ class YtdlpTab(QWidget):
             if item:
                 # p < 0 — индикатор активности без реального % (download-sections/ffmpeg)
                 item.setText(1, "…" if p < 0 else f"{p:.1f}%"); item.setText(3, t)
+            self._dl_pct[iid_] = p
+            self._update_dl_taskbar()
 
         def on_done(iid_, status, clean_info, file_path):
+            self._dl_pct.pop(iid_, None); self._update_dl_taskbar()
             item = self.items.get(iid_, {}).get('item')
             if item:
                 item.setText(3, "✅ " + status)
@@ -406,6 +420,7 @@ class YtdlpTab(QWidget):
                     except Exception: pass
 
         def on_err(iid_, msg):
+            self._dl_pct.pop(iid_, None); self._update_dl_taskbar()
             try:
                 item = self.items.get(iid_, {}).get('item')
                 if not item: return
@@ -496,6 +511,22 @@ class YtdlpTab(QWidget):
         """Кнопка СТОП активна только когда есть хотя бы одна активная загрузка."""
         try: self.btn_stop.setEnabled(bool(self.active_workers))
         except Exception: pass
+
+    def _update_dl_taskbar(self):
+        """Сводный прогресс загрузок на иконке в панели задач: среднее по
+        активным элементам. Если все в «неопределённом» режиме (—1) — бегущая
+        полоса; если активных нет — снять индикатор."""
+        try:
+            vals = list(self._dl_pct.values())
+            if not vals:
+                self.main.clear_taskbar_progress(); return
+            real = [v for v in vals if v is not None and v >= 0]
+            if real:
+                self.main.set_taskbar_progress(int(sum(real) / len(real)), 100)
+            else:
+                self.main.set_taskbar_progress(0, 100)  # 0 → неопределённый режим
+        except Exception:
+            pass
 
     def _remove_worker(self, iid):
         self.active_workers.pop(iid, None)
@@ -849,7 +880,14 @@ class MediaTab(QWidget):
         foot_l.addWidget(self.c_priority)
         foot_l.addWidget(info_badge("Приоритет процессов кодирования (ffmpeg) в системе. Высокий — кодирует быстрее; на Низком ПК отзывчивее. Виден в Диспетчере задач у ffmpeg.exe."))
         foot_l.addStretch()
-        self.lbl_threads = QLabel("Задействовано потоков: 0/0")
+        # Всего логических потоков ЦП на этой машине — показываем сразу (0/N),
+        # а не 0/0, чтобы было видно потенциал ещё до запуска обработки.
+        self._cpu_threads = max(1, os.cpu_count() or 1)
+        self.lbl_threads = QLabel(f"Потоки ЦП в работе: 0/{self._cpu_threads}")
+        self.lbl_threads.setToolTip(
+            "Занятые логические потоки ЦП. Видео/аудио кодируются по одному файлу, "
+            "но SVT-AV1 нагружает все ядра — поэтому показывается полное число потоков. "
+            "Изображения обрабатываются параллельно (по числу ядер).")
         foot_l.addWidget(self.lbl_threads)
         right_layout.addWidget(foot)
 
@@ -1221,13 +1259,14 @@ class MediaTab(QWidget):
 
     def _on_active_threads(self, n, m):
         try:
-            self.lbl_threads.setText(f"Задействовано потоков: {n}/{m}" if m > 0
-                                     else "Задействовано потоков: 0/0")
+            # В простое показываем 0 из всех потоков ЦП машины (а не 0/0).
+            total = m if m > 0 else self._cpu_threads
+            self.lbl_threads.setText(f"Потоки ЦП в работе: {n}/{total}")
         except Exception: pass
 
     def done(self):
         self.b_run.setEnabled(True); self.b_stop.setEnabled(False)
-        try: self.lbl_threads.setText("Задействовано потоков: 0/0")
+        try: self.lbl_threads.setText(f"Потоки ЦП в работе: 0/{self._cpu_threads}")
         except Exception: pass
         self.main.log("Готово")
         try: play_done_sound()
@@ -1623,17 +1662,19 @@ class PhotoMergerTab(QWidget):
         top = QHBoxLayout()
         self.lbl_status = QLabel("Перетащите фотографии или нажмите «Добавить»")
         self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 13px;")
+        # Подсказка уступает место кнопкам (иначе её длинный текст распирает ряд
+        # и подписи кнопок обрезаются).
+        self.lbl_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
 
+        # Без setFixedWidth — крупный шрифт обрезал подписи («Добави…», «Очистить вс…»).
+        # Кнопки берут ширину по содержимому; статус-лейбл (stretch=1) отдаёт им место.
         btn_open = QPushButton("📂  Добавить файлы")
-        btn_open.setFixedWidth(150)
         btn_open.clicked.connect(self._open_files)
 
         btn_clear_sel = QPushButton("✂  Удалить выбранные")
-        btn_clear_sel.setFixedWidth(160)
         btn_clear_sel.clicked.connect(self._remove_selected)
 
         btn_clear_all = QPushButton("🗑  Очистить всё")
-        btn_clear_all.setFixedWidth(130)
         btn_clear_all.setObjectName("b_stop")
         btn_clear_all.clicked.connect(self._clear_all)
 

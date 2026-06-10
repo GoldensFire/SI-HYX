@@ -1,4 +1,11 @@
 # -*- coding: utf-8 -*-
+#
+# SI-HYX — медиа-загрузчик и перекодировщик.
+# Copyright (C) 2026 GoldensFire
+#
+# Свободное ПО: распространяется/изменяется на условиях GNU General Public
+# License v3 (или новее) от Free Software Foundation. БЕЗ ВСЯКИХ ГАРАНТИЙ.
+# Полный текст — в файле LICENSE (https://www.gnu.org/licenses/gpl-3.0.txt).
 # widgets.py — кастомные виджеты, делегаты, превью, info-подсказки
 from config import *
 from utils import *
@@ -98,39 +105,74 @@ class SpeedSpinBox(QSpinBox):
 
 
 # --- Информационные подсказки "ⓘ" для пунктов настроек ---
-class _InfoBadge(QLabel):
-    """Маленький значок ⓘ. При наведении показывает описание (tooltip).
+class _InfoTipPopup(QLabel):
+    """Единый всплывающий ярлык-подсказка для значков ⓘ.
 
-    Стандартный QToolTip иногда не успевает показаться на крошечном виджете,
-    поэтому при входе курсора и по клику принудительно вызываем QToolTip.showText —
-    подсказка появляется мгновенно и стабильно.
-    Чтобы изменить текст подсказки — правьте строку, передаваемую в info_badge()
-    (или label_with_info / row_with_info) в файле tabs.py.
-    """
+    Почему не QToolTip: его глобальный менеджер на крошечном виджете реагирует
+    на каждое микродвижение мыши, повторно показывая/пряча окно — отсюда
+    «мерцание» и «подлагивание» первые 1-2 секунды. Здесь собственный
+    фреймлес-попап: прозрачен для мыши и не активируется, показывается строго
+    по enter и прячется по leave значка — циклов enter/leave не возникает."""
+    _instance = None
+
+    @classmethod
+    def instance(cls):
+        if cls._instance is None:
+            cls._instance = _InfoTipPopup()
+        return cls._instance
+
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setWordWrap(True)
+        self.setMaximumWidth(360)
+        self.setObjectName("infoTip")
+        self.setStyleSheet(
+            "#infoTip{background:#1e1e2e;color:#cdd6f4;border:1px solid #585b70;"
+            "border-radius:6px;padding:6px 8px;font-size:12px;}")
+
+    def show_for(self, badge, text):
+        self.setText(text)
+        self.adjustSize()
+        # Ниже-правее значка — курсор на значке не попадёт на попап (иначе цикл).
+        gp = badge.mapToGlobal(badge.rect().bottomLeft())
+        x, y = gp.x(), gp.y() + 4
+        try:
+            scr = badge.screen().availableGeometry()
+            if x + self.width() > scr.right(): x = scr.right() - self.width() - 4
+            if x < scr.left(): x = scr.left() + 4
+        except Exception:
+            pass
+        self.move(x, y); self.show(); self.raise_()
+
+
+class _InfoBadge(QLabel):
+    """Маленький значок ⓘ. При наведении показывает подсказку (свой попап).
+    Чтобы изменить текст — правьте строку в info_badge()/label_with_info()/
+    row_with_info() в файле tabs.py."""
     def __init__(self, tip: str):
         super().__init__("ⓘ")
         self._tip = tip
         self.setObjectName("infoBadge")
-        # НЕ ставим setToolTip: нативный тултип + ручной showText дают двойной
-        # показ и мерцание. Используем только ручной QToolTip.showText.
         self.setCursor(Qt.CursorShape.WhatsThisCursor)
         self.setFixedSize(20, 20)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-    def _show_tip(self):
-        # Смещаем подсказку вниз-вправо от курсора, чтобы окно тултипа не
-        # перекрывало сам бейдж (иначе leave/enter зацикливаются → мерцание).
-        try:
-            pos = QCursor.pos(); pos.setX(pos.x() + 14); pos.setY(pos.y() + 16)
-            QToolTip.showText(pos, self._tip, self)
-        except Exception: pass
-
     def enterEvent(self, e):
-        self._show_tip()
+        try: _InfoTipPopup.instance().show_for(self, self._tip)
+        except Exception: pass
         super().enterEvent(e)
 
+    def leaveEvent(self, e):
+        try: _InfoTipPopup.instance().hide()
+        except Exception: pass
+        super().leaveEvent(e)
+
     def mousePressEvent(self, e):
-        self._show_tip()
+        try: _InfoTipPopup.instance().show_for(self, self._tip)
+        except Exception: pass
         super().mousePressEvent(e)
 
 
@@ -370,6 +412,7 @@ class RecentFileThumb(QWidget):
         self.setToolTip(path)
         self._drag_start = None
         self._thumb_attempts = 0
+        self._last_seen_size = -1   # для дозаписываемых файлов (Filmora и пр.)
 
         ext = os.path.splitext(path)[1].lower()
         is_img   = ext in ALLOWED_IMG
@@ -417,7 +460,11 @@ class RecentFileThumb(QWidget):
         for _w in (thumb_container, self._thumb_lbl, name_lbl):
             _w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
-        self.setStyleSheet("RecentFileThumb{background:#2a2a2a;border-radius:5px;}"
+        # Прозрачная рамка 1px уже в обычном состоянии: при наведении меняется
+        # только ЦВЕТ рамки, а не геометрия. Иначе добавление рамки на :hover
+        # сдвигало содержимое на 1px → переразметка → мерцание/лаг (как было у ⓘ).
+        self.setStyleSheet("RecentFileThumb{background:#2a2a2a;border-radius:5px;"
+                           "border:1px solid transparent;}"
                            "RecentFileThumb:hover{background:#363636;border:1px solid #555;}")
 
         # Загрузка миниатюры в фоне (через QThreadPool — НЕ блокирует GUI при старте)
@@ -430,14 +477,31 @@ class RecentFileThumb(QWidget):
                 f"<div style='font-size:9px; color:#9399b2;'>{self._ext_txt}</div>"
                 f"<div style='font-size:9px; color:#7f849c;'>{self._size_str}</div>")
 
+    def _refresh_size(self):
+        """Перечитать размер файла (мог вырасти, пока шла генерация миниатюры)."""
+        try:
+            self._size_str = human_size(os.path.getsize(self.path))
+        except Exception:
+            pass
+
     def _apply_thumb(self, data, dur_str):
         """Слот в GUI-потоке: строит QPixmap из байтов и рисует длительность."""
         try:
+            # Размер мог измениться с момента создания карточки (Filmora и др.
+            # пишут файл постепенно) — всегда показываем актуальный.
+            self._refresh_size()
             if not data:
                 self._thumb_lbl.setText(self._placeholder_html())
-                # Свежий файл мог быть ещё не дописан/занят при первой попытке —
-                # повторяем генерацию миниатюры несколько раз с задержкой.
-                if self._thumb_attempts < 6:
+                try: cur = os.path.getsize(self.path)
+                except Exception: cur = -1
+                if cur != self._last_seen_size:
+                    # Файл ещё дозаписывается (размер растёт) — сбрасываем счётчик
+                    # и продолжаем ждать готовности, сколько бы ни длилась запись.
+                    self._last_seen_size = cur
+                    self._thumb_attempts = 0
+                    QTimer.singleShot(1500, self._retry_thumb)
+                elif self._thumb_attempts < 8:
+                    # Размер стабилен, но превью пока нет (файл занят) — ещё попытки.
                     self._thumb_attempts += 1
                     QTimer.singleShot(1500, self._retry_thumb)
                 return

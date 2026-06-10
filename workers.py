@@ -1,4 +1,11 @@
 # -*- coding: utf-8 -*-
+#
+# SI-HYX — медиа-загрузчик и перекодировщик.
+# Copyright (C) 2026 GoldensFire
+#
+# Свободное ПО: распространяется/изменяется на условиях GNU General Public
+# License v3 (или новее) от Free Software Foundation. БЕЗ ВСЯКИХ ГАРАНТИЙ.
+# Полный текст — в файле LICENSE (https://www.gnu.org/licenses/gpl-3.0.txt).
 # workers.py — фоновые потоки: загрузка (yt-dlp) и обработка (ffmpeg)
 from config import *
 from utils import *
@@ -530,15 +537,15 @@ class ProcessWorker(QThread):
             return getattr(subprocess, 'HIGH_PRIORITY_CLASS', 0)
         return getattr(subprocess, 'NORMAL_PRIORITY_CLASS', 0)
 
-    def _inc_active(self):
+    def _inc_active(self, weight=1):
         with self._active_lock:
-            self._active_count += 1
+            self._active_count += weight
             n = self._active_count
         self.active_threads.emit(n, max(1, self._max_threads))
 
-    def _dec_active(self):
+    def _dec_active(self, weight=1):
         with self._active_lock:
-            self._active_count = max(0, self._active_count - 1)
+            self._active_count = max(0, self._active_count - weight)
             n = self._active_count
         self.active_threads.emit(n, max(1, self._max_threads))
 
@@ -1398,16 +1405,18 @@ class ProcessWorker(QThread):
             if os.path.exists(guessed): item['out_path'] = guessed
         except Exception: pass
 
-    def _process_item(self, item, smooth, total, start):
+    def _process_item(self, item, smooth, total, start, weight=1):
         """Обрабатывает один элемент очереди.
         smooth=True — глобальный прогресс плавно отражает прогресс файла
         (видео/аудио идут по одному). smooth=False — прогресс по факту
-        завершения (изображения идут параллельно через QThreadPool)."""
+        завершения (изображения идут параллельно через QThreadPool).
+        weight — вклад в счётчик «занятых потоков ЦП»: видео = все ядра
+        (один ffmpeg/SVT-AV1 грузит весь ЦП), изображение = 1."""
         if self.stop_flag:
             return
         iid = item['iid']; path = item['path']
         self.status.emit(iid, "Обработка.", "proc")
-        self._inc_active()
+        self._inc_active(weight)
         max_frac_seen = [0.0]
 
         def item_prog(pct, pass_label=None):
@@ -1456,7 +1465,7 @@ class ProcessWorker(QThread):
                 self.status.emit(iid, "Ошибка", "err")
             item['is_done'] = True
         finally:
-            self._dec_active()
+            self._dec_active(weight)
             with self._prog_lock:
                 self._done_count += 1
                 done = self._done_count
@@ -1477,11 +1486,18 @@ class ProcessWorker(QThread):
         images = [it for it in pending if it.get('type') == 'IMG']
         others = [it for it in pending if it.get('type') != 'IMG']
 
-        self._max_threads = 1
+        cpu = max(1, os.cpu_count() or 1)
+        # Видео/аудио идут по одному файлу, но кодировщик SVT-AV1 сам нагружает
+        # ВСЕ логические ядра ЦП. Поэтому счётчик показывает занятые потоки ЦП
+        # (а не «1 файл»), иначе создаётся ложное впечатление загрузки в 1 поток.
+        if others:
+            self._max_threads = cpu
+            self.log.emit(f"Кодирование видео/аудио: SVT-AV1 задействует все {cpu} лог. ядра ЦП "
+                          f"(файлы обрабатываются по одному, каждый — на всех ядрах).")
         for it in others:
             if self.stop_flag:
                 break
-            self._process_item(it, True, total, start)
+            self._process_item(it, True, total, start, weight=cpu)
 
         if images and not self.stop_flag:
             nworkers = min(len(images), max(1, os.cpu_count() or 4))

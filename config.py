@@ -1,4 +1,11 @@
 # -*- coding: utf-8 -*-
+#
+# SI-HYX — медиа-загрузчик и перекодировщик.
+# Copyright (C) 2026 GoldensFire
+#
+# Свободное ПО: распространяется/изменяется на условиях GNU General Public
+# License v3 (или новее) от Free Software Foundation. БЕЗ ВСЯКИХ ГАРАНТИЙ.
+# Полный текст — в файле LICENSE (https://www.gnu.org/licenses/gpl-3.0.txt).
 # config.py — импорты, пути, константы, стили, FORMAT_OPTIONS
 
 
@@ -154,9 +161,13 @@ class _Resp:
         except Exception: pass
 
 
-def http_get(url, headers=None, timeout=30, stream=True):
-    """GET через requests с проверкой сертификата; при SSL-ошибке —
-    повтор без проверки (verify=False), чтобы работать и без системных CA.
+def http_get(url, headers=None, timeout=30, stream=True, allow_insecure=True):
+    """GET через requests с проверкой сертификата.
+    allow_insecure=True: при SSL-ошибке повторяет без проверки (verify=False) —
+    нужно для превью/картинок на машинах без системных CA.
+    allow_insecure=False: повтора НЕТ, нужен валидный сертификат. Критично для
+    автообновления: иначе MITM мог бы подсунуть вредоносный .exe (повтор без
+    проверки = установка непроверенного кода = RCE).
     Возвращает _Resp (совместим со старым urllib-кодом)."""
     h = headers or {}
     try:
@@ -164,6 +175,8 @@ def http_get(url, headers=None, timeout=30, stream=True):
         r.raise_for_status()
         return _Resp(r)
     except requests.exceptions.SSLError:
+        if not allow_insecure:
+            raise
         r = requests.get(url, headers=h, timeout=timeout, stream=stream, verify=False)
         r.raise_for_status()
         return _Resp(r)
@@ -343,7 +356,7 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # Репозиторий для автообновления (GitHub Releases)
 GITHUB_OWNER = "GoldensFire"
