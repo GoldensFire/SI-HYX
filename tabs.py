@@ -882,7 +882,7 @@ class MediaTab(QWidget):
         foot_l.addStretch()
         # Всего логических потоков ЦП на этой машине — показываем сразу (0/N),
         # а не 0/0, чтобы было видно потенциал ещё до запуска обработки.
-        self._cpu_threads = max(1, os.cpu_count() or 1)
+        self._cpu_threads = max(1, cpu_thread_count())
         self.lbl_threads = QLabel(f"Потоки ЦП в работе: 0/{self._cpu_threads}")
         self.lbl_threads.setToolTip(
             "Занятые логические потоки ЦП. Видео/аудио кодируются по одному файлу, "
@@ -1401,6 +1401,27 @@ class Base64Tab(QWidget):
         btn_row.addWidget(self.btn_stop)
         right.addLayout(btn_row)
 
+        # ── Маскировка HTML под VK (скрытие JS) ─────────────────────────────
+        mask_row = QHBoxLayout()
+        self.btn_mask_file = QPushButton("🎭  Замаскировать HTML (VK)")
+        self.btn_mask_file.setFixedHeight(32)
+        self.btn_mask_file.setToolTip(
+            "Прячет JavaScript из выбранного HTML под VK: убирает теги <script>,\n"
+            "тело кодирует в base64, запуск вешает на onload скрытой картинки.\n"
+            "Игра работает, VK принимает .siq. Результат рядом: <имя>_vk.html")
+        self.btn_mask_file.clicked.connect(self._mask_current_html)
+
+        self.btn_mask_folder = QPushButton("📁  Папка с HTML → VK")
+        self.btn_mask_folder.setFixedHeight(32)
+        self.btn_mask_folder.setToolTip(
+            "Пакетно обрабатывает все .html в выбранной папке.\n"
+            "Оригиналы не трогаются — результат в подпапке encoded\\")
+        self.btn_mask_folder.clicked.connect(self._mask_folder_html)
+
+        mask_row.addWidget(self.btn_mask_file)
+        mask_row.addWidget(self.btn_mask_folder)
+        right.addLayout(mask_row)
+
         top.addLayout(right, 1)
         root.addLayout(top)
 
@@ -1471,8 +1492,14 @@ class Base64Tab(QWidget):
         self.txt_out.clear()
         self.lbl_size.setText("")
         self._load_thumb(path)
-        # Автоматически запускаем кодирование сразу после выбора файла
-        QTimer.singleShot(80, self._start_encode)
+        # HTML-файлы предназначены для маскировки под VK, а не для обычного
+        # base64: НЕ запускаем авто-кодирование (никаких .txt и дампа base64 в
+        # GUI) — пользователь жмёт «🎭 Замаскировать HTML (VK)».
+        if os.path.splitext(path)[1].lower() in (".html", ".htm"):
+            self.lbl_size.setText("HTML готов — нажмите «🎭 Замаскировать HTML (VK)»")
+        else:
+            # Для прочих файлов — авто-кодирование сразу после выбора
+            QTimer.singleShot(80, self._start_encode)
 
     def _load_thumb(self, path):
         ext = os.path.splitext(path)[1].lower()
@@ -1537,6 +1564,102 @@ class Base64Tab(QWidget):
         if text:
             QApplication.clipboard().setText(text)
             self.main.log("Base64 скопирован в буфер обмена")
+
+    # ── Маскировка HTML под VK ───────────────────────────────────────────────
+    @staticmethod
+    def _read_html(path):
+        # utf-8-sig снимает возможный BOM; ошибки декодирования не роняют процесс
+        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+            return f.read()
+
+    def _mask_current_html(self):
+        """Маскирует текущий выбранный HTML-файл → encoded\\<имя>_base.html."""
+        path = self._current_path
+        if not path or not os.path.isfile(path):
+            self.lbl_size.setText("❌ Сначала выберите .html файл")
+            self.main.log("HTML→VK: файл не выбран")
+            return
+        if os.path.splitext(path)[1].lower() not in (".html", ".htm"):
+            self.lbl_size.setText("❌ Это не HTML-файл (нужен .html / .htm)")
+            self.main.log("HTML→VK: выбран не HTML-файл")
+            return
+        try:
+            masked, n_in, n_ext = mask_html_js(self._read_html(path))
+            if n_in == 0 and n_ext == 0:
+                self.lbl_size.setText("⚠ В файле нет <script> — кодировать нечего")
+                self.main.log("HTML→VK: тегов <script> не найдено")
+                return
+            base, ext = os.path.splitext(os.path.basename(path))
+            out_dir = os.path.join(os.path.dirname(path), "encoded")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, base + "_base" + ext)
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(masked)
+            self.txt_out.setPlainText(
+                "✅ HTML замаскирован под VK\n"
+                f"Исходник:  {os.path.basename(path)}\n"
+                f"Результат: encoded\\{os.path.basename(out_path)}\n\n"
+                f"Закодировано инлайн-скриптов: {n_in}\n"
+                f"Внешних <script src> → динамическая загрузка: {n_ext}\n\n"
+                "Что сделано:\n"
+                "• теги <script> удалены из разметки;\n"
+                "• тело JS закодировано в base64;\n"
+                "• запуск повешен на onload скрытой картинки;\n"
+                "• инлайн onclick=… сохранены (код исполняется в глобале).")
+            self.lbl_size.setText(
+                f"✅ encoded\\{os.path.basename(out_path)}  •  инлайн: {n_in}, внешних: {n_ext}")
+            self.main.log(f"HTML→VK: {os.path.basename(path)} → {out_path} "
+                          f"(инлайн {n_in}, внешних {n_ext})")
+        except Exception as ex:
+            self.lbl_size.setText(f"❌ {ex}")
+            self.main.log(f"HTML→VK error: {ex}")
+
+    def _mask_folder_html(self):
+        """Пакетно маскирует все .html в выбранной папке → подпапка encoded\\."""
+        folder = QFileDialog.getExistingDirectory(self, "Папка с HTML-файлами для маскировки", "")
+        if not folder:
+            return
+        try:
+            files = [f for f in os.listdir(folder)
+                     if f.lower().endswith((".html", ".htm"))]
+        except Exception as ex:
+            self.lbl_size.setText(f"❌ {ex}")
+            self.main.log(f"HTML→VK error: {ex}")
+            return
+        if not files:
+            self.lbl_size.setText("⚠ В папке нет .html файлов")
+            self.main.log("HTML→VK: в папке нет .html")
+            return
+
+        out_dir = os.path.join(folder, "encoded")
+        os.makedirs(out_dir, exist_ok=True)
+        done = skipped = errors = 0
+        report = [f"📁 {folder}", f"→ {out_dir}", ""]
+        for name in files:
+            src = os.path.join(folder, name)
+            try:
+                masked, n_in, n_ext = mask_html_js(self._read_html(src))
+                stem, ext = os.path.splitext(name)
+                with open(os.path.join(out_dir, stem + "_base" + ext), "w", encoding="utf-8") as f:
+                    f.write(masked)
+                if n_in or n_ext:
+                    done += 1
+                    report.append(f"✅ {name} — инлайн {n_in}, внешних {n_ext}")
+                    self.main.log(f"HTML→VK: {name} (инлайн {n_in}, внешних {n_ext})")
+                else:
+                    skipped += 1
+                    report.append(f"➖ {name} — нет <script>, скопировано как есть")
+                    self.main.log(f"HTML→VK: {name} — нет <script>, копия")
+            except Exception as ex:
+                errors += 1
+                report.append(f"❌ {name} — {ex}")
+                self.main.log(f"HTML→VK: {name} — ошибка: {ex}")
+
+        self.txt_out.setPlainText("\n".join(report))
+        self.lbl_size.setText(
+            f"✅ Готово: замаскировано {done}, без скриптов {skipped}, ошибок {errors} → encoded\\")
+        self.main.log(f"HTML→VK: папка обработана — {done} замаскировано, "
+                      f"{skipped} без скриптов, {errors} ошибок. Результат: {out_dir}")
 
     # ── Кодирование ──────────────────────────────────────────────────────────
     def _start_encode(self):

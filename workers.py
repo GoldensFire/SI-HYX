@@ -117,6 +117,86 @@ class YtdlpWorker(QThread):
             try: p.kill()
             except Exception: pass
 
+    # ─── ДОБАВИТЬ В YtdlpWorker ───────────────────────────────────────────────────
+
+    def _exec_ytdlp(self, cmd: list, iid: str, is_audio_only: bool):
+        """
+        Запускает yt-dlp, читает stdout построчно.
+        Возвращает (returncode, out_fullpath, clean_res_str, tail_lines).
+        Вынесено из run() для поддержки fallback-retry без дублирования кода.
+        """
+        out_fullpath = ""
+        clean_res_str = ""
+        tail = deque(maxlen=40)
+
+        self._dl_start_ts = time.time()
+        self._last_real_progress = time.time()
+
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=CREATE_NO_WINDOW, bufsize=1, env=subprocess_env())
+        threading.Thread(target=self._watchdog, daemon=True).start()
+
+        for raw in self._proc.stdout:
+            if not self.is_running:
+                break
+            line = clean_ansi(raw.rstrip("\r\n"))
+            if not line:
+                continue
+            if line.startswith("@@@"):
+                self._parse_progress(line[3:])
+                continue
+            if "@@META@@" in line:
+                try:
+                    th, w, h, abr = (line.split("@@META@@", 1)[1].split("\t") + ["", "", "", ""])[:4]
+                    if th and th != "NA":
+                        self.thumb_sig.emit(iid, th)
+                    if not clean_res_str:
+                        if is_audio_only and abr and abr != "NA":
+                            clean_res_str = f"{int(float(abr))} кбит/с"
+                        elif w not in ("", "NA") and h not in ("", "NA"):
+                            clean_res_str = f"{w}x{h}"
+                except Exception:
+                    pass
+                continue
+            if "@@PATH@@" in line:
+                out_fullpath = line.split("@@PATH@@", 1)[1].strip()
+                continue
+            tail.append(line)
+            self.log_sig.emit(line)
+            low = line.lower()
+            if "[merger]" in low or "[extractaudio]" in low or "merging formats" in low:
+                self.progress_sig.emit(iid, 100.0, "Обработка...")
+
+        self._proc.wait()
+        return self._proc.returncode, out_fullpath, clean_res_str, list(tail)
+
+
+    @staticmethod
+    def _strip_tiktok_headers(cmd: list, ua: str, header_values: set) -> list:
+        """
+        Удаляет из cmd именно TikTok-специфичные пары аргументов:
+          --user-agent  <ua>
+          --add-header  <значение из header_values>
+        Все остальные аргументы оставляет нетронутыми.
+        Нужен для сборки fallback-команды без кастомных заголовков.
+        """
+        result = []
+        i = 0
+        while i < len(cmd):
+            tok = cmd[i]
+            if tok == "--user-agent" and i + 1 < len(cmd) and cmd[i + 1] == ua:
+                i += 2
+                continue
+            if tok == "--add-header" and i + 1 < len(cmd) and cmd[i + 1] in header_values:
+                i += 2
+                continue
+            result.append(tok)
+            i += 1
+        return result
+
+
     @staticmethod
     def _height_from_fmt(fmt: str) -> int:
         """Желаемая высота из строки формата yt-dlp (height<=1080 → 1080)."""
@@ -235,12 +315,34 @@ class YtdlpWorker(QThread):
                 cmd += ["-f", self.c.get('fmt') or "bestvideo+bestaudio/best",
                         "--merge-output-format", merge]
 
-            if 'tiktok.com' in url.lower():
-                self.log_sig.emit("TikTok обнаружен: применяю Mobile API Fix...")
-                cmd += ["--extractor-args",
-                        "tiktok:api_hostname=api22-normal-c-useast2a.tiktokv.com;app_info=7355728856979392262",
-                        "--user-agent",
-                        "com.zhiliaoapp.musically/2022600030 (Linux; U; Android 7.1.2; es_ES; SM-G988N; Build/NRD90M; Cronet/58.0.2991.0)"]
+            # Константы выбраны глобально в блоке, чтобы _strip_tiktok_headers
+# точно знал, что именно вырезать при fallback.
+            _is_tiktok = 'tiktok.com' in url.lower()
+            _TIKTOK_UA = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            )
+            _TIKTOK_EXTRA_HEADERS = {
+                "Accept-Language:en-US,en;q=0.9",
+                "Referer:https://www.tiktok.com/",
+                "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                'sec-ch-ua:"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+                "sec-ch-ua-mobile:?0",
+                'sec-ch-ua-platform:"Windows"',
+            }
+
+            if _is_tiktok:
+                self.log_sig.emit("TikTok обнаружен: Desktop Browser Mode (Chrome 125 / Windows 11)...")
+                cmd += ["--user-agent", _TIKTOK_UA]
+                for _hdr in _TIKTOK_EXTRA_HEADERS:
+                    cmd += ["--add-header", _hdr]
+                # ВАЖНО: --extractor-args с api_hostname=api22-normal-c-useast2a.tiktokv.com
+                # НАМЕРЕННО убран. Этот Mobile API с 2024 г. требует динамических подписей
+                # X-Gorgon + X-Khronos (HMAC, генерируется в нативном коде TikTok-app).
+                # Без подписей → TCP RST до HTTP-ответа → пустая строка → JSONDecodeError
+                # → "status code 0". yt-dlp без extractor-args использует веб-скрейпинг,
+                # которому подписи не нужны — достаточно cookies + браузерного UA.
 
             if 'youtube.com' in url.lower() or 'youtu.be' in url.lower():
                 self.log_sig.emit("YouTube: клиенты default + web_safari (n-challenge через Deno)...")
@@ -284,52 +386,42 @@ class YtdlpWorker(QThread):
 
             cmd += [url]
 
-            self._proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace",
-                creationflags=CREATE_NO_WINDOW, bufsize=1, env=subprocess_env())
+            rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(cmd, iid, is_audio_only)
 
-            # Watchdog: показывает активность, даже когда yt-dlp не шлёт прогресс
-            self._dl_start_ts = time.time()
-            self._last_real_progress = time.time()
-            threading.Thread(target=self._watchdog, daemon=True).start()
+            # ── TikTok fallback ────────────────────────────────────────────────────────────
+            # Если Desktop-UA тоже дал пустой ответ (JSONDecodeError / status code 0),
+            # пробуем ещё раз — без КАКИХ-ЛИБО кастомных заголовков.
+            # Иногда дефолтный UA yt-dlp проходит там, где «умный» Chrome UA
+            # срабатывает как триггер enhanced TLS-fingerprinting (Akamai / Cloudflare).
+            if _is_tiktok and rc != 0 and self.is_running:
+                _TT_ERROR_MARKERS = ("failed to parse json", "status code 0", "video not available")
+                _tt_triggered = any(
+                    any(m in ln.lower() for m in _TT_ERROR_MARKERS) for ln in tail
+                )
+                if _tt_triggered:
+                    # ── Отладочный вывод: показываем сырые строки, вызвавшие fallback ──
+                    for ln in tail:
+                        ll = ln.lower()
+                        if "failed to parse json" in ll:
+                            self.log_sig.emit(
+                                f"[DEBUG TikTok] JSONDecodeError — тело ответа пустое (len=0).\n"
+                                f"  Полная строка yt-dlp: {ln}"
+                            )
+                        elif "status code 0" in ll:
+                            self.log_sig.emit(
+                                f"[DEBUG TikTok] status_code=0 — TCP RST до HTTP-ответа.\n"
+                                f"  Тип сбоя: Connection Reset (сервер TikTok оборвал TLS до отправки данных).\n"
+                                f"  Строка yt-dlp: {ln}"
+                            )
 
-            out_fullpath = ""
-            clean_res_str = ""
-            tail = deque(maxlen=40)
-            for raw in self._proc.stdout:
-                if not self.is_running:
-                    break
-                line = clean_ansi(raw.rstrip("\r\n"))
-                if not line:
-                    continue
-                if line.startswith("@@@"):
-                    self._parse_progress(line[3:])
-                    continue
-                if "@@META@@" in line:
-                    try:
-                        th, w, h, abr = (line.split("@@META@@", 1)[1].split("\t") + ["", "", "", ""])[:4]
-                        if th and th != "NA":
-                            self.thumb_sig.emit(iid, th)
-                        if not clean_res_str:
-                            if is_audio_only and abr and abr != "NA":
-                                clean_res_str = f"{int(float(abr))} кбит/с"
-                            elif w not in ("", "NA") and h not in ("", "NA"):
-                                clean_res_str = f"{w}x{h}"
-                    except Exception:
-                        pass
-                    continue
-                if "@@PATH@@" in line:
-                    out_fullpath = line.split("@@PATH@@", 1)[1].strip()
-                    continue
-                tail.append(line)
-                self.log_sig.emit(line)
-                low = line.lower()
-                if "[merger]" in low or "[extractaudio]" in low or "merging formats" in low:
-                    self.progress_sig.emit(iid, 100.0, "Обработка...")
-
-            self._proc.wait()
-            rc = self._proc.returncode
+                    self.log_sig.emit(
+                        "TikTok fallback: Desktop UA заблокирован — "
+                        "повторяю через дефолтный yt-dlp (без кастомных заголовков)..."
+                    )
+                    cmd_fallback = self._strip_tiktok_headers(cmd, _TIKTOK_UA, _TIKTOK_EXTRA_HEADERS)
+                    rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(
+                        cmd_fallback, iid, is_audio_only
+                    )
 
             if not self.is_running:
                 raise Exception("Загрузка остановлена пользователем")
@@ -434,6 +526,24 @@ class YtdlpWorker(QThread):
         if "Sign in to confirm" in err_msg or "not a bot" in err_msg:
             self.log_sig.emit("СОВЕТ: YouTube требует «не бот» — куки без данных входа.")
             self.log_sig.emit("  Экспортируйте куки залогиненного YouTube (нужны LOGIN_INFO, __Secure-1PSID, SID, SAPISID).")
+
+# Добавить ПЕРЕД блоком: elif "Forbidden" in err_msg or "403" in err_msg:
+        elif ("tiktok" in low and (
+                "status code 0" in low or
+                "failed to parse json" in low or
+                "video not available" in low)):
+            self.log_sig.emit(
+                "СОВЕТ (TikTok status 0 / JSONDecodeError): сервер TikTok оборвал соединение "
+                "до отправки ответа — это TLS-fingerprint или rate-limit блокировка."
+            )
+            self.log_sig.emit(
+                "  Варианты решения:\n"
+                "  1) Обновите cookies_tiktok.txt — авторизованные куки снижают агрессивность "
+                "rate-limit (нужны sessionid, tt_csrf_token, ttwid).\n"
+                "  2) Включите VPN/прокси — смена IP часто снимает бан по rate-limit.\n"
+                "  3) Обновите yt-dlp: pip install -U yt-dlp  (экстрактор TikTok меняется часто)."
+            )
+
         elif "Forbidden" in err_msg or "403" in err_msg:
             u = self.c.get("url", "").lower()
             if "tiktok.com" in u:
@@ -1486,7 +1596,7 @@ class ProcessWorker(QThread):
         images = [it for it in pending if it.get('type') == 'IMG']
         others = [it for it in pending if it.get('type') != 'IMG']
 
-        cpu = max(1, os.cpu_count() or 1)
+        cpu = max(1, cpu_thread_count())
         # Видео/аудио идут по одному файлу, но кодировщик SVT-AV1 сам нагружает
         # ВСЕ логические ядра ЦП. Поэтому счётчик показывает занятые потоки ЦП
         # (а не «1 файл»), иначе создаётся ложное впечатление загрузки в 1 поток.
@@ -1500,7 +1610,7 @@ class ProcessWorker(QThread):
             self._process_item(it, True, total, start, weight=cpu)
 
         if images and not self.stop_flag:
-            nworkers = min(len(images), max(1, os.cpu_count() or 4))
+            nworkers = min(len(images), max(1, cpu_thread_count()))
             if nworkers > 1:
                 self._max_threads = nworkers
                 self.log.emit(f"Параллельная обработка изображений: {nworkers} потоков")

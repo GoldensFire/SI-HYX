@@ -653,105 +653,160 @@ class UnifiedWindow(QMainWindow):
         return None
 
     def _apply_update(self, src_root: str):
-        """Готовит PowerShell-апдейтер, запускает его и закрывает программу.
-        Апдейтер дождётся выхода, заменит файлы (с ретраями, пока exe залочен)
-        и запустит новую версию. Пишет лог в %TEMP%\\sihyx_update\\update_log.txt."""
+        """Готовит апдейтер и запускает его ВНЕ job-объекта программы через
+        Планировщик задач, затем закрывает программу. В Win Sandbox/жёстких
+        лаунчерах обычный detached-процесс убивается job'ом при выходе родителя
+        (апдейтер не стартовал — не было даже update_log.txt). Планировщик
+        исполняет задачу в своей сессии-службе, job родителя на неё не влияет.
+        Лог апдейтера: %TEMP%\\sihyx_update\\update_log.txt."""
         try:
             app_dir = os.path.dirname(os.path.abspath(sys.executable))
             exe_path = os.path.abspath(sys.executable)
             upd_dir = os.path.join(tempfile.gettempdir(), "sihyx_update")
             os.makedirs(upd_dir, exist_ok=True)
             ps_path = os.path.join(upd_dir, "apply_update.ps1")
+            cmd_path = os.path.join(upd_dir, "run_updater.cmd")
             log_path = os.path.join(upd_dir, "update_log.txt")
-            try:
-                if os.path.exists(log_path): os.remove(log_path)
-            except Exception: pass
+            lock_path = os.path.join(upd_dir, "updater.lock")
+            for _p in (log_path, lock_path):
+                try:
+                    if os.path.exists(_p): os.remove(_p)
+                except Exception: pass
 
-            script = (
-                "param([int]$AppPid,[string]$Src,[string]$Dst,[string]$Exe,[string]$Log)\n"
+            def q(s):  # безопасная одинарно-кавыченная строка PowerShell
+                return "'" + str(s).replace("'", "''") + "'"
+
+            task_name = "SIHYX_SelfUpdate"
+            launch_task = task_name + "_Launch"
+            relaunch_path = os.path.join(upd_dir, "relaunch.cmd")
+            register_path = os.path.join(upd_dir, "register.cmd")
+            leaf = os.path.basename(exe_path)
+            src_exe = os.path.join(src_root, leaf)
+            # Время триггера задач (в будущем). Реально задачи запускаются через
+            # schtasks /Run; авто-срабатывание по /ST безвредно — у программы
+            # single-instance (повторный старт просто закроется).
+            st = time.strftime("%H:%M", time.localtime(time.time() + 120))
+
+            # Параметры «зашиты» в скрипт (а не через -args) — запускается и
+            # Планировщиком, и напрямую, без возни с кавычками в путях.
+            hdr = (
+                "$AppPid=" + str(int(os.getpid())) + "\n"
+                "$Src=" + q(src_root) + "\n"
+                "$Dst=" + q(app_dir) + "\n"
+                "$Exe=" + q(exe_path) + "\n"
+                "$Log=" + q(log_path) + "\n"
+                "$Lock=" + q(lock_path) + "\n"
+                "$TaskName=" + q(task_name) + "\n"
+                "$RelaunchCmd=" + q(relaunch_path) + "\n"
+            )
+            body = (
                 "$ErrorActionPreference='SilentlyContinue'\n"
                 "function W($m){ \"$([DateTime]::Now.ToString('HH:mm:ss')) $m\" | "
                 "Out-File -FilePath $Log -Append -Encoding utf8 }\n"
+                # защита от двойного запуска (ручной /Run + срабатывание по времени)
+                "if(Test-Path $Lock){ exit }\n"
+                "New-Item -ItemType File -Path $Lock -Force | Out-Null\n"
                 "W 'Updater started.'\n"
-                "W \"AppPid=$AppPid\"\n"
-                "W \"Src=$Src\"\n"
-                "W \"Dst=$Dst\"\n"
-                "W \"Exe=$Exe\"\n"
+                "W \"AppPid=$AppPid\"; W \"Src=$Src\"; W \"Dst=$Dst\"; W \"Exe=$Exe\"\n"
                 "# 1) Ждём выхода процесса программы (до ~30 сек)\n"
-                "for($i=0; $i -lt 30; $i++){\n"
-                "  if(-not (Get-Process -Id $AppPid -ErrorAction SilentlyContinue)){ break }\n"
-                "  Start-Sleep -Milliseconds 1000\n"
-                "}\n"
-                "# 2) Ждём, пока сам .exe реально освободится (эксклюзивное открытие)\n"
+                "for($i=0; $i -lt 30; $i++){ if(-not (Get-Process -Id $AppPid -ErrorAction SilentlyContinue)){ break }; Start-Sleep -Milliseconds 1000 }\n"
+                "# 2) Ждём, пока .exe реально освободится\n"
                 "$free=$false\n"
                 "if(-not (Test-Path $Exe)){ $free=$true }\n"
-                "for($i=0; ($i -lt 60) -and (-not $free); $i++){\n"
-                "  try { $fs=[System.IO.File]::Open($Exe,'Open','ReadWrite','None'); "
-                "$fs.Close(); $free=$true; break }\n"
-                "  catch { Start-Sleep -Milliseconds 500 }\n"
-                "}\n"
+                "for($i=0; ($i -lt 60) -and (-not $free); $i++){ try { $fs=[System.IO.File]::Open($Exe,'Open','ReadWrite','None'); $fs.Close(); $free=$true; break } catch { Start-Sleep -Milliseconds 500 } }\n"
                 "W \"Exe free=$free\"\n"
                 "Start-Sleep -Milliseconds 500\n"
                 "# 3) Копируем новую версию поверх старой (с ретраями)\n"
                 "$ok=$false\n"
-                "for($try=1; $try -le 12; $try++){\n"
-                "  robocopy $Src $Dst /E /IS /IT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null\n"
-                "  $rc=$LASTEXITCODE\n"
-                "  W \"robocopy try $try rc=$rc\"\n"
-                "  if($rc -lt 8){ $ok=$true; break }\n"
-                "  Start-Sleep -Seconds 2\n"
-                "}\n"
-                "# 4) Проверка: совпал ли размер обновлённого exe\n"
-                "try {\n"
-                "  $leaf=Split-Path $Exe -Leaf\n"
-                "  $s=(Get-Item (Join-Path $Src $leaf)).Length\n"
-                "  $d=(Get-Item $Exe).Length\n"
-                "  W \"exe size src=$s dst=$d match=$($s -eq $d)\"\n"
-                "} catch { W 'verify: не удалось сравнить exe' }\n"
-                "$SrcExe = Join-Path $Src (Split-Path $Exe -Leaf)\n"
+                "for($try=1; $try -le 12; $try++){ robocopy $Src $Dst /E /IS /IT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null; $rc=$LASTEXITCODE; W \"robocopy try $try rc=$rc\"; if($rc -lt 8){ $ok=$true; break }; Start-Sleep -Seconds 2 }\n"
                 "if($ok){ W 'Copy OK.' } else { W 'Copy FAILED (robocopy rc>=8).' }\n"
-                "W 'Launching new version...'\n"
-                "$launched=$false\n"
-                "# Запуск обновлённой версии из папки установки; при любом сбое —\n"
-                "# из распакованной папки, чтобы новая версия в любом случае стартовала.\n"
-                "if($ok){ try { Start-Process -FilePath $Exe -WorkingDirectory $Dst; $launched=$true; W 'Launched from Dst.' } catch { W \"Launch Dst failed: $_\" } }\n"
-                "if(-not $launched){ try { Start-Process -FilePath $SrcExe -WorkingDirectory $Src; $launched=$true; W 'Launched from Src (fallback).' } catch { W \"Launch Src failed: $_\" } }\n"
-                "W \"Done. launched=$launched\"\n"
+                "# 4) Перезапуск новой версии ОТДЕЛЬНОЙ задачей (relaunch.cmd).\n"
+                "#    Планировщик убивает ВСЁ дерево процессов завершившейся задачи —\n"
+                "#    поэтому запускать приложение из самой задачи-апдейтера нельзя\n"
+                "#    (новая версия тут же умрёт). Отдельная задача делает приложение\n"
+                "#    своим ГЛАВНЫМ процессом → оно живёт и стартует в интерактивной\n"
+                "#    сессии (видимое окно).\n"
+                "try { Start-Process -FilePath $RelaunchCmd -Wait -WindowStyle Hidden; W 'Relaunch task triggered.' } catch { W \"Relaunch failed: $_\" }\n"
+                "W 'Done.'\n"
+                "Remove-Item $Lock -Force -ErrorAction SilentlyContinue\n"
+                "schtasks /Delete /TN $TaskName /F | Out-Null\n"
             )
             with open(ps_path, "w", encoding="utf-8-sig") as f:
-                f.write(script)
+                f.write(hdr + body)
+            # run_updater.cmd — действие задачи-апдейтера (находит ps1 рядом, %~dp0)
+            with open(cmd_path, "w", encoding="ascii", errors="replace") as f:
+                f.write("@echo off\r\n"
+                        "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden "
+                        "-File \"%~dp0apply_update.ps1\"\r\n")
+            # relaunch.cmd — регистрирует и запускает ОТДЕЛЬНУЮ задачу-лаунчер,
+            # действие которой = сам .exe (он становится главным процессом задачи
+            # → переживает завершение задачи-апдейтера). Кавычки form2: /TR "\"path\""
+            # — единственная форма, что работает для путей с пробелами (проверено).
+            with open(relaunch_path, "w", encoding="ascii", errors="replace") as f:
+                f.write("@echo off\r\n"
+                        'set "EXE=' + exe_path + '"\r\n'
+                        'if not exist "%EXE%" set "EXE=' + src_exe + '"\r\n'
+                        'schtasks /Create /F /TN "' + launch_task + '" /TR "\\"%EXE%\\"" '
+                        '/SC ONCE /ST ' + st + ' /RL LIMITED >nul 2>&1\r\n'
+                        'schtasks /Run /TN "' + launch_task + '" >nul 2>&1\r\n')
+            # register.cmd — регистрирует и запускает задачу-апдейтер (form2-кавычки)
+            with open(register_path, "w", encoding="ascii", errors="replace") as f:
+                f.write("@echo off\r\n"
+                        'schtasks /Create /F /TN "' + task_name + '" /TR "\\"' + cmd_path + '\\"" '
+                        '/SC ONCE /ST ' + st + ' /RL LIMITED >nul 2>&1\r\n'
+                        'schtasks /Run /TN "' + task_name + '" >nul 2>&1\r\n')
 
-            DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0)
-            NEWGRP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
-            ps_args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                       "-File", ps_path,
-                       "-AppPid", str(os.getpid()),
-                       "-Src", src_root, "-Dst", app_dir, "-Exe", exe_path,
-                       "-Log", log_path]
-            # CREATE_BREAKAWAY_FROM_JOB: в песочнице/некоторых лаунчерах программа
-            # живёт в job-объекте, который убивает всех дочерних при выходе
-            # родителя — тогда апдейтер умирал вместе с программой (файлы
-            # оставались в …\extracted, перезапуска не было). Брейкэвей выводит
-            # апдейтер из job. Если job его запрещает — повторяем без флага.
-            try:
-                subprocess.Popen(ps_args, creationflags=DETACHED | NEWGRP | BREAKAWAY,
-                                 close_fds=True)
-            except OSError:
-                subprocess.Popen(ps_args, creationflags=DETACHED | NEWGRP,
-                                 close_fds=True)
+            if not self._spawn_updater(task_name, register_path, ps_path):
+                self._updating = False
+                self.log("Не удалось запустить апдейтер. Обновите вручную из папки: " + src_root)
+                return
+
             self.log(f"Обновление готово. Перезапуск… (лог: {log_path})")
-            # Сохраняем настройки и ЖЁСТКО завершаем процесс: QApplication.quit()
-            # не всегда освобождает файлы (живут Qt-потоки/серверы), и тогда
-            # robocopy не может перезаписать залоченный exe → оставалась старая версия.
+            # ЖЁСТКО завершаем процесс: QApplication.quit() не всегда освобождает
+            # файлы (живут Qt-потоки/серверы) → robocopy не перезапишет залоченный exe.
             try: self._save_settings_now()
             except Exception: pass
             try: self._stop_browser_http_server()
             except Exception: pass
-            QTimer.singleShot(400, lambda: os._exit(0))
+            QTimer.singleShot(700, lambda: os._exit(0))
         except Exception as e:
             self._updating = False
             self.log(f"Ошибка применения обновления: {e}")
+
+    def _spawn_updater(self, task_name, register_cmd, ps_path):
+        """Запускает апдейтер ВНЕ job-объекта программы. Основной путь —
+        Планировщик задач через register.cmd (служба исполняет задачу в своей
+        сессии, job родителя на неё не влияет — работает даже в Win Sandbox).
+        Фолбэк — обычный detached Popen (+breakaway) для машин без жёсткого job."""
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # 1) Планировщик задач (register.cmd сам делает /Create и /Run)
+        try:
+            subprocess.run(["cmd", "/c", register_cmd], creationflags=flags,
+                           capture_output=True, text=True, timeout=30)
+            chk = subprocess.run(["schtasks", "/Query", "/TN", task_name],
+                                 creationflags=flags, capture_output=True, text=True, timeout=15)
+            if chk.returncode == 0:
+                self.log("Апдейтер запущен через Планировщик задач (вне job-объекта).")
+                return True
+            self.log("Планировщик: задача не зарегистрирована — пробую прямой запуск.")
+        except Exception as e:
+            self.log(f"Планировщик задач недоступен ({e}); пробую прямой запуск.")
+        # 2) Фолбэк: detached Popen (+breakaway) — для обычных машин без жёсткого job
+        try:
+            DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0)
+            NEWGRP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            BREAKAWAY = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+            args = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-WindowStyle", "Hidden", "-File", ps_path]
+            try:
+                subprocess.Popen(args, creationflags=DETACHED | NEWGRP | BREAKAWAY, close_fds=True)
+            except OSError:
+                subprocess.Popen(args, creationflags=DETACHED | NEWGRP, close_fds=True)
+            self.log("Апдейтер запущен напрямую (detached).")
+            return True
+        except Exception as e:
+            self.log(f"Не удалось запустить апдейтер: {e}")
+            return False
 
     def _open_settings_dialog(self):
         dlg = QDialog(self)

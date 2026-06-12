@@ -308,6 +308,23 @@ def deno_available():
     return shutil.which("deno") is not None
 
 
+def cpu_thread_count():
+    """Надёжное число логических потоков ЦП.
+    os.cpu_count() в части frozen/песочница-окружений (PyInstaller windowed,
+    Windows Sandbox с ограниченным affinity) возвращает None → счётчик «потоков»
+    падал до 1/1. Фолбэк: NUMBER_OF_PROCESSORS → разумный дефолт 4."""
+    n = os.cpu_count()
+    if n and n > 0:
+        return n
+    try:
+        n = int(os.environ.get("NUMBER_OF_PROCESSORS", "") or 0)
+        if n > 0:
+            return n
+    except Exception:
+        pass
+    return 4
+
+
 TEMP_DIR = tempfile.gettempdir()
 
 
@@ -356,7 +373,7 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.4"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # Репозиторий для автообновления (GitHub Releases)
 GITHUB_OWNER = "GoldensFire"
