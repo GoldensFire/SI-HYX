@@ -1422,6 +1422,16 @@ class Base64Tab(QWidget):
         mask_row.addWidget(self.btn_mask_folder)
         right.addLayout(mask_row)
 
+        # Галочка: переименовывать ли выходной HTML (добавлять суффикс _base).
+        # Включена — поведение как раньше (<имя>_base.html).
+        # Выключена — файл на выходе сохраняет оригинальное имя (<имя>.html).
+        self.chk_rename_html = QCheckBox("Переименовывать выходной HTML (суффикс _base)")
+        self.chk_rename_html.setChecked(True)
+        self.chk_rename_html.setToolTip(
+            "Включено: результат маскировки называется <имя>_base.html.\n"
+            "Выключено: выходной HTML сохраняет оригинальное имя <имя>.html.")
+        right.addWidget(self.chk_rename_html)
+
         top.addLayout(right, 1)
         root.addLayout(top)
 
@@ -1592,7 +1602,8 @@ class Base64Tab(QWidget):
             base, ext = os.path.splitext(os.path.basename(path))
             out_dir = os.path.join(os.path.dirname(path), "encoded")
             os.makedirs(out_dir, exist_ok=True)
-            out_path = os.path.join(out_dir, base + "_base" + ext)
+            suffix = "_base" if self.chk_rename_html.isChecked() else ""
+            out_path = os.path.join(out_dir, base + suffix + ext)
             with open(out_path, "w", encoding="utf-8") as f:
                 f.write(masked)
             self.txt_out.setPlainText(
@@ -1640,7 +1651,8 @@ class Base64Tab(QWidget):
             try:
                 masked, n_in, n_ext = mask_html_js(self._read_html(src))
                 stem, ext = os.path.splitext(name)
-                with open(os.path.join(out_dir, stem + "_base" + ext), "w", encoding="utf-8") as f:
+                suffix = "_base" if self.chk_rename_html.isChecked() else ""
+                with open(os.path.join(out_dir, stem + suffix + ext), "w", encoding="utf-8") as f:
                     f.write(masked)
                 if n_in or n_ext:
                     done += 1
