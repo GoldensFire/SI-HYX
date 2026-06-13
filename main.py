@@ -13,12 +13,13 @@ from widgets import *
 from workers import *
 from tabs import *
 from taskbar import TaskbarProgress
+import hashlib
 
 
 class UnifiedWindow(QMainWindow):
     url_from_browser = pyqtSignal(str, bool)  # URL + audio_only из браузерного расширения (HTTP-сервер → Qt)
     log_signal = pyqtSignal(str)              # потокобезопасный лог (из фоновых потоков → GUI)
-    update_available_sig = pyqtSignal(str, str, int)  # версия, ссылка на zip, размер (байт)
+    update_available_sig = pyqtSignal(str, str, int, str)  # версия, ссылка на zip, размер (байт), sha256 архива ("" = не проверять)
     update_ready_sig = pyqtSignal(str)        # путь к распакованной новой версии (готово к установке)
 
     def __init__(self):
@@ -58,6 +59,7 @@ class UnifiedWindow(QMainWindow):
         # --- Плашка обновления (скрыта по умолчанию) ---
         self._pending_update_url = ""
         self._pending_update_version = ""
+        self._pending_update_sha = ""
         self._skipped_update_version = self._load_skipped_version()
         self.update_banner = QWidget()
         self.update_banner.setObjectName("updateBanner")
@@ -293,10 +295,48 @@ class UnifiedWindow(QMainWindow):
         PORT = HTTP_PORT
 
         class _Handler(BaseHTTPRequestHandler):
+            # Разрешаем только запросы из расширения браузера. Origin браузер
+            # проставляет сам — со страницы его из JS не подделать, поэтому это
+            # надёжно отсекает «любой сайт дёргает наши эндпоинты», не требуя
+            # изменений в расширении (оно шлёт chrome-extension://… Origin).
+            _ALLOWED_ORIGIN_SCHEMES = (
+                "chrome-extension://", "moz-extension://", "safari-web-extension://",
+            )
+
+            def _req_origin(self) -> str:
+                return self.headers.get("Origin", "") or ""
+
+            def _origin_allowed(self) -> bool:
+                # Нет Origin → не веб-страница (нативный клиент/локальный инструмент)
+                # — пропускаем (сервер и так слушает только 127.0.0.1).
+                origin = self._req_origin().lower()
+                if not origin:
+                    return True
+                return any(origin.startswith(s) for s in self._ALLOWED_ORIGIN_SCHEMES)
+
             def _send_cors(self):
-                self.send_header("Access-Control-Allow-Origin", "*")
+                origin = self._req_origin()
+                # ACAO отдаём только разрешённому Origin (а не "*"), иначе браузер
+                # чужого сайта не сможет прочитать ответ.
+                if origin and self._origin_allowed():
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                    self.send_header("Vary", "Origin")
                 self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Filename")
+
+            def _reject_foreign_origin(self) -> bool:
+                """Если Origin чужой (обычный сайт) — отвечает 403 и возвращает
+                True. Вызывать до любого действия с побочными эффектами."""
+                if self._origin_allowed():
+                    return False
+                self.send_response(403)
+                self._send_cors()
+                self.end_headers()
+                try:
+                    self.wfile.write(b'{"ok":false,"error":"forbidden origin"}')
+                except Exception:
+                    pass
+                return True
 
             def do_OPTIONS(self):
                 self.send_response(200)
@@ -324,12 +364,15 @@ class UnifiedWindow(QMainWindow):
                 _safe_name, но явная проверка не зависит от его реализации."""
                 base = os.path.realpath(out_dir)
                 full = os.path.realpath(os.path.join(base, os.path.basename(filename)))
-                if full != base and not full.startswith(base + os.sep):
+                if not full.startswith(base + os.sep):
                     raise ValueError("path traversal blocked")
                 return full
 
             def do_POST(self):
                 try:
+                    # Отсекаем запросы со сторонних сайтов до любых действий.
+                    if self._reject_foreign_origin():
+                        return
                     try:
                         length = int(self.headers.get("Content-Length", 0))
                     except (TypeError, ValueError):
@@ -535,13 +578,14 @@ class UnifiedWindow(QMainWindow):
                         best_ver, best_tag, best_rel = ver, tag, rel
 
                 if best_rel is not None and best_ver > parse_version(APP_VERSION):
-                    # Выбираем ассет умно: только код (app.zip), если bin не менялся,
-                    # иначе полный zip (см. _pick_update_asset).
-                    best_url, best_size = self._pick_update_asset(best_rel)
+                    # Выбираем ассет умно: только код (update-архив), если bin не
+                    # менялся, иначе полный zip (см. _pick_update_asset). Третьим
+                    # элементом — ожидаемый sha256 для проверки после загрузки.
+                    best_url, best_size, best_sha = self._pick_update_asset(best_rel)
                     if best_url:
                         # запоминаем, тихая ли это проверка — слот решает, уважать ли «пропуск»
                         self._check_was_silent = silent
-                        self.update_available_sig.emit(best_tag, best_url, best_size)
+                        self.update_available_sig.emit(best_tag, best_url, best_size, best_sha)
                     elif not silent:
                         self.log_signal.emit("Обновление найдено, но подходящий ассет не найден.")
                 elif not silent:
@@ -571,45 +615,51 @@ class UnifiedWindow(QMainWindow):
 
     def _pick_update_asset(self, rel):
         """Решает, что качать из релиза, экономя трафик:
-        • app.zip (только код, ~десятки МБ) — если bin не изменился
+        • update-архив (только код, ~десятки МБ) — если bin не изменился
           (manifest.bin_sha == локальный bin/.binver);
-        • полный zip (код + bin, ~сотни МБ) — если bin изменился, либо релиз
-          старого формата (нет manifest.json / app.zip).
-        Возвращает (url, size_bytes)."""
+        • full-архив (код + bin, ~сотни МБ) — если bin изменился, либо релиз
+          старого формата (нет manifest.json / update-архива).
+        Возвращает (url, size_bytes, sha256). sha256 — ожидаемый хеш выбранного
+        архива из manifest (для проверки после загрузки); "" если проверить
+        нечем (старый формат / нет хеша в manifest)."""
         assets = rel.get("assets", [])
 
         def by(pred):
             return next((a for a in assets if pred(str(a.get("name", "")).lower())), None)
 
-        def is_app(n):  return n.endswith("-app.zip") or n == "app.zip"
-        app_asset  = by(is_app)
-        full_asset = by(lambda n: n.endswith(".zip") and not is_app(n))
-        manifest   = by(lambda n: n == "manifest.json")
+        # update-архив: новый суффикс "-update.zip" + легаси "-app.zip"/"app.zip".
+        def is_update(n):
+            return n.endswith("-update.zip") or n.endswith("-app.zip") or n == "app.zip"
+        update_asset = by(is_update)
+        full_asset   = by(lambda n: n.endswith(".zip") and not is_update(n))
+        manifest     = by(lambda n: n == "manifest.json")
 
-        # Старый формат релиза (нет app.zip/manifest) → поведение как раньше:
-        # берём полный (первый не-app) zip, а если такого нет — любой .zip.
-        if not app_asset or not manifest:
+        # Старый формат релиза (нет update-архива/manifest) → поведение как раньше:
+        # берём полный (первый не-update) zip, а если такого нет — любой .zip.
+        # Проверить целостность нечем → sha = "".
+        if not update_asset or not manifest:
             z = full_asset or by(lambda n: n.endswith(".zip"))
-            return (z.get("browser_download_url", ""), int(z.get("size", 0) or 0)) if z else ("", 0)
+            return (z.get("browser_download_url", ""), int(z.get("size", 0) or 0), "") if z else ("", 0, "")
 
-        # Сверяем bin: качаем app-часть, только если хеши совпали.
-        remote_bin_sha = ""
+        # Читаем manifest: bin_sha (что качать) + update_sha/full_sha (что проверять).
+        man = {}
         try:
             with http_get(manifest.get("browser_download_url", ""),
                           headers={"User-Agent": APP_NAME}, timeout=15,
                           allow_insecure=False) as r:
-                remote_bin_sha = (json.loads(r.read().decode("utf-8", "replace"))
-                                  .get("bin_sha", "") or "")
+                man = json.loads(r.read().decode("utf-8", "replace")) or {}
         except Exception:
-            remote_bin_sha = ""
+            man = {}
+        remote_bin_sha = man.get("bin_sha", "") or ""
 
         bin_unchanged = bool(remote_bin_sha) and remote_bin_sha == self._local_bin_sha()
-        if bin_unchanged and app_asset:
-            self.log_signal.emit("Обновление: bin не изменился — качаем только app-часть (меньше трафика).")
-            chosen = app_asset
+        if bin_unchanged and update_asset:
+            self.log_signal.emit("Обновление: bin не изменился — качаем только update-часть (меньше трафика).")
+            chosen, sha = update_asset, (man.get("update_sha", "") or "")
         else:
-            chosen = full_asset or app_asset
-        return (chosen.get("browser_download_url", ""), int(chosen.get("size", 0) or 0)) if chosen else ("", 0)
+            chosen = full_asset or update_asset
+            sha = (man.get("full_sha", "") or "") if chosen is full_asset else (man.get("update_sha", "") or "")
+        return (chosen.get("browser_download_url", ""), int(chosen.get("size", 0) or 0), sha) if chosen else ("", 0, "")
 
     def _skip_file(self):
         return os.path.join(CONFIG_DIR, "skipped_update.txt")
@@ -640,7 +690,7 @@ class UnifiedWindow(QMainWindow):
             self.log(f"Версия {ver} пропущена. Предложу обновиться при следующем релизе "
                      f"(или нажмите «Проверить обновления» вручную).")
 
-    def _on_update_available(self, version: str, url: str, size: int):
+    def _on_update_available(self, version: str, url: str, size: int, sha: str = ""):
         if getattr(self, "_updating", False):
             return
         # Пропущенную версию не показываем при ТИХОЙ (авто) проверке; ручная
@@ -655,6 +705,7 @@ class UnifiedWindow(QMainWindow):
         sz = f"~{size/1024/1024:.0f} МБ" if size else "размер неизвестен"
         self._pending_update_url = url
         self._pending_update_version = version
+        self._pending_update_sha = sha or ""
         self.update_banner_lbl.setText(
             f"Доступна новая версия {version} ({sz}). "
             f"Программа обновится и перезапустится.")
@@ -695,6 +746,23 @@ class UnifiedWindow(QMainWindow):
                                 if pct != last_pct and pct % 5 == 0:
                                     last_pct = pct
                                     self.log_signal.emit(f"Загрузка обновления: {pct}%")
+
+                # Проверка целостности: сверяем sha256 загруженного архива с
+                # ожидаемым из manifest. Битый/подменённый zip не распаковываем.
+                expected_sha = (getattr(self, "_pending_update_sha", "") or "").lower()
+                if expected_sha:
+                    h = hashlib.sha256()
+                    with open(zip_path, "rb") as f:
+                        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                            h.update(chunk)
+                    actual_sha = h.hexdigest()
+                    if actual_sha != expected_sha:
+                        self.log_signal.emit(
+                            "Ошибка обновления: контрольная сумма архива не совпала "
+                            "(файл повреждён или подменён). Установка отменена.")
+                        self._updating = False
+                        return
+                    self.log_signal.emit("Контрольная сумма архива подтверждена.")
 
                 self.log_signal.emit("Распаковка обновления…")
                 extract_dir = os.path.join(tmp, "extracted")

@@ -13,7 +13,8 @@ if not defined APP_VERSION (
     exit /b 1
 )
 set "RELEASE_NAME=SI-HYX v%APP_VERSION%"
-set "APP_ZIP=SI-HYX-v%APP_VERSION%-app.zip"
+set "UPDATE_ZIP=SI-HYX-v%APP_VERSION%-update.zip"
+set "FULL_ZIP=SI-HYX-v%APP_VERSION%-full.zip"
 echo Version: %APP_VERSION%   ->   "%RELEASE_NAME%"
 
 REM 1) Install / upgrade PyInstaller
@@ -38,12 +39,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM 4) app.zip — ТОЛЬКО код + _internal (без bin). Качается при обновлении,
+REM 4) update-архив — ТОЛЬКО код + _internal (без bin). Качается при обновлении,
 REM    если bin не менялся. Делаем ДО копирования bin.
-if exist "dist\%APP_ZIP%" del /Q "dist\%APP_ZIP%"
-powershell -NoProfile -Command "Compress-Archive -Path 'dist\%RELEASE_NAME%' -DestinationPath 'dist\%APP_ZIP%' -Force"
+if exist "dist\%UPDATE_ZIP%" del /Q "dist\%UPDATE_ZIP%"
+powershell -NoProfile -Command "Compress-Archive -Path 'dist\%RELEASE_NAME%' -DestinationPath 'dist\%UPDATE_ZIP%' -Force"
 if errorlevel 1 (
-    echo [ERROR] Could not create app.zip archive.
+    echo [ERROR] Could not create update archive.
     pause
     exit /b 1
 )
@@ -51,20 +52,29 @@ if errorlevel 1 (
 REM 5) Copy external binaries next to the exe (icon is already inside _internal)
 xcopy /E /I /Y bin "dist\%RELEASE_NAME%\bin" >nul
 
-REM 6) Генерируем bin\.binver (хеш bin) и dist\manifest.json {version, bin_sha}
-python make_manifest.py "dist\%RELEASE_NAME%" "dist"
+REM 6) Пишем bin\.binver (хеш bin) — ДО упаковки full, чтобы он попал внутрь.
+python make_manifest.py binver "dist\%RELEASE_NAME%"
 if errorlevel 1 (
-    echo [ERROR] make_manifest.py failed.
+    echo [ERROR] make_manifest.py binver failed.
     pause
     exit /b 1
 )
 
-REM 7) Полный zip (код + bin). Для новых клиентов при изменённом bin и для
-REM    старых клиентов (легаси-апдейтер). Содержит bin\.binver.
-if exist "dist\%RELEASE_NAME%.zip" del /Q "dist\%RELEASE_NAME%.zip"
-powershell -NoProfile -Command "Compress-Archive -Path 'dist\%RELEASE_NAME%' -DestinationPath 'dist\%RELEASE_NAME%.zip' -Force"
+REM 7) full-архив (код + bin + .binver). Для новых клиентов при изменённом bin
+REM    и для старых клиентов (легаси-апдейтер).
+if exist "dist\%FULL_ZIP%" del /Q "dist\%FULL_ZIP%"
+powershell -NoProfile -Command "Compress-Archive -Path 'dist\%RELEASE_NAME%' -DestinationPath 'dist\%FULL_ZIP%' -Force"
 if errorlevel 1 (
-    echo [ERROR] Could not create full zip archive.
+    echo [ERROR] Could not create full archive.
+    pause
+    exit /b 1
+)
+
+REM 8) manifest.json {version, bin_sha, update_sha, full_sha} — ПОСЛЕ обоих
+REM    архивов, чтобы записать их SHA256 для проверки целостности при загрузке.
+python make_manifest.py manifest "dist\%RELEASE_NAME%" "dist" "dist\%UPDATE_ZIP%" "dist\%FULL_ZIP%"
+if errorlevel 1 (
+    echo [ERROR] make_manifest.py manifest failed.
     pause
     exit /b 1
 )
@@ -74,8 +84,8 @@ echo DONE. Program is here:  dist\%RELEASE_NAME%\
 echo Run: dist\%RELEASE_NAME%\SI-HYX.exe
 echo.
 echo Upload these 3 assets to the GitHub Release:
-echo   1) dist\%RELEASE_NAME%.zip      ^(full: code + bin^)
-echo   2) dist\%APP_ZIP%   ^(app only: code, no bin^)
-echo   3) dist\manifest.json           ^(version + bin_sha^)
+echo   1) dist\%FULL_ZIP%     ^(full: code + bin^)
+echo   2) dist\%UPDATE_ZIP%   ^(update only: code, no bin^)
+echo   3) dist\manifest.json             ^(version + bin/update/full SHA^)
 echo.
 pause
