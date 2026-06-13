@@ -596,6 +596,10 @@ class MediaTab(QWidget):
 
         self.tree = DraggableTreeWidget()
         self.tree.setAcceptDrops(True)
+        self.tree.setPlaceholderText(
+            "Добавляйте файлы сюда\n\n"
+            "Перетащите видео, аудио или изображения в это окно\n"
+            "или нажмите «Добавить файлы»")
         self.tree.setHeaderLabels(["Превью", "", "Размер", "Битрейт", "LUFS", "Статус"])
         self.tree.setRootIsDecorated(False)
         self.tree.setItemDelegate(StatusColorDelegate(self.tree))  # цветовая подсветка строк
@@ -1423,15 +1427,12 @@ class Base64Tab(QWidget):
 
         # ── Маскировка HTML под VK (скрытие JS) ─────────────────────────────
         mask_row = QHBoxLayout()
-        self.btn_mask_file = QPushButton("🎭  Замаскировать HTML (VK)")
+        self.btn_mask_file = QPushButton("🎭  Замаскировать HTML (JavaScript) для VK")
         self.btn_mask_file.setFixedHeight(32)
-        self.btn_mask_file.setToolTip(
-            "Прячет JavaScript из выбранного HTML под VK: убирает теги <script>,\n"
-            "тело кодирует в base64, запуск вешает на onload скрытой картинки.\n"
-            "Игра работает, VK принимает .siq. Результат рядом: <имя>_vk.html")
+        self.btn_mask_file.setToolTip("Прячет JavaScript, чтобы обойти запрет VK")
         self.btn_mask_file.clicked.connect(self._mask_current_html)
 
-        self.btn_mask_folder = QPushButton("📁  Папка с HTML → VK")
+        self.btn_mask_folder = QPushButton("📁  Замаскировать все HTML (JavaScript) в папке для VK")
         self.btn_mask_folder.setFixedHeight(32)
         self.btn_mask_folder.setToolTip(
             "Пакетно обрабатывает все .html в выбранной папке.\n"
@@ -1534,9 +1535,9 @@ class Base64Tab(QWidget):
         self._load_thumb(path)
         # HTML-файлы предназначены для маскировки под VK, а не для обычного
         # base64: НЕ запускаем авто-кодирование (никаких .txt и дампа base64 в
-        # GUI) — пользователь жмёт «🎭 Замаскировать HTML (VK)».
+        # GUI) — пользователь жмёт «🎭 Замаскировать HTML (JavaScript) для VK».
         if os.path.splitext(path)[1].lower() in (".html", ".htm"):
-            self.lbl_size.setText("HTML готов — нажмите «🎭 Замаскировать HTML (VK)»")
+            self.lbl_size.setText("HTML готов — нажмите «🎭 Замаскировать HTML (JavaScript) для VK»")
         else:
             # Для прочих файлов — авто-кодирование сразу после выбора
             QTimer.singleShot(80, self._start_encode)
@@ -1828,7 +1829,7 @@ class PhotoMergerTab(QWidget):
 
         # ── Status bar ─────────────────────────────────────
         top = QHBoxLayout()
-        self.lbl_status = QLabel("Перетащите фотографии или нажмите «Добавить»")
+        self.lbl_status = QLabel("")
         self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 13px;")
         # Подсказка уступает место кнопкам (иначе её длинный текст распирает ряд
         # и подписи кнопок обрезаются).
@@ -2044,12 +2045,17 @@ class PhotoMergerTab(QWidget):
 
 
 class PromptTab(QWidget):
-    """Вкладка с промптами из Промпт.txt, лежащего рядом со скриптом."""
+    """Вкладка с промптами из произвольного .txt файла, выбранного пользователем.
+    Последний выбранный файл запоминается в настройках и подгружается при старте."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Промпт.txt")
         self._checkboxes = []  # list of QCheckBox, each has ._full_text attribute
+        # Последний выбранный файл (любой .txt) — из настроек; по умолчанию пусто.
+        try:
+            self._prompt_path = load_settings().get("prompt_file", "") or ""
+        except Exception:
+            self._prompt_path = ""
         self._build_ui()
         self._load_prompts()
 
@@ -2073,7 +2079,7 @@ class PromptTab(QWidget):
         self.btn_copy_sel = QPushButton("📋  Копировать выбранные")
         self.btn_copy_sel.clicked.connect(self._copy_selected)
         btn_pick = QPushButton("📂  Выбрать файл")
-        btn_pick.setToolTip("Загрузить промпты из другого .txt файла")
+        btn_pick.setToolTip("Загрузить промпты из любого .txt файла")
         btn_pick.clicked.connect(self._choose_prompt_file)
         btn_reload = QPushButton("↺  Обновить")
         btn_reload.clicked.connect(self._load_prompts)
@@ -2092,6 +2098,23 @@ class PromptTab(QWidget):
         self._cb_layout = QVBoxLayout(self._cb_widget)
         self._cb_layout.setContentsMargins(4, 4, 4, 4)
         self._cb_layout.setSpacing(2)
+
+        # Подсказка на пустом поле — как пользоваться вкладкой.
+        self._empty_hint = QLabel(
+            "Как это работает\n\n"
+            "• Нажмите «📂 Выбрать файл» и укажите любой .txt с промптами.\n"
+            "   Выбранный файл запоминается и подгружается при следующем запуске.\n"
+            "• Каждый пункт, начинающийся с «1)», «2)», «3)» … — отдельный промпт.\n"
+            "   Файл без такой нумерации показывается одним цельным промптом.\n"
+            "• Отметьте нужные галочками и нажмите «📋 Копировать выбранные» —\n"
+            "   они скопируются в буфер обмена (через пустую строку между собой).\n"
+            "• «↺ Обновить» — перечитать файл, если вы его изменили.\n\n"
+            "Сейчас файл не выбран — нажмите «📂 Выбрать файл».")
+        self._empty_hint.setWordWrap(True)
+        self._empty_hint.setStyleSheet("color:#9399b2; font-size:12px; padding:8px 4px;")
+        self._empty_hint.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._cb_layout.addWidget(self._empty_hint)
+
         self._cb_layout.addStretch()
         scroll.setWidget(self._cb_widget)
         root.addWidget(scroll)
@@ -2101,20 +2124,26 @@ class PromptTab(QWidget):
         root.addWidget(self._status)
 
     def _load_prompts(self):
-        while self._cb_layout.count() > 1:
-            item = self._cb_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        # Удаляем только сами чекбоксы — подсказка _empty_hint и stretch остаются.
+        for cb in self._checkboxes:
+            self._cb_layout.removeWidget(cb)
+            cb.deleteLater()
         self._checkboxes.clear()
 
+        if not self._prompt_path:
+            self._status.setText("Файл не выбран — нажмите «📂 Выбрать файл»")
+            self._empty_hint.setVisible(True)
+            return
         if not os.path.exists(self._prompt_path):
             self._status.setText(f"Файл не найден: {self._prompt_path}")
+            self._empty_hint.setVisible(True)
             return
         try:
             with open(self._prompt_path, "r", encoding="utf-8") as f:
                 content = f.read()
         except Exception as e:
             self._status.setText(f"Ошибка чтения: {e}")
+            self._empty_hint.setVisible(True)
             return
 
         sections = self._parse_sections(content)
@@ -2122,6 +2151,7 @@ class PromptTab(QWidget):
         if not sections and content.strip():
             sections = [(os.path.basename(self._prompt_path), content.strip())]
 
+        # Чекбоксы вставляем перед stretch (последний элемент), но после подсказки.
         for title, body in sections:
             cb = QCheckBox(title)
             cb.setStyleSheet("font-size:13px; padding:5px 2px;")
@@ -2129,6 +2159,8 @@ class PromptTab(QWidget):
             self._checkboxes.append(cb)
             self._cb_layout.insertWidget(self._cb_layout.count() - 1, cb)
 
+        # Подсказку показываем, только когда промптов нет.
+        self._empty_hint.setVisible(not self._checkboxes)
         self._status.setText(f"{len(self._checkboxes)} промптов  ·  {os.path.basename(self._prompt_path)}")
 
     def _choose_prompt_file(self):
@@ -2138,6 +2170,11 @@ class PromptTab(QWidget):
             "Текстовые файлы (*.txt);;Все файлы (*.*)")
         if path:
             self._prompt_path = path
+            # Запоминаем выбор в общих настройках (merge, чтобы не затереть прочее).
+            try:
+                s = load_settings(); s["prompt_file"] = path; save_settings(s)
+            except Exception:
+                pass
             self._load_prompts()
 
     def _parse_sections(self, text):

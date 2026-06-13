@@ -766,7 +766,25 @@ class RecentFilesStrip(QWidget):
 
 
 class DraggableTreeWidget(QTreeWidget):
-    """QTreeWidget с поддержкой drag-and-drop файлов наружу (по tooltip = полный путь)."""
+    """QTreeWidget с поддержкой drag-and-drop файлов наружу (по tooltip = полный
+    путь) и текстом-подсказкой по центру, когда список пуст."""
+
+    def setPlaceholderText(self, text: str):
+        self._placeholder = text or ""
+        self.viewport().update()
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        text = getattr(self, "_placeholder", "")
+        if text and self.topLevelItemCount() == 0:
+            painter = QPainter(self.viewport())
+            painter.setPen(QColor(150, 150, 150))
+            rect = self.viewport().rect().adjusted(24, 24, -24, -24)
+            painter.drawText(
+                rect,
+                int(Qt.AlignmentFlag.AlignCenter) | int(Qt.TextFlag.TextWordWrap),
+                text)
+            painter.end()
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:

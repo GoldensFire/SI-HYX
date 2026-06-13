@@ -1475,7 +1475,7 @@ class ProcessWorker(QThread):
                     self.log.emit(f"Удалён повреждённый AVIF: {out}")
                 except Exception: pass
             raise Exception(f"AVIF conversion failed: {stderr_tail[:4000]}")
-        except Exception as e:
+        except Exception:
             _cleanup(tried_tmp_files)
             if os.path.exists(out):
                 try:

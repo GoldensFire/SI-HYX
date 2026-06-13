@@ -614,7 +614,6 @@ def kodik_get_info(page_url: str, proxy: str = "") -> dict:
             return info
         # AJAX-плеер не отдал данные (другой клон, напр. DLE-сайт animego.online)
         # — проваливаемся в общий Kodik-путь ниже (_find_kodik_iframe видит DLE).
-    from urllib.parse import urlparse
     s = requests.Session()
     s.headers.update({"User-Agent": USER_AGENT})
     if proxy:

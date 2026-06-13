@@ -299,27 +299,36 @@ class UnifiedWindow(QMainWindow):
             # проставляет сам — со страницы его из JS не подделать, поэтому это
             # надёжно отсекает «любой сайт дёргает наши эндпоинты», не требуя
             # изменений в расширении (оно шлёт chrome-extension://… Origin).
-            _ALLOWED_ORIGIN_SCHEMES = (
-                "chrome-extension://", "moz-extension://", "safari-web-extension://",
-            )
+            # fullmatch + строгий набор символов (без CR/LF и прочих управляющих)
+            # — Origin отражается в заголовок ответа, поэтому он обязан быть без
+            # переводов строки (защита от HTTP response splitting).
+            _EXT_ORIGIN_RX = re.compile(
+                r"(?:chrome-extension|moz-extension|safari-web-extension)://[A-Za-z0-9._-]+")
 
             def _req_origin(self) -> str:
                 return self.headers.get("Origin", "") or ""
 
+            def _safe_ext_origin(self) -> str:
+                """Возвращает Origin, ТОЛЬКО если это origin расширения строгого
+                формата (без управляющих символов). Иначе — пустую строку. Именно
+                это значение можно безопасно отражать в заголовок."""
+                origin = self._req_origin()
+                if not origin or "\r" in origin or "\n" in origin:
+                    return ""
+                return origin if self._EXT_ORIGIN_RX.fullmatch(origin) else ""
+
             def _origin_allowed(self) -> bool:
                 # Нет Origin → не веб-страница (нативный клиент/локальный инструмент)
-                # — пропускаем (сервер и так слушает только 127.0.0.1).
-                origin = self._req_origin().lower()
-                if not origin:
-                    return True
-                return any(origin.startswith(s) for s in self._ALLOWED_ORIGIN_SCHEMES)
+                # — пропускаем (сервер и так слушает только 127.0.0.1). Иначе —
+                # только строгий origin расширения.
+                return not self._req_origin() or bool(self._safe_ext_origin())
 
             def _send_cors(self):
-                origin = self._req_origin()
-                # ACAO отдаём только разрешённому Origin (а не "*"), иначе браузер
-                # чужого сайта не сможет прочитать ответ.
-                if origin and self._origin_allowed():
-                    self.send_header("Access-Control-Allow-Origin", origin)
+                # ACAO отдаём только проверенному origin расширения (а не "*" и не
+                # сырому заголовку), иначе браузер чужого сайта не прочитает ответ.
+                safe_origin = self._safe_ext_origin()
+                if safe_origin:
+                    self.send_header("Access-Control-Allow-Origin", safe_origin)
                     self.send_header("Vary", "Origin")
                 self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Filename")
@@ -1063,6 +1072,7 @@ class UnifiedWindow(QMainWindow):
                 'server_enabled': bool(getattr(self, '_server_enabled', False)),
                 'wheel_changes_values': bool(getattr(self, '_wheel_changes_values', False)),
                 'priority': tm.c_priority.currentText() if hasattr(tm, 'c_priority') else 'Обычный',
+                'prompt_file': getattr(getattr(self, 'tab_prompt', None), '_prompt_path', '') or '',
             }
             return s
         except Exception: return {}
