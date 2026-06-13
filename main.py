@@ -232,7 +232,8 @@ class UnifiedWindow(QMainWindow):
             tm.s_passes.setValue(av.get("fit_passes", 4))
             try: tm.c_priority.setCurrentText(s.get("priority", "Обычный"))
             except Exception: pass
-            tm.ck_arec.setChecked(av.get("arec", tm.ck_arec.isChecked()))
+            if hasattr(tm, "ck_overwrite_src"):
+                tm.ck_overwrite_src.setChecked(av.get("overwrite_src", False))
             combo_set_value(tm.c_img_fmt, av.get("img_fmt", "avif"))
 
             # Обновляем стрип последних файлов по восстановленной папке
@@ -315,6 +316,18 @@ class UnifiedWindow(QMainWindow):
                 name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
                 return name or fallback
 
+            @staticmethod
+            def _safe_out_path(out_dir: str, filename: str) -> str:
+                """Строит путь записи внутри out_dir и нормализацией+проверкой
+                префикса гарантирует, что результат не выходит за пределы out_dir
+                (защита от path traversal, CWE-22). filename уже очищен
+                _safe_name, но явная проверка не зависит от его реализации."""
+                base = os.path.realpath(out_dir)
+                full = os.path.realpath(os.path.join(base, os.path.basename(filename)))
+                if full != base and not full.startswith(base + os.sep):
+                    raise ValueError("path traversal blocked")
+                return full
+
             def do_POST(self):
                 try:
                     try:
@@ -340,10 +353,10 @@ class UnifiedWindow(QMainWindow):
                             out_dir = ""
                         if not out_dir or not os.path.isdir(out_dir):
                             out_dir = str(Path.home())
-                        out_path = os.path.join(out_dir, filename)
+                        out_path = self._safe_out_path(out_dir, filename)
                         if os.path.exists(out_path):
                             base_n, ext_n = os.path.splitext(filename)
-                            out_path = os.path.join(out_dir, f"{base_n}_{int(time.time())}{ext_n}")
+                            out_path = self._safe_out_path(out_dir, f"{base_n}_{int(time.time())}{ext_n}")
                         with open(out_path, "wb") as fout:
                             fout.write(img_bytes)
                         win.url_from_browser.emit(f"__screenshot_saved__{out_path}", False)
@@ -375,10 +388,10 @@ class UnifiedWindow(QMainWindow):
                             out_dir = ""
                         if not out_dir or not os.path.isdir(out_dir):
                             out_dir = str(Path.home())
-                        out_path = os.path.join(out_dir, filename)
+                        out_path = self._safe_out_path(out_dir, filename)
                         if os.path.exists(out_path):
                             base_n, ext_n = os.path.splitext(filename)
-                            out_path = os.path.join(out_dir, f"{base_n}_{int(time.time())}{ext_n}")
+                            out_path = self._safe_out_path(out_dir, f"{base_n}_{int(time.time())}{ext_n}")
                         with http_get(img_url, headers={"User-Agent": USER_AGENT, "Referer": img_url}, timeout=30) as resp:
                             img_bytes = resp.read(200 * 1024 * 1024)  # лимит 200 МБ
                         with open(out_path, "wb") as fout:
@@ -509,26 +522,28 @@ class UnifiedWindow(QMainWindow):
                 if not isinstance(releases, list):
                     releases = []
 
-                # Выбираем самый свежий не-черновик с zip-ассетом и наибольшей версией
-                best_tag, best_url, best_size, best_ver = "", "", 0, (0,)
+                # Находим самый свежий не-черновик с zip-ассетом и наибольшей версией
+                best_tag, best_ver, best_rel = "", (0,), None
                 for rel in releases:
                     if rel.get("draft"):
                         continue
                     tag = rel.get("tag_name") or rel.get("name") or ""
                     ver = parse_version(tag)
-                    zip_asset = next(
-                        (a for a in rel.get("assets", [])
-                         if str(a.get("name", "")).lower().endswith(".zip")), None)
-                    if zip_asset and ver > best_ver:
-                        best_ver = ver
-                        best_tag = tag
-                        best_url = zip_asset.get("browser_download_url", "")
-                        best_size = int(zip_asset.get("size", 0) or 0)
+                    has_zip = any(str(a.get("name", "")).lower().endswith(".zip")
+                                  for a in rel.get("assets", []))
+                    if has_zip and ver > best_ver:
+                        best_ver, best_tag, best_rel = ver, tag, rel
 
-                if best_url and best_ver > parse_version(APP_VERSION):
-                    # запоминаем, тихая ли это проверка — слот решает, уважать ли «пропуск»
-                    self._check_was_silent = silent
-                    self.update_available_sig.emit(best_tag, best_url, best_size)
+                if best_rel is not None and best_ver > parse_version(APP_VERSION):
+                    # Выбираем ассет умно: только код (app.zip), если bin не менялся,
+                    # иначе полный zip (см. _pick_update_asset).
+                    best_url, best_size = self._pick_update_asset(best_rel)
+                    if best_url:
+                        # запоминаем, тихая ли это проверка — слот решает, уважать ли «пропуск»
+                        self._check_was_silent = silent
+                        self.update_available_sig.emit(best_tag, best_url, best_size)
+                    elif not silent:
+                        self.log_signal.emit("Обновление найдено, но подходящий ассет не найден.")
                 elif not silent:
                     self.log_signal.emit(
                         f"Обновлений нет. Текущая версия: {APP_VERSION}"
@@ -538,6 +553,63 @@ class UnifiedWindow(QMainWindow):
                     self.log_signal.emit(f"Не удалось проверить обновления: {e}")
 
         threading.Thread(target=_run, daemon=True).start()
+
+    @staticmethod
+    def _local_bin_sha() -> str:
+        """Хеш текущего набора bin — читаем из bin/.binver рядом с программой.
+        Пусто, если файла нет (старая установка без манифеста) → значит «bin
+        неизвестен», и обновление возьмёт полный zip."""
+        try:
+            if getattr(sys, "frozen", False):
+                app_dir = os.path.dirname(os.path.abspath(sys.executable))
+            else:
+                app_dir = os.path.dirname(os.path.abspath(__file__))
+            with open(os.path.join(app_dir, "bin", ".binver"), encoding="ascii") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
+
+    def _pick_update_asset(self, rel):
+        """Решает, что качать из релиза, экономя трафик:
+        • app.zip (только код, ~десятки МБ) — если bin не изменился
+          (manifest.bin_sha == локальный bin/.binver);
+        • полный zip (код + bin, ~сотни МБ) — если bin изменился, либо релиз
+          старого формата (нет manifest.json / app.zip).
+        Возвращает (url, size_bytes)."""
+        assets = rel.get("assets", [])
+
+        def by(pred):
+            return next((a for a in assets if pred(str(a.get("name", "")).lower())), None)
+
+        def is_app(n):  return n.endswith("-app.zip") or n == "app.zip"
+        app_asset  = by(is_app)
+        full_asset = by(lambda n: n.endswith(".zip") and not is_app(n))
+        manifest   = by(lambda n: n == "manifest.json")
+
+        # Старый формат релиза (нет app.zip/manifest) → поведение как раньше:
+        # берём полный (первый не-app) zip, а если такого нет — любой .zip.
+        if not app_asset or not manifest:
+            z = full_asset or by(lambda n: n.endswith(".zip"))
+            return (z.get("browser_download_url", ""), int(z.get("size", 0) or 0)) if z else ("", 0)
+
+        # Сверяем bin: качаем app-часть, только если хеши совпали.
+        remote_bin_sha = ""
+        try:
+            with http_get(manifest.get("browser_download_url", ""),
+                          headers={"User-Agent": APP_NAME}, timeout=15,
+                          allow_insecure=False) as r:
+                remote_bin_sha = (json.loads(r.read().decode("utf-8", "replace"))
+                                  .get("bin_sha", "") or "")
+        except Exception:
+            remote_bin_sha = ""
+
+        bin_unchanged = bool(remote_bin_sha) and remote_bin_sha == self._local_bin_sha()
+        if bin_unchanged and app_asset:
+            self.log_signal.emit("Обновление: bin не изменился — качаем только app-часть (меньше трафика).")
+            chosen = app_asset
+        else:
+            chosen = full_asset or app_asset
+        return (chosen.get("browser_download_url", ""), int(chosen.get("size", 0) or 0)) if chosen else ("", 0)
 
     def _skip_file(self):
         return os.path.join(CONFIG_DIR, "skipped_update.txt")
@@ -915,7 +987,8 @@ class UnifiedWindow(QMainWindow):
                 'avif': {
                     'limit': int(tm.s_lim.value()), 'limit_on': bool(tm.ck_lim.isChecked()),
                     'adim': int(tm.s_dim.value()), 'adim_on': bool(tm.ck_dim.isChecked()),
-                    'aspd': int(tm.sl_aspd.value()), 'arec': bool(tm.ck_arec.isChecked()),
+                    'aspd': int(tm.sl_aspd.value()),
+                    'overwrite_src': bool(tm.ck_overwrite_src.isChecked()) if hasattr(tm, 'ck_overwrite_src') else False,
                     'fit_passes': int(tm.s_passes.value()),
                     'img_fmt': strip_default_tag(tm.c_img_fmt.currentText())
                 },
@@ -937,7 +1010,8 @@ class UnifiedWindow(QMainWindow):
             # Виджеты с сигналом toggled (QCheckBox, QPushButton checkable)
             toggle_widgets = [
                 tm.ck_norm, tm.ck_fade, tm.ck_fade_in, tm.ck_deg, tm.ck_u8,
-                tm.chk_enable_video, tm.btn_mode_dark, tm.ck_arec,
+                tm.chk_enable_video, tm.btn_mode_dark,
+                tm.ck_overwrite_src,
                 tm.ck_lim, tm.ck_dim,
                 tm.ck_vfade_in, tm.ck_vfade_out,
                 ty.chk_k,

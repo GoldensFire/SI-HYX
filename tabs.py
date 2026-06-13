@@ -863,9 +863,13 @@ class MediaTab(QWidget):
         favi.addRow(hdim)
 
         self.sl_aspd = QSlider(Qt.Orientation.Horizontal); self.sl_aspd.setRange(0, 8); self.sl_aspd.setValue(0)
-        self.ck_arec = QCheckBox("Перезаписывать"); self.ck_arec.setChecked(True)
+        # Перезаписывать ИСХОДНИК: результат сохраняется под именем оригинала
+        # (без суффикса «_Сжатый»), а сам исходный файл удаляется. По умолчанию
+        # ВЫКЛ — операция необратима (оригинал не восстановить).
+        self.ck_overwrite_src = QCheckBox("Перезаписывать исходник")
+        self.ck_overwrite_src.setChecked(False)
         favi.addRow(label_with_info("Скорость:", "левее — медленнее и компактнее файл, правее — быстрее, но больше"), self.sl_aspd)
-        favi.addRow(row_with_info(self.ck_arec, "(Перекодируешь 2-ой раз одно и то же изображение? Включи эту опцию, чтобы перезаписать старый файл(не исходный) вместо создания ещё 1 копии)"))
+        favi.addRow(row_with_info(self.ck_overwrite_src, "ОПАСНО: удаляет исходное изображение и оставляет только сжатую версию (с именем оригинала, без «_Сжатый»). Оригинал не восстановить. По умолчанию выключено."))
         gavi.setLayout(favi); rv_inner.addWidget(gavi)
 
         rv_inner.addStretch(); w.setLayout(rv_inner); rw.setWidget(w); right_layout.addWidget(rw)
@@ -931,16 +935,23 @@ class MediaTab(QWidget):
         m.exec(self.url_edit.mapToGlobal(pos))
 
     def on_double_click(self, item, column):
-        """Двойной клик по обработанному файлу — открывает результат в плеере."""
+        """Двойной клик: по готовому файлу — открыть результат в плеере;
+        по ещё не обработанному (только добавленному) — запустить
+        перекодирование ТОЛЬКО этого файла."""
         try:
             iid = item.data(0, Qt.ItemDataRole.UserRole)
             entry = self._item_data_map.get(iid)
-            if entry and entry.get('is_done'):
+            if not entry:
+                return
+            if entry.get('is_done'):
                 out_path = entry.get('out_path')
                 if out_path and os.path.exists(out_path):
                     self.open_output_file(out_path)
                 else:
                     self.open_file_location(item)
+            else:
+                # Файл ещё в очереди — перекодируем только его
+                self._run_items([entry])
         except Exception: pass
 
     def open_output_file(self, path):
@@ -1183,7 +1194,18 @@ class MediaTab(QWidget):
         except Exception: pass
 
     def run(self):
-        if not self.items: return
+        """Кнопка «НАЧАТЬ» — обрабатывает всю очередь."""
+        self._run_items(self.items)
+
+    def _run_items(self, target):
+        if not target: return
+        # Не запускаем второй воркер поверх активного (двойной клик во время работы)
+        if getattr(self, 'worker', None) is not None:
+            try:
+                if self.worker.isRunning():
+                    self.main.log("Дождитесь завершения текущей обработки.")
+                    return
+            except Exception: pass
         try: ab = self.c_abitrate.currentText() or "128"
         except Exception: ab = "128"
         try: spd = self.s_spd.value()
@@ -1208,7 +1230,8 @@ class MediaTab(QWidget):
             'avif': {
                 'limit': int(self.s_lim.value()) if self.ck_lim.isChecked() else 0,
                 'adim': int(self.s_dim.value()) if self.ck_dim.isChecked() else 0,
-                'aspd': int(self.sl_aspd.value()), 'arec': bool(self.ck_arec.isChecked()),
+                'aspd': int(self.sl_aspd.value()),
+                'overwrite_src': bool(self.ck_overwrite_src.isChecked()) if hasattr(self, 'ck_overwrite_src') else False,
                 'fit_passes': int(self.s_passes.value()) if hasattr(self, 's_passes') else 4,
                 'img_fmt': strip_default_tag(self.c_img_fmt.currentText()) if hasattr(self, 'c_img_fmt') else 'avif'
             },
@@ -1216,7 +1239,7 @@ class MediaTab(QWidget):
             'priority': {'Низкий': 'low', 'Обычный': 'normal', 'Высокий': 'high'}.get(
                 self.c_priority.currentText(), 'normal') if hasattr(self, 'c_priority') else 'normal'
         }
-        self.worker = ProcessWorker(self.items, s)
+        self.worker = ProcessWorker(target, s)
         self.worker.status.connect(self.on_stat); self.worker.progress.connect(self.on_prog)
         self.worker.log.connect(self.main.log); self.worker.finished_all.connect(self.done)
         self.worker.global_progress.connect(self.main.update_global_progress)
@@ -1224,7 +1247,7 @@ class MediaTab(QWidget):
         self.worker.active_threads.connect(self._on_active_threads)
 
         try:
-            for itdata in self.items:
+            for itdata in target:
                 if itdata.get('is_done'): continue
                 iid = itdata.get('iid')
                 item = self._find_item(iid)
@@ -1387,17 +1410,14 @@ class Base64Tab(QWidget):
         btn_browse = QPushButton("📂  Выбрать файл")
         btn_browse.clicked.connect(self._browse)
 
-        self.btn_encode = QPushButton("⚙  Кодировать")
-        self.btn_encode.setFixedHeight(32)
-        self.btn_encode.clicked.connect(self._start_encode)
-
+        # Кнопка «Кодировать» убрана: файлы кодируются автоматически при
+        # добавлении (drag&drop / «Выбрать файл»).
         self.btn_stop = QPushButton("🗑  Очистить")
         self.btn_stop.setFixedHeight(32)
         self.btn_stop.setEnabled(True)
         self.btn_stop.clicked.connect(self._clear_result)
 
         btn_row.addWidget(btn_browse)
-        btn_row.addWidget(self.btn_encode)
         btn_row.addWidget(self.btn_stop)
         right.addLayout(btn_row)
 
@@ -1454,6 +1474,16 @@ class Base64Tab(QWidget):
         self.txt_out.setMinimumHeight(80)
         self.txt_out.setMaximumHeight(260)
         vl.addWidget(self.txt_out)
+
+        # Сохранять ли результат в <имя>_base64.txt рядом с файлом.
+        # По умолчанию ВЫКЛ — base64 копируется в буфер и показан в поле,
+        # лишний .txt на диск не пишется.
+        self.chk_make_txt = QCheckBox("Создавать .txt файл")
+        self.chk_make_txt.setChecked(False)
+        self.chk_make_txt.setToolTip(
+            "Включено: рядом с файлом сохраняется <имя>_base64.txt.\n"
+            "Выключено: результат только в этом поле и в буфере обмена.")
+        vl.addWidget(self.chk_make_txt)
 
         h_btns = QHBoxLayout()
         self.lbl_size = QLabel("")
@@ -1680,11 +1710,11 @@ class Base64Tab(QWidget):
             self.main.log("Base64: файл не выбран или не существует")
             return
         self._stop_flag.clear()
-        self.btn_encode.setEnabled(False)
         self.txt_out.clear()
         self.lbl_size.setText("Чтение файла…")
         self.progress.setValue(0)
         self.progress.show()
+        make_txt = self.chk_make_txt.isChecked()  # читаем до старта потока
 
         def _worker():
             try:
@@ -1711,10 +1741,12 @@ class Base64Tab(QWidget):
 
                 b64 = base64.b64encode(raw).decode("ascii")
 
-                base_name = os.path.splitext(os.path.basename(path))[0]
-                txt_path = os.path.join(os.path.dirname(path), base_name + "_base64.txt")
-                with open(txt_path, "w", encoding="ascii") as f:
-                    f.write(b64)
+                txt_path = ""
+                if make_txt:
+                    base_name = os.path.splitext(os.path.basename(path))[0]
+                    txt_path = os.path.join(os.path.dirname(path), base_name + "_base64.txt")
+                    with open(txt_path, "w", encoding="ascii") as f:
+                        f.write(b64)
 
                 size_kb = len(b64) / 1024
                 size_str = (f"{size_kb/1024:.2f} МБ" if size_kb >= 1024 else f"{size_kb:.1f} КБ")
@@ -1741,22 +1773,23 @@ class Base64Tab(QWidget):
         self.progress.hide()
         self.progress.setValue(0)
         self._current_path = ""
-        self.btn_encode.setEnabled(True)
 
     def _on_done(self, b64: str, size_str: str, txt_path: str):
         self.txt_out.setPlainText(b64)
         self.progress.setValue(100)
         self.progress.hide()
-        self.btn_encode.setEnabled(True)
         # Автокопирование в буфер обмена
         QApplication.clipboard().setText(b64)
-        self.lbl_size.setText(f"✅ Скопировано! Размер: {size_str}  •  {os.path.basename(txt_path)}")
-        self.main.log(f"Base64 готов ({size_str}), скопирован в буфер, сохранён: {txt_path}")
+        if txt_path:
+            self.lbl_size.setText(f"✅ Скопировано! Размер: {size_str}  •  {os.path.basename(txt_path)}")
+            self.main.log(f"Base64 готов ({size_str}), скопирован в буфер, сохранён: {txt_path}")
+        else:
+            self.lbl_size.setText(f"✅ Скопировано! Размер: {size_str}")
+            self.main.log(f"Base64 готов ({size_str}), скопирован в буфер")
 
     def _on_error(self, msg: str):
         self.lbl_size.setText(f"❌ {msg}")
         self.progress.hide()
-        self.btn_encode.setEnabled(True)
         self.main.log(f"Base64: {msg}")
 
 

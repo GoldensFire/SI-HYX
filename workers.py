@@ -39,9 +39,9 @@ class InfoWorker(QThread):
                 cmd += ["--cookies", c_path]
             if self.proxy:
                 cmd += ["--proxy", self.proxy]
-            if 'youtube.com' in self.url.lower() or 'youtu.be' in self.url.lower():
+            if host_matches(self.url, 'youtube.com', 'youtu.be'):
                 cmd += ["--extractor-args", "youtube:player_client=default,web_safari"]
-            if 'bilibili.com' in self.url.lower() or 'b23.tv' in self.url.lower():
+            if host_matches(self.url, 'bilibili.com', 'b23.tv'):
                 cmd += ["--referer", "https://www.bilibili.com/", "--user-agent", USER_AGENT]
             cmd += [self.url]
 
@@ -317,7 +317,7 @@ class YtdlpWorker(QThread):
 
             # Константы выбраны глобально в блоке, чтобы _strip_tiktok_headers
 # точно знал, что именно вырезать при fallback.
-            _is_tiktok = 'tiktok.com' in url.lower()
+            _is_tiktok = host_matches(url, 'tiktok.com')
             _TIKTOK_UA = (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -344,13 +344,13 @@ class YtdlpWorker(QThread):
                 # → "status code 0". yt-dlp без extractor-args использует веб-скрейпинг,
                 # которому подписи не нужны — достаточно cookies + браузерного UA.
 
-            if 'youtube.com' in url.lower() or 'youtu.be' in url.lower():
+            if host_matches(url, 'youtube.com', 'youtu.be'):
                 self.log_sig.emit("YouTube: клиенты default + web_safari (n-challenge через Deno)...")
                 if not deno_available():
                     self.log_sig.emit("ВНИМАНИЕ: Deno не найден — YouTube может отдать только 360p. Положите deno.exe в bin.")
                 cmd += ["--extractor-args", "youtube:player_client=default,web_safari"]
 
-            if 'bilibili.com' in url.lower() or 'b23.tv' in url.lower():
+            if host_matches(url, 'bilibili.com', 'b23.tv'):
                 self.log_sig.emit("BiliBili обнаружен: добавляю Referer + User-Agent (фикс HTTP 412 Precondition Failed).")
                 cmd += ["--referer", "https://www.bilibili.com/", "--user-agent", USER_AGENT]
 
@@ -545,16 +545,16 @@ class YtdlpWorker(QThread):
             )
 
         elif "Forbidden" in err_msg or "403" in err_msg:
-            u = self.c.get("url", "").lower()
-            if "tiktok.com" in u:
+            u = self.c.get("url", "")
+            if host_matches(u, "tiktok.com"):
                 self.log_sig.emit("СОВЕТ: 403 на TikTok. Удалите/переименуйте cookies_tiktok.txt.")
-            elif "fbcdn.net" in u or "instagram.com" in u:
+            elif host_matches(u, "fbcdn.net", "instagram.com", "cdninstagram.com"):
                 self.log_sig.emit("СОВЕТ: 403 на Instagram CDN. Ссылка устарела — откройте видео заново.")
             else:
                 self.log_sig.emit("СОВЕТ: 403 Forbidden. Возможно, нужны куки или ссылка устарела.")
         elif "412" in err_msg or "Precondition Failed" in err_msg:
-            u = self.c.get("url", "").lower()
-            if "bilibili.com" in u or "b23.tv" in u:
+            u = self.c.get("url", "")
+            if host_matches(u, "bilibili.com", "b23.tv"):
                 self.log_sig.emit("СОВЕТ: 412 на BiliBili — их анти-бот (риск-контроль) режет playurl для гостей.")
                 self.log_sig.emit("  Нужны cookies залогиненного аккаунта (SESSDATA). Войдите на bilibili.com в браузере, "
                                   "экспортируйте cookies.txt и укажите его в поле «Cookies» (или положите cookies_bilibili.txt в папку настроек).")
@@ -1092,7 +1092,8 @@ class ProcessWorker(QThread):
             raise Exception("Pillow (PIL) не установлен — конвертация в этот формат недоступна.")
         fmt = fmt.lower()
         ext = {'jpeg': 'jpg', 'jpg': 'jpg', 'png': 'png', 'ico': 'ico', 'webp': 'webp'}.get(fmt, fmt)
-        out_path = os.path.join(out_dir, f"{sanitized}_Сжатый.{ext}")
+        suffix = "" if av.get('overwrite_src') else "_Сжатый"
+        out_path = os.path.join(out_dir, f"{sanitized}{suffix}.{ext}")
         cb(10, ext.upper())
 
         with Image.open(src_path) as im:
@@ -1182,7 +1183,8 @@ class ProcessWorker(QThread):
         sanitized = self._sanitize_name(raw_name)
         if sanitized != raw_name:
             self.log.emit(f"Имя переименовано (AI-бренд): «{raw_name}» → «{sanitized}»")
-        out_name = sanitized + "_Сжатый.avif"
+        suffix = "" if av.get('overwrite_src') else "_Сжатый"
+        out_name = sanitized + suffix + ".avif"
         out = os.path.join(out_dir, out_name)
 
         # Выбранный пользователем формат: png/jpg/ico обрабатываем через Pillow
@@ -1515,6 +1517,24 @@ class ProcessWorker(QThread):
             if os.path.exists(guessed): item['out_path'] = guessed
         except Exception: pass
 
+    def _overwrite_source_if_needed(self, item, out_path):
+        """Если включено «Перезаписывать исходник» — удаляет оригинальный файл,
+        оставляя только сжатую версию. При совпадении путей (тот же формат)
+        файл уже перезаписан на месте — удалять нечего."""
+        av = self.settings.get('avif', {})
+        if not av.get('overwrite_src'):
+            return
+        src = item.get('path')
+        if not (out_path and src):
+            return
+        try:
+            if (os.path.exists(out_path) and os.path.exists(src)
+                    and os.path.abspath(out_path) != os.path.abspath(src)):
+                os.remove(src)
+                self.log.emit(f"Исходник удалён (перезапись): {os.path.basename(src)}")
+        except Exception as e:
+            self.log.emit(f"Не удалось удалить исходник: {e}")
+
     def _process_item(self, item, smooth, total, start, weight=1):
         """Обрабатывает один элемент очереди.
         smooth=True — глобальный прогресс плавно отражает прогресс файла
@@ -1557,12 +1577,17 @@ class ProcessWorker(QThread):
                 pass
 
         try:
+            out_path = None
             if item.get('type') == 'IMG':
-                self.process_avif(item, item_prog)
+                out_path = self.process_avif(item, item_prog)
+                self._overwrite_source_if_needed(item, out_path)
             else:
                 self.process_media(item, item_prog)
             item['is_done'] = True
-            self._guess_out_path(item, path)
+            if out_path:
+                item['out_path'] = out_path
+            else:
+                self._guess_out_path(item, path)
             self.status.emit(iid, "Готово", "done")
             self.progress.emit(iid, 100)
         except Exception as e:

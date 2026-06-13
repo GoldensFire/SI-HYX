@@ -28,7 +28,10 @@ from config import *
 # Пересозданные <script> исполняются в ГЛОБАЛЬНОЙ области, поэтому существующие
 # инлайн onclick=... работают. Внешние <script src> грузятся по цепочке (onload)
 # перед инлайн-кодом — порядок сохраняется.
-_B64_SCRIPT_RX = re.compile(r'(?is)<script\b([^>]*)>(.*?)</script>')
+# Закрывающий тег матчим как </script…> с любыми пробелами/мусором до '>'
+# (браузеры принимают </script >, </script foo="bar"> и т.п.) — иначе
+# часть скриптов осталась бы незакодированной (CodeQL py/bad-tag-filter).
+_B64_SCRIPT_RX = re.compile(r'(?is)<script\b([^>]*)>(.*?)</script\b[^>]*>')
 _B64_SRC_RX    = re.compile(r'(?i)src\s*=\s*[\'"]([^\'"]+)[\'"]')
 # 1×1 прозрачный gif — носитель onload-триггера
 _B64_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
@@ -239,13 +242,37 @@ def human_size(n):
     return f"{n * 1024:.1f}TB"  # fallback для экстремально больших значений
 
 
+def url_host(url: str) -> str:
+    """Возвращает hostname URL в нижнем регистре ('' если не распарсилось).
+    Если схема отсутствует — подставляем https://, чтобы netloc распознался."""
+    try:
+        from urllib.parse import urlparse
+        raw = url if '://' in url else 'https://' + url.lstrip('/')
+        return (urlparse(raw).hostname or '').lower()
+    except Exception:
+        return ''
+
+
+def host_matches(url: str, *domains: str) -> bool:
+    """True, если hostname URL равен одному из domains ИЛИ является его
+    поддоменом. Безопасная замена проверки `'domain' in url`, которую легко
+    обойти (evil.com/youtube.com, youtube.com.evil.com и т.п.) — CWE-20."""
+    host = url_host(url)
+    if not host:
+        return False
+    for d in domains:
+        d = d.lower().lstrip('.')
+        if host == d or host.endswith('.' + d):
+            return True
+    return False
+
+
 def get_cookies_path(url: str) -> str:
-    u = url.lower()
-    if 'tiktok.com' in u:   return COOKIE_PATHS['tiktok']
-    if 'instagram.com' in u or 'fbcdn.net' in u or 'cdninstagram.com' in u:
+    if host_matches(url, 'tiktok.com'):   return COOKIE_PATHS['tiktok']
+    if host_matches(url, 'instagram.com', 'fbcdn.net', 'cdninstagram.com'):
         return COOKIE_PATHS['instagram']
-    if 'youtube.com' in u or 'youtu.be' in u: return COOKIE_PATHS['youtube']
-    if 'bilibili.com' in u or 'b23.tv' in u: return COOKIE_PATHS['bilibili']
+    if host_matches(url, 'youtube.com', 'youtu.be'): return COOKIE_PATHS['youtube']
+    if host_matches(url, 'bilibili.com', 'b23.tv'): return COOKIE_PATHS['bilibili']
     return COOKIE_PATHS['default']
 
 
@@ -253,11 +280,13 @@ def _cookie_matches_domain(cookie_path: str, url: str) -> bool:
     """Проверяет, подходит ли файл куки к домену URL.
     Если имя файла содержит название другого сервиса — не подходит."""
     cp = os.path.basename(cookie_path).lower()
-    u  = url.lower()
+    is_ig = host_matches(url, 'instagram.com', 'fbcdn.net', 'cdninstagram.com')
+    is_tt = host_matches(url, 'tiktok.com')
+    is_yt = host_matches(url, 'youtube.com', 'youtu.be')
     # Instagram/fbcdn с YouTube-куками → не подходит
-    if ('instagram' in u or 'fbcdn.net' in u) and 'youtube' in cp: return False
-    if 'tiktok' in u and ('youtube' in cp or 'instagram' in cp): return False
-    if ('youtube' in u or 'youtu.be' in u) and 'instagram' in cp: return False
+    if is_ig and 'youtube' in cp: return False
+    if is_tt and ('youtube' in cp or 'instagram' in cp): return False
+    if is_yt and 'instagram' in cp: return False
     return True
 
 
@@ -270,8 +299,7 @@ def is_direct_cdn_video(url: str) -> bool:
         from urllib.parse import urlparse
         p = urlparse(url)
         path = p.path.lower()
-        cdn_hosts = ('fbcdn.net', 'cdninstagram.com', 'cdntiktok.com')
-        is_cdn_host = any(h in p.netloc.lower() for h in cdn_hosts)
+        is_cdn_host = host_matches(url, 'fbcdn.net', 'cdninstagram.com', 'cdntiktok.com')
         is_video_ext = path.endswith(('.mp4', '.webm', '.mov', '.m4v', '.ts'))
         return is_cdn_host and is_video_ext
     except Exception:
@@ -768,7 +796,7 @@ def default_download_dir() -> str:
 
 
 def clean_url(url: str) -> str:
-    if 'tiktok.com' in url and '?' in url:
+    if host_matches(url, 'tiktok.com') and '?' in url:
         return url.split('?')[0]
     # Прямые CDN-ссылки на видеофайлы (Instagram, Facebook и др.):
     # yt-dlp не может извлечь title/id из CDN URL → имя файла содержит
