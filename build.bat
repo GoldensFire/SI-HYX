@@ -22,7 +22,11 @@ python -m pip install --upgrade pyinstaller
 
 REM 2) Build (folder, not single file - fast startup + bin alongside)
 REM    icon.ico is bundled as data -> lands in dist\SI-HYX\_internal\ (found via _MEIPASS)
-pyinstaller --noconfirm --windowed --name SI-HYX --icon=icon.ico --add-data "icon.ico;." main.py
+REM    --collect-submodules siquester: вкладка SiQuester импортируется лениво
+REM    (внутри try/except), поэтому явно включаем весь пакет в сборку.
+REM    soundfile/numpy/lxml тоже импортируются лениво (волны/LUFS/разбор .siq) —
+REM    --collect-all soundfile тянет нативный libsndfile, остальное hidden-import.
+pyinstaller --noconfirm --windowed --name SI-HYX --icon=icon.ico --add-data "icon.ico;." --collect-submodules siquester --collect-all soundfile --collect-all qtawesome --hidden-import numpy --hidden-import lxml.etree main.py
 if errorlevel 1 (
     echo [ERROR] Build failed.
     pause

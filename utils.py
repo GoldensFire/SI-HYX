@@ -211,19 +211,40 @@ def clean_ansi(text: str) -> str:
 
 
 def load_settings() -> dict:
-    try:
-        if os.path.exists(SETTINGS_FILE):
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception:
-        pass
+    # Сначала основной файл, затем .bak (на случай, если основной оказался
+    # повреждён/обрезан — например, если процесс убили прямо во время записи).
+    for path in (SETTINGS_FILE, SETTINGS_FILE + ".bak"):
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            continue
     return {}
 
 
 def save_settings(settings: dict):
+    # Атомарная запись: пишем во временный файл (с fsync), сохраняем предыдущую
+    # версию в .bak и подменяем основной через os.replace. Иначе жёсткое
+    # завершение процесса (апдейтер делает os._exit) могло обрезать settings.json
+    # → при следующем запуске load_settings возвращал {} и ВСЕ настройки
+    # (включая папки) сбрасывались к значениям по умолчанию.
     try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        tmp = SETTINGS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(settings, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        try:
+            if os.path.exists(SETTINGS_FILE):
+                os.replace(SETTINGS_FILE, SETTINGS_FILE + ".bak")
+        except Exception:
+            pass
+        os.replace(tmp, SETTINGS_FILE)
     except Exception:
         pass
 

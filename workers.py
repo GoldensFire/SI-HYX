@@ -584,16 +584,15 @@ class _ImgRunnable(QRunnable):
     """Обёртка для параллельной обработки одного изображения в QThreadPool.
     Потоки QThreadPool — настоящие потоки Qt: эмит сигналов из них безопасен,
     а очистка корректна (в отличие от обычных threading.Thread)."""
-    def __init__(self, worker, item, total, start):
+    def __init__(self, worker, item, start):
         super().__init__()
         self.worker = worker
         self.item = item
-        self.total = total
         self.start = start
 
     def run(self):
         try:
-            self.worker._process_item(self.item, False, self.total, self.start)
+            self.worker._process_item(self.item, False, self.start)
         except Exception:
             pass
 
@@ -855,17 +854,32 @@ class ProcessWorker(QThread):
         try:
             current_input = path
             audio_codec = "libopus"  # opus в mp4
+            # libopus отвергает «боковые»/нестандартные раскладки каналов
+            # (например 5.1(side) у AC3-дорожек) с mapping family по умолчанию →
+            # "Invalid channel layout … (exit -22)". Нормализуем раскладку к
+            # стандартной (5.1(side)→5.1) фильтром aformat перед кодером: на
+            # stereo/mono это no-op, downmix не делается. Применяем на КАЖДОМ
+            # кодировании в libopus (в т.ч. когда других аудиофильтров нет).
+            opus_layout_fix = "aformat=channel_layouts=mono|stereo|3.0|4.0|quad|5.0|5.1|6.1|7.1"
+            def _opus_af(filters):
+                return ",".join(list(filters) + [opus_layout_fix])
             is_hevc = (vcodec and ('hevc' in vcodec or 'h265' in vcodec))
             step1_needed = is_hevc or bool(audio_filters) or (is_video and abs(speed_factor - 1.0) > 0.01)
 
             if step1_needed:
-                temp_ext = ".mp4" if is_video else ".opus"
+                # Промежуточный контейнер для видео — Matroska: он принимает копию
+                # ЛЮБОГО видеокодека + libopus. .mp4 же отвергает копию ряда
+                # кодеков/потоков (легаси-видео, обложки) → "Invalid argument"
+                # (exit -22). Финал всё равно делает step2 (AV1→mp4) или ремукс.
+                temp_ext = ".mkv" if is_video else ".opus"
                 temp_intermediate = os.path.join(TEMP_DIR, f"inter_{uuid.uuid4().hex}{temp_ext}")
                 temp_files.append(temp_intermediate)
 
-                cmd_step1 = [FFMPEG, "-y", "-i", current_input, "-map", "0"]
-                if audio_filters: cmd_step1 += ["-af", ",".join(audio_filters)]
-                
+                # Берём только НАСТОЯЩЕЕ видео+аудио (0:V? исключает обложки/
+                # attached_pic, 0:a? — аудио). Субтитры/вложения/данные не маппим:
+                # их кодеки несовместимы с контейнером → иначе ffmpeg падает.
+                cmd_step1 = [FFMPEG, "-y", "-i", current_input, "-map", "0:V?", "-map", "0:a?"]
+                cmd_step1 += ["-af", _opus_af(audio_filters)]
                 cmd_step1 += ["-c:a", audio_codec, "-b:a", audio_bitrate]
                 if is_video: cmd_step1 += ["-c:v", "copy"]
                 else: cmd_step1 += ["-vn"]
@@ -882,7 +896,9 @@ class ProcessWorker(QThread):
 
             if is_video and video_enabled:
                 if not self.svt_available: raise Exception("libsvtav1 отсутствует — отмена перекодирования.")
-                cmd_step2 = [FFMPEG, "-y", "-i", current_input, "-map", "0"]
+                # Только видео+аудио (см. step1): субтитры/вложения не маппим,
+                # чтобы не падать на контейнерах, которые их не поддерживают.
+                cmd_step2 = [FFMPEG, "-y", "-i", current_input, "-map", "0:V?", "-map", "0:a?"]
 
                 res_sel = sv.get('res', 'Исходное') or 'Исходное'
                 vf_list = []
@@ -944,47 +960,29 @@ class ProcessWorker(QThread):
                 is_dark_scenes = (preset_mode == "dark")
 
                 if is_dark_scenes:
-                    # Профиль «Тёмные сцены»: 10-бит, tune=ssim, 2-pass AV1
+                    # Профиль «Тёмные сцены»: 10-бит, tune=ssim, одно-проходный CRF AV1.
+                    # SVT-AV1 НЕ поддерживает multi-pass в режиме CRF
+                    # ("CRF does not support multi-pass. Use single pass."),
+                    # поэтому используем один проход. Для CRF (постоянное качество)
+                    # 2-pass всё равно не даёт выигрыша.
                     has_alpha = self._source_has_alpha(current_input)
                     pix_fmt = self._choose_pix_fmt(has_alpha, ten_bit=True)
                     svt_params = "tune=2"   # tune=ssim в SVT-AV1
                     preset_val = str(max(0, min(13, sv.get('pre', 0))))
                     est = max(1, int(os.path.getsize(current_input)/400000)) if os.path.exists(current_input) else 10
 
-                    stats_file = os.path.join(TEMP_DIR, f"svtav1stats_{uuid.uuid4().hex}")
-                    temp_files.append(stats_file + "-0.log")
-                    temp_files.append(stats_file + "-0.log.mbtree")
-
-                    # Pass 1
-                    cmd_pass1 = [
-                        FFMPEG, "-y", "-i", current_input, "-map", "0:v:0",
+                    cmd_dark = [
+                        FFMPEG, "-y", "-i", current_input, "-map", "0:V?", "-map", "0:a?",
                         "-c:v", "libsvtav1", "-crf", str(crf), "-preset", preset_val,
                         "-svtav1-params", svt_params,
                         "-pix_fmt", pix_fmt,
-                        "-pass", "1", "-passlogfile", stats_file,
-                        "-an", "-f", "null",
-                        "NUL" if IS_WIN else "/dev/null"
                     ]
                     if vf_list:
-                        cmd_pass1 = cmd_pass1[:4] + ["-vf", ",".join(vf_list)] + cmd_pass1[4:]
+                        cmd_dark += ["-vf", ",".join(vf_list)]
+                    cmd_dark += ["-threads", "0", "-c:a", "copy", attempted_out]
 
-                    self.log.emit("🌑 Тёмные сцены: Pass 1/2 (анализ)...")
-                    self.run_ffmpeg_capture(cmd_pass1, est, cb, label="Pass 1 (AV1 анализ)")
-
-                    # Pass 2
-                    cmd_pass2 = [
-                        FFMPEG, "-y", "-i", current_input, "-map", "0",
-                        "-c:v", "libsvtav1", "-crf", str(crf), "-preset", preset_val,
-                        "-svtav1-params", svt_params,
-                        "-pix_fmt", pix_fmt,
-                        "-pass", "2", "-passlogfile", stats_file,
-                    ]
-                    if vf_list:
-                        cmd_pass2 += ["-vf", ",".join(vf_list)]
-                    cmd_pass2 += ["-threads", "0", "-c:a", "copy", attempted_out]
-
-                    self.log.emit("🌑 Тёмные сцены: Pass 2/2 (кодирование)...")
-                    self.run_ffmpeg_capture(cmd_pass2, est, cb, label="Pass 2 (AV1 кодирование)")
+                    self.log.emit("🌑 Тёмные сцены: кодирование (AV1 10-бит, CRF)...")
+                    self.run_ffmpeg_capture(cmd_dark, est, cb, label="AV1 кодирование (тёмные сцены)")
 
                 else:
                     # Стандартный профиль
@@ -1021,9 +1019,19 @@ class ProcessWorker(QThread):
                     if inter_ext == out_ext:
                         if os.path.exists(out): os.remove(out)
                         shutil.move(current_input, out)  # step1 уже применил libopus, просто переносим
+                    else:
+                        # Контейнер промежуточного (.mkv) ≠ выходной → ремукс копией
+                        # (видео уже в нужном кодеке, аудио — libopus из step1).
+                        cmd_remux = [FFMPEG, "-y", "-i", current_input,
+                                     "-map", "0:V?", "-map", "0:a?",
+                                     "-c", "copy", out]
+                        self.run_ffmpeg_capture(
+                            cmd_remux,
+                            max(1, int(os.path.getsize(current_input) / 1000000)),
+                            cb, label=None)
                 else:
-                    cmd_direct = [FFMPEG, "-y", "-i", path, "-map", "0"]
-                    if audio_filters: cmd_direct += ["-af", ",".join(audio_filters)]
+                    cmd_direct = [FFMPEG, "-y", "-i", path, "-map", "0:V?", "-map", "0:a?"]
+                    cmd_direct += ["-af", _opus_af(audio_filters)]
                     cmd_direct += ["-c:a", audio_codec, "-b:a", audio_bitrate]
                     if is_video: cmd_direct += ["-c:v", "copy"]
                     else: cmd_direct += ["-vn"]
@@ -1061,15 +1069,21 @@ class ProcessWorker(QThread):
                     try: os.remove(t)
                     except Exception: pass
 
-    def _search_quality_under_limit(self, save_to_tmp, limit_kb, passes, q_lo=10, q_hi=95):
+    def _search_quality_under_limit(self, save_to_tmp, limit_kb, passes, q_lo=10, q_hi=95,
+                                    on_pass=None):
         """Бинарный поиск макс. quality (q_lo..q_hi), при котором размер файла ≤ limit_kb.
         save_to_tmp(q) -> путь к временному файлу (удаляется здесь же).
-        passes — число проб (1..8). Возвращает выбранное quality:
+        passes — число проб (1..8). on_pass(n, total) — колбэк прогресса подбора
+        (n — номер текущей пробы 1..total). Возвращает выбранное quality:
         максимальное влезающее, а если ничего не влезло — q_lo (минимальный размер)."""
         passes = max(1, min(8, int(passes or 4)))
         lo, hi = int(q_lo), int(q_hi)
         chosen, found, n = q_lo, False, 0
         while lo <= hi and n < passes:
+            n += 1
+            if on_pass:
+                try: on_pass(n, passes)
+                except Exception: pass
             mid = (lo + hi) // 2
             tmp = save_to_tmp(mid)
             try:
@@ -1081,7 +1095,6 @@ class ProcessWorker(QThread):
                 chosen, found, lo = mid, True, mid + 1
             else:
                 hi = mid - 1
-            n += 1
         return chosen if found else q_lo
 
     def _convert_simple_image(self, item, src_path, out_dir, sanitized, adim, av, fmt, cb):
@@ -1094,7 +1107,13 @@ class ProcessWorker(QThread):
         ext = {'jpeg': 'jpg', 'jpg': 'jpg', 'png': 'png', 'ico': 'ico', 'webp': 'webp'}.get(fmt, fmt)
         suffix = "" if av.get('overwrite_src') else "_Сжатый"
         out_path = os.path.join(out_dir, f"{sanitized}{suffix}.{ext}")
-        cb(10, ext.upper())
+
+        # Прогресс подбора качества под лимит: во время прохода n из total процент
+        # не превышает n/total*100 (реалистично отражает, что подбор ещё не закончен).
+        def _on_pass(n, total):
+            cb(int((n - 1) / total * 100), f"Конвертация картинки {n}/{total}")
+
+        cb(0, "Конвертация картинки")
 
         with Image.open(src_path) as im:
             if ImageOps:
@@ -1119,8 +1138,9 @@ class ProcessWorker(QThread):
                 sc = cap / max(im.width, im.height)
                 im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), Image.LANCZOS)
 
-            cb(55, ext.upper())
             limit_kb = int(av.get('limit', 0) or 0) if av.get('limit_on', True) else 0
+            if limit_kb <= 0:
+                cb(55, "Конвертация картинки")
 
             if ext == 'ico':
                 # Иконки квадратные — добавляем прозрачные поля, если нужно
@@ -1139,7 +1159,8 @@ class ProcessWorker(QThread):
                         im.save(t, format='JPEG', quality=q, optimize=True)
                         return t
                     chosen = self._search_quality_under_limit(
-                        _save_jpg, limit_kb, av.get('fit_passes', 4), q_lo=10, q_hi=95)
+                        _save_jpg, limit_kb, av.get('fit_passes', 4), q_lo=10, q_hi=95,
+                        on_pass=_on_pass)
                     im.save(out_path, format='JPEG', quality=chosen, optimize=True)
                 else:
                     im.save(out_path, format='JPEG', quality=92, optimize=True)
@@ -1152,14 +1173,15 @@ class ProcessWorker(QThread):
                         im.save(t, format='WEBP', quality=q, method=6)
                         return t
                     chosen = self._search_quality_under_limit(
-                        _save_webp, limit_kb, av.get('fit_passes', 4), q_lo=10, q_hi=95)
+                        _save_webp, limit_kb, av.get('fit_passes', 4), q_lo=10, q_hi=95,
+                        on_pass=_on_pass)
                     im.save(out_path, format='WEBP', quality=chosen, method=6)
                 else:
                     im.save(out_path, format='WEBP', quality=90, method=6)
             else:  # png
                 im.save(out_path, format='PNG', optimize=True)
 
-        cb(100, ext.upper())
+        cb(100, "Конвертация картинки")
         try:
             self.update_item_sig.emit(item['iid'], human_size(os.path.getsize(out_path)), "-")
         except Exception:
@@ -1244,7 +1266,10 @@ class ProcessWorker(QThread):
         if has_alpha and Image:
             try:
                 self.log.emit("Альфа-канал → WebP (RGBA)")
-                cb(10, "WebP (alpha)")
+                cb(0, "Конвертация картинки")
+
+                def _on_pass_a(n, total):
+                    cb(int((n - 1) / total * 100), f"Конвертация картинки {n}/{total}")
 
                 with Image.open(path) as im:
                     if ImageOps: im = ImageOps.exif_transpose(im)
@@ -1255,7 +1280,6 @@ class ProcessWorker(QThread):
                             (max(1, int(im.width * scale)), max(1, int(im.height * scale))),
                             Image.LANCZOS)
 
-                    cb(50, "WebP (alpha)")
                     out_webp = os.path.splitext(out)[0] + ".webp"
                     limit_kb = int(av.get('limit', 0) or 0)
 
@@ -1265,12 +1289,14 @@ class ProcessWorker(QThread):
                             im.save(t, format="WEBP", quality=q, lossless=False)
                             return t
                         chosen_quality = self._search_quality_under_limit(
-                            _save_webp_a, limit_kb, av.get('fit_passes', 4), q_lo=10, q_hi=85)
+                            _save_webp_a, limit_kb, av.get('fit_passes', 4), q_lo=10, q_hi=85,
+                            on_pass=_on_pass_a)
                         im.save(out_webp, format="WEBP", quality=chosen_quality, lossless=False)
                     else:
+                        cb(50, "Конвертация картинки")
                         im.save(out_webp, format="WEBP", quality=85, lossless=False)
 
-                cb(100, "WebP (alpha)")
+                cb(100, "Конвертация картинки")
                 size_new = os.path.getsize(out_webp)
                 self.update_item_sig.emit(item['iid'], human_size(size_new), "-")
                 _cleanup(tried_tmp_files)
@@ -1293,7 +1319,25 @@ class ProcessWorker(QThread):
         else:
             avif_enc = 'libsvtav1'
 
+        # Подбор под лимит — несколько проб (подборов). Прогресс масштабируем в
+        # долю текущей пробы: во время пробы n из total процент не превышает
+        # n/total*100, статус — «Конвертация картинки n/total».
+        _limit_on = bool(limit_kb and limit_kb > 0)
+        total_passes = max(1, min(8, int(av.get('fit_passes', 4)))) if _limit_on else 1
+        pass_state = {'n': 0}
+
+        def _pass_cb(pct, _label=None):
+            total = total_passes
+            nn = min(pass_state['n'], total) or 1
+            overall = int(((nn - 1) + pct / 100.0) / total * 100) if total > 0 else pct
+            overall = max(0, min(100, overall))
+            if total > 1:
+                cb(overall, f"Конвертация картинки {nn}/{total}")
+            else:
+                cb(overall, "Конвертация картинки")
+
         def _encode_to(tmp_out, crf_val, vf_override=None):
+            pass_state['n'] += 1
             cmd = [FFMPEG, "-y", "-i", path]
             if vf_override: cmd += ["-vf", vf_override]
             elif vf: cmd += ["-vf", vf]
@@ -1309,7 +1353,7 @@ class ProcessWorker(QThread):
             try:
                 orig_size = os.path.getsize(path) if os.path.exists(path) else 1
                 est_seconds = max(1, int(orig_size / 400_000))
-                self.run_ffmpeg_capture(cmd, est_seconds, cb, label="AVIF")
+                self.run_ffmpeg_capture(cmd, est_seconds, _pass_cb)
                 return True, None
             except subprocess.CalledProcessError as e: return False, (e.stderr[:4000] if hasattr(e, 'stderr') else str(e))
             except Exception as e: return False, str(e)
@@ -1535,7 +1579,17 @@ class ProcessWorker(QThread):
         except Exception as e:
             self.log.emit(f"Не удалось удалить исходник: {e}")
 
-    def _process_item(self, item, smooth, total, start, weight=1):
+    def _total_now(self) -> int:
+        """Текущее известное число файлов: уже завершённые + ещё не
+        завершённые в очереди. self.queue — живой список MediaTab.items,
+        поэтому файлы, доброшенные во время обработки, автоматически
+        увеличивают знаменатель прогресса."""
+        with self._prog_lock:
+            done = self._done_count
+        pending = sum(1 for it in list(self.queue) if not it.get('is_done', False))
+        return max(1, done + pending)
+
+    def _process_item(self, item, smooth, start, weight=1):
         """Обрабатывает один элемент очереди.
         smooth=True — глобальный прогресс плавно отражает прогресс файла
         (видео/аудио идут по одному). smooth=False — прогресс по факту
@@ -1548,13 +1602,18 @@ class ProcessWorker(QThread):
         self.status.emit(iid, "Обработка.", "proc")
         self._inc_active(weight)
         max_frac_seen = [0.0]
+        last_label = [None]
 
         def item_prog(pct, pass_label=None):
             try:
                 if not smooth:
-                    # Параллельная обработка изображений: НЕ шлём частые сигналы
-                    # из множества потоков (строка покажет «Обработка.» → «Готово»,
-                    # общий прогресс обновляется по факту завершения файла).
+                    # Параллельная обработка изображений: НЕ шлём частые % -сигналы
+                    # из множества потоков, но статус («Конвертация картинки N/X»)
+                    # обновляем при смене подписи — это редкое событие (раз в проход),
+                    # потоки/сигналы Qt безопасны.
+                    if pass_label and pass_label != last_label[0]:
+                        last_label[0] = pass_label
+                        self.status.emit(iid, pass_label, "proc")
                     return
                 if pass_label and "Pass 1" in pass_label:
                     display_pct = int(pct * 0.5)
@@ -1563,11 +1622,12 @@ class ProcessWorker(QThread):
                 else:
                     display_pct = pct
                 self.progress.emit(iid, display_pct)
-                if pass_label and pct < 100:
+                if pass_label and pct < 100 and pass_label != last_label[0]:
+                    last_label[0] = pass_label
                     self.status.emit(iid, pass_label, "proc")
                 with self._prog_lock:
                     base = self._done_count
-                fraction = (base + display_pct / 100.0) / total
+                fraction = (base + display_pct / 100.0) / self._total_now()
                 fraction = max(min(1.0, fraction), max_frac_seen[0])
                 max_frac_seen[0] = fraction
                 gl_pct = int(min(100, fraction * 100))
@@ -1604,54 +1664,73 @@ class ProcessWorker(QThread):
             with self._prog_lock:
                 self._done_count += 1
                 done = self._done_count
+            total = self._total_now()
             frac = done / total
             self.global_progress.emit(int(min(100, frac * 100)),
                                       f"Готово {done}/{total} ETA: {self._fmt_eta(frac, start)}")
 
     def run(self):
         start = time.time()
-        pending = [it for it in self.queue if not it.get('is_done', False)]
-        total = max(1, len(pending))
         self._done_count = 0
         self._prog_lock = threading.Lock()
-
-        # Видео/аудио — по одному: каждый файл сам грузит все ядра кодеком (SVT-AV1).
-        # Изображения — параллельно по числу ядер через QThreadPool: одиночный кадр
-        # CPU не насыщает, а потоки Qt безопасны для сигналов и корректно очищаются.
-        images = [it for it in pending if it.get('type') == 'IMG']
-        others = [it for it in pending if it.get('type') != 'IMG']
+        self._processed_ids = set()   # iid'ы, уже отправленные в работу за этот запуск
+        self._logged_cpu_msg = False
 
         cpu = max(1, cpu_thread_count())
-        # Видео/аудио идут по одному файлу, но кодировщик SVT-AV1 сам нагружает
-        # ВСЕ логические ядра ЦП. Поэтому счётчик показывает занятые потоки ЦП
-        # (а не «1 файл»), иначе создаётся ложное впечатление загрузки в 1 поток.
-        if others:
-            self._max_threads = cpu
-            self.log.emit(f"Кодирование видео/аудио: SVT-AV1 задействует все {cpu} лог. ядра ЦП "
-                          f"(файлы обрабатываются по одному, каждый — на всех ядрах).")
-        for it in others:
-            if self.stop_flag:
-                break
-            self._process_item(it, True, total, start, weight=cpu)
 
-        if images and not self.stop_flag:
-            nworkers = min(len(images), max(1, cpu_thread_count()))
-            if nworkers > 1:
-                self._max_threads = nworkers
-                self.log.emit(f"Параллельная обработка изображений: {nworkers} потоков")
-                self._img_pool = QThreadPool()
-                self._img_pool.setMaxThreadCount(nworkers)
-                for itm in images:
+        # Обрабатываем очередь проходами: после каждого снова заглядываем в живой
+        # список self.queue. Файлы, доброшенные во время обработки, подхватываются
+        # следующим проходом — кодируем, пока очередь не опустеет.
+        while not self.stop_flag:
+            batch = [it for it in list(self.queue)
+                     if not it.get('is_done', False)
+                     and it.get('iid') not in self._processed_ids]
+            if not batch:
+                break
+            for it in batch:
+                self._processed_ids.add(it.get('iid'))
+
+            # Видео/аудио — по одному: каждый файл сам грузит все ядра кодеком (SVT-AV1).
+            # Изображения — параллельно по числу ядер через QThreadPool: одиночный кадр
+            # CPU не насыщает, а потоки Qt безопасны для сигналов и корректно очищаются.
+            images = [it for it in batch if it.get('type') == 'IMG']
+            others = [it for it in batch if it.get('type') != 'IMG']
+
+            # Видео/аудио идут по одному файлу, но кодировщик SVT-AV1 сам нагружает
+            # ВСЕ логические ядра ЦП. Поэтому счётчик показывает занятые потоки ЦП
+            # (а не «1 файл»), иначе создаётся ложное впечатление загрузки в 1 поток.
+            if others:
+                self._max_threads = cpu
+                if not self._logged_cpu_msg:
+                    self.log.emit(f"Кодирование видео/аудио: SVT-AV1 задействует все {cpu} лог. ядра ЦП "
+                                  f"(файлы обрабатываются по одному, каждый — на всех ядрах).")
+                    self._logged_cpu_msg = True
+                for it in others:
                     if self.stop_flag:
                         break
-                    self._img_pool.start(_ImgRunnable(self, itm, total, start))
-                self._img_pool.waitForDone()
-            else:
-                self._max_threads = 1
-                for it in images:
-                    if self.stop_flag:
-                        break
-                    self._process_item(it, True, total, start)
+                    self._process_item(it, True, start, weight=cpu)
+
+            if images and not self.stop_flag:
+                nworkers = min(len(images), cpu)
+                # Знаменатель счётчика — всегда ВСЕ логические потоки ЦП машины (cpu),
+                # а не число воркеров. Иначе при 6 картинках показывалось «2/6» (хотя
+                # потоков 12), а в конце — «0/12»: знаменатель менялся и сбивал с толку.
+                # Теперь это честно «занято/всего», напр. 6 картинок = до «6/12».
+                self._max_threads = cpu
+                if nworkers > 1:
+                    self.log.emit(f"Параллельная обработка изображений: {nworkers} потоков")
+                    self._img_pool = QThreadPool()
+                    self._img_pool.setMaxThreadCount(nworkers)
+                    for itm in images:
+                        if self.stop_flag:
+                            break
+                        self._img_pool.start(_ImgRunnable(self, itm, start))
+                    self._img_pool.waitForDone()
+                else:
+                    for it in images:
+                        if self.stop_flag:
+                            break
+                        self._process_item(it, True, start)
 
         self.active_threads.emit(0, 0)
         self.finished_all.emit()

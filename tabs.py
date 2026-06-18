@@ -14,6 +14,16 @@ from workers import *
 from PyQt6.QtWidgets import QSizePolicy
 
 
+def _icon_btn(text, icon, size=20, color=None):
+    """QPushButton с векторной иконкой qtawesome (см. get_icon в config.py).
+    color=None → мягкий светлый значок (для тёмных кнопок). На светлой заливке
+    (b_run/b_stop) передавайте тёмный цвет (#1e1e2e), чтобы значок не «выцветал»."""
+    b = QPushButton(text)
+    b.setIcon(get_icon(icon) if color is None else get_icon(icon, color))
+    b.setIconSize(QSize(size, size))
+    return b
+
+
 class YtdlpTab(QWidget):
     thumb_sig = pyqtSignal(str, QIcon)
     kodik_info_sig = pyqtSignal(object, int, str, int)  # (озвучки, число серий, тек.озвучка, тек.серия)
@@ -67,21 +77,21 @@ class YtdlpTab(QWidget):
         self.url_edit.textChanged.connect(lambda: self.fetch_timer.start())
 
         h = QHBoxLayout()
-        btn_v = QPushButton("⬇  Скачать"); btn_v.clicked.connect(lambda: self.add_dl(False))
-        btn_a = QPushButton("🎵  Скачать (Audio)"); btn_a.clicked.connect(lambda: self.add_dl(True))
-        self.btn_stop = QPushButton("■  СТОП"); self.btn_stop.setObjectName("b_stop")
+        btn_v = _icon_btn("Скачать", 'fa5s.download'); btn_v.clicked.connect(lambda: self.add_dl(False))
+        btn_a = _icon_btn("Скачать (аудио)", 'fa5s.music'); btn_a.clicked.connect(lambda: self.add_dl(True))
+        self.btn_stop = _icon_btn("СТОП", 'fa5s.stop', color='#1e1e2e'); self.btn_stop.setObjectName("b_stop")
         self.btn_stop.clicked.connect(self.stop_all_dl)
         self.btn_stop.setEnabled(False)   # активна только при активных загрузках
         
         h.addWidget(self.url_edit); h.addWidget(btn_v); h.addWidget(btn_a); h.addWidget(self.btn_stop)
         
         self.out = QLineEdit(default_download_dir())
-        btn_p = QPushButton("📂"); btn_p.clicked.connect(self.ch_dir); btn_p.setFixedWidth(36)
+        btn_p = _icon_btn("", 'fa5s.folder-open'); btn_p.clicked.connect(self.ch_dir); btn_p.setFixedWidth(36)
         ho = QHBoxLayout(); ho.addWidget(self.out); ho.addWidget(btn_p)
 
         self.cookie_edit = QLineEdit(); self.cookie_edit.setPlaceholderText("Путь к файлу cookies.txt (необязательно)")
         self.cookie_edit.setClearButtonEnabled(True)
-        btn_ck = QPushButton("📂"); btn_ck.setFixedWidth(36)
+        btn_ck = _icon_btn("", 'fa5s.folder-open'); btn_ck.setFixedWidth(36)
         btn_ck.clicked.connect(self._choose_cookie)
         ho_ck = QHBoxLayout(); ho_ck.addWidget(self.cookie_edit); ho_ck.addWidget(btn_ck)
 
@@ -170,7 +180,7 @@ class YtdlpTab(QWidget):
         end_box.addWidget(QLabel("По:"))
         for w in self.te: end_box.addWidget(w)
 
-        btn_clear_time = QPushButton("✕")
+        btn_clear_time = _icon_btn("", 'fa5s.times')
         # Равная высота с полями-циферками слева (С: / По:), чтобы стоять с ними в одну строку
         btn_clear_time.setFixedHeight(self.ts[0].sizeHint().height())
         btn_clear_time.setFixedWidth(40)
@@ -212,8 +222,8 @@ class YtdlpTab(QWidget):
         self._sc_delete.activated.connect(self.delete_sel)
 
         hb = QHBoxLayout()
-        b_del = QPushButton("✖  Удалить"); b_del.clicked.connect(self.delete_sel)
-        b_clr = QPushButton("🗑  Очистить"); b_clr.clicked.connect(self.tree.clear)
+        b_del = _icon_btn("Удалить", 'fa5s.times'); b_del.clicked.connect(self.delete_sel)
+        b_clr = _icon_btn("Очистить", 'fa5s.trash'); b_clr.clicked.connect(self.tree.clear)
         hb.addWidget(b_del); hb.addWidget(b_clr); hb.addStretch(); left.addLayout(hb)
 
     def _spin_to_sliders(self):
@@ -364,6 +374,7 @@ class YtdlpTab(QWidget):
         sel = self.tree.itemAt(pos)
         if sel:
             m.addAction(QAction("Перейти к URL (копировать в буфер)", self, triggered=lambda checked=False, it=sel: QApplication.clipboard().setText(it.text(0))))
+            m.addAction(QAction(get_icon('fa5s.redo'), "Скачать заново", self, triggered=self.redownload_sel))
             m.addAction(QAction("Остановить загрузку", self, triggered=self.stop_sel_dl))
             m.addSeparator()
         try: cb = QApplication.clipboard().text().strip()
@@ -407,7 +418,8 @@ class YtdlpTab(QWidget):
             self._dl_pct.pop(iid_, None); self._update_dl_taskbar()
             item = self.items.get(iid_, {}).get('item')
             if item:
-                item.setText(3, "✅ " + status)
+                item.setIcon(3, get_icon('fa5s.check-circle', color='#a6e3a1'))
+                item.setText(3, status)
                 for col in range(self.tree.columnCount()):
                     item.setBackground(col, QBrush(COLOR_DONE))
                 self.tree.viewport().update()
@@ -454,7 +466,7 @@ class YtdlpTab(QWidget):
             it = QTreeWidgetItem(self.tree)
             it.setText(0, url); it.setText(1, "-"); it.setText(2, "-"); it.setText(3, "В очереди")
             it.setData(0, Qt.ItemDataRole.UserRole, iid)
-            self.items[iid] = {'item': it, 'url': url}
+            self.items[iid] = {'item': it, 'url': url, 'audio_only': bool(audio_only)}
 
             config = {
                 'iid': iid, 'url': url,
@@ -485,7 +497,7 @@ class YtdlpTab(QWidget):
             it = QTreeWidgetItem(self.tree)
             it.setText(0, url); it.setText(1, "-"); it.setText(2, "-"); it.setText(3, "В очереди")
             it.setData(0, Qt.ItemDataRole.UserRole, iid)
-            self.items[iid] = {'item': it, 'url': url}
+            self.items[iid] = {'item': it, 'url': url, 'audio_only': bool(audio_only)}
             config = {
                 'iid': iid, 'url': url, 'fmt': FORMAT_OPTIONS.get(self.c_q.currentText(), 'best'),
                 'outdir': self.out.text(), 'merge': self.c_c.currentText(), 'sub_lang': self.c_s.currentText(),
@@ -530,7 +542,31 @@ class YtdlpTab(QWidget):
 
     def _remove_worker(self, iid):
         self.active_workers.pop(iid, None)
+        # Сигнал finished у потока срабатывает ВСЕГДА при его завершении — даже если
+        # загрузка упала, не отправив error_sig/finished_sig (тогда в _dl_pct оставался
+        # бы «-1», и на иконке в панели задач навсегда зависала «бегущая полоса»
+        # загрузки, хотя по факту ошибка). Снимаем элемент из прогресса здесь —
+        # это гарантированно убирает индикатор после ошибочной/прерванной загрузки.
+        self._dl_pct.pop(iid, None)
+        self._update_dl_taskbar()
         self._update_stop_btn()
+
+    def redownload_sel(self):
+        """Скачать выбранные элементы заново. Берём URL из элемента и тот же режим
+        (видео/аудио), что был выбран изначально, и запускаем новую загрузку с
+        текущими настройками вкладки (качество, формат, cookies, прокси)."""
+        for it in list(self.tree.selectedItems()):
+            try:
+                iid = it.data(0, Qt.ItemDataRole.UserRole)
+                entry = self.items.get(iid, {}) if iid else {}
+                url = (entry.get('url') if isinstance(entry, dict) else "") or it.text(0)
+                if not (url and url.strip().startswith('http')):
+                    continue
+                audio_only = bool(entry.get('audio_only', False)) if isinstance(entry, dict) else False
+                self.url_edit.setText(url.strip())
+                self.add_dl(audio_only)
+            except Exception as e:
+                self.main.log(f"redownload error: {e}")
 
     def delete_sel(self):
         try:
@@ -587,8 +623,8 @@ class MediaTab(QWidget):
         self.url_edit.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.url_edit.customContextMenuRequested.connect(self.on_url_ctx)
 
-        btn_qdl_video = QPushButton("⬇  Скачать"); btn_qdl_video.clicked.connect(lambda: self.download_url(False))
-        btn_qdl_audio = QPushButton("🎵  Скачать (Audio)"); btn_qdl_audio.clicked.connect(lambda: self.download_url(True))
+        btn_qdl_video = _icon_btn("Скачать", 'fa5s.download'); btn_qdl_video.clicked.connect(lambda: self.download_url(False))
+        btn_qdl_audio = _icon_btn("Скачать (аудио)", 'fa5s.music'); btn_qdl_audio.clicked.connect(lambda: self.download_url(True))
 
         qdl_h.addWidget(self.url_edit); qdl_h.addWidget(btn_qdl_video); qdl_h.addWidget(btn_qdl_audio)
         qdl_form.addRow("URL:", qdl_h)
@@ -607,19 +643,26 @@ class MediaTab(QWidget):
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.ctx)
         self.tree.setWordWrap(True)
+        # Плавная прокрутка: по умолчанию список «прыгает» на целую строку (а строки
+        # тут высокие — с превью 160×90), отчего колесо/скроллбар двигаются рывками.
+        # Попиксельный режим прокручивает гладко, а шаг колеса задаём вручную (иначе
+        # в попиксельном режиме одно деление колеса = 1 px, и крутить пришлось бы вечно).
+        self.tree.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.tree.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.tree.verticalScrollBar().setSingleStep(24)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.tree.header().resizeSection(0, 180)
         for i in range(1, 6): self.tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
 
         h = QHBoxLayout()
-        b1 = QPushButton("➕  Добавить файлы"); b1.clicked.connect(self.add)
-        b2 = QPushButton("✖  Удалить"); b2.clicked.connect(self.rem)
-        b3 = QPushButton("🗑  Очистить"); b3.clicked.connect(self.clear)
-        self.btn_export_dir = QPushButton("📂")
+        b1 = _icon_btn("Добавить файлы", 'fa5s.plus'); b1.clicked.connect(self.add)
+        b2 = _icon_btn("Удалить", 'fa5s.times'); b2.clicked.connect(self.rem)
+        b3 = _icon_btn("Очистить", 'fa5s.trash'); b3.clicked.connect(self.clear)
+        self.btn_export_dir = _icon_btn("", 'fa5s.folder-open')  # выбор папки экспорта
         self.btn_export_dir.setFixedWidth(36)
         self.btn_export_dir.setToolTip("Выбрать папку экспорта. По умолчанию — рядом с исходным файлом.")
         self.btn_export_dir.clicked.connect(self._choose_export_dir)
-        self.btn_export_reset = QPushButton("↺")
+        self.btn_export_reset = _icon_btn("", 'fa5s.undo')
         self.btn_export_reset.setFixedWidth(36)
         self.btn_export_reset.setToolTip("Сбросить — экспортировать в папку исходника")
         self.btn_export_reset.clicked.connect(self._reset_export_dir)
@@ -750,7 +793,7 @@ class MediaTab(QWidget):
 
         # --- Переключатель профиля: две кнопки-тогглы ---
         self.btn_mode_std  = QPushButton("Стандарт");       self.btn_mode_std.setCheckable(True);  self.btn_mode_std.setChecked(True)
-        self.btn_mode_dark = QPushButton("🌑 Тёмные сцены"); self.btn_mode_dark.setCheckable(True); self.btn_mode_dark.setChecked(False)
+        self.btn_mode_dark = _icon_btn("Тёмные сцены", 'fa5s.moon'); self.btn_mode_dark.setCheckable(True); self.btn_mode_dark.setChecked(False)
         self.btn_mode_std.setToolTip("yuv420p, 1-pass")
         self.btn_mode_dark.setToolTip("10-бит (yuv420p10le), tune=ssim, 2-pass AV1\nCRF, preset и разрешение — без изменений")
         self.btn_mode_std.clicked.connect(lambda: self._set_preset_mode("std"))
@@ -901,8 +944,8 @@ class MediaTab(QWidget):
 
         btn_box = QWidget(); btn_layout = QHBoxLayout(btn_box)
         btn_layout.setContentsMargins(0, 6, 0, 6)
-        self.b_run = QPushButton("▶  НАЧАТЬ"); self.b_run.setObjectName("b_run")
-        self.b_stop = QPushButton("■  СТОП"); self.b_stop.setObjectName("b_stop"); self.b_stop.setEnabled(False)
+        self.b_run = _icon_btn("НАЧАТЬ", 'fa5s.play', color='#1e1e2e'); self.b_run.setObjectName("b_run")
+        self.b_stop = _icon_btn("СТОП", 'fa5s.stop', color='#1e1e2e'); self.b_stop.setObjectName("b_stop"); self.b_stop.setEnabled(False)
         self.b_run.clicked.connect(self.run); self.b_stop.clicked.connect(self.stop)
         btn_layout.addWidget(self.b_run); btn_layout.addWidget(self.b_stop)
 
@@ -1052,13 +1095,13 @@ class MediaTab(QWidget):
             entry = self._item_data_map.get(iid, {})
             out_path = entry.get('out_path', '')
             if out_path and os.path.exists(out_path):
-                m.addAction("▶  Открыть файл", lambda checked=False, p=out_path: self.open_output_file(p))
-            m.addAction("📁  Перейти к файлу", lambda checked=False, it=sel: self.open_file_location(it))
-            m.addAction("↺  Сбросить статус", lambda checked=False: self.reset_status())
+                m.addAction(get_icon('fa5s.play'), "Открыть файл", lambda checked=False, p=out_path: self.open_output_file(p))
+            m.addAction(get_icon('fa5s.folder-open'), "Перейти к файлу", lambda checked=False, it=sel: self.open_file_location(it))
+            m.addAction(get_icon('fa5s.undo'), "Сбросить статус", lambda checked=False: self.reset_status())
             m.addSeparator()
-            m.addAction("✕  Удалить", lambda checked=False: self.rem())
-        m.addAction("📋  Вставить файлы", lambda checked=False: self.paste_files())
-        m.addAction("🗑  Очистить всё", lambda checked=False: self.clear())
+            m.addAction(get_icon('fa5s.times'), "Удалить", lambda checked=False: self.rem())
+        m.addAction(get_icon('fa5s.paste'), "Вставить файлы", lambda checked=False: self.paste_files())
+        m.addAction(get_icon('fa5s.trash'), "Очистить всё", lambda checked=False: self.clear())
         m.exec(self.tree.mapToGlobal(pos))
 
     def open_file_location(self, item):
@@ -1110,7 +1153,7 @@ class MediaTab(QWidget):
 
                 it = QTreeWidgetItem(self.tree)
                 it.setToolTip(0, f"{os.path.basename(p)}\n{p}")
-                it.setText(1, "было\nстало")              # метка двух строк
+                it.setText(1, "Было\nСтало")              # метка двух строк
                 it.setText(2, f"{human_size(size)}\n—")   # Размер: было(исх) / стало(нов)
                 it.setText(3, "—\n—")                     # Битрейт: исх / итог
                 it.setText(4, "—\n—")                     # LUFS: до / после
@@ -1322,43 +1365,43 @@ class Base64Tab(QWidget):
     _sig_error    = pyqtSignal(str)
     _sig_progress = pyqtSignal(int)             # 0-100, только из фонового потока
 
-    # Расширения и их иконки
+    # Расширения и их иконки — имена значков qtawesome (см. get_icon в config.py).
     _ICON_MAP = {
         # Видео
-        '.mp4': '🎬', '.mkv': '🎬', '.avi': '🎬', '.mov': '🎬', '.webm': '🎬',
-        '.flv': '🎬', '.wmv': '🎬', '.m4v': '🎬', '.ts': '🎬', '.mts': '🎬',
-        '.m2ts': '🎬', '.vob': '🎬', '.ogv': '🎬', '.3gp': '🎬', '.3g2': '🎬',
-        '.divx': '🎬', '.f4v': '🎬', '.mxf': '🎬', '.rm': '🎬', '.rmvb': '🎬',
+        '.mp4': 'fa5s.film', '.mkv': 'fa5s.film', '.avi': 'fa5s.film', '.mov': 'fa5s.film', '.webm': 'fa5s.film',
+        '.flv': 'fa5s.film', '.wmv': 'fa5s.film', '.m4v': 'fa5s.film', '.ts': 'fa5s.film', '.mts': 'fa5s.film',
+        '.m2ts': 'fa5s.film', '.vob': 'fa5s.film', '.ogv': 'fa5s.film', '.3gp': 'fa5s.film', '.3g2': 'fa5s.film',
+        '.divx': 'fa5s.film', '.f4v': 'fa5s.film', '.mxf': 'fa5s.film', '.rm': 'fa5s.film', '.rmvb': 'fa5s.film',
         # Аудио
-        '.mp3': '🎵', '.opus': '🎵', '.wav': '🎵', '.flac': '🎵', '.ogg': '🎵',
-        '.aac': '🎵', '.m4a': '🎵', '.wma': '🎵', '.aiff': '🎵', '.aif': '🎵',
-        '.ape': '🎵', '.mka': '🎵', '.mid': '🎵', '.midi': '🎵', '.amr': '🎵',
-        '.ac3': '🎵', '.dts': '🎵', '.ra': '🎵', '.au': '🎵',
+        '.mp3': 'fa5s.music', '.opus': 'fa5s.music', '.wav': 'fa5s.music', '.flac': 'fa5s.music', '.ogg': 'fa5s.music',
+        '.aac': 'fa5s.music', '.m4a': 'fa5s.music', '.wma': 'fa5s.music', '.aiff': 'fa5s.music', '.aif': 'fa5s.music',
+        '.ape': 'fa5s.music', '.mka': 'fa5s.music', '.mid': 'fa5s.music', '.midi': 'fa5s.music', '.amr': 'fa5s.music',
+        '.ac3': 'fa5s.music', '.dts': 'fa5s.music', '.ra': 'fa5s.music', '.au': 'fa5s.music',
         # 3D / Игровые ассеты
-        '.glb': '🧊', '.gltf': '🧊', '.obj': '🧊', '.fbx': '🧊', '.dae': '🧊',
-        '.3ds': '🧊', '.stl': '🧊', '.ply': '🧊', '.blend': '🧊', '.usdz': '🧊',
-        '.usd': '🧊', '.abc': '🧊', '.x3d': '🧊', '.vrml': '🧊', '.wrl': '🧊',
+        '.glb': 'fa5s.cube', '.gltf': 'fa5s.cube', '.obj': 'fa5s.cube', '.fbx': 'fa5s.cube', '.dae': 'fa5s.cube',
+        '.3ds': 'fa5s.cube', '.stl': 'fa5s.cube', '.ply': 'fa5s.cube', '.blend': 'fa5s.cube', '.usdz': 'fa5s.cube',
+        '.usd': 'fa5s.cube', '.abc': 'fa5s.cube', '.x3d': 'fa5s.cube', '.vrml': 'fa5s.cube', '.wrl': 'fa5s.cube',
         # Изображения (будут показываться как превью)
         '.jpg': None, '.jpeg': None, '.png': None, '.gif': None, '.webp': None,
         '.bmp': None, '.tiff': None, '.tif': None, '.avif': None, '.heic': None,
-        '.heif': None, '.ico': None, '.svg': '🖼',
+        '.heif': None, '.ico': None, '.svg': 'fa5s.image',
         # Документы
-        '.pdf': '📄', '.doc': '📄', '.docx': '📄', '.xls': '📄', '.xlsx': '📄',
-        '.ppt': '📄', '.pptx': '📄', '.txt': '📄', '.rtf': '📄', '.odt': '📄',
-        '.ods': '📄', '.odp': '📄', '.csv': '📄', '.md': '📄',
+        '.pdf': 'fa5s.file-alt', '.doc': 'fa5s.file-alt', '.docx': 'fa5s.file-alt', '.xls': 'fa5s.file-alt', '.xlsx': 'fa5s.file-alt',
+        '.ppt': 'fa5s.file-alt', '.pptx': 'fa5s.file-alt', '.txt': 'fa5s.file-alt', '.rtf': 'fa5s.file-alt', '.odt': 'fa5s.file-alt',
+        '.ods': 'fa5s.file-alt', '.odp': 'fa5s.file-alt', '.csv': 'fa5s.file-alt', '.md': 'fa5s.file-alt',
         # Архивы
-        '.zip': '🗜', '.rar': '🗜', '.7z': '🗜', '.tar': '🗜', '.gz': '🗜',
-        '.bz2': '🗜', '.xz': '🗜', '.zst': '🗜', '.lz4': '🗜',
+        '.zip': 'fa5s.file-archive', '.rar': 'fa5s.file-archive', '.7z': 'fa5s.file-archive', '.tar': 'fa5s.file-archive', '.gz': 'fa5s.file-archive',
+        '.bz2': 'fa5s.file-archive', '.xz': 'fa5s.file-archive', '.zst': 'fa5s.file-archive', '.lz4': 'fa5s.file-archive',
         # Шрифты
-        '.ttf': '🔤', '.otf': '🔤', '.woff': '🔤', '.woff2': '🔤', '.eot': '🔤',
+        '.ttf': 'fa5s.font', '.otf': 'fa5s.font', '.woff': 'fa5s.font', '.woff2': 'fa5s.font', '.eot': 'fa5s.font',
         # Код / данные
-        '.json': '💾', '.xml': '💾', '.yaml': '💾', '.yml': '💾', '.toml': '💾',
-        '.bin': '💾', '.dat': '💾', '.db': '💾', '.sqlite': '💾', '.proto': '💾',
+        '.json': 'fa5s.database', '.xml': 'fa5s.database', '.yaml': 'fa5s.database', '.yml': 'fa5s.database', '.toml': 'fa5s.database',
+        '.bin': 'fa5s.database', '.dat': 'fa5s.database', '.db': 'fa5s.database', '.sqlite': 'fa5s.database', '.proto': 'fa5s.database',
         # Игровые / движковые форматы
-        '.pak': '🎮', '.vpk': '🎮', '.bsp': '🎮', '.mdl': '🎮', '.vtf': '🎮',
-        '.vmt': '🎮', '.prefab': '🎮', '.asset': '🎮', '.unity': '🎮',
+        '.pak': 'fa5s.gamepad', '.vpk': 'fa5s.gamepad', '.bsp': 'fa5s.gamepad', '.mdl': 'fa5s.gamepad', '.vtf': 'fa5s.gamepad',
+        '.vmt': 'fa5s.gamepad', '.prefab': 'fa5s.gamepad', '.asset': 'fa5s.gamepad', '.unity': 'fa5s.gamepad',
         # Прочее
-        '.iso': '💿', '.img': '💿', '.dmg': '💿',
+        '.iso': 'fa5s.compact-disc', '.img': 'fa5s.compact-disc', '.dmg': 'fa5s.compact-disc',
     }
 
     def __init__(self, main_window):
@@ -1375,8 +1418,21 @@ class Base64Tab(QWidget):
         self.progress.setValue(pct)
 
     def add_paths(self, paths):
-        """Совместимость с RecentFileThumb — устанавливает первый файл."""
-        if paths:
+        """Принимает один или несколько файлов. Если передано несколько и среди
+        них есть HTML — маскирует все HTML-файлы сразу; иначе берёт первый файл."""
+        self._route_paths(paths)
+
+    def _route_paths(self, paths):
+        paths = [p for p in (paths or []) if p]
+        if not paths:
+            return
+        html = [p for p in paths
+                if os.path.splitext(p)[1].lower() in (".html", ".htm")]
+        if len(paths) > 1 and html:
+            # Показываем первый HTML для превью и сразу маскируем все HTML-файлы.
+            self._set_path(html[0])
+            self._mask_paths(html)
+        else:
             self._set_path(paths[0])
 
     def _build_ui(self):
@@ -1405,18 +1461,20 @@ class Base64Tab(QWidget):
         self.lbl_fname.setWordWrap(True)
         right.addWidget(self.lbl_fname)
 
-        self.lbl_hint = QLabel("💡 Перетащите файл из любой вкладки или с рабочего стола")
+        self.lbl_hint = QLabel(status_html('fa5s.lightbulb',
+            "Перетащите файл (или сразу несколько HTML) из любой "
+            "вкладки или с рабочего стола", '#6c7086', 11))
         self.lbl_hint.setStyleSheet("color:#6c7086; font-size:10px;")
         right.addWidget(self.lbl_hint)
         right.addStretch()
 
         btn_row = QHBoxLayout()
-        btn_browse = QPushButton("📂  Выбрать файл")
+        btn_browse = _icon_btn("Выбрать файл", 'fa5s.folder-open')
         btn_browse.clicked.connect(self._browse)
 
         # Кнопка «Кодировать» убрана: файлы кодируются автоматически при
         # добавлении (drag&drop / «Выбрать файл»).
-        self.btn_stop = QPushButton("🗑  Очистить")
+        self.btn_stop = _icon_btn("Очистить", 'fa5s.trash')
         self.btn_stop.setFixedHeight(32)
         self.btn_stop.setEnabled(True)
         self.btn_stop.clicked.connect(self._clear_result)
@@ -1427,12 +1485,12 @@ class Base64Tab(QWidget):
 
         # ── Маскировка HTML под VK (скрытие JS) ─────────────────────────────
         mask_row = QHBoxLayout()
-        self.btn_mask_file = QPushButton("🎭  Замаскировать HTML (JavaScript) для VK")
+        self.btn_mask_file = _icon_btn("Замаскировать HTML (JavaScript) для VK", 'fa5s.mask')
         self.btn_mask_file.setFixedHeight(32)
         self.btn_mask_file.setToolTip("Прячет JavaScript, чтобы обойти запрет VK")
         self.btn_mask_file.clicked.connect(self._mask_current_html)
 
-        self.btn_mask_folder = QPushButton("📁  Замаскировать все HTML (JavaScript) в папке для VK")
+        self.btn_mask_folder = _icon_btn("Замаскировать все HTML (JavaScript) в папке для VK", 'fa5s.mask')
         self.btn_mask_folder.setFixedHeight(32)
         self.btn_mask_folder.setToolTip(
             "Пакетно обрабатывает все .html в выбранной папке.\n"
@@ -1489,7 +1547,7 @@ class Base64Tab(QWidget):
         h_btns = QHBoxLayout()
         self.lbl_size = QLabel("")
         self.lbl_size.setStyleSheet("color:#6c7086; font-size:11px;")
-        btn_copy = QPushButton("📋  Копировать")
+        btn_copy = _icon_btn("Копировать", 'fa5s.copy')
         btn_copy.setFixedWidth(130)
         btn_copy.clicked.connect(self._copy)
         h_btns.addWidget(self.lbl_size)
@@ -1509,7 +1567,7 @@ class Base64Tab(QWidget):
 
     def dropEvent(self, e):
         urls = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
-        if urls: self._set_path(urls[0])
+        if urls: self._route_paths(urls)
 
     # ── Вспомогательные ──────────────────────────────────────────────────────
     def _browse(self):
@@ -1521,10 +1579,12 @@ class Base64Tab(QWidget):
         fonts   = "Шрифты (*.ttf *.otf *.woff *.woff2 *.eot)"
         archives= "Архивы (*.zip *.rar *.7z *.tar *.gz *.bz2 *.xz *.zst)"
         other   = "Прочее (*.bin *.dat *.db *.sqlite *.iso *.img *.dmg)"
+        html    = "HTML (*.html *.htm)"
         all_f   = "Все файлы (*)"
-        flt = ";;".join([media, images, model3d, docs, fonts, archives, other, all_f])
-        path, _ = QFileDialog.getOpenFileName(self, "Выбрать файл для кодирования в Base64", "", flt)
-        if path: self._set_path(path)
+        flt = ";;".join([media, images, model3d, docs, fonts, archives, html, other, all_f])
+        # Можно выбрать несколько файлов: несколько HTML маскируются разом.
+        paths, _ = QFileDialog.getOpenFileNames(self, "Выбрать файл(ы) для кодирования в Base64", "", flt)
+        if paths: self._route_paths(paths)
 
     def _set_path(self, path):
         self._current_path = path
@@ -1537,14 +1597,14 @@ class Base64Tab(QWidget):
         # base64: НЕ запускаем авто-кодирование (никаких .txt и дампа base64 в
         # GUI) — пользователь жмёт «🎭 Замаскировать HTML (JavaScript) для VK».
         if os.path.splitext(path)[1].lower() in (".html", ".htm"):
-            self.lbl_size.setText("HTML готов — нажмите «🎭 Замаскировать HTML (JavaScript) для VK»")
+            self.lbl_size.setText("HTML готов — нажмите «Замаскировать HTML (JavaScript) для VK»")
         else:
             # Для прочих файлов — авто-кодирование сразу после выбора
             QTimer.singleShot(80, self._start_encode)
 
     def _load_thumb(self, path):
         ext = os.path.splitext(path)[1].lower()
-        icon_val = self._ICON_MAP.get(ext, '📦')  # 📦 для неизвестных
+        icon_val = self._ICON_MAP.get(ext, 'fa5s.box')  # fa5s.box — для неизвестных
 
         # Изображения — показываем превью
         img_exts = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp',
@@ -1592,13 +1652,14 @@ class Base64Tab(QWidget):
                                Qt.TransformationMode.SmoothTransformation))
                 return
 
-        # Для всего остального — большой эмодзи-значок
-        icon_chr = icon_val if icon_val else '📦'
+        # Для всего остального — большой векторный значок типа файла + расширение.
+        icon_name = icon_val if icon_val else 'fa5s.box'
         ext_upper = ext.upper().lstrip('.') if ext else '??'
-        self.lbl_thumb.setText(f"{icon_chr}\n{ext_upper}")
+        self.lbl_thumb.setText(
+            f"{icon_html(icon_name, 30, '#89b4fa')}<br>{ext_upper}")
         self.lbl_thumb.setStyleSheet(
             "background:#1e1e2e; border:1px solid #45475a; border-radius:6px; "
-            "color:#89b4fa; font-size:22px; qproperty-alignment: AlignCenter;")
+            "color:#89b4fa; font-size:18px; qproperty-alignment: AlignCenter;")
 
     def _copy(self):
         text = self.txt_out.toPlainText()
@@ -1613,30 +1674,72 @@ class Base64Tab(QWidget):
         with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             return f.read()
 
+    def _mask_one(self, src):
+        """Маскирует один HTML-файл → encoded\\<имя>[_base].html.
+        Возвращает (out_path, n_in, n_ext)."""
+        masked, n_in, n_ext = mask_html_js(self._read_html(src))
+        base, ext = os.path.splitext(os.path.basename(src))
+        out_dir = os.path.join(os.path.dirname(src), "encoded")
+        os.makedirs(out_dir, exist_ok=True)
+        suffix = "_base" if self.chk_rename_html.isChecked() else ""
+        out_path = os.path.join(out_dir, base + suffix + ext)
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(masked)
+        return out_path, n_in, n_ext
+
+    def _mask_paths(self, paths):
+        """Пакетно маскирует переданный список HTML-файлов (из разных папок)."""
+        files = [p for p in paths
+                 if os.path.isfile(p)
+                 and os.path.splitext(p)[1].lower() in (".html", ".htm")]
+        if not files:
+            self.lbl_size.setText(status_html('fa5s.exclamation-triangle', "Среди файлов нет .html", '#f9e2af'))
+            return
+        if len(files) == 1:
+            # Один файл — показываем подробный отчёт как для одиночной маскировки.
+            self._set_path(files[0])
+            self._mask_current_html()
+            return
+        done = skipped = errors = 0
+        report = [f"🎭 Маскировка HTML-файлов: {len(files)} шт.", ""]
+        for src in files:
+            try:
+                out_path, n_in, n_ext = self._mask_one(src)
+                if n_in or n_ext:
+                    done += 1
+                    report.append(f"✅ {os.path.basename(src)} — инлайн {n_in}, внешних {n_ext}")
+                    self.main.log(f"HTML→VK: {os.path.basename(src)} (инлайн {n_in}, внешних {n_ext})")
+                else:
+                    skipped += 1
+                    report.append(f"➖ {os.path.basename(src)} — нет <script>, копия")
+                    self.main.log(f"HTML→VK: {os.path.basename(src)} — нет <script>, копия")
+            except Exception as ex:
+                errors += 1
+                report.append(f"❌ {os.path.basename(src)} — {ex}")
+                self.main.log(f"HTML→VK: {os.path.basename(src)} — ошибка: {ex}")
+        self.txt_out.setPlainText("\n".join(report))
+        self.lbl_size.setText(
+            status_html('fa5s.check-circle', f"Готово: замаскировано {done}, без скриптов {skipped}, ошибок {errors} → encoded\\", '#a6e3a1'))
+        self.main.log(f"HTML→VK: пакет из {len(files)} файлов — {done} замаскировано, "
+                      f"{skipped} без скриптов, {errors} ошибок.")
+
     def _mask_current_html(self):
         """Маскирует текущий выбранный HTML-файл → encoded\\<имя>_base.html."""
         path = self._current_path
         if not path or not os.path.isfile(path):
-            self.lbl_size.setText("❌ Сначала выберите .html файл")
+            self.lbl_size.setText(status_html('fa5s.times-circle', "Сначала выберите .html файл", '#f38ba8'))
             self.main.log("HTML→VK: файл не выбран")
             return
         if os.path.splitext(path)[1].lower() not in (".html", ".htm"):
-            self.lbl_size.setText("❌ Это не HTML-файл (нужен .html / .htm)")
+            self.lbl_size.setText(status_html('fa5s.times-circle', "Это не HTML-файл (нужен .html / .htm)", '#f38ba8'))
             self.main.log("HTML→VK: выбран не HTML-файл")
             return
         try:
-            masked, n_in, n_ext = mask_html_js(self._read_html(path))
+            out_path, n_in, n_ext = self._mask_one(path)
             if n_in == 0 and n_ext == 0:
-                self.lbl_size.setText("⚠ В файле нет <script> — кодировать нечего")
+                self.lbl_size.setText(status_html('fa5s.exclamation-triangle', "В файле нет <script> — скопировано как есть", '#f9e2af'))
                 self.main.log("HTML→VK: тегов <script> не найдено")
                 return
-            base, ext = os.path.splitext(os.path.basename(path))
-            out_dir = os.path.join(os.path.dirname(path), "encoded")
-            os.makedirs(out_dir, exist_ok=True)
-            suffix = "_base" if self.chk_rename_html.isChecked() else ""
-            out_path = os.path.join(out_dir, base + suffix + ext)
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(masked)
             self.txt_out.setPlainText(
                 "✅ HTML замаскирован под VK\n"
                 f"Исходник:  {os.path.basename(path)}\n"
@@ -1649,11 +1752,11 @@ class Base64Tab(QWidget):
                 "• запуск повешен на onload скрытой картинки;\n"
                 "• инлайн onclick=… сохранены (код исполняется в глобале).")
             self.lbl_size.setText(
-                f"✅ encoded\\{os.path.basename(out_path)}  •  инлайн: {n_in}, внешних: {n_ext}")
+                status_html('fa5s.check-circle', f"encoded\\{os.path.basename(out_path)}  •  инлайн: {n_in}, внешних: {n_ext}", '#a6e3a1'))
             self.main.log(f"HTML→VK: {os.path.basename(path)} → {out_path} "
                           f"(инлайн {n_in}, внешних {n_ext})")
         except Exception as ex:
-            self.lbl_size.setText(f"❌ {ex}")
+            self.lbl_size.setText(status_html('fa5s.times-circle', f"{ex}", '#f38ba8'))
             self.main.log(f"HTML→VK error: {ex}")
 
     def _mask_folder_html(self):
@@ -1665,11 +1768,11 @@ class Base64Tab(QWidget):
             files = [f for f in os.listdir(folder)
                      if f.lower().endswith((".html", ".htm"))]
         except Exception as ex:
-            self.lbl_size.setText(f"❌ {ex}")
+            self.lbl_size.setText(status_html('fa5s.times-circle', f"{ex}", '#f38ba8'))
             self.main.log(f"HTML→VK error: {ex}")
             return
         if not files:
-            self.lbl_size.setText("⚠ В папке нет .html файлов")
+            self.lbl_size.setText(status_html('fa5s.exclamation-triangle', "В папке нет .html файлов", '#f9e2af'))
             self.main.log("HTML→VK: в папке нет .html")
             return
 
@@ -1699,8 +1802,8 @@ class Base64Tab(QWidget):
                 self.main.log(f"HTML→VK: {name} — ошибка: {ex}")
 
         self.txt_out.setPlainText("\n".join(report))
-        self.lbl_size.setText(
-            f"✅ Готово: замаскировано {done}, без скриптов {skipped}, ошибок {errors} → encoded\\")
+        self.lbl_size.setText(status_html('fa5s.check-circle',
+            f"Готово: замаскировано {done}, без скриптов {skipped}, ошибок {errors} → encoded\\", '#a6e3a1'))
         self.main.log(f"HTML→VK: папка обработана — {done} замаскировано, "
                       f"{skipped} без скриптов, {errors} ошибок. Результат: {out_dir}")
 
@@ -1782,14 +1885,14 @@ class Base64Tab(QWidget):
         # Автокопирование в буфер обмена
         QApplication.clipboard().setText(b64)
         if txt_path:
-            self.lbl_size.setText(f"✅ Скопировано! Размер: {size_str}  •  {os.path.basename(txt_path)}")
+            self.lbl_size.setText(status_html('fa5s.check-circle', f"Скопировано! Размер: {size_str}  •  {os.path.basename(txt_path)}", '#a6e3a1'))
             self.main.log(f"Base64 готов ({size_str}), скопирован в буфер, сохранён: {txt_path}")
         else:
-            self.lbl_size.setText(f"✅ Скопировано! Размер: {size_str}")
+            self.lbl_size.setText(status_html('fa5s.check-circle', f"Скопировано! Размер: {size_str}", '#a6e3a1'))
             self.main.log(f"Base64 готов ({size_str}), скопирован в буфер")
 
     def _on_error(self, msg: str):
-        self.lbl_size.setText(f"❌ {msg}")
+        self.lbl_size.setText(status_html('fa5s.times-circle', f"{msg}", '#f38ba8'))
         self.progress.hide()
         self.main.log(f"Base64: {msg}")
 
@@ -1837,13 +1940,13 @@ class PhotoMergerTab(QWidget):
 
         # Без setFixedWidth — крупный шрифт обрезал подписи («Добави…», «Очистить вс…»).
         # Кнопки берут ширину по содержимому; статус-лейбл (stretch=1) отдаёт им место.
-        btn_open = QPushButton("📂  Добавить файлы")
+        btn_open = _icon_btn("Добавить файлы", 'fa5s.folder-open')
         btn_open.clicked.connect(self._open_files)
 
-        btn_clear_sel = QPushButton("✂  Удалить выбранные")
+        btn_clear_sel = _icon_btn("Удалить выбранные", 'fa5s.times')
         btn_clear_sel.clicked.connect(self._remove_selected)
 
-        btn_clear_all = QPushButton("🗑  Очистить всё")
+        btn_clear_all = _icon_btn("Очистить всё", 'fa5s.trash', color='#1e1e2e')
         btn_clear_all.setObjectName("b_stop")
         btn_clear_all.clicked.connect(self._clear_all)
 
@@ -1863,8 +1966,8 @@ class PhotoMergerTab(QWidget):
 
         # ── ПРАВО: настройки объединения ──────────────────────
         grp_set = QGroupBox("Настройки"); set_l = QVBoxLayout(grp_set)
-        self.rb_horiz = QPushButton("➡  Горизонт.")
-        self.rb_vert  = QPushButton("⬇  Вертикал.")
+        self.rb_horiz = _icon_btn("Горизонт.", 'fa5s.arrow-right')
+        self.rb_vert  = _icon_btn("Вертикал.", 'fa5s.arrow-down')
         self.rb_horiz.setCheckable(True); self.rb_horiz.setChecked(True)
         self.rb_vert.setCheckable(True)
         self.rb_horiz.clicked.connect(lambda: self.rb_vert.setChecked(False))
@@ -1881,10 +1984,10 @@ class PhotoMergerTab(QWidget):
         set_l.addLayout(row_fmt)
         right.addWidget(grp_set)
 
-        self.btn_merge_new = QPushButton("▶  Объединить новые")
+        self.btn_merge_new = _icon_btn("Объединить новые", 'fa5s.object-group', color='#1e1e2e')
         self.btn_merge_new.setObjectName("b_run")
         self.btn_merge_new.clicked.connect(lambda: self._do_merge(force_all=False))
-        self.btn_merge_all = QPushButton("⟳  Переобъединить всё")
+        self.btn_merge_all = _icon_btn("Переобъединить всё", 'fa5s.redo', color='#1e1e2e')
         self.btn_merge_all.setObjectName("b_restart")
         self.btn_merge_all.clicked.connect(lambda: self._do_merge(force_all=True))
         right.addWidget(self.btn_merge_new)
@@ -1954,7 +2057,7 @@ class PhotoMergerTab(QWidget):
     # ── Core merge ──────────────────────────────────────────
     def _do_merge(self, force_all: bool):
         if not Image:
-            self.lbl_status.setText("❌ Pillow не установлен (pip install Pillow)")
+            self.lbl_status.setText(status_html('fa5s.times-circle', "Pillow не установлен (pip install Pillow)", '#f38ba8'))
             return
 
         items = self.file_list.get_all_items() if force_all else self.file_list.get_new_items()
@@ -2019,8 +2122,8 @@ class PhotoMergerTab(QWidget):
             self.lbl_preview.setPixmap(
                 pix.scaledToWidth(prev_w, Qt.TransformationMode.SmoothTransformation))
 
-            self.lbl_status.setText(
-                f"✅ Готово! {len(imgs)} фото → {os.path.basename(out_path)}")
+            self.lbl_status.setText(status_html('fa5s.check-circle',
+                f"Готово! {len(imgs)} фото → {os.path.basename(out_path)}", '#a6e3a1'))
             self.main.log(f"[Фото] Объединено {len(imgs)} файлов → {out_path}")
 
             # ── Отправить результат в очередь первой вкладки ──
@@ -2035,7 +2138,7 @@ class PhotoMergerTab(QWidget):
             except Exception: pass
 
         except Exception as exc:
-            self.lbl_status.setText(f"❌ Ошибка: {exc}")
+            self.lbl_status.setText(status_html('fa5s.times-circle', f"Ошибка: {exc}", '#f38ba8'))
             self.main.log(f"[Фото] Ошибка объединения: {exc}")
         finally:
             # Закрываем все PIL-изображения, чтобы избежать утечки памяти
@@ -2070,18 +2173,18 @@ class PromptTab(QWidget):
         top.addWidget(lbl)
         top.addStretch()
 
-        btn_all = QPushButton("✓ Все")
+        btn_all = _icon_btn("Все", 'fa5s.check')
         btn_all.setFixedWidth(72)
         btn_all.clicked.connect(self._select_all)
-        btn_none = QPushButton("✗ Снять")
+        btn_none = _icon_btn("Снять", 'fa5s.times')
         btn_none.setFixedWidth(72)
         btn_none.clicked.connect(self._select_none)
-        self.btn_copy_sel = QPushButton("📋  Копировать выбранные")
+        self.btn_copy_sel = _icon_btn("Копировать выбранные", 'fa5s.copy')
         self.btn_copy_sel.clicked.connect(self._copy_selected)
-        btn_pick = QPushButton("📂  Выбрать файл")
+        btn_pick = _icon_btn("Выбрать файл", 'fa5s.folder-open')
         btn_pick.setToolTip("Загрузить промпты из любого .txt файла")
         btn_pick.clicked.connect(self._choose_prompt_file)
-        btn_reload = QPushButton("↺  Обновить")
+        btn_reload = _icon_btn("Обновить", 'fa5s.sync-alt')
         btn_reload.clicked.connect(self._load_prompts)
 
         top.addWidget(btn_all)
@@ -2102,14 +2205,14 @@ class PromptTab(QWidget):
         # Подсказка на пустом поле — как пользоваться вкладкой.
         self._empty_hint = QLabel(
             "Как это работает\n\n"
-            "• Нажмите «📂 Выбрать файл» и укажите любой .txt с промптами.\n"
+            "• Нажмите «Выбрать файл» и укажите любой .txt с промптами.\n"
             "   Выбранный файл запоминается и подгружается при следующем запуске.\n"
             "• Каждый пункт, начинающийся с «1)», «2)», «3)» … — отдельный промпт.\n"
             "   Файл без такой нумерации показывается одним цельным промптом.\n"
-            "• Отметьте нужные галочками и нажмите «📋 Копировать выбранные» —\n"
+            "• Отметьте нужные галочками и нажмите «Копировать выбранные» —\n"
             "   они скопируются в буфер обмена (через пустую строку между собой).\n"
-            "• «↺ Обновить» — перечитать файл, если вы его изменили.\n\n"
-            "Сейчас файл не выбран — нажмите «📂 Выбрать файл».")
+            "• «Обновить» — перечитать файл, если вы его изменили.\n\n"
+            "Сейчас файл не выбран — нажмите «Выбрать файл».")
         self._empty_hint.setWordWrap(True)
         self._empty_hint.setStyleSheet("color:#9399b2; font-size:12px; padding:8px 4px;")
         self._empty_hint.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
@@ -2131,7 +2234,7 @@ class PromptTab(QWidget):
         self._checkboxes.clear()
 
         if not self._prompt_path:
-            self._status.setText("Файл не выбран — нажмите «📂 Выбрать файл»")
+            self._status.setText("Файл не выбран — нажмите «Выбрать файл»")
             self._empty_hint.setVisible(True)
             return
         if not os.path.exists(self._prompt_path):
@@ -2211,6 +2314,6 @@ class PromptTab(QWidget):
         n = len(parts)
         suffix = "а" if n in (2, 3, 4) else "ов" if n != 1 else ""
         orig = self.btn_copy_sel.text()
-        self.btn_copy_sel.setText(f"✓  Скопировано {n} пункт{suffix}!")
+        self.btn_copy_sel.setText(f"Скопировано {n} пункт{suffix}!")
         QTimer.singleShot(2000, lambda: self.btn_copy_sel.setText(orig))
         self._status.setText(f"Скопировано {n} пункт{suffix} в буфер")

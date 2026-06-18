@@ -31,9 +31,12 @@ class StatusColorDelegate(QStyledItemDelegate):
         if color:
             # Цветная строка: всегда показываем статус-цвет
             if is_sel:
-                # Выделение цветной строки: осветляем цвет статуса (мягко,
-                # без резкой белой рамки — она «вырвиглазная»).
-                bg = QColor(color).lighter(135)
+                # Выделение цветной строки: ЗАТЕМНЯЕМ статус-цвет, а не осветляем.
+                # Осветление давало почти белый фон, на котором светлый текст
+                # («Готово», «Было/Стало», размеры) «засвечивался» и не читался.
+                # Тёмный насыщенный фон + светлый текст = выделение видно, надписи
+                # читаются.
+                bg = QColor(color).darker(150)
                 bg.setAlpha(255)
             else:
                 bg = color  # переиспользуем объект из словаря без копирования
@@ -153,19 +156,26 @@ class _InfoBadge(QLabel):
     Чтобы изменить текст — правьте строку в info_badge()/label_with_info()/
     row_with_info() в файле tabs.py."""
     def __init__(self, tip: str):
-        super().__init__("ⓘ")
+        super().__init__()
         self._tip = tip
         self.setObjectName("infoBadge")
         self.setCursor(Qt.CursorShape.WhatsThisCursor)
-        self.setFixedSize(20, 20)
+        self.setFixedSize(16, 16)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Векторный значок-подсказка вместо эмодзи «ⓘ»; цвет переключается
+        # на наведении (как раньше делал CSS color для текста).
+        self._pm_normal = get_icon_pixmap('fa5s.info-circle', 13, '#89b4fa')
+        self._pm_hover = get_icon_pixmap('fa5s.info-circle', 13, '#cba6f7')
+        self.setPixmap(self._pm_normal)
 
     def enterEvent(self, e):
+        self.setPixmap(self._pm_hover)
         try: _InfoTipPopup.instance().show_for(self, self._tip)
         except Exception: pass
         super().enterEvent(e)
 
     def leaveEvent(self, e):
+        self.setPixmap(self._pm_normal)
         try: _InfoTipPopup.instance().hide()
         except Exception: pass
         super().leaveEvent(e)
@@ -207,6 +217,10 @@ class WheelBlocker(QObject):
                         break
                     p = p.parent() if hasattr(p, "parent") else None
                     depth += 1
+                # Виджеты с пометкой wheelAlways (напр. ползунок громкости) —
+                # колесо меняет значение ВСЕГДА, не блокируем.
+                if target is not None and target.property("wheelAlways"):
+                    return False
                 if target is not None:
                     sa = target.parent()
                     while sa is not None and not isinstance(sa, QScrollArea):
@@ -398,9 +412,9 @@ class _RecentThumbWorker(QRunnable):
 class RecentFileThumb(QWidget):
     """Карточка в стрипе: миниатюра + тип-значок + имя файла."""
 
-    _ICON_VIDEO = "🎬"
-    _ICON_IMAGE = "🖼"
-    _ICON_AUDIO = "🎵"
+    _ICON_VIDEO = "fa5s.film"
+    _ICON_IMAGE = "fa5s.image"
+    _ICON_AUDIO = "fa5s.music"
 
     _thumb_ready = pyqtSignal(object, str)  # (bytes|None, dur_str)
 
@@ -413,6 +427,7 @@ class RecentFileThumb(QWidget):
         self._drag_start = None
         self._thumb_attempts = 0
         self._last_seen_size = -1   # для дозаписываемых файлов (Filmora и пр.)
+        self._has_thumb = False     # получена ли настоящая миниатюра
 
         ext = os.path.splitext(path)[1].lower()
         is_img   = ext in ALLOWED_IMG
@@ -446,7 +461,7 @@ class RecentFileThumb(QWidget):
         # Имя файла
         name = os.path.basename(path)
         short = (name[:15] + "…") if len(name) > 15 else name
-        name_lbl = QLabel(f"{self._type_icon} {short}")
+        name_lbl = QLabel(f"{icon_html(self._type_icon, 10, '#cccccc')} {short}")
         name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         name_lbl.setWordWrap(False)
         name_lbl.setStyleSheet("color:#ccc;font-size:8px;")
@@ -473,7 +488,7 @@ class RecentFileThumb(QWidget):
 
     def _placeholder_html(self):
         """HTML-заглушка превью: крупный значок типа + расширение файла снизу."""
-        return (f"<div style='font-size:24px; line-height:25px;'>{self._type_icon}</div>"
+        return (f"<div style='line-height:25px;'>{icon_html(self._type_icon, 24, '#cdd6f4')}</div>"
                 f"<div style='font-size:9px; color:#9399b2;'>{self._ext_txt}</div>"
                 f"<div style='font-size:9px; color:#7f849c;'>{self._size_str}</div>")
 
@@ -538,8 +553,28 @@ class RecentFileThumb(QWidget):
                 p2.end()
             self._thumb_lbl.setText("")
             self._thumb_lbl.setPixmap(pix)
+            self._has_thumb = True
         except Exception:
             pass
+
+    def recheck_pending(self):
+        """Периодический пинг от стрипа (раз в 5 c): если миниатюры ещё нет,
+        а размер файла изменился — значит файл дописали (ffmpeg пишет moov-атом
+        mp4 только в конце, до этого файл «висит» крошечным). Обновляем размер и
+        пробуем снова. ffmpeg-воркер запускаем только при изменении размера —
+        для готовых/безвидеошных файлов лишних запусков нет."""
+        if self._has_thumb:
+            return
+        try:
+            cur = os.path.getsize(self.path)
+        except Exception:
+            return
+        if cur != self._last_seen_size:
+            self._last_seen_size = cur
+            self._refresh_size()
+            self._thumb_lbl.setText(self._placeholder_html())  # показать актуальный размер
+            self._thumb_attempts = 0
+            self._retry_thumb()
 
     def _retry_thumb(self):
         """Повторная попытка сделать миниатюру (файл мог быть занят/недописан)."""
@@ -577,6 +612,96 @@ class RecentFileThumb(QWidget):
                 p = p.parent()
             if p: p.add_paths([self.path])
         except Exception: pass
+
+    # ── Контекстное меню (ПКМ) с действиями над файлом ──────────────────────
+    def contextMenuEvent(self, e):
+        m = QMenu(self)
+        a_add = m.addAction(get_icon('fa5s.plus'), "Добавить в активную вкладку")
+        a_open = m.addAction(get_icon('fa5s.play'), "Открыть в системе")
+        a_folder = m.addAction(get_icon('fa5s.folder-open'), "Показать в папке")
+        m.addSeparator()
+        a_copy_path = m.addAction(get_icon('fa5s.clipboard'), "Копировать путь")
+        a_copy_file = m.addAction(get_icon('fa5s.copy'), "Копировать файл (в буфер)")
+        a_rename = m.addAction(get_icon('fa5s.pen'), "Переименовать…")
+        m.addSeparator()
+        a_delete = m.addAction(get_icon('fa5s.trash'), "Удалить файл")
+        chosen = m.exec(e.globalPos())
+        if chosen is None:
+            return
+        if chosen is a_add:
+            self.mouseDoubleClickEvent(None)
+        elif chosen is a_open:
+            self._action_open()
+        elif chosen is a_folder:
+            self._action_show_in_folder()
+        elif chosen is a_copy_path:
+            QApplication.clipboard().setText(self.path)
+        elif chosen is a_copy_file:
+            self._action_copy_file()
+        elif chosen is a_rename:
+            self._action_rename()
+        elif chosen is a_delete:
+            self._action_delete()
+
+    def _action_open(self):
+        try:
+            if os.name == 'nt':
+                os.startfile(self.path)  # noqa
+            else:
+                subprocess.Popen(["xdg-open", self.path])
+        except Exception:
+            pass
+
+    def _action_show_in_folder(self):
+        try:
+            if os.name == 'nt':
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(self.path)])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(self.path)])
+        except Exception:
+            pass
+
+    def _action_copy_file(self):
+        """Кладёт сам файл (как URL) в буфер обмена — можно вставить в проводник."""
+        try:
+            from PyQt6.QtCore import QMimeData, QUrl
+            md = QMimeData()
+            md.setUrls([QUrl.fromLocalFile(self.path)])
+            QApplication.clipboard().setMimeData(md)
+        except Exception:
+            pass
+
+    def _action_rename(self):
+        try:
+            old = os.path.basename(self.path)
+            new, ok = QInputDialog.getText(self, "Переименовать", "Новое имя файла:", text=old)
+            if not ok or not new.strip() or new == old:
+                return
+            new = new.strip()
+            dst = os.path.join(os.path.dirname(self.path), new)
+            if os.path.exists(dst):
+                QMessageBox.warning(self, "Переименование", "Файл с таким именем уже существует.")
+                return
+            os.rename(self.path, dst)
+            self.path = dst
+            self.setToolTip(dst)
+        except Exception as ex:
+            QMessageBox.warning(self, "Переименование", f"Не удалось переименовать:\n{ex}")
+
+    def _action_delete(self):
+        try:
+            r = QMessageBox.question(
+                self, "Удалить файл",
+                f"Удалить файл безвозвратно?\n\n{os.path.basename(self.path)}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if r != QMessageBox.StandardButton.Yes:
+                return
+            os.remove(self.path)
+            # Карточку уберёт автообновление стрипа (poll), а саму скрываем сразу.
+            self.hide()
+        except Exception as ex:
+            QMessageBox.warning(self, "Удаление", f"Не удалось удалить:\n{ex}")
 
 
 class RecentFilesStrip(QWidget):
@@ -680,6 +805,13 @@ class RecentFilesStrip(QWidget):
         new_paths = self._scan()
         if new_paths != self._known_paths:
             self._apply(new_paths)
+        # Пингуем карточки без миниатюры: файл мог дозаписаться (mp4 при
+        # перекодировании весь процесс висит ~48 Б, moov пишется в конце).
+        for i in range(self._row.count()):
+            it = self._row.itemAt(i)
+            w = it.widget() if it else None
+            if isinstance(w, RecentFileThumb):
+                w.recheck_pending()
 
     def refresh(self, folder: str):
         """Вызывается вручную при смене папки."""
@@ -935,6 +1067,7 @@ class PhotoDragList(QTreeWidget):
     def mark_processed(self, items, color: QColor):
         for it in items:
             it.setData(0, Qt.ItemDataRole.UserRole + 1, "processed")
-            it.setText(2, "✓ готово")
+            it.setIcon(2, get_icon('fa5s.check', color='#a6e3a1'))
+            it.setText(2, "готово")
             for col in range(3):
                 it.setBackground(col, QBrush(color))

@@ -12,8 +12,43 @@ from utils import *
 from widgets import *
 from workers import *
 from tabs import *
+from edit_tab import EditTab
 from taskbar import TaskbarProgress
+from PyQt6.QtCore import qInstallMessageHandler, QSize
+from PyQt6.QtWidgets import QTabBar
+import qtawesome as qta
 import hashlib
+
+
+# QtMultimedia с FFmpeg-бэкендом (плеер вкладки «Монтаж») при каждой смене
+# состояния (play/pause/seek) пересобирает декодер и сыпет безобидными
+# «QObject::disconnect: wildcard call disconnects from destroyed signal of
+# QFFmpeg::…» в stderr. Глушим ТОЛЬКО этот шум, остальное пропускаем дальше.
+_QT_LOG_NOISE = (
+    "disconnects from destroyed signal",
+    # Безобидное предупреждение opus-декодера ffmpeg-бэкенда при паузе/возобновлении
+    # воспроизведения во вкладке «Монтаж» — глушим, чтобы не пугать пользователя.
+    "Could not update timestamps for skipped samples",
+    # MKV с прикреплёнными шрифтами (Attachment-потоки): ffmpeg-бэкенд QtMultimedia
+    # не знает кодек шрифта и сыпет «Could not find codec parameters for stream N
+    # (Attachment: none): unknown codec» + совет про analyzeduration/probesize.
+    # Это безобидно (шрифты не нужны для воспроизведения видео/аудио) — глушим,
+    # в т.ч. когда тот же файл открывает вкладка «SiQuesterHYX».
+    "Could not find codec parameters for stream",
+    "Consider increasing the value for the 'analyzeduration'",
+)
+
+
+def _qt_message_filter(mode, context, message):
+    for noise in _QT_LOG_NOISE:
+        if noise in message:
+            return
+    try:
+        if sys.stderr is not None:
+            sys.stderr.write(message + "\n")
+            sys.stderr.flush()
+    except Exception:
+        pass
 
 
 class UnifiedWindow(QMainWindow):
@@ -21,6 +56,12 @@ class UnifiedWindow(QMainWindow):
     log_signal = pyqtSignal(str)              # потокобезопасный лог (из фоновых потоков → GUI)
     update_available_sig = pyqtSignal(str, str, int, str)  # версия, ссылка на zip, размер (байт), sha256 архива ("" = не проверять)
     update_ready_sig = pyqtSignal(str)        # путь к распакованной новой версии (готово к установке)
+
+    # ВНИМАНИЕ РАЗРАБОТЧИКА: В этом приложении категорически запрещено использовать
+    # эмодзи. Все новые иконки добавлять строго через метод get_icon() из библиотеки
+    # qtawesome! (Реализация — общая функция get_icon() в config.py.)
+    def get_icon(self, name, color='#cdd6f4'):
+        return get_icon(name, color=color)
 
     def __init__(self):
         super().__init__()
@@ -70,7 +111,9 @@ class UnifiedWindow(QMainWindow):
         bl.setContentsMargins(12, 6, 12, 6); bl.setSpacing(8)
         self.update_banner_lbl = QLabel("Доступно обновление")
         self.update_banner_lbl.setStyleSheet("color:#cdd6f4; font-weight:bold; background:transparent;")
-        btn_up_now = QPushButton("⬇  Обновить")
+        btn_up_now = QPushButton("Обновить")
+        btn_up_now.setIcon(get_icon('fa5s.download', color='#1e1e2e'))
+        btn_up_now.setIconSize(QSize(20, 20))
         btn_up_now.setObjectName("b_run")
         btn_up_now.clicked.connect(self._on_banner_update)
         btn_skip = QPushButton("Пропустить версию")
@@ -87,17 +130,64 @@ class UnifiedWindow(QMainWindow):
         self.tab_photo = PhotoMergerTab(self)
         self.tab_b64    = Base64Tab(self)
         self.tab_prompt = PromptTab(self)
+        self.tab_edit   = EditTab(self)
         self.tab_media.thumb_sig.connect(self.tab_media.set_thumb)
         self.tab_ytdlp.thumb_sig.connect(self.tab_ytdlp.set_thumb)
-        self.tabs.addTab(self.tab_media,  "🎬  Обработка")
-        self.tabs.addTab(self.tab_ytdlp,  "📥  Загрузчик")
-        self.tabs.addTab(self.tab_photo,  "🖼️  Фото")
-        self.tabs.addTab(self.tab_b64,    "🔡  Base64")
-        self.tabs.addTab(self.tab_prompt, "📋  Промпт")
+        # Заголовки + краткие описания вкладок (подсказка ⓘ при наведении).
+        # (icon_name, title, tip) — значок вкладки рисуется через get_icon().
+        self._tab_info = {
+            'media':  ("fa5s.cogs", "Обработка",
+                       "Перекодирование видео в AV1 (SVT-AV1), смена скорости/"
+                       "разрешения/FPS, аудиоэффекты, конвертация изображений."),
+            'ytdlp':  ("fa5s.cloud-download-alt", "Загрузчик",
+                       "Скачивание видео/аудио по ссылке (YouTube, TikTok и др.): "
+                       "качество, обрезка по таймингам, субтитры, куки."),
+            'edit':   ("fa5s.cut", "Монтаж",
+                       "Обрезка видео/аудио по волне: предпросмотр, точки IN/OUT, "
+                       "быстрый режим (copy) и перекодировка, экспорт в MP3."),
+            'photo':  ("fa5s.image", "Фото",
+                       "Объединение нескольких изображений в одно."),
+            'b64':    ("fa5s.font", "Base64",
+                       "Кодирование и декодирование файлов и текста в Base64."),
+            'prompt': ("fa5s.clipboard", "Промпт",
+                       "Менеджер промптов: хранение и быстрый выбор заготовок."),
+            'siquester': ("fa5s.dice", "SiQuesterHYX",
+                          "Экспериментальная вкладка SiQuester: просмотр и работа "
+                          "с .siq-вопросами."),
+        }
+        self.tabs.setIconSize(QSize(16, 16))
+        self._add_tab(self.tab_media,  'media')
+        self._add_tab(self.tab_ytdlp,  'ytdlp')
+        self._add_tab(self.tab_edit,   'edit')
+        self._add_tab(self.tab_photo,  'photo')
+        self._add_tab(self.tab_b64,    'b64')
+        self._add_tab(self.tab_prompt, 'prompt')
+
+        # Вкладки можно перетаскивать мышью и сортировать в удобном порядке;
+        # порядок сохраняется между запусками (см. _save_tab_order / tab_order).
+        self.tabs.setMovable(True)
+        self._reordering_tabs = False
+        try:
+            self.tabs.tabBar().tabMoved.connect(self._on_tab_moved)
+        except Exception:
+            pass
+
+        # Подсказка ⓘ на вкладке: значок-бейдж внутри QTabBar не получает
+        # enter/leave надёжно (таббар сам обрабатывает наведение), поэтому
+        # показываем фирменный попап сами — отслеживаем движение мыши над
+        # таббаром и проверяем, под каким бейджем курсор.
+        self._tab_tip_idx = -1
+        try:
+            bar = self.tabs.tabBar()
+            bar.setMouseTracking(True)
+            bar.installEventFilter(self)
+        except Exception:
+            pass
 
         # Кнопки в строке вкладок — corner widget подгоняется под высоту таббара
         self.btn_settings = QToolButton()
-        self.btn_settings.setText("⚙")
+        self.btn_settings.setIcon(get_icon('fa5s.cog'))
+        self.btn_settings.setIconSize(QSize(20, 20))
         self.btn_settings.setToolTip("Настройки")
         self.btn_settings.setStyleSheet("QToolButton{min-height:0px; padding:2px 8px;}")
         self.btn_settings.setFixedHeight(26)
@@ -116,20 +206,64 @@ class UnifiedWindow(QMainWindow):
         self.pbar.setFixedHeight(22)
         l.addWidget(self.pbar)
 
-        self.txt_log = QTextEdit(); self.txt_log.setFixedHeight(120); self.txt_log.setReadOnly(True)
+        # Лог-консоль внизу окна. Показывается на всех вкладках, КРОМЕ «Монтаж»
+        # (там она занимает место, нужное редактору) — скрывается при переходе
+        # на вкладку монтажа, см. _sync_console_visibility.
+        self.console_panel = QWidget(c)
+        cpl = QVBoxLayout(self.console_panel)
+        cpl.setContentsMargins(0, 0, 0, 0); cpl.setSpacing(2)
+
+        self.txt_log = QTextEdit(self.console_panel); self.txt_log.setReadOnly(True)
         self.txt_log.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.txt_log.customContextMenuRequested.connect(self._log_context_menu)
-        l.addWidget(self.txt_log)
+        self.txt_log.setMaximumHeight(150)
+        cpl.addWidget(self.txt_log)
+        l.addWidget(self.console_panel)
+
+        # Кнопка-значок «развернуть консоль» — поверх самой консоли, в правом
+        # верхнем углу (как кнопка полноэкранного режима у видео).
+        self.btn_open_console = QToolButton(self.txt_log)
+        self.btn_open_console.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMaxButton))
+        self.btn_open_console.setIconSize(QSize(14, 14))
+        self.btn_open_console.setToolTip("Развернуть консоль почти на всё окно")
+        self.btn_open_console.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_console.setFixedSize(22, 22)
+        self.btn_open_console.setStyleSheet(
+            "QToolButton{background:rgba(40,40,48,0.65); border:1px solid rgba(255,255,255,0.12);"
+            " border-radius:4px; padding:0;}"
+            "QToolButton:hover{background:rgba(70,70,85,0.9);}")
+        self.btn_open_console.clicked.connect(self._open_console_window)
+        self.btn_open_console.raise_()
+        self.txt_log.installEventFilter(self)
+        self._reposition_console_btn()
+        self._console_dialog = None
+        self.tabs.currentChanged.connect(self._sync_console_visibility)
+        self._sync_console_visibility()
 
         # Состояние локального сервера для расширения (по умолчанию ВЫКЛ)
         self._server_enabled = False
         self._http_srv = None
         self._http_thread = None
 
+        # Экспериментальная вкладка SiQuester (по умолчанию ВЫКЛ, см. Настройки).
+        self._siquester_tab_enabled = False
+        self.tab_siquester = None
+
         try: self._load_settings()
         except Exception: pass
 
         self._attach_save_handlers()
+
+        # Подключаем экспериментальную вкладку SiQuester, если включена в настройках.
+        if getattr(self, "_siquester_tab_enabled", False):
+            self._add_siquester_tab()
+
+        # Восстанавливаем сохранённый порядок вкладок (перетаскивание мышью).
+        try:
+            self._apply_tab_order(getattr(self, "_tab_order", []))
+        except Exception:
+            pass
 
         # Колёсико над полями не должно «активировать» их визуально (фокус по скроллу):
         # убираем WheelFocus у всех числовых полей/списков/ползунков во всех вкладках.
@@ -171,6 +305,9 @@ class UnifiedWindow(QMainWindow):
         ty = self.tab_ytdlp
         self._server_enabled = bool(s.get("server_enabled", False))
         self._wheel_changes_values = bool(s.get("wheel_changes_values", False))
+        self._video_software_render = bool(s.get("video_software_render", False))
+        self._siquester_tab_enabled = bool(s.get("siquester_tab_enabled", False))
+        self._tab_order = list(s.get("tab_order", []) or [])
         try:
             m = s.get("media", {}); a = m.get("audio", {})
             tm.ck_norm.setChecked(a.get("norm", True))
@@ -517,6 +654,120 @@ class UnifiedWindow(QMainWindow):
 
     def _set_wheel_changes_values(self, checked: bool):
         self._wheel_changes_values = bool(checked)
+        try: self._save_settings_now()
+        except Exception: pass
+
+    def _set_video_software_render(self, checked: bool):
+        self._video_software_render = bool(checked)
+        try: self._save_settings_now()
+        except Exception: pass
+
+    # ------------------------------------------------------------------
+    # Вкладки: подсказки (ⓘ) и сохраняемый порядок (drag-n-drop)
+    # ------------------------------------------------------------------
+    def _add_tab(self, widget, key):
+        """Добавляет вкладку с заголовком и значком ⓘ (тот же info_badge с
+        всплывающей подсказкой, что и внутри первых двух вкладок — см. widgets.py).
+        objectName вида 'tab::<key>' нужен для сохранения порядка вкладок."""
+        icon_name, title, tip = self._tab_info.get(key, (None, key, ""))
+        try:
+            widget.setObjectName(f"tab::{key}")
+        except Exception:
+            pass
+        if icon_name:
+            idx = self.tabs.addTab(widget, get_icon(icon_name), title)
+        else:
+            idx = self.tabs.addTab(widget, title)
+        # Значок ⓘ — отдельным виджетом на самой вкладке (как info_badge в формах),
+        # с фирменным попапом-подсказкой вместо системного тултипа.
+        try:
+            badge = info_badge(tip)
+            badge.setStyleSheet("#infoBadge{color:#89b4fa;}")
+            self.tabs.tabBar().setTabButton(
+                idx, QTabBar.ButtonPosition.RightSide, badge)
+        except Exception:
+            self.tabs.setTabToolTip(idx, tip)
+        return idx
+
+    def _on_tab_moved(self, *args):
+        # Пользователь перетащил вкладку — сохраняем порядок (но не во время
+        # программной перестановки в _apply_tab_order).
+        if getattr(self, "_reordering_tabs", False):
+            return
+        self._save_tab_order()
+
+    def _save_tab_order(self):
+        order = []
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            on = w.objectName() if w is not None else ""
+            if on.startswith("tab::"):
+                order.append(on[len("tab::"):])
+        self._tab_order = order
+        try: self._save_settings_now()
+        except Exception: pass
+
+    def _apply_tab_order(self, order):
+        """Переставляет вкладки согласно сохранённому порядку ключей. Двигаем
+        через tabBar().moveTab (QTabWidget сам синхронизирует страницы по сигналу
+        tabMoved), а от рекурсивного сохранения защищаемся флагом."""
+        if not order:
+            return
+        bar = self.tabs.tabBar()
+        self._reordering_tabs = True
+        try:
+            target = 0
+            for key in order:
+                name = f"tab::{key}"
+                for i in range(self.tabs.count()):
+                    w = self.tabs.widget(i)
+                    if w is not None and w.objectName() == name:
+                        if i != target:
+                            bar.moveTab(i, target)
+                        target += 1
+                        break
+        finally:
+            self._reordering_tabs = False
+
+    # ------------------------------------------------------------------
+    # Экспериментальная вкладка SiQuester (просмотр .siq + статистика)
+    # ------------------------------------------------------------------
+    def _add_siquester_tab(self):
+        """Создаёт и добавляет вкладку SiQuester (если ещё не добавлена).
+        Импорт ленивый — пакет siquester тянет QtMultimedia и грузится только
+        когда вкладка включена."""
+        if getattr(self, "tab_siquester", None) is not None:
+            return
+        try:
+            from siquester_tab import SiQuesterTab
+            self.tab_siquester = SiQuesterTab(self)
+            self._add_tab(self.tab_siquester, 'siquester')
+            # Сохранённый порядок мог включать эту вкладку — применяем заново.
+            self._apply_tab_order(getattr(self, "_tab_order", []))
+        except Exception as e:
+            self.tab_siquester = None
+            self.log(f"Не удалось добавить вкладку SiQuester: {e}")
+
+    def _remove_siquester_tab(self):
+        t = getattr(self, "tab_siquester", None)
+        if t is None:
+            return
+        try:
+            idx = self.tabs.indexOf(t)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            try: t.cleanup()
+            except Exception: pass
+            t.deleteLater()
+        except Exception: pass
+        self.tab_siquester = None
+
+    def _set_siquester_tab_enabled(self, checked: bool):
+        self._siquester_tab_enabled = bool(checked)
+        if checked:
+            self._add_siquester_tab()
+        else:
+            self._remove_siquester_tab()
         try: self._save_settings_now()
         except Exception: pass
 
@@ -960,77 +1211,263 @@ class UnifiedWindow(QMainWindow):
     def _open_settings_dialog(self):
         dlg = QDialog(self)
         dlg.setWindowTitle("Настройки — " + APP_TITLE)
-        dlg.setMinimumWidth(400)
-        lay = QVBoxLayout(dlg); lay.setSpacing(10)
+        dlg.setMinimumSize(680, 520)
+        outer = QVBoxLayout(dlg); outer.setSpacing(10); outer.setContentsMargins(12, 12, 12, 12)
 
-        title = QLabel(APP_TITLE)
-        title.setStyleSheet("font-size:17px; font-weight:bold; color:#89b4fa;")
-        lay.addWidget(title)
+        # ── Поиск по настройкам ──────────────────────────────────────────────
+        search = QLineEdit()
+        search.setPlaceholderText("Поиск настроек…")
+        search.addAction(get_icon('fa5s.search'),
+                         QLineEdit.ActionPosition.LeadingPosition)
+        search.setClearButtonEnabled(True)
+        outer.addWidget(search)
 
-        # --- Сервер расширения ---
+        body = QHBoxLayout(); body.setSpacing(10)
+        outer.addLayout(body, 1)
+
+        # ── Левая навигация (категории) ──────────────────────────────────────
+        nav = QListWidget()
+        nav.setFixedWidth(160)
+        nav.setStyleSheet(
+            "QListWidget{background:#181825;border:1px solid #45475a;border-radius:6px;"
+            "padding:4px;outline:none;}"
+            "QListWidget::item{padding:8px 10px;border-radius:5px;color:#cdd6f4;}"
+            "QListWidget::item:selected{background:#89b4fa;color:#1e1e2e;font-weight:bold;}"
+            "QListWidget::item:hover:!selected{background:#313244;}")
+        body.addWidget(nav)
+
+        # ── Правая прокручиваемая область со всеми секциями ───────────────────
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget(); content_l = QVBoxLayout(content)
+        content_l.setContentsMargins(4, 4, 8, 4); content_l.setSpacing(14)
+        scroll.setWidget(content)
+        body.addWidget(scroll, 1)
+
+        sections = []  # [{'name','widget','header','layout','rows':[(w,keywords)]}]
+
+        def make_section(name):
+            sec = QWidget()
+            secl = QVBoxLayout(sec); secl.setContentsMargins(0, 0, 0, 0); secl.setSpacing(10)
+            hdr = QLabel(name)
+            hdr.setStyleSheet("font-size:16px; font-weight:bold; color:#89b4fa; padding-top:2px;")
+            secl.addWidget(hdr)
+            rec = {'name': name, 'widget': sec, 'header': hdr, 'layout': secl, 'rows': []}
+            sections.append(rec)
+            content_l.addWidget(sec)
+            nav.addItem(name)
+            return rec
+
+        def add_row(rec, widget, keywords=""):
+            rec['layout'].addWidget(widget)
+            rec['rows'].append((widget, (rec['name'] + " " + keywords).lower()))
+
+        def hint(text):
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color:#a6adc8; font-size:11px;")
+            lbl.setWordWrap(True)
+            return lbl
+
+        # ══ Секция «Основное» ════════════════════════════════════════════════
+        sec_main = make_section("Основное")
+
         grp_sv = QGroupBox("Браузерное расширение")
         vsv = QVBoxLayout(grp_sv)
         chk = QCheckBox(f"Включить локальный сервер (localhost:{HTTP_PORT})")
         chk.setChecked(bool(self._server_enabled))
         chk.toggled.connect(self._set_server_enabled)
         vsv.addWidget(chk)
-        hint = QLabel("По умолчанию выключен. Включите, чтобы кнопки расширения "
-                      "в браузере могли отправлять ссылки в программу.")
-        hint.setStyleSheet("color:#a6adc8; font-size:11px;")
-        hint.setWordWrap(True)
-        vsv.addWidget(hint)
-        lay.addWidget(grp_sv)
+        vsv.addWidget(hint("По умолчанию выключен. Включите, чтобы кнопки расширения "
+                           "в браузере могли отправлять ссылки в программу."))
+        add_row(sec_main, grp_sv, "браузер расширение сервер localhost порт ссылки")
 
-        # --- Интерфейс ---
         grp_ui = QGroupBox("Интерфейс")
         vui = QVBoxLayout(grp_ui)
         chk_wheel = QCheckBox("Колёсико мыши меняет значения в полях")
         chk_wheel.setChecked(bool(self._wheel_changes_values))
         chk_wheel.toggled.connect(self._set_wheel_changes_values)
         vui.addWidget(chk_wheel)
-        hint_w = QLabel("Если выключено — колёсико над полями (битрейт, ползунки, "
-                        "числа) ничего не меняет, а просто прокручивает панель.")
-        hint_w.setStyleSheet("color:#a6adc8; font-size:11px;")
-        hint_w.setWordWrap(True)
-        vui.addWidget(hint_w)
-        lay.addWidget(grp_ui)
+        vui.addWidget(hint("Если выключено — колёсико над полями (битрейт, ползунки, "
+                           "числа) ничего не меняет, а просто прокручивает панель."))
+        add_row(sec_main, grp_ui, "колесо мышь интерфейс значения прокрутка битрейт ползунки")
 
-        # --- Обновления ---
+        # ══ Секция «Экспериментально» ════════════════════════════════════════
+        sec_exp = make_section("Экспериментально")
+
+        grp_siq = QGroupBox("Дополнительные вкладки")
+        vexp = QVBoxLayout(grp_siq)
+        chk_siq = QCheckBox("Включить вкладку «SiQuesterHYX» (просмотр .siq + статистика)")
+        chk_siq.setChecked(bool(getattr(self, "_siquester_tab_enabled", False)))
+        chk_siq.toggled.connect(self._set_siquester_tab_enabled)
+        vexp.addWidget(chk_siq)
+        vexp.addWidget(hint(icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
+                            + " Экспериментальная вкладка (по умолчанию выключена). Встроенный "
+                            "просмотрщик пакетов SIGame (.siq) и анализатор статистики из "
+                            "SiQuesterHYX. Видео и аудио воспроизводятся через QtMultimedia. "
+                            "Включается и выключается без перезапуска программы."))
+        add_row(sec_exp, grp_siq,
+                "siquester сиквестер siq пакет вопросы статистика эксперимент вкладка просмотр sigame")
+
+        # ══ Секция «Монтаж» ══════════════════════════════════════════════════
+        sec_edit = make_section("Монтаж")
+
+        grp_keys = QGroupBox("Сочетания обрезки")
+        vk = QVBoxLayout(grp_keys)
+        te = getattr(self, "tab_edit", None)
+        if te is not None and getattr(te, "_ready", False):
+            start_seq, end_seq = te.get_trim_shortcuts()
+
+            def _mk_key_row(label_text, init_seq, apply_idx):
+                row = QHBoxLayout()
+                lbl = QLabel(label_text)
+                lbl.setStyleSheet("color:#cdd6f4; font-size:12px;")
+                lbl.setFixedWidth(230)
+                kse = QKeySequenceEdit()
+                kse.setKeySequence(QKeySequence(init_seq))
+                row.addWidget(lbl); row.addWidget(kse, 1)
+                w = QWidget(); w.setLayout(row)
+                return w, kse
+
+            row_start, kse_start = _mk_key_row("Обрезать старт до плейхеда", start_seq, 0)
+            row_end,   kse_end   = _mk_key_row("Обрезать конец до плейхеда", end_seq, 1)
+            vk.addWidget(row_start)
+            vk.addWidget(row_end)
+
+            def _apply_keys():
+                te.set_trim_shortcuts(
+                    kse_start.keySequence().toString(),
+                    kse_end.keySequence().toString())
+
+            kse_start.editingFinished.connect(_apply_keys)
+            kse_end.editingFinished.connect(_apply_keys)
+            kse_start.keySequenceChanged.connect(lambda *_: _apply_keys())
+            kse_end.keySequenceChanged.connect(lambda *_: _apply_keys())
+
+            btn_reset = QPushButton("Сбросить по умолчанию (Shift+C / Shift+V)")
+            def _reset_keys():
+                kse_start.setKeySequence(QKeySequence("Shift+C"))
+                kse_end.setKeySequence(QKeySequence("Shift+V"))
+                te.set_trim_shortcuts("Shift+C", "Shift+V")
+            btn_reset.clicked.connect(_reset_keys)
+            vk.addWidget(btn_reset)
+            vk.addWidget(hint("Кликните в поле и нажмите нужную комбинацию. «Старт» "
+                              "ставит точку IN, «Конец» — точку OUT на текущую позицию "
+                              "воспроизведения."))
+        else:
+            vk.addWidget(hint("Вкладка «Монтаж» недоступна (нет модуля мультимедиа), "
+                              "настройка сочетаний невозможна."))
+        add_row(sec_edit, grp_keys, "монтаж обрезка сочетание клавиши shift c v плейхед старт конец in out горячие")
+
+        grp_render = QGroupBox("Видео и оверлеи")
+        vr = QVBoxLayout(grp_render)
+
+        if te is not None and getattr(te, "_ready", False):
+            chk_subframe = QCheckBox("Субтитры рендерить прямо в кадр (как в VLC)")
+            chk_subframe.setChecked(bool(getattr(te, "_subs_in_frame", True)))
+            chk_subframe.toggled.connect(lambda v: te.set_subs_in_frame(bool(v)))
+            vr.addWidget(chk_subframe)
+            vr.addWidget(hint("Включено (по умолчанию): субтитры рисуются ВНУТРИ кадра — "
+                              "корректно обрезаются по видео и перекрываются панелями/окнами "
+                              "сверху (как в VLC). Выключено: старый метод — отдельное "
+                              "окно-оверлей поверх видео (чуть легче для ЦП, но всплывает "
+                              "над другими окнами). Применяется сразу."))
+
+        chk_sw = QCheckBox("Программный рендер видео (убирает оверлей RivaTuner/FPS)")
+        chk_sw.setChecked(bool(getattr(self, "_video_software_render", False)))
+        chk_sw.toggled.connect(self._set_video_software_render)
+        vr.addWidget(chk_sw)
+        vr.addWidget(hint("Помогает, когда RivaTuner рисует счётчик FPS поверх окна видео. "
+                          "Видео рендерится без аппаратного D3D/GL-свопчейна, который "
+                          "перехватывает RivaTuner. Изменение вступит в силу после перезапуска "
+                          "программы."))
+        add_row(sec_edit, grp_render, "rivatuner оверлей fps d3d11 рендер видео аппаратное программное ускорение субтитры кадр vlc метод")
+
+        # ══ Секция «О программе» ═════════════════════════════════════════════
+        sec_about = make_section("О программе")
+
         grp_up = QGroupBox("Обновления")
         vup = QVBoxLayout(grp_up)
-
-        btn_app_up = QPushButton("🔄  Проверить обновления программы")
+        btn_app_up = QPushButton("Проверить обновления программы")
+        btn_app_up.setIcon(get_icon('fa5s.sync-alt'))
+        btn_app_up.setIconSize(QSize(20, 20))
         btn_app_up.setToolTip("Проверяет последнюю версию на GitHub и предлагает обновиться")
         btn_app_up.clicked.connect(lambda: self._check_updates(silent=False))
         vup.addWidget(btn_app_up)
-        hint_app = QLabel(f"Текущая версия: {APP_VERSION}. При наличии новой версии "
-                          "программа сама скачает её и перезапустится.")
-        hint_app.setStyleSheet("color:#a6adc8; font-size:11px;")
-        hint_app.setWordWrap(True)
-        vup.addWidget(hint_app)
-
-        btn_up = QPushButton("⬇  Обновить yt-dlp")
+        vup.addWidget(hint("При наличии новой версии программа сама скачает её и перезапустится."))
+        btn_up = QPushButton("Обновить yt-dlp")
+        btn_up.setIcon(get_icon('fa5s.download'))
+        btn_up.setIconSize(QSize(20, 20))
         btn_up.setToolTip("Скачивает свежую версию yt-dlp (исправляет загрузку, когда YouTube/TikTok ломают старую)")
         btn_up.clicked.connect(self._update_ytdlp)
         vup.addWidget(btn_up)
-        hint_up = QLabel("Если перестало качать с YouTube/TikTok — нажмите, чтобы обновить yt-dlp "
-                         "(работает для bin/yt-dlp.exe). Результат — в логе программы.")
-        hint_up.setStyleSheet("color:#a6adc8; font-size:11px;")
-        hint_up.setWordWrap(True)
-        vup.addWidget(hint_up)
-        lay.addWidget(grp_up)
+        vup.addWidget(hint("Если перестало качать с YouTube/TikTok — нажмите, чтобы обновить yt-dlp "
+                           "(работает для bin/yt-dlp.exe)."))
+        add_row(sec_about, grp_up, "обновление обновить программа yt-dlp youtube tiktok версия github")
 
-        # --- Сообщество: чистые ссылки в самом низу (без кнопок) ---
-        lay.addStretch()
+        grp_links = QGroupBox("Ссылки и сообщество")
+        vl = QVBoxLayout(grp_links)
         links = QLabel(
             f'Discord: <a href="{DISCORD_URL}" style="color:#89b4fa;">{DISCORD_URL}</a><br>'
-            f'GitHub: <a href="{GITHUB_URL}" style="color:#89b4fa;">{GITHUB_URL}</a>'
-        )
+            f'GitHub: <a href="{GITHUB_URL}" style="color:#89b4fa;">{GITHUB_URL}</a>')
         links.setOpenExternalLinks(True)
         links.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         links.setWordWrap(True)
-        links.setStyleSheet("color:#a6adc8; font-size:11px;")
-        lay.addWidget(links)
+        links.setStyleSheet("color:#a6adc8; font-size:12px;")
+        vl.addWidget(links)
+        add_row(sec_about, grp_links, "discord github ссылки сообщество поддержка обновления")
+
+        content_l.addStretch(1)
+
+        # ── Навигация ↔ прокрутка (взаимная синхронизация) ───────────────────
+        # Клик по категории прокручивает к секции; прокрутка колесом/ползунком
+        # подсвечивает категорию активной секции. Флаг гасит рекурсию сигналов.
+        syncing = {'v': False}
+
+        def _goto(idx):
+            if syncing['v']:
+                return
+            if 0 <= idx < len(sections):
+                syncing['v'] = True
+                scroll.ensureWidgetVisible(sections[idx]['header'], 0, 0)
+                syncing['v'] = False
+        nav.currentRowChanged.connect(_goto)
+
+        def _on_scroll(_val=None):
+            if syncing['v']:
+                return
+            val = scroll.verticalScrollBar().value()
+            cur = 0
+            for i, rec in enumerate(sections):
+                if rec['widget'].isVisible() and rec['widget'].y() <= val + 12:
+                    cur = i
+            if cur != nav.currentRow():
+                syncing['v'] = True
+                nav.setCurrentRow(cur)
+                syncing['v'] = False
+        scroll.verticalScrollBar().valueChanged.connect(_on_scroll)
+
+        nav.setCurrentRow(0)
+
+        # ── Поиск: прячем несовпадающие строки/секции ────────────────────────
+        def _do_search(text):
+            q = (text or "").strip().lower()
+            first_visible = None
+            for i, rec in enumerate(sections):
+                any_vis = False
+                for w, kw in rec['rows']:
+                    vis = (q in kw) if q else True
+                    w.setVisible(vis)
+                    any_vis = any_vis or vis
+                show_sec = any_vis if q else True
+                rec['widget'].setVisible(show_sec)
+                rec['header'].setVisible(show_sec)
+                nav.item(i).setHidden(bool(q) and not show_sec)
+                if show_sec and first_visible is None:
+                    first_visible = rec
+            if q and first_visible is not None:
+                scroll.ensureWidgetVisible(first_visible['header'], 0, 0)
+        search.textChanged.connect(_do_search)
+
         dlg.exec()
 
     def _collect_settings(self):
@@ -1071,8 +1508,11 @@ class UnifiedWindow(QMainWindow):
                 },
                 'server_enabled': bool(getattr(self, '_server_enabled', False)),
                 'wheel_changes_values': bool(getattr(self, '_wheel_changes_values', False)),
+                'video_software_render': bool(getattr(self, '_video_software_render', False)),
+                'siquester_tab_enabled': bool(getattr(self, '_siquester_tab_enabled', False)),
                 'priority': tm.c_priority.currentText() if hasattr(tm, 'c_priority') else 'Обычный',
                 'prompt_file': getattr(getattr(self, 'tab_prompt', None), '_prompt_path', '') or '',
+                'tab_order': list(getattr(self, '_tab_order', [])),
             }
             return s
         except Exception: return {}
@@ -1157,18 +1597,137 @@ class UnifiedWindow(QMainWindow):
         try: self._taskbar.clear(self._tb_hwnd())
         except Exception: pass
 
-    def _log_context_menu(self, pos):
+    def _sync_console_visibility(self, *args):
+        """Нижняя консоль и прогрессбар. Консоль скрыта на «Монтаж» и
+        «SiQuesterHYX» (там она лишь занимает место). Прогрессбар скрыт на
+        «SiQuesterHYX» (на «Монтаж» он нужен для прогресса экспорта)."""
+        try:
+            cur = self.tabs.currentWidget()
+            is_edit = cur is self.tab_edit
+            tsq = getattr(self, "tab_siquester", None)
+            is_siq = tsq is not None and cur is tsq
+            self.console_panel.setVisible(not (is_edit or is_siq))
+            self.pbar.setVisible(not is_siq)
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, event):
+        # Держим кнопку-значок «развернуть консоль» прижатой к правому верхнему
+        # углу консоли при её ресайзе/показе.
+        if obj is getattr(self, "txt_log", None) and event.type() in (
+                QEvent.Type.Resize, QEvent.Type.Show):
+            self._reposition_console_btn()
+        bar = self.tabs.tabBar() if getattr(self, "tabs", None) is not None else None
+        if bar is not None and obj is bar:
+            et = event.type()
+            if et == QEvent.Type.MouseMove:
+                try: self._update_tab_tip(event.position().toPoint())
+                except Exception: pass
+            elif et in (QEvent.Type.Leave, QEvent.Type.Hide,
+                        QEvent.Type.WindowDeactivate):
+                self._hide_tab_tip()
+        return super().eventFilter(obj, event)
+
+    def _update_tab_tip(self, pos):
+        """Показывает попап-подсказку, если курсор над значком ⓘ вкладки.
+
+        Текст берём не из значка, а из _tab_info по стабильному ключу вкладки
+        (objectName 'tab::<key>'): Qt при tabButton() может вернуть значок как
+        обычный QLabel, потеряв питоновский атрибут _tip, поэтому полагаться на
+        сам объект значка нельзя."""
+        from widgets import _InfoTipPopup
+        bar = self.tabs.tabBar()
+        idx = bar.tabAt(pos)
+        if idx < 0:
+            self._hide_tab_tip(); return
+        badge = bar.tabButton(idx, QTabBar.ButtonPosition.RightSide)
+        page = self.tabs.widget(idx)
+        on = page.objectName() if page is not None else ""
+        tip = self._tab_info.get(on[5:], ("", "", ""))[2] if on.startswith("tab::") else ""
+        if badge is not None and tip and badge.geometry().contains(pos):
+            if self._tab_tip_idx != idx:
+                _InfoTipPopup.instance().show_for(badge, tip)
+                self._tab_tip_idx = idx
+        else:
+            self._hide_tab_tip()
+
+    def _hide_tab_tip(self):
+        if getattr(self, "_tab_tip_idx", -1) != -1:
+            try:
+                from widgets import _InfoTipPopup
+                _InfoTipPopup.instance().hide()
+            except Exception:
+                pass
+            self._tab_tip_idx = -1
+
+    def _reposition_console_btn(self):
+        btn = getattr(self, "btn_open_console", None)
+        if btn is None:
+            return
+        try:
+            vp = self.txt_log.viewport()
+            x = vp.width() - btn.width() - 4
+            btn.move(max(0, x), 4)
+            btn.raise_()
+        except Exception:
+            pass
+
+    def _open_console_window(self):
+        """Открывает консоль в окне почти на весь размер главного окна.
+        Использует тот же QTextDocument, поэтому лог обновляется вживую."""
+        dlg = getattr(self, "_console_dialog", None)
+        if dlg is not None and dlg.isVisible():
+            dlg.raise_(); dlg.activateWindow()
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Консоль")
+        dlg.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        v = QVBoxLayout(dlg); v.setContentsMargins(8, 8, 8, 8); v.setSpacing(6)
+
+        big = QTextEdit(dlg); big.setReadOnly(True)
+        big.setDocument(self.txt_log.document())   # общий документ → живой лог
+        big.moveCursor(QTextCursor.MoveOperation.End)
+        big.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        big.customContextMenuRequested.connect(
+            lambda pos, w=big: self._log_context_menu(pos, w))
+        v.addWidget(big)
+
+        row = QHBoxLayout(); row.addStretch(1)
+        btn_clr = QPushButton("Очистить", dlg)
+        btn_clr.clicked.connect(self.txt_log.clear)
+        btn_close = QPushButton("Закрыть", dlg)
+        btn_close.clicked.connect(dlg.close)
+        row.addWidget(btn_clr); row.addWidget(btn_close)
+        v.addLayout(row)
+
+        # Размер ~90% от главного окна, по центру над ним
+        g = self.geometry()
+        w = int(g.width() * 0.9); h = int(g.height() * 0.9)
+        dlg.resize(max(640, w), max(400, h))
+        dlg.move(g.x() + (g.width() - dlg.width()) // 2,
+                 g.y() + (g.height() - dlg.height()) // 2)
+
+        def _on_close():
+            self._console_dialog = None
+        dlg.finished.connect(lambda *_: _on_close())
+        self._console_dialog = dlg
+        dlg.show()
+        big.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _log_context_menu(self, pos, widget=None):
         """Русское контекстное меню для лог-консоли (вместо системного англ.)."""
-        m = QMenu(self.txt_log)
+        w = widget or self.txt_log
+        m = QMenu(w)
         a_copy = m.addAction("Копировать")
-        a_copy.setEnabled(self.txt_log.textCursor().hasSelection())
-        a_copy.triggered.connect(self.txt_log.copy)
+        a_copy.setEnabled(w.textCursor().hasSelection())
+        a_copy.triggered.connect(w.copy)
         a_sel = m.addAction("Выделить всё")
-        a_sel.triggered.connect(self.txt_log.selectAll)
+        a_sel.triggered.connect(w.selectAll)
         m.addSeparator()
         a_clr = m.addAction("Очистить")
         a_clr.triggered.connect(self.txt_log.clear)
-        m.exec(self.txt_log.mapToGlobal(pos))
+        m.exec(w.mapToGlobal(pos))
 
     def log(self, txt):
         try: t = time.strftime("%Y-%m-%d %H:%M:%S"); self.txt_log.append(f"[{t}] {txt}")
@@ -1195,6 +1754,18 @@ class UnifiedWindow(QMainWindow):
                 self._stop_worker(mr)
             for w in list(getattr(self.tab_ytdlp, "active_workers", [])):
                 self._stop_worker(w)
+            try:
+                te = getattr(self, "tab_edit", None)
+                if te is not None:
+                    te.shutdown()
+            except Exception:
+                pass
+            try:
+                tsq = getattr(self, "tab_siquester", None)
+                if tsq is not None:
+                    tsq.cleanup()
+            except Exception:
+                pass
             try:
                 self._stop_browser_http_server()
             except Exception:
@@ -1239,6 +1810,8 @@ def main():
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GoldensFire.SI-HYX")
         except Exception:
             pass
+
+    qInstallMessageHandler(_qt_message_filter)
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")

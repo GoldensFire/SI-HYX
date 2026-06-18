@@ -66,6 +66,18 @@ from pathlib import Path
 from collections import deque
 
 
+# Программное декодирование видео в QtMultimedia (бэкенд ffmpeg).
+# На встроенных видеоядрах (напр. Vega у Ryzen 5600H) аппаратного декодера AV1
+# нет: бэкенд пытается d3d11-hwaccel, не может и показывает чёрный экран —
+# играет только звук («Your platform doesn't support hardware accelerated AV1
+# decoding» / «Get current frame error»). Пустой список HW-устройств = плеер
+# декодирует на ЦП и AV1 (и прочие неподдерживаемые кодеки) воспроизводятся.
+# Qt читает эту переменную один раз на процесс при первом декодировании, поэтому
+# ставим её здесь — config.py импортируется раньше любого QtMultimedia-плеера
+# (и вкладки «Монтаж», и вкладки SiQuesterHYX).
+os.environ.setdefault("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", "")
+
+
 # PyQt6 imports
 def fail_and_exit(msg, exc=None):
     print(msg)
@@ -82,7 +94,9 @@ try:
         QMessageBox, QTextEdit, QPlainTextEdit, QSlider, QGroupBox, QFormLayout, QComboBox,
         QLineEdit, QMenu, QScrollArea, QAbstractSpinBox, QAbstractItemView,
         QTreeWidgetItemIterator, QHeaderView, QToolButton, QDialog,
-        QStyledItemDelegate, QStyle, QSplashScreen, QToolTip, QFrame
+        QStyledItemDelegate, QStyle, QSplashScreen, QToolTip, QFrame,
+        QInputDialog, QKeySequenceEdit, QListWidget, QListWidgetItem,
+        QStackedWidget
     )
     from PyQt6.QtCore import (
         Qt, QThread, pyqtSignal, QSize, QRunnable, QThreadPool, QByteArray, QTimer,
@@ -90,11 +104,57 @@ try:
     )
     from PyQt6.QtGui import (
         QAction, QColor, QFont, QIcon, QPixmap, QBrush, QImage as QtGuiImage,
-        QKeySequence, QShortcut, QPainter, QPen, QCursor
+        QKeySequence, QShortcut, QPainter, QPen, QCursor, QTextCursor
     )
     from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 except Exception as e:
     fail_and_exit("Не удалось импортировать PyQt6. Убедитесь, что установлено: pip install PyQt6", e)
+
+# Векторные иконки интерфейса (Font Awesome / Material Design через qtawesome).
+import qtawesome as qta
+
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  ВНИМАНИЕ РАЗРАБОТЧИКА: В этом приложении категорически запрещено          ║
+# ║  использовать эмодзи. Все новые иконки добавлять строго через метод/       ║
+# ║  функцию get_icon() из библиотеки qtawesome!                              ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+def get_icon(name, color='#cdd6f4'):
+    """Единая точка создания иконок интерфейса. У приложения ТОЛЬКО тёмная тема,
+    поэтому по умолчанию иконки светлые — но не «жёсткий» белый, а мягкий
+    Catppuccin text (#cdd6f4): лучше смотрится на тёмном фоне. На кнопках со
+    СВЕТЛОЙ заливкой (accent/green/red) передавайте тёмный цвет (#11111b/#1e1e2e).
+    scale_factor<1 даёт глифу поля внутри иконки — он не упирается в края кнопки.
+    name — имя иконки из паков Font Awesome 5 Solid (fa5s.*) или Material Design (mdi6.*)."""
+    return qta.icon(name, color=color, scale_factor=0.8)
+
+
+def get_icon_pixmap(name, size=16, color='white'):
+    """Иконка как QPixmap — для QLabel.setPixmap() (значки без интерактивности)."""
+    return get_icon(name, color=color).pixmap(QSize(size, size))
+
+
+def icon_html(name, size=16, color='white'):
+    """Иконка как <img …> для вставки в rich-text (QLabel/HTML), где нельзя
+    использовать setIcon(). Заменяет инлайновые эмодзи в HTML-подписях."""
+    from PyQt6.QtCore import QBuffer
+    pm = get_icon_pixmap(name, size, color)
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QBuffer.OpenModeFlag.WriteOnly)
+    pm.save(buf, 'PNG')
+    buf.close()
+    b64 = bytes(ba.toBase64()).decode('ascii')
+    return (f"<img src='data:image/png;base64,{b64}' "
+            f"width='{size}' height='{size}'>")
+
+
+def status_html(icon_name, text, color='white', size=13):
+    """Строка статуса «значок + текст» для QLabel.setText(): значок-эмодзи
+    заменён на векторную иконку. Текст экранируется (html.escape), чтобы
+    «<script>», «<...>» и т.п. в сообщениях не ломали rich-text рендеринг."""
+    import html as _html
+    return icon_html(icon_name, size, color) + " " + _html.escape(str(text))
 
 
 # Optional libs
@@ -373,7 +433,7 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.3.6"
+APP_VERSION = "0.4.0"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # Репозиторий для автообновления (GitHub Releases)
 GITHUB_OWNER = "GoldensFire"
@@ -627,7 +687,7 @@ QTabBar::tab {
     color: #a6adc8;
     border: 1px solid #45475a;
     border-bottom: none;
-    padding: 7px 22px;
+    padding: 5px 12px;
     border-top-left-radius: 6px;
     border-top-right-radius: 6px;
     margin-right: 2px;
