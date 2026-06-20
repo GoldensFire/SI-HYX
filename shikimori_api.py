@@ -76,6 +76,27 @@ MANGA_STATUS_LABELS = {
 CONTENT_ANIME = "anime"
 CONTENT_MANGA = "manga"
 
+# «Просмотры» тайтла = сумма по спискам пользователей, КРОМЕ «запланировано»
+# (и «отложено» — пользователь просил считать только реально смотревших):
+# completed (просмотрено) + watching (смотрю) + dropped (брошено). Берётся из
+# rates_statuses_stats полной карточки /api/animes/{id} (в списочном ответе её нет).
+VIEW_STATUSES = ("completed", "watching", "dropped")
+
+
+def views_from_card(card: dict) -> int:
+    """Считает «просмотры» (completed+watching+dropped) из карточки тайтла.
+    Запланировано/отложено НЕ учитываются. При отсутствии данных вернёт 0."""
+    if not isinstance(card, dict):
+        return 0
+    total = 0
+    for s in card.get("rates_statuses_stats") or []:
+        if isinstance(s, dict) and s.get("name") in VIEW_STATUSES:
+            try:
+                total += int(s.get("value") or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
+
 
 def kinds_for(content_type: str):
     return MANGA_KINDS if content_type == CONTENT_MANGA else KINDS

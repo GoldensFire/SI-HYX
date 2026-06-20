@@ -496,15 +496,22 @@ class UnifiedWindow(QMainWindow):
                 """Удаляет любые CR/LF (и прочие управляющие) символы из значения
                 перед записью в HTTP-заголовок — барьер против HTTP response
                 splitting (CWE-113). Дублирует проверку в _safe_ext_origin, но
-                делает безопасность явной в точке записи заголовка."""
-                return re.sub(r"[\r\n\x00-\x1f]", "", value or "")
+                делает безопасность явной в точке записи заголовка.
+
+                Сначала явные str.replace по CR/LF (их распознаёт статанализ как
+                санитайзер), затем re.sub добивает остальные управляющие символы."""
+                value = (value or "").replace("\r", "").replace("\n", "")
+                return re.sub(r"[\x00-\x1f]", "", value)
 
             def _send_cors(self):
                 # ACAO отдаём только проверенному origin расширения (а не "*" и не
                 # сырому заголовку), иначе браузер чужого сайта не прочитает ответ.
-                # _strip_crlf — явный барьер от response splitting в точке записи.
                 safe_origin = self._strip_crlf(self._safe_ext_origin())
-                if safe_origin:
+                # Барьер от HTTP response splitting (CWE-113) ИМЕННО в точке записи:
+                # явная проверка на CR/LF в одной функции с send_header, чтобы её
+                # видел и статанализ (его guard'ы межпроцедурно не прослеживаются —
+                # проверки в _safe_ext_origin/_strip_crlf ему не видны отсюда).
+                if safe_origin and "\r" not in safe_origin and "\n" not in safe_origin:
                     self.send_header("Access-Control-Allow-Origin", safe_origin)
                     self.send_header("Vary", "Origin")
                 self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -1038,9 +1045,11 @@ class UnifiedWindow(QMainWindow):
         def by(pred):
             return next((a for a in assets if pred(str(a.get("name", "")).lower())), None)
 
-        # update-архив: новый суффикс "-update.zip" + легаси "-app.zip"/"app.zip".
+        # update-архив: префикс "hyxupdate" (новое имя HYXUpdate-vX.Y.Z.zip) +
+        # легаси-суффиксы "-update.zip"/"-app.zip"/"app.zip".
         def is_update(n):
-            return n.endswith("-update.zip") or n.endswith("-app.zip") or n == "app.zip"
+            return (n.startswith("hyxupdate") or n.endswith("-update.zip")
+                    or n.endswith("-app.zip") or n == "app.zip")
         update_asset = by(is_update)
         full_asset   = by(lambda n: n.endswith(".zip") and not is_update(n))
         manifest     = by(lambda n: n == "manifest.json")

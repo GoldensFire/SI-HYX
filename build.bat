@@ -14,9 +14,10 @@ if not defined APP_VERSION (
 )
 set "RELEASE_NAME=SI-HYX v%APP_VERSION%"
 REM update-архив именуется ОТДЕЛЬНО от полного («HYXUpdate-…»), чтобы его нельзя
-REM было перепутать с основным архивом релиза. Суффикс «-update.zip» сохранён —
-REM по нему апдейтер опознаёт update-архив (см. _pick_update_asset в main.py).
-set "UPDATE_ZIP=HYXUpdate-v%APP_VERSION%-update.zip"
+REM было перепутать с основным архивом релиза. Апдейтер опознаёт update-архив по
+REM префиксу «HYXUpdate» (см. _pick_update_asset в main.py) — дублирующий суффикс
+REM «-update» больше не нужен.
+set "UPDATE_ZIP=HYXUpdate-v%APP_VERSION%.zip"
 set "FULL_ZIP=SI-HYX-v%APP_VERSION%-full.zip"
 echo Version: %APP_VERSION%   ->   "%RELEASE_NAME%"
 

@@ -48,7 +48,7 @@ try:
     from shikimori_api import (
         ShikimoriApiClient, AnimeFilter, Anime, ShikimoriError, find_anime,
         ORDERS, DEFAULT_BASE_URL, CONTENT_ANIME, CONTENT_MANGA,
-        kinds_for, statuses_for, kind_label, status_label,
+        kinds_for, statuses_for, kind_label, status_label, views_from_card,
     )
     _HAS_API = True
 except Exception as _e:  # pragma: no cover
@@ -65,7 +65,12 @@ C = {
     "text3": "#6c7086", "green": "#a6e3a1", "yellow": "#f9e2af", "red": "#f38ba8",
 }
 
+# Локальная (не серверная) сортировка по «просмотрам» — completed+watching+dropped
+# из карточки каждого тайтла. По умолчанию выбрана именно она (просьба пользователя).
+ORDER_VIEWS = "views"
+
 ORDER_LABELS = {
+    ORDER_VIEWS: "По просмотрам",
     "ranked": "По рейтингу", "popularity": "По популярности", "name": "По имени",
     "aired_on": "По дате выхода", "episodes": "По эпизодам", "kind": "По типу",
     "id": "По id", "random": "Случайно",
@@ -73,6 +78,11 @@ ORDER_LABELS = {
 
 # Размер обложки в списке (постер 7:10).
 _THUMB_W, _THUMB_H = 56, 80
+
+# Сортировка по просмотрам тянет по карточке на тайтл — при широком поиске их
+# могут быть тысячи. Ограничиваем дозагрузку верхушкой выдачи (она и так идёт в
+# серверном порядке релевантности); остальное остаётся в найденном порядке.
+_VIEWS_SORT_MAX = 200
 
 
 def _user_agent() -> str:
@@ -93,6 +103,40 @@ def _norm_title(s: str) -> str:
     s = (s or "").lower().strip()
     s = re.sub(r"\s+", " ", s)
     s = s.strip(" .!?–—-:;\"'«»()[]")
+    return s
+
+
+# Хвостовой «сезонный» маркер: отдельный токен в конце названия — число (1–2
+# цифры), римская цифра, либо слово «сезон/season/часть/part/tv/тв/cour» с/без
+# числа, либо «финальный сезон». ОБЯЗАТЕЛЬНО с разделителем перед собой ([\s:.\-]+),
+# чтобы не отрезать буквы у обычных названий («matrix» → не «matri», «86» цел,
+# «mob psycho 100» цел — 3 цифры не матчатся). Нужно, чтобы пак с «Ванпанчмен»
+# скрывал из выдачи и «Ванпанчмен 2/3», и наоборот (все сезоны одного тайтла).
+_SEASON_TAIL_RX = re.compile(
+    r"[\s:.\-–—]+(?:"
+    r"(?:the\s+)?(?:final\s+)?(?:season|сезон[а-я]*|часть|части|part|cour|кор|tv|тв)"
+    r"\s*-?\s*\d{0,2}"
+    r"|\d{1,2}(?:\s*-?\s*(?:nd|rd|th|st|й|ый|ой|ая|я)?\s*"
+    r"(?:season|сезон[а-я]*|часть|part|cour))?"
+    r"|i{1,3}|iv|vi{0,3}|ix|xi{0,2}|x"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _base_title(s: str) -> str:
+    """«Базовое» название без хвостовых сезонных маркеров (для сопоставления
+    разных сезонов одного тайтла). Применяет _SEASON_TAIL_RX многократно:
+    «ванпанчмен 3» → «ванпанчмен», «attack on titan final season» → «attack on
+    titan». Пустой результат не отдаём (возвращаем последнюю непустую форму)."""
+    s = _norm_title(s)
+    prev = None
+    while s and s != prev:
+        prev = s
+        stripped = _SEASON_TAIL_RX.sub("", s).strip(" :.-–—")
+        if not stripped:
+            break
+        s = stripped
     return s
 
 
@@ -195,6 +239,48 @@ class _ThumbTask(QRunnable):
             pass
 
 
+class _ViewsSignals(QObject):
+    item = pyqtSignal(int, int)        # anime_id, просмотры (-1 при ошибке)
+    progress = pyqtSignal(int, int)    # обработано, всего
+    finished = pyqtSignal()
+
+
+class _ViewsTask(QRunnable):
+    """Дозагрузка «просмотров» для сортировки по ним. Тянет карточки тайтлов
+    ПОСЛЕДОВАТЕЛЬНО одним клиентом — мягче к лимитам Shikimori, чем веер
+    параллельных запросов (списочный ответ /api/animes просмотров не содержит)."""
+
+    def __init__(self, ids):
+        super().__init__()
+        self.setAutoDelete(False)
+        self.ids = list(ids)
+        self.signals = _ViewsSignals()
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        client = None
+        try:
+            client = _client_factory()
+            total = len(self.ids)
+            for i, aid in enumerate(self.ids, 1):
+                if self._stop:
+                    break
+                views = -1
+                try:
+                    views = views_from_card(client.get_anime(aid))
+                except Exception:
+                    views = -1
+                self.signals.item.emit(aid, views)
+                self.signals.progress.emit(i, total)
+        finally:
+            if client is not None:
+                client.close()
+            self.signals.finished.emit()
+
+
 # ─── Вкладка ─────────────────────────────────────────────────────────────────
 class ShikimoriTab(QWidget):
     """Экспериментальная вкладка поиска аниме/манги через Shikimori API.
@@ -215,7 +301,10 @@ class ShikimoriTab(QWidget):
         self._thumb_cache: dict = {}   # anime_id -> QIcon
         self._placeholder = None       # серая заглушка-обложка
         self._excluded: set = set()    # нормализованные названия из паков
+        self._excluded_bases: set = set()  # их «базовые» формы (без сезонов)
         self._excluded_packs: list = []  # имена выбранных паков
+        self._views_cache: dict = {}   # anime_id -> просмотры (для сортировки)
+        self._views_task = None        # текущая задача дозагрузки просмотров
         self._pending_genre = 0        # жанр для восстановления после загрузки
         self._initial_settings = dict(getattr(main_window, "_shikimori_settings", {}) or {})
 
@@ -338,6 +427,8 @@ class ShikimoriTab(QWidget):
         self.cb_kind = QComboBox()
         self.cb_status = QComboBox()
         self.cb_order = QComboBox()
+        # «По просмотрам» — локальная сортировка, по умолчанию (первый пункт).
+        self.cb_order.addItem(ORDER_LABELS[ORDER_VIEWS], ORDER_VIEWS)
         for o in ORDERS:
             self.cb_order.addItem(ORDER_LABELS.get(o, o), o)
 
@@ -510,7 +601,7 @@ class ShikimoriTab(QWidget):
             query=self.ed_query.text().strip(),
             kind=self.cb_kind.currentData() or "",
             status=self.cb_status.currentData() or "",
-            order=self.cb_order.currentData() or "ranked",
+            order=self.cb_order.currentData() or ORDER_VIEWS,
             score_min=(smin if smin > 0 else None),
             score_max=(smax if smax < 10.0 else None),
             year_from=(yf if yf > 0 else None),
@@ -531,6 +622,7 @@ class ShikimoriTab(QWidget):
             QMessageBox.warning(self, "Проверьте фильтры", err)
             return
         # Новый поиск — чистим список и потоково наполняем его по мере страниц.
+        self._stop_views_task()
         self.list.clear()
         self._raw_results = []
         self._results = []
@@ -555,6 +647,9 @@ class ShikimoriTab(QWidget):
         self._set_actions_enabled(n > 0)
         self.lbl_status.setText(f"Остановлено. Найдено: {n}" if n
                                 else "Остановлено.")
+        # Сортировка по просмотрам — досортируем то, что успели набрать.
+        if n and self._views_sort_active():
+            self._begin_views_sort()
 
     def _on_search_progress(self, page: int, matched: int):
         if self._task is not None:
@@ -580,6 +675,9 @@ class ShikimoriTab(QWidget):
         # дублей/исключений), даём финальный статус.
         self._raw_results = results
         self._apply_exclusions()
+        # Если выбрана сортировка по просмотрам — дозагрузим их и пересортируем.
+        if self._results and self._views_sort_active():
+            self._begin_views_sort()
 
     def _on_search_failed(self, message: str):
         self._task = None
@@ -600,8 +698,21 @@ class ShikimoriTab(QWidget):
     def _is_excluded(self, a: "Anime") -> bool:
         if not self._excluded:
             return False
-        return (_norm_title(a.title) in self._excluded
-                or _norm_title(a.name) in self._excluded)
+        nt, nn = _norm_title(a.title), _norm_title(a.name)
+        if nt in self._excluded or nn in self._excluded:
+            return True
+        # Сезонные варианты: пак с «Ванпанчмен» прячет и «Ванпанчмен 3» (и наоборот)
+        # — сравниваем «базовые» формы без хвостового номера/«сезон N».
+        if self._excluded_bases:
+            if _base_title(nt) in self._excluded_bases:
+                return True
+            if nn and _base_title(nn) in self._excluded_bases:
+                return True
+        return False
+
+    def _rebuild_excluded_bases(self):
+        """Пересобирает множество «базовых» форм исключённых названий."""
+        self._excluded_bases = {b for b in (_base_title(x) for x in self._excluded) if b}
 
     def _apply_exclusions(self):
         """Фильтрует «сырые» результаты по выбранным пакам и обновляет список."""
@@ -613,7 +724,7 @@ class ShikimoriTab(QWidget):
             else:
                 kept.append(a)
         self._results = kept
-        self._fill_list(self._results)
+        self._display_results()
         n = len(self._results)
         self._set_actions_enabled(n > 0)
         if n:
@@ -625,6 +736,66 @@ class ShikimoriTab(QWidget):
             self.lbl_status.setText("Всё найденное уже есть в выбранных паках.")
         else:
             self.lbl_status.setText("Ничего не найдено под заданные фильтры.")
+
+    # ── Сортировка по просмотрам (локально, с дозагрузкой карточек) ────────────
+    def _views_sort_active(self) -> bool:
+        return self.cb_order.currentData() == ORDER_VIEWS
+
+    def _display_results(self):
+        """Заполняет список результатами. При сортировке по просмотрам сначала
+        упорядочивает их по кешу просмотров (неизвестные — в конец)."""
+        if self._views_sort_active():
+            self._results.sort(
+                key=lambda a: self._views_cache.get(a.id, -1), reverse=True)
+        self._fill_list(self._results)
+
+    def _stop_views_task(self):
+        if self._views_task is not None:
+            try:
+                self._views_task.stop()
+            except Exception:
+                pass
+            self._views_task = None
+
+    def _begin_views_sort(self):
+        """Дозагружает просмотры для результатов, у которых их ещё нет, и затем
+        пересортировывает список. Уже известные берём из кеша (не перезапрашиваем)."""
+        self._stop_views_task()
+        ids = [a.id for a in self._results[:_VIEWS_SORT_MAX]
+               if a.id not in self._views_cache]
+        if not ids:
+            self._resort_by_views(done=True)
+            return
+        self.lbl_status.setText(f"Сортировка по просмотрам… 0/{len(ids)}")
+        task = _ViewsTask(ids)
+        task.signals.item.connect(self._on_views_item)
+        task.signals.progress.connect(self._on_views_progress)
+        task.signals.finished.connect(self._on_views_finished)
+        self._views_task = task
+        self._pool.start(task)
+
+    def _on_views_item(self, anime_id: int, views: int):
+        self._views_cache[anime_id] = views
+
+    def _on_views_progress(self, done: int, total: int):
+        if self._views_task is not None:
+            self.lbl_status.setText(f"Сортировка по просмотрам… {done}/{total}")
+
+    def _on_views_finished(self):
+        self._views_task = None
+        self._resort_by_views(done=True)
+
+    def _resort_by_views(self, done: bool = False):
+        """Пересобирает список в порядке убывания просмотров (по кешу)."""
+        if not self._views_sort_active():
+            return
+        self._results.sort(
+            key=lambda a: self._views_cache.get(a.id, -1), reverse=True)
+        self._fill_list(self._results)
+        if done:
+            n = len(self._results)
+            self.lbl_status.setText(f"Найдено: {n} (по просмотрам)" if n
+                                    else "Ничего не найдено.")
 
     def _fill_list(self, results: list):
         self.list.clear()
@@ -643,6 +814,10 @@ class ShikimoriTab(QWidget):
             parts.append(str(a.year))
         if a.episodes:
             parts.append(f"{a.episodes} {unit}")
+        # Просмотры (если уже дозагружены для сортировки) — с пробелами в тысячах.
+        v = self._views_cache.get(a.id)
+        if v is not None and v >= 0:
+            parts.append(f"👁 {v:,}".replace(",", " "))
         sub = "  ·  ".join(parts)
         text = a.title
         if a.name and a.name != a.title:
@@ -769,6 +944,7 @@ class ShikimoriTab(QWidget):
                 chosen_names.append(name)
                 excluded |= self._pack_answers(ds)
         self._excluded = excluded
+        self._rebuild_excluded_bases()
         self._excluded_packs = chosen_names
         if chosen_names:
             self.lbl_packs.setText(
@@ -855,7 +1031,7 @@ class ShikimoriTab(QWidget):
         self.ed_query.setText(str(s.get("query", "")))
         self.sp_score_min.setValue(float(s.get("score_min", 0.0) or 0.0))
         self.sp_score_max.setValue(float(s.get("score_max", 10.0) or 10.0))
-        oi = self.cb_order.findData(s.get("order", "ranked"))
+        oi = self.cb_order.findData(s.get("order", ORDER_VIEWS))
         if oi >= 0:
             self.cb_order.setCurrentIndex(oi)
         ki = self.cb_kind.findData(s.get("kind", ""))
@@ -892,6 +1068,7 @@ class ShikimoriTab(QWidget):
         # Имена помним даже если паки ещё не открыты — попадут при следующем выборе.
         self._excluded_packs = found or list(names)
         self._excluded = excluded
+        self._rebuild_excluded_bases()
         if found:
             self.lbl_packs.setText(
                 f"Выбрано паков: {len(found)} ({len(excluded)} ответов).\n"
@@ -918,6 +1095,7 @@ class ShikimoriTab(QWidget):
         self.sp_ep_min.setValue(0)
         self.sp_ep_max.setValue(0)
         self._excluded = set()
+        self._excluded_bases = set()
         self._excluded_packs = []
         self.lbl_packs.setText("Паки не выбраны.")
         self.lbl_status.setText("Настройки сброшены.")
@@ -962,6 +1140,7 @@ class ShikimoriTab(QWidget):
             except Exception:
                 pass
             self._task = None
+        self._stop_views_task()
         if self._genres_task is not None:
             try:
                 self._genres_task.signals.finished.disconnect()

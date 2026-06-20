@@ -1001,11 +1001,34 @@ def get_video_codec(path):
         return None
 
 
-def measure_loudness(path):
+def measure_loudness(path, should_stop=None):
+    """Сканирует громкость файла. should_stop — необязательный callable: если он
+    начинает возвращать True во время сканирования (пользователь нажал «Стоп»),
+    процесс ffmpeg убивается и функция возвращает None. Без него — как раньше,
+    блокирующий проход. Для длинных файлов (часы) без этого «Стоп» не срабатывал,
+    пока полный проход loudnorm не закончится (см. process_media)."""
     try:
         cmd = [FFMPEG, "-hide_banner", "-nostats", "-i", path, "-af", "loudnorm=I=-16:LRA=20:TP=-1.5:print_format=json", "-f", "null", "-"]
         p = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
-        stderr = p.communicate()[1] or ""
+        if should_stop is None:
+            stderr = p.communicate()[1] or ""
+        else:
+            # communicate(timeout=…) короткими тиками: фоновые потоки чтения
+            # сами осушают pipe (нет дедлока на длинном файле), а мы между
+            # тиками проверяем should_stop() и убиваем ffmpeg при «Стоп».
+            stderr = ""
+            while True:
+                if should_stop():
+                    try: p.kill()
+                    except Exception: pass
+                    try: p.communicate(timeout=2)
+                    except Exception: pass
+                    return None
+                try:
+                    stderr = p.communicate(timeout=0.2)[1] or ""
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         m = _RE_LUFS.search(stderr)
         if m:
             data = json.loads(m.group(0))

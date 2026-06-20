@@ -783,7 +783,7 @@ class ProcessWorker(QThread):
         return name
 
     def stop(self): self.stop_flag = True
-    def measure_loudness(self, path): return measure_loudness(path)
+    def measure_loudness(self, path): return measure_loudness(path, should_stop=lambda: self.stop_flag)
 
     @staticmethod
     def _priority_creationflag(priority):
@@ -1004,6 +1004,10 @@ class ProcessWorker(QThread):
         before_lufs = None
         try: before_lufs = self.measure_loudness(path)
         except Exception: pass
+        # Замер громкости делается всегда (для «Было LUFS») и для длинных файлов
+        # длится минуты — если за это время нажали «Стоп», прерываемся здесь же.
+        if self.stop_flag:
+            raise Exception("StoppedByUser")
 
         if is_video and video_enabled and not self.svt_available:
             raise Exception("libsvtav1 не доступен в вашей сборке ffmpeg — скрипт настроен работать ТОЛЬКО с svt (libsvtav1).")
