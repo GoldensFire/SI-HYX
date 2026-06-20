@@ -80,7 +80,16 @@ CONTENT_MANGA = "manga"
 # (и «отложено» — пользователь просил считать только реально смотревших):
 # completed (просмотрено) + watching (смотрю) + dropped (брошено). Берётся из
 # rates_statuses_stats полной карточки /api/animes/{id} (в списочном ответе её нет).
-VIEW_STATUSES = ("completed", "watching", "dropped")
+#
+# ВАЖНО: Shikimori отдаёт `name` в rates_statuses_stats ЛОКАЛИЗОВАННОЙ строкой
+# (по умолчанию по-русски: «Просмотрено»/«Смотрю»/«Брошено»…), а НЕ английским
+# ключом. Поэтому матчим и английские ключи, и русские подписи (аниме и манга:
+# «Прочитано»/«Читаю»). Сравнение регистронезависимое (см. views_from_card).
+VIEW_STATUSES = frozenset({
+    "completed", "watching", "dropped",          # английские ключи (на всякий)
+    "просмотрено", "смотрю", "брошено",          # русские подписи (аниме)
+    "прочитано", "читаю",                        # русские подписи (манга)
+})
 
 
 def views_from_card(card: dict) -> int:
@@ -90,7 +99,10 @@ def views_from_card(card: dict) -> int:
         return 0
     total = 0
     for s in card.get("rates_statuses_stats") or []:
-        if isinstance(s, dict) and s.get("name") in VIEW_STATUSES:
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get("name") or "").strip().lower()
+        if name in VIEW_STATUSES:
             try:
                 total += int(s.get("value") or 0)
             except (TypeError, ValueError):
@@ -421,6 +433,7 @@ class ShikimoriApiClient:
 
 def find_anime(client: ShikimoriApiClient, criteria: AnimeFilter, *,
                max_pages: int = 200, per_page: int = 50,
+               throttle: float = 0.0,
                progress: Optional[Any] = None,
                on_batch: Optional[Any] = None,
                should_stop: Optional[Any] = None) -> list[Anime]:
@@ -433,6 +446,8 @@ def find_anime(client: ShikimoriApiClient, criteria: AnimeFilter, *,
     поиск идёт «до конца или до Стоп» (как просил пользователь).
 
     • max_pages — жёсткий потолок (страховка от выкачивания всей базы).
+    • throttle — пауза (сек) между страницами, чтобы не упереться в лимит
+      Shikimori на длинной выдаче. 0 — без паузы.
     • progress(page, matched) — необязательный колбэк прогресса.
     • on_batch(new_matches: list[Anime]) — колбэк с НОВЫМИ подходящими тайтлами
       каждой страницы (для потокового наполнения списка в UI).
@@ -445,8 +460,16 @@ def find_anime(client: ShikimoriApiClient, criteria: AnimeFilter, *,
     for page in range(1, max_pages + 1):
         if should_stop is not None and should_stop():
             break
-        batch = client.search_titles(ctype, page=page, limit=per_page,
-                                     **server_params)
+        try:
+            batch = client.search_titles(ctype, page=page, limit=per_page,
+                                         **server_params)
+        except ShikimoriError:
+            # Временная ошибка (обычно 429 на большой глубине выдачи): если уже
+            # что-то набрали — отдаём накопленное, а не теряем весь поиск. На
+            # самой первой странице ошибка реальна — пробрасываем дальше.
+            if matched:
+                break
+            raise
         new_matches: list[Anime] = []
         for a in batch:
             if a.id in seen:
@@ -467,6 +490,14 @@ def find_anime(client: ShikimoriApiClient, criteria: AnimeFilter, *,
                 pass
         if len(batch) < per_page:
             break  # последняя страница
+        if throttle > 0:
+            # Дробим паузу, чтобы «Стоп» срабатывал быстро.
+            slept = 0.0
+            while slept < throttle:
+                if should_stop is not None and should_stop():
+                    break
+                time.sleep(min(0.1, throttle - slept))
+                slept += 0.1
     return matched
 
 

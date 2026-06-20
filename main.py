@@ -345,7 +345,7 @@ class UnifiedWindow(QMainWindow):
             tm.s_tgt.setValue(a.get("tgt", -20.0))
             tm.s_lra.setValue(a.get("lra", 20.0))
             tm.s_tp.setValue(a.get("tp", -1.5))
-            tm.ck_fade.setChecked(a.get("fade", True))
+            tm.ck_fade.setChecked(a.get("fade", False))
             tm.s_fade.setValue(a.get("fade_d", 1.0))
             tm.ck_fade_in.setChecked(a.get("fade_in", False))
             tm.s_fade_in.setValue(a.get("fade_in_d", 1.0))
@@ -360,10 +360,10 @@ class UnifiedWindow(QMainWindow):
             v = m.get("video", {})
             tm.chk_enable_video.setChecked(v.get("enabled", True))
             tm.s_spd.setValue(v.get("speed", 100))
-            tm.s_crf.setValue(v.get("crf", 35))
-            tm.s_pre.setValue(v.get("pre", 8))
-            combo_set_value(tm.c_res, v.get("res", "Исходное"))
-            tm.c_fps.setCurrentText(v.get("fps", "Исходный"))
+            tm.s_crf.setValue(v.get("crf", 45))
+            tm.s_pre.setValue(v.get("pre", 1))
+            combo_set_value(tm.c_res, v.get("res", "1280x720"))
+            tm.c_fps.setCurrentText(v.get("fps", "Исходный (max 30)"))
             tm._set_preset_mode(v.get("preset_mode", "std"))
             tm.ck_vfade_in.setChecked(v.get("vfade_in", False))
             tm.s_vfade_in.setValue(v.get("vfade_in_d", 1.0))
@@ -1045,10 +1045,12 @@ class UnifiedWindow(QMainWindow):
         def by(pred):
             return next((a for a in assets if pred(str(a.get("name", "")).lower())), None)
 
-        # update-архив: префикс "hyxupdate" (новое имя HYXUpdate-vX.Y.Z.zip) +
-        # легаси-суффиксы "-update.zip"/"-app.zip"/"app.zip".
+        # update-архив: префикс "updatehyx" (новое имя UpdateHYX-vX.Y.Z.zip) +
+        # легаси-префикс "hyxupdate" (старое имя) и суффиксы
+        # "-update.zip"/"-app.zip"/"app.zip".
         def is_update(n):
-            return (n.startswith("hyxupdate") or n.endswith("-update.zip")
+            return (n.startswith("updatehyx") or n.startswith("hyxupdate")
+                    or n.endswith("-update.zip")
                     or n.endswith("-app.zip") or n == "app.zip")
         update_asset = by(is_update)
         full_asset   = by(lambda n: n.endswith(".zip") and not is_update(n))

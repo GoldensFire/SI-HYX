@@ -25,13 +25,13 @@ import re
 import time
 import webbrowser
 
-from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QSize, QRect
 from PyQt6.QtGui import QColor, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget,
     QListWidgetItem, QFileDialog, QMessageBox, QScrollArea, QGroupBox,
-    QDialog, QCheckBox, QDialogButtonBox, QFrame,
+    QDialog, QCheckBox, QDialogButtonBox, QFrame, QStyledItemDelegate,
 )
 
 try:
@@ -174,7 +174,7 @@ class _SearchTask(QRunnable):
         try:
             client = _client_factory()
             res = find_anime(
-                client, self.criteria,
+                client, self.criteria, throttle=0.25,
                 progress=lambda p, c: self.signals.progress.emit(p, c),
                 on_batch=lambda items: self.signals.batch.emit(items),
                 should_stop=lambda: self._stop)
@@ -295,6 +295,46 @@ class _ViewsTask(QRunnable):
             self.signals.finished.emit()
 
 
+# ─── Делегат: значок «глаз» с числом просмотров ──────────────────────────────
+class _ViewsBadgeDelegate(QStyledItemDelegate):
+    """Дорисовывает к строке тайтла настоящий SVG-значок «глаз» (qtawesome
+    fa5s.eye) и число просмотров у правого края. Используется вместо emoji 👁 —
+    одинаково выглядит на всех ОС и темах. Число берётся из кеша просмотров
+    вкладки (тот же, что и для сортировки), отрисовывается, когда дозагружено."""
+
+    def __init__(self, tab: "ShikimoriTab"):
+        super().__init__(tab)
+        self._tab = tab
+        self._icon = get_icon('fa5s.eye', color=C['text2'])
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        try:
+            aid = index.data(Qt.ItemDataRole.UserRole + 1)
+            views = self._tab._views_cache.get(aid)
+        except Exception:
+            views = None
+        if views is None or views < 0:
+            return
+        text = f"{views:,}".replace(",", " ")
+        icon_sz, pad, gap = 14, 8, 5
+        rect = option.rect
+        fm = option.fontMetrics
+        tw = fm.horizontalAdvance(text)
+        x_text = rect.right() - pad - tw
+        x_icon = x_text - gap - icon_sz
+        y_icon = rect.center().y() - icon_sz // 2
+        painter.save()
+        painter.drawPixmap(int(x_icon), int(y_icon),
+                           self._icon.pixmap(icon_sz, icon_sz))
+        painter.setPen(QColor(C['text2']))
+        painter.drawText(
+            QRect(int(x_text), rect.top(), tw + 2, rect.height()),
+            int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+            text)
+        painter.restore()
+
+
 # ─── Вкладка ─────────────────────────────────────────────────────────────────
 class ShikimoriTab(QWidget):
     """Экспериментальная вкладка поиска аниме/манги через Shikimori API.
@@ -313,6 +353,7 @@ class ShikimoriTab(QWidget):
         self._raw_results: list = []   # до применения исключения паков
         self._genres_cache: dict = {}  # content_type -> [(label, id)]
         self._thumb_cache: dict = {}   # anime_id -> QIcon
+        self._thumb_pending: set = set()  # anime_id с уже запущенной загрузкой обложки
         self._placeholder = None       # серая заглушка-обложка
         self._excluded: set = set()    # нормализованные названия из паков
         self._excluded_bases: set = set()  # их «базовые» формы (без сезонов)
@@ -403,6 +444,12 @@ class ShikimoriTab(QWidget):
         self.list.setWordWrap(True)
         self.list.itemDoubleClicked.connect(self._open_selected_in_browser)
         self.list.itemSelectionChanged.connect(self._on_selection_changed)
+        # Значок «глаз» + просмотры рисует делегат (qtawesome SVG, не emoji).
+        self.list.setItemDelegate(_ViewsBadgeDelegate(self))
+        # Обложки грузим ЛЕНИВО — только для видимых строк (иначе при широком
+        # поиске сотни параллельных запросов к Shikimori упираются в лимит → 429).
+        self.list.verticalScrollBar().valueChanged.connect(
+            lambda *_: self._load_visible_thumbs())
         left.addWidget(self.list, 1)
         self.lbl_status = QLabel("Готово к поиску.")
         self.lbl_status.setStyleSheet(f"color:{C['text2']}; font-size:12px;")
@@ -707,6 +754,7 @@ class ShikimoriTab(QWidget):
                 continue
             self._results.append(a)
             self._append_anime(a)
+        self._load_visible_thumbs()
         self._set_actions_enabled(bool(self._results))
 
     def _on_search_finished(self, results: list):
@@ -826,16 +874,14 @@ class ShikimoriTab(QWidget):
 
     def _on_views_item(self, anime_id: int, views: int):
         self._views_cache[anime_id] = views
-        # Сразу показываем число у карточки (не дожидаясь конца дозагрузки).
+        # Сразу показываем число у карточки (значок «глаз» рисует делегат) —
+        # перерисовываем только нужную строку, не дожидаясь конца дозагрузки.
         if views < 0:
-            return
-        a = self._anime_by_id.get(anime_id)
-        if a is None:
             return
         for i in range(self.list.count()):
             it = self.list.item(i)
             if it.data(Qt.ItemDataRole.UserRole + 1) == anime_id:
-                it.setText(self._row_text(a))
+                self.list.update(self.list.indexFromItem(it))
                 break
 
     def _on_views_progress(self, done: int, total: int):
@@ -863,10 +909,11 @@ class ShikimoriTab(QWidget):
         self._anime_by_id = {a.id: a for a in results}
         for a in results:
             self._append_anime(a)
+        self._load_visible_thumbs()
 
     def _row_text(self, a: "Anime") -> str:
-        """Текст строки тайтла: название + краткая инфа. Если просмотры уже
-        дозагружены — показываем их числом (то самое совместное число)."""
+        """Текст строки тайтла: название + краткая инфа. Просмотры (значок «глаз»
+        + число) рисует _ViewsBadgeDelegate справа — в текст они не входят."""
         ct = self._content_type()
         unit = "гл." if ct == CONTENT_MANGA else "эп."
         parts = []
@@ -877,10 +924,6 @@ class ShikimoriTab(QWidget):
             parts.append(str(a.year))
         if a.episodes:
             parts.append(f"{a.episodes} {unit}")
-        # Просмотры (если уже дозагружены) — с пробелами в тысячах.
-        v = self._views_cache.get(a.id)
-        if v is not None and v >= 0:
-            parts.append(f"👁 {v:,}".replace(",", " "))
         sub = "  ·  ".join(parts)
         text = a.title
         if a.name and a.name != a.title:
@@ -889,16 +932,18 @@ class ShikimoriTab(QWidget):
         return text
 
     def _append_anime(self, a: "Anime"):
-        """Добавляет один тайтл в список (обложка + название + краткая инфа)."""
+        """Добавляет один тайтл в список (обложка + название + краткая инфа).
+        Обложку НЕ запрашиваем здесь — она грузится лениво для видимых строк
+        (см. _load_visible_thumbs), иначе сотни параллельных запросов → 429."""
         self._anime_by_id[a.id] = a
         it = QListWidgetItem(self._row_text(a))
         it.setData(Qt.ItemDataRole.UserRole, a.url)
         it.setData(Qt.ItemDataRole.UserRole + 1, a.id)
-        it.setIcon(self._icon_for(a))
+        it.setIcon(self._thumb_cache.get(a.id) or self._placeholder_icon())
         it.setSizeHint(QSize(0, _THUMB_H + 12))
         self.list.addItem(it)
 
-    # ── Обложки (асинхронно, с кешем) ──────────────────────────────────────────
+    # ── Обложки (ленивая загрузка только видимых, с кешем) ──────────────────────
     def _placeholder_icon(self) -> QIcon:
         if self._placeholder is None:
             pm = QPixmap(_THUMB_W, _THUMB_H)
@@ -906,16 +951,34 @@ class ShikimoriTab(QWidget):
             self._placeholder = QIcon(pm)
         return self._placeholder
 
-    def _icon_for(self, a: "Anime") -> QIcon:
-        if a.id in self._thumb_cache:
-            return self._thumb_cache[a.id]
-        if a.image_url:
-            task = _ThumbTask(a.id, a.image_url)
+    def _load_visible_thumbs(self):
+        """Запускает загрузку обложек ТОЛЬКО для строк, попадающих в видимую
+        область списка. Уже загруженные (кеш) и уже запрошенные (pending) —
+        пропускаем. Вызывается при наполнении списка и при прокрутке."""
+        n = self.list.count()
+        if not n:
+            return
+        vp = self.list.viewport().rect()
+        for i in range(n):
+            it = self.list.item(i)
+            if it is None:
+                continue
+            r = self.list.visualItemRect(it)
+            if r.bottom() < vp.top() or r.top() > vp.bottom():
+                continue
+            aid = it.data(Qt.ItemDataRole.UserRole + 1)
+            if aid in self._thumb_cache or aid in self._thumb_pending:
+                continue
+            a = self._anime_by_id.get(aid)
+            if a is None or not a.image_url:
+                continue
+            self._thumb_pending.add(aid)
+            task = _ThumbTask(aid, a.image_url)
             task.signals.done.connect(self._on_thumb_loaded)
             self._pool.start(task)
-        return self._placeholder_icon()
 
     def _on_thumb_loaded(self, anime_id: int, data: bytes):
+        self._thumb_pending.discard(anime_id)
         pm = QPixmap()
         if not pm.loadFromData(data):
             return
