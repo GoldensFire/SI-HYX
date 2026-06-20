@@ -22,6 +22,7 @@ import csv
 import json
 import os
 import re
+import time
 import webbrowser
 
 from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QSize
@@ -80,21 +81,27 @@ ORDER_LABELS = {
 _THUMB_W, _THUMB_H = 56, 80
 
 # Сортировка по просмотрам тянет по карточке на тайтл — при широком поиске их
-# могут быть тысячи. Ограничиваем дозагрузку верхушкой выдачи (она и так идёт в
-# серверном порядке релевантности); остальное остаётся в найденном порядке.
-_VIEWS_SORT_MAX = 200
+# могут быть тысячи. Поэтому: (1) поиск идёт по ПОПУЛЯРНОСТИ (вверху — известные
+# тайтлы, а не мусор), (2) просмотры дозагружаем только для верхушки выдачи,
+# (3) между запросами держим паузу — Shikimori лимитирует ~90 запросов/мин и без
+# троттлинга на длинной дозагрузке сыпал 429. Остальное остаётся в найденном
+# (популярном) порядке.
+_VIEWS_SORT_MAX = 100
+_VIEWS_THROTTLE = 0.7   # сек между карточками (≈85 запросов/мин < лимита 90)
 
 
 def _user_agent() -> str:
     return f"{APP_NAME}/{APP_VERSION} (+https://github.com)"
 
 
-def _client_factory() -> "ShikimoriApiClient":
+def _client_factory(max_retries: int = 3) -> "ShikimoriApiClient":
     """Создаёт клиент. OAuth-токен (если задан) берём из переменной окружения
-    SHIKIMORI_TOKEN — безопасно, без хранения в коде/настройках."""
+    SHIKIMORI_TOKEN — безопасно, без хранения в коде/настройках. max_retries
+    повышаем для дозагрузки просмотров (там длинная серия запросов)."""
     token = os.environ.get("SHIKIMORI_TOKEN") or None
     return ShikimoriApiClient(base_url=DEFAULT_BASE_URL,
-                              user_agent=_user_agent(), token=token)
+                              user_agent=_user_agent(), token=token,
+                              max_retries=max_retries)
 
 
 def _norm_title(s: str) -> str:
@@ -263,7 +270,7 @@ class _ViewsTask(QRunnable):
     def run(self):
         client = None
         try:
-            client = _client_factory()
+            client = _client_factory(max_retries=5)
             total = len(self.ids)
             for i, aid in enumerate(self.ids, 1):
                 if self._stop:
@@ -275,6 +282,13 @@ class _ViewsTask(QRunnable):
                     views = -1
                 self.signals.item.emit(aid, views)
                 self.signals.progress.emit(i, total)
+                # Троттлинг под лимит Shikimori (~90 req/min): пауза между
+                # карточками, дробим её, чтобы «Стоп» срабатывал мгновенно.
+                if i < total:
+                    slept = 0.0
+                    while slept < _VIEWS_THROTTLE and not self._stop:
+                        time.sleep(0.1)
+                        slept += 0.1
         finally:
             if client is not None:
                 client.close()
@@ -305,6 +319,7 @@ class ShikimoriTab(QWidget):
         self._excluded_packs: list = []  # имена выбранных паков
         self._views_cache: dict = {}   # anime_id -> просмотры (для сортировки)
         self._views_task = None        # текущая задача дозагрузки просмотров
+        self._anime_by_id: dict = {}   # anime_id -> Anime (для live-обновления строк)
         self._pending_genre = 0        # жанр для восстановления после загрузки
         self._initial_settings = dict(getattr(main_window, "_shikimori_settings", {}) or {})
 
@@ -363,10 +378,15 @@ class ShikimoriTab(QWidget):
         self.btn_cancel.setToolTip("Остановить поиск (накопленные результаты останутся)")
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self.cancel_search)
+        self.btn_clear = QPushButton("Очистить")
+        self.btn_clear.setIcon(get_icon('fa5s.trash'))
+        self.btn_clear.setToolTip("Очистить список результатов")
+        self.btn_clear.clicked.connect(self.clear_results)
         search_row.addWidget(self.cb_content)
         search_row.addWidget(self.ed_query, 1)
         search_row.addWidget(self.btn_search)
         search_row.addWidget(self.btn_cancel)
+        search_row.addWidget(self.btn_clear)
         root.addLayout(search_row)
 
         # ── Тело: слева список с обложками, справа панель настроек ─────────
@@ -597,11 +617,16 @@ class ShikimoriTab(QWidget):
         yt = self.sp_year_to.value()
         epmin = self.sp_ep_min.value()
         epmax = self.sp_ep_max.value()
+        ui_order = self.cb_order.currentData() or ORDER_VIEWS
+        # «По просмотрам» — локальная сортировка: на СЕРВЕРЕ берём популярные
+        # (чтобы вверху были известные тайтлы, а не безвестный мусор), а уже их
+        # пересортировываем по просмотрам локально (см. _begin_views_sort).
+        server_order = "popularity" if ui_order == ORDER_VIEWS else ui_order
         return AnimeFilter(
             query=self.ed_query.text().strip(),
             kind=self.cb_kind.currentData() or "",
             status=self.cb_status.currentData() or "",
-            order=self.cb_order.currentData() or ORDER_VIEWS,
+            order=server_order,
             score_min=(smin if smin > 0 else None),
             score_max=(smax if smax < 10.0 else None),
             year_from=(yf if yf > 0 else None),
@@ -624,6 +649,7 @@ class ShikimoriTab(QWidget):
         # Новый поиск — чистим список и потоково наполняем его по мере страниц.
         self._stop_views_task()
         self.list.clear()
+        self._anime_by_id.clear()
         self._raw_results = []
         self._results = []
         self._set_actions_enabled(False)
@@ -650,6 +676,21 @@ class ShikimoriTab(QWidget):
         # Сортировка по просмотрам — досортируем то, что успели набрать.
         if n and self._views_sort_active():
             self._begin_views_sort()
+
+    def clear_results(self):
+        """Очищает список результатов (кнопка «Очистить»). Идущий поиск/дозагрузку
+        просмотров останавливает; кеш просмотров сохраняем — пригодится повторно."""
+        if self._task is not None:
+            self._task.stop()
+            self._task = None
+            self._set_busy(False)
+        self._stop_views_task()
+        self.list.clear()
+        self._anime_by_id.clear()
+        self._raw_results = []
+        self._results = []
+        self._set_actions_enabled(False)
+        self.lbl_status.setText("Список очищен.")
 
     def _on_search_progress(self, page: int, matched: int):
         if self._task is not None:
@@ -755,6 +796,15 @@ class ShikimoriTab(QWidget):
                 self._views_task.stop()
             except Exception:
                 pass
+            # Отписываемся от сигналов: задача в пуле ещё доживёт цикл, но её
+            # поздние сигналы не должны трогать UI после «Очистить»/нового поиска.
+            for sig in (self._views_task.signals.item,
+                        self._views_task.signals.progress,
+                        self._views_task.signals.finished):
+                try:
+                    sig.disconnect()
+                except Exception:
+                    pass
             self._views_task = None
 
     def _begin_views_sort(self):
@@ -776,6 +826,17 @@ class ShikimoriTab(QWidget):
 
     def _on_views_item(self, anime_id: int, views: int):
         self._views_cache[anime_id] = views
+        # Сразу показываем число у карточки (не дожидаясь конца дозагрузки).
+        if views < 0:
+            return
+        a = self._anime_by_id.get(anime_id)
+        if a is None:
+            return
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            if it.data(Qt.ItemDataRole.UserRole + 1) == anime_id:
+                it.setText(self._row_text(a))
+                break
 
     def _on_views_progress(self, done: int, total: int):
         if self._views_task is not None:
@@ -799,11 +860,13 @@ class ShikimoriTab(QWidget):
 
     def _fill_list(self, results: list):
         self.list.clear()
+        self._anime_by_id = {a.id: a for a in results}
         for a in results:
             self._append_anime(a)
 
-    def _append_anime(self, a: "Anime"):
-        """Добавляет один тайтл в список (обложка + название + краткая инфа)."""
+    def _row_text(self, a: "Anime") -> str:
+        """Текст строки тайтла: название + краткая инфа. Если просмотры уже
+        дозагружены — показываем их числом (то самое совместное число)."""
         ct = self._content_type()
         unit = "гл." if ct == CONTENT_MANGA else "эп."
         parts = []
@@ -814,16 +877,21 @@ class ShikimoriTab(QWidget):
             parts.append(str(a.year))
         if a.episodes:
             parts.append(f"{a.episodes} {unit}")
-        # Просмотры (если уже дозагружены для сортировки) — с пробелами в тысячах.
+        # Просмотры (если уже дозагружены) — с пробелами в тысячах.
         v = self._views_cache.get(a.id)
         if v is not None and v >= 0:
-            parts.append(f"👁 {v:,}".replace(",", " "))
+            parts.append(f"👁 {v:,}".replace(",", " "))
         sub = "  ·  ".join(parts)
         text = a.title
         if a.name and a.name != a.title:
             text += f"\n{a.name}"
         text += f"\n{sub}"
-        it = QListWidgetItem(text)
+        return text
+
+    def _append_anime(self, a: "Anime"):
+        """Добавляет один тайтл в список (обложка + название + краткая инфа)."""
+        self._anime_by_id[a.id] = a
+        it = QListWidgetItem(self._row_text(a))
         it.setData(Qt.ItemDataRole.UserRole, a.url)
         it.setData(Qt.ItemDataRole.UserRole + 1, a.id)
         it.setIcon(self._icon_for(a))
