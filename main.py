@@ -14,7 +14,7 @@ from workers import *
 from tabs import *
 from edit_tab import EditTab
 from taskbar import TaskbarProgress
-from PyQt6.QtCore import qInstallMessageHandler, QSize
+from PyQt6.QtCore import qInstallMessageHandler, QSize, QTranslator, QLibraryInfo, QLocale
 from PyQt6.QtWidgets import QTabBar
 import qtawesome as qta
 import hashlib
@@ -130,6 +130,10 @@ class UnifiedWindow(QMainWindow):
         self.tab_photo = PhotoMergerTab(self)
         self.tab_b64    = Base64Tab(self)
         self.tab_prompt = PromptTab(self)
+        # Объект создан, но если вкладка выключена — он НЕ в таббаре. Родитель у
+        # него — главное окно, поэтому без явного hide() он «висит» дочерним
+        # виджетом в левом верхнем углу. Прячем; addTab() сам покажет при включении.
+        self.tab_prompt.hide()
         self.tab_edit   = EditTab(self)
         self.tab_media.thumb_sig.connect(self.tab_media.set_thumb)
         self.tab_ytdlp.thumb_sig.connect(self.tab_ytdlp.set_thumb)
@@ -137,23 +141,22 @@ class UnifiedWindow(QMainWindow):
         # (icon_name, title, tip) — значок вкладки рисуется через get_icon().
         self._tab_info = {
             'media':  ("fa5s.cogs", "Обработка",
-                       "Перекодирование видео в AV1 (SVT-AV1), смена скорости/"
-                       "разрешения/FPS, аудиоэффекты, конвертация изображений."),
+                       "Тут происходит сжатие медиафайлов"),
             'ytdlp':  ("fa5s.cloud-download-alt", "Загрузчик",
-                       "Скачивание видео/аудио по ссылке (YouTube, TikTok и др.): "
-                       "качество, обрезка по таймингам, субтитры, куки."),
+                       "Скачивание видео/аудио с YouTube и других платформ"),
             'edit':   ("fa5s.cut", "Монтаж",
-                       "Обрезка видео/аудио по волне: предпросмотр, точки IN/OUT, "
-                       "быстрый режим (copy) и перекодировка, экспорт в MP3."),
-            'photo':  ("fa5s.image", "Фото",
+                       "(Бета-тест) Обрезка видео / аудио, в том числе без перекодирования"),
+            'photo':  ("fa5s.image", "Объединить фото",
                        "Объединение нескольких изображений в одно."),
             'b64':    ("fa5s.font", "Base64",
-                       "Кодирование и декодирование файлов и текста в Base64."),
+                       "Кодирование файлов и текста в Base64."),
             'prompt': ("fa5s.clipboard", "Промпт",
                        "Менеджер промптов: хранение и быстрый выбор заготовок."),
             'siquester': ("fa5s.dice", "SiQuesterHYX",
                           "Экспериментальная вкладка SiQuester: просмотр и работа "
                           "с .siq-вопросами."),
+            'shikimori': ("fa5s.tv", "ShikimoriHYX",
+                          "Экспериментальная вкладка: поиск аниме/манги через Shikimori"),
         }
         self.tabs.setIconSize(QSize(16, 16))
         self._add_tab(self.tab_media,  'media')
@@ -161,7 +164,9 @@ class UnifiedWindow(QMainWindow):
         self._add_tab(self.tab_edit,   'edit')
         self._add_tab(self.tab_photo,  'photo')
         self._add_tab(self.tab_b64,    'b64')
-        self._add_tab(self.tab_prompt, 'prompt')
+        # Вкладка «Промпт» по умолчанию ВЫКЛЮЧЕНА (как SiQuesterHYX/ShikimoriHYX).
+        # Объект создан выше (он лёгкий и на него ссылается сохранение настроек),
+        # но в таббар добавляется только если включена — см. _add_prompt_tab.
 
         # Вкладки можно перетаскивать мышью и сортировать в удобном порядке;
         # порядок сохраняется между запусками (см. _save_tab_order / tab_order).
@@ -223,9 +228,8 @@ class UnifiedWindow(QMainWindow):
         # Кнопка-значок «развернуть консоль» — поверх самой консоли, в правом
         # верхнем углу (как кнопка полноэкранного режима у видео).
         self.btn_open_console = QToolButton(self.txt_log)
-        self.btn_open_console.setIcon(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMaxButton))
-        self.btn_open_console.setIconSize(QSize(14, 14))
+        self.btn_open_console.setIcon(get_icon('fa5s.expand-alt'))
+        self.btn_open_console.setIconSize(QSize(13, 13))
         self.btn_open_console.setToolTip("Развернуть консоль почти на всё окно")
         self.btn_open_console.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_open_console.setFixedSize(22, 22)
@@ -236,6 +240,13 @@ class UnifiedWindow(QMainWindow):
         self.btn_open_console.clicked.connect(self._open_console_window)
         self.btn_open_console.raise_()
         self.txt_log.installEventFilter(self)
+        # Перепозиционируем кнопку, когда появляется/исчезает вертикальный
+        # скроллбар (рост лога), иначе он наезжает на кнопку.
+        try:
+            self.txt_log.verticalScrollBar().rangeChanged.connect(
+                lambda *_: self._reposition_console_btn())
+        except Exception:
+            pass
         self._reposition_console_btn()
         self._console_dialog = None
         self.tabs.currentChanged.connect(self._sync_console_visibility)
@@ -250,14 +261,30 @@ class UnifiedWindow(QMainWindow):
         self._siquester_tab_enabled = False
         self.tab_siquester = None
 
+        # Экспериментальная вкладка ShikimoriHYX (по умолчанию ВЫКЛ).
+        self._shikimori_tab_enabled = False
+        self.tab_shikimori = None
+        self._shikimori_settings = {}   # сохранённые фильтры вкладки ShikimoriHYX
+
+        # Вкладка «Промпт» (по умолчанию ВЫКЛ).
+        self._prompt_tab_enabled = False
+
         try: self._load_settings()
         except Exception: pass
 
         self._attach_save_handlers()
 
+        # Подключаем вкладку «Промпт», если включена в настройках.
+        if getattr(self, "_prompt_tab_enabled", False):
+            self._add_prompt_tab()
+
         # Подключаем экспериментальную вкладку SiQuester, если включена в настройках.
         if getattr(self, "_siquester_tab_enabled", False):
             self._add_siquester_tab()
+
+        # …и вкладку ShikimoriHYX, если включена.
+        if getattr(self, "_shikimori_tab_enabled", False):
+            self._add_shikimori_tab()
 
         # Восстанавливаем сохранённый порядок вкладок (перетаскивание мышью).
         try:
@@ -306,7 +333,11 @@ class UnifiedWindow(QMainWindow):
         self._server_enabled = bool(s.get("server_enabled", False))
         self._wheel_changes_values = bool(s.get("wheel_changes_values", False))
         self._video_software_render = bool(s.get("video_software_render", False))
+        self._video_hw_decode = bool(s.get("video_hw_decode", True))
         self._siquester_tab_enabled = bool(s.get("siquester_tab_enabled", False))
+        self._shikimori_tab_enabled = bool(s.get("shikimori_tab_enabled", False))
+        self._shikimori_settings = dict(s.get("shikimori", {}) or {})
+        self._prompt_tab_enabled = bool(s.get("prompt_tab_enabled", False))
         self._tab_order = list(s.get("tab_order", []) or [])
         try:
             m = s.get("media", {}); a = m.get("audio", {})
@@ -460,10 +491,19 @@ class UnifiedWindow(QMainWindow):
                 # только строгий origin расширения.
                 return not self._req_origin() or bool(self._safe_ext_origin())
 
+            @staticmethod
+            def _strip_crlf(value: str) -> str:
+                """Удаляет любые CR/LF (и прочие управляющие) символы из значения
+                перед записью в HTTP-заголовок — барьер против HTTP response
+                splitting (CWE-113). Дублирует проверку в _safe_ext_origin, но
+                делает безопасность явной в точке записи заголовка."""
+                return re.sub(r"[\r\n\x00-\x1f]", "", value or "")
+
             def _send_cors(self):
                 # ACAO отдаём только проверенному origin расширения (а не "*" и не
                 # сырому заголовку), иначе браузер чужого сайта не прочитает ответ.
-                safe_origin = self._safe_ext_origin()
+                # _strip_crlf — явный барьер от response splitting в точке записи.
+                safe_origin = self._strip_crlf(self._safe_ext_origin())
                 if safe_origin:
                     self.send_header("Access-Control-Allow-Origin", safe_origin)
                     self.send_header("Vary", "Origin")
@@ -662,6 +702,11 @@ class UnifiedWindow(QMainWindow):
         try: self._save_settings_now()
         except Exception: pass
 
+    def _set_video_hw_decode(self, checked: bool):
+        self._video_hw_decode = bool(checked)
+        try: self._save_settings_now()
+        except Exception: pass
+
     # ------------------------------------------------------------------
     # Вкладки: подсказки (ⓘ) и сохраняемый порядок (drag-n-drop)
     # ------------------------------------------------------------------
@@ -683,6 +728,10 @@ class UnifiedWindow(QMainWindow):
         try:
             badge = info_badge(tip)
             badge.setStyleSheet("#infoBadge{color:#89b4fa;}")
+            # Бейдж ⓘ (16×16, значок 13px по центру) визуально садится на ~1px
+            # ниже центра текста вкладки. Нижний отступ сдвигает значок вверх,
+            # чтобы он встал на одну высоту с надписью (и с левым значком вкладки).
+            badge.setContentsMargins(0, 0, 0, 2)
             self.tabs.tabBar().setTabButton(
                 idx, QTabBar.ButtonPosition.RightSide, badge)
         except Exception:
@@ -730,6 +779,45 @@ class UnifiedWindow(QMainWindow):
             self._reordering_tabs = False
 
     # ------------------------------------------------------------------
+    # Вкладка «Промпт» (включается/выключается в Настройках, по умолч. ВЫКЛ)
+    # ------------------------------------------------------------------
+    def _add_prompt_tab(self):
+        """Добавляет вкладку «Промпт» в таббар (если ещё не добавлена). Сам
+        объект self.tab_prompt создаётся в __init__ — здесь только показ."""
+        t = getattr(self, "tab_prompt", None)
+        if t is None or self.tabs.indexOf(t) >= 0:
+            return
+        self._add_tab(t, 'prompt')
+        try:
+            self._apply_tab_order(getattr(self, "_tab_order", []))
+        except Exception:
+            pass
+
+    def _remove_prompt_tab(self):
+        t = getattr(self, "tab_prompt", None)
+        if t is None:
+            return
+        try:
+            idx = self.tabs.indexOf(t)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            # removeTab оставляет виджет дочерним к таббару — снова прячем, чтобы
+            # он не всплыл в углу окна.
+            t.setParent(self)
+            t.hide()
+        except Exception:
+            pass
+
+    def _set_prompt_tab_enabled(self, checked: bool):
+        self._prompt_tab_enabled = bool(checked)
+        if checked:
+            self._add_prompt_tab()
+        else:
+            self._remove_prompt_tab()
+        try: self._save_settings_now()
+        except Exception: pass
+
+    # ------------------------------------------------------------------
     # Экспериментальная вкладка SiQuester (просмотр .siq + статистика)
     # ------------------------------------------------------------------
     def _add_siquester_tab(self):
@@ -771,6 +859,59 @@ class UnifiedWindow(QMainWindow):
         try: self._save_settings_now()
         except Exception: pass
 
+    # ------------------------------------------------------------------
+    # Экспериментальная вкладка ShikimoriHYX (поиск аниме через Shikimori API)
+    # ------------------------------------------------------------------
+    def _add_shikimori_tab(self):
+        """Создаёт и добавляет вкладку ShikimoriHYX (если ещё не добавлена).
+        Импорт ленивый — модуль тянется только когда вкладка включена."""
+        if getattr(self, "tab_shikimori", None) is not None:
+            return
+        try:
+            from shikimori_tab import ShikimoriTab
+            self.tab_shikimori = ShikimoriTab(self)
+            self._add_tab(self.tab_shikimori, 'shikimori')
+            self._apply_tab_order(getattr(self, "_tab_order", []))
+        except Exception as e:
+            self.tab_shikimori = None
+            self.log(f"Не удалось добавить вкладку ShikimoriHYX: {e}")
+
+    def _remove_shikimori_tab(self):
+        t = getattr(self, "tab_shikimori", None)
+        if t is None:
+            return
+        try:
+            idx = self.tabs.indexOf(t)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            try: t.cleanup()
+            except Exception: pass
+            t.deleteLater()
+        except Exception: pass
+        self.tab_shikimori = None
+
+    def _set_shikimori_tab_enabled(self, checked: bool):
+        self._shikimori_tab_enabled = bool(checked)
+        if checked:
+            self._add_shikimori_tab()
+        else:
+            # Перед закрытием запоминаем текущие фильтры вкладки.
+            self._shikimori_settings = self._collect_shikimori_settings()
+            self._remove_shikimori_tab()
+        try: self._save_settings_now()
+        except Exception: pass
+
+    def _collect_shikimori_settings(self):
+        """Актуальные настройки вкладки ShikimoriHYX (или последние сохранённые,
+        если вкладка сейчас не открыта)."""
+        t = getattr(self, "tab_shikimori", None)
+        if t is not None and hasattr(t, "get_settings"):
+            try:
+                return t.get_settings()
+            except Exception:
+                pass
+        return dict(getattr(self, "_shikimori_settings", {}) or {})
+
     def _open_url(self, url: str):
         try:
             import webbrowser
@@ -779,21 +920,31 @@ class UnifiedWindow(QMainWindow):
             self.log(f"Не удалось открыть ссылку: {e}")
 
     def _update_ytdlp(self):
-        """Обновляет yt-dlp.exe командой `-U` (работает только для standalone-exe)."""
+        """Обновляет yt-dlp.exe до последнего NIGHTLY (работает только для
+        standalone-exe). Именно nightly первым получает исправления экстракторов,
+        когда TikTok/YouTube ломают разметку (стабильный канал отстаёт на недели).
+        `--update-to nightly` и переключает канал, и обновляет за один шаг —
+        повторные нажатия тянут свежий nightly.
+
+        ПРИМЕЧАНИЕ: ошибка TikTok «universal data for rehydration» — НЕ про версию.
+        Это флапающий JS-challenge (~60% запусков отдают пустую страницу,
+        НЕЗАВИСИМО от версии/UA/cookies). Лечится ПОВТОРАМИ процесса в workers.py
+        (InfoWorker и YtdlpWorker), а не обновлением — см. там."""
         base = ytdlp_base_cmd()
         if not base:
             self.log("yt-dlp не найден — положите yt-dlp.exe в папку bin рядом с программой.")
             return
         if len(base) != 1:
-            self.log("Обновление через -U доступно только для bin/yt-dlp.exe "
+            self.log("Обновление доступно только для bin/yt-dlp.exe "
                      "(в dev-режиме используется pip-версия: обновляйте через `pip install -U yt-dlp`).")
             return
         exe = base[0]
-        self.log("Обновляю yt-dlp…")
+        self.log("Обновляю yt-dlp (nightly)…")
 
         def _run():
             try:
-                p = subprocess.run([exe, "-U"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                p = subprocess.run([exe, "--update-to", "nightly"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    text=True, encoding="utf-8", errors="replace",
                                    creationflags=CREATE_NO_WINDOW, timeout=180)
                 for ln in (p.stdout or "").splitlines():
@@ -1271,42 +1422,14 @@ class UnifiedWindow(QMainWindow):
         # ══ Секция «Основное» ════════════════════════════════════════════════
         sec_main = make_section("Основное")
 
-        grp_sv = QGroupBox("Браузерное расширение")
-        vsv = QVBoxLayout(grp_sv)
-        chk = QCheckBox(f"Включить локальный сервер (localhost:{HTTP_PORT})")
-        chk.setChecked(bool(self._server_enabled))
-        chk.toggled.connect(self._set_server_enabled)
-        vsv.addWidget(chk)
-        vsv.addWidget(hint("По умолчанию выключен. Включите, чтобы кнопки расширения "
-                           "в браузере могли отправлять ссылки в программу."))
-        add_row(sec_main, grp_sv, "браузер расширение сервер localhost порт ссылки")
-
         grp_ui = QGroupBox("Интерфейс")
         vui = QVBoxLayout(grp_ui)
         chk_wheel = QCheckBox("Колёсико мыши меняет значения в полях")
         chk_wheel.setChecked(bool(self._wheel_changes_values))
         chk_wheel.toggled.connect(self._set_wheel_changes_values)
         vui.addWidget(chk_wheel)
-        vui.addWidget(hint("Если выключено — колёсико над полями (битрейт, ползунки, "
-                           "числа) ничего не меняет, а просто прокручивает панель."))
+        vui.addWidget(hint("Выкл — колёсико над полями прокручивает панель, а не меняет числа."))
         add_row(sec_main, grp_ui, "колесо мышь интерфейс значения прокрутка битрейт ползунки")
-
-        # ══ Секция «Экспериментально» ════════════════════════════════════════
-        sec_exp = make_section("Экспериментально")
-
-        grp_siq = QGroupBox("Дополнительные вкладки")
-        vexp = QVBoxLayout(grp_siq)
-        chk_siq = QCheckBox("Включить вкладку «SiQuesterHYX» (просмотр .siq + статистика)")
-        chk_siq.setChecked(bool(getattr(self, "_siquester_tab_enabled", False)))
-        chk_siq.toggled.connect(self._set_siquester_tab_enabled)
-        vexp.addWidget(chk_siq)
-        vexp.addWidget(hint(icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
-                            + " Экспериментальная вкладка (по умолчанию выключена). Встроенный "
-                            "просмотрщик пакетов SIGame (.siq) и анализатор статистики из "
-                            "SiQuesterHYX. Видео и аудио воспроизводятся через QtMultimedia. "
-                            "Включается и выключается без перезапуска программы."))
-        add_row(sec_exp, grp_siq,
-                "siquester сиквестер siq пакет вопросы статистика эксперимент вкладка просмотр sigame")
 
         # ══ Секция «Монтаж» ══════════════════════════════════════════════════
         sec_edit = make_section("Монтаж")
@@ -1322,7 +1445,7 @@ class UnifiedWindow(QMainWindow):
                 lbl = QLabel(label_text)
                 lbl.setStyleSheet("color:#cdd6f4; font-size:12px;")
                 lbl.setFixedWidth(230)
-                kse = QKeySequenceEdit()
+                kse = LatinKeySequenceEdit()
                 kse.setKeySequence(QKeySequence(init_seq))
                 row.addWidget(lbl); row.addWidget(kse, 1)
                 w = QWidget(); w.setLayout(row)
@@ -1358,6 +1481,19 @@ class UnifiedWindow(QMainWindow):
                               "настройка сочетаний невозможна."))
         add_row(sec_edit, grp_keys, "монтаж обрезка сочетание клавиши shift c v плейхед старт конец in out горячие")
 
+        grp_scrub = QGroupBox("Покадровая перемотка")
+        vsc = QVBoxLayout(grp_scrub)
+        if te is not None and getattr(te, "_ready", False):
+            chk_scrub_audio = QCheckBox("Звук при покадровой перемотке (скраб, как в Filmora)")
+            chk_scrub_audio.setChecked(bool(getattr(te, "_scrub_audio_enabled", True)))
+            chk_scrub_audio.toggled.connect(lambda v: te.set_scrub_audio(bool(v)))
+            vsc.addWidget(chk_scrub_audio)
+            vsc.addWidget(hint("Вкл (по умолч.): при шаге по кадрам (←/→, WASD) звучит короткий "
+                               "фрагмент новой позиции — слышно, что под курсором."))
+        else:
+            vsc.addWidget(hint("Вкладка «Монтаж» недоступна (нет модуля мультимедиа)."))
+        add_row(sec_edit, grp_scrub, "монтаж покадровая перемотка скраб звук filmora кадр шаг стрелки wasd аудио")
+
         grp_render = QGroupBox("Видео и оверлеи")
         vr = QVBoxLayout(grp_render)
 
@@ -1366,21 +1502,65 @@ class UnifiedWindow(QMainWindow):
             chk_subframe.setChecked(bool(getattr(te, "_subs_in_frame", True)))
             chk_subframe.toggled.connect(lambda v: te.set_subs_in_frame(bool(v)))
             vr.addWidget(chk_subframe)
-            vr.addWidget(hint("Включено (по умолчанию): субтитры рисуются ВНУТРИ кадра — "
-                              "корректно обрезаются по видео и перекрываются панелями/окнами "
-                              "сверху (как в VLC). Выключено: старый метод — отдельное "
-                              "окно-оверлей поверх видео (чуть легче для ЦП, но всплывает "
-                              "над другими окнами). Применяется сразу."))
+            vr.addWidget(hint("Вкл (по умолч.): субтитры рисуются внутри кадра (как в VLC). "
+                              "Выкл: отдельный оверлей поверх видео. Применяется сразу."))
+
+        chk_hw = QCheckBox("Аппаратное ускорение видео (H.264 / HEVC)")
+        chk_hw.setChecked(bool(getattr(self, "_video_hw_decode", True)))
+        chk_hw.toggled.connect(self._set_video_hw_decode)
+        vr.addWidget(chk_hw)
+        vr.addWidget(hint("Вкл (по умолч.): H.264/HEVC декодируются на видеокарте (D3D11VA/DXVA2) "
+                          "— тяжёлые файлы в «Монтаже» играют плавно. Выключите, если прямой AV1 "
+                          "(SiQuesterHYX) даёт чёрный экран. Нужен перезапуск."))
 
         chk_sw = QCheckBox("Программный рендер видео (убирает оверлей RivaTuner/FPS)")
         chk_sw.setChecked(bool(getattr(self, "_video_software_render", False)))
         chk_sw.toggled.connect(self._set_video_software_render)
         vr.addWidget(chk_sw)
-        vr.addWidget(hint("Помогает, когда RivaTuner рисует счётчик FPS поверх окна видео. "
-                          "Видео рендерится без аппаратного D3D/GL-свопчейна, который "
-                          "перехватывает RivaTuner. Изменение вступит в силу после перезапуска "
-                          "программы."))
-        add_row(sec_edit, grp_render, "rivatuner оверлей fps d3d11 рендер видео аппаратное программное ускорение субтитры кадр vlc метод")
+        vr.addWidget(hint("Помогает, когда RivaTuner рисует FPS поверх видео: рендер без "
+                          "D3D/GL-свопчейна (HW-ускорение видео при этом тоже выключается). "
+                          "Нужен перезапуск."))
+        add_row(sec_edit, grp_render, "rivatuner оверлей fps d3d11 рендер видео аппаратное программное ускорение субтитры кадр vlc метод hevc h264 dxva декодирование")
+
+        # ══ Секция «Экспериментально» (предпоследняя) ════════════════════════
+        sec_exp = make_section("Экспериментально")
+
+        grp_sv = QGroupBox("Браузерное расширение")
+        vsv = QVBoxLayout(grp_sv)
+        chk = QCheckBox(f"Включить локальный сервер (localhost:{HTTP_PORT})")
+        chk.setChecked(bool(self._server_enabled))
+        chk.toggled.connect(self._set_server_enabled)
+        vsv.addWidget(chk)
+        vsv.addWidget(hint("Выкл по умолчанию. Включите, чтобы расширение в браузере "
+                           "слало ссылки в программу."))
+        add_row(sec_exp, grp_sv, "браузер расширение сервер localhost порт ссылки экспериментально")
+
+        grp_siq = QGroupBox("Дополнительные вкладки")
+        vexp = QVBoxLayout(grp_siq)
+        chk_prompt = QCheckBox("Включить вкладку «Промпт»")
+        chk_prompt.setChecked(bool(getattr(self, "_prompt_tab_enabled", False)))
+        chk_prompt.toggled.connect(self._set_prompt_tab_enabled)
+        vexp.addWidget(chk_prompt)
+        vexp.addWidget(hint("Менеджер промптов: хранение и быстрый выбор заготовок."))
+        chk_siq = QCheckBox("Включить вкладку «SiQuesterHYX» (просмотр .siq + статистика)")
+        chk_siq.setChecked(bool(getattr(self, "_siquester_tab_enabled", False)))
+        chk_siq.toggled.connect(self._set_siquester_tab_enabled)
+        vexp.addWidget(chk_siq)
+        vexp.addWidget(hint(icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
+                            + " Экспериментально. Просмотрщик пакетов SIGame (.siq) и "
+                            "статистика. Без перезапуска."))
+        chk_shiki = QCheckBox("Включить вкладку «ShikimoriHYX» (поиск аниме по Shikimori API)")
+        chk_shiki.setChecked(bool(getattr(self, "_shikimori_tab_enabled", False)))
+        chk_shiki.toggled.connect(self._set_shikimori_tab_enabled)
+        vexp.addWidget(chk_shiki)
+        vexp.addWidget(hint(icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
+                            + " Экспериментально. Поиск аниме через Shikimori API с фильтрами; "
+                            "экспорт в JSON/CSV. OAuth-токен — в переменной SHIKIMORI_TOKEN. "
+                            "Без перезапуска."))
+        add_row(sec_exp, grp_siq,
+                "промпт prompt заготовки шаблоны "
+                "siquester сиквестер siq пакет вопросы статистика эксперимент вкладка просмотр sigame "
+                "shikimori шикимори аниме поиск оценка жанр год api джойнт")
 
         # ══ Секция «О программе» ═════════════════════════════════════════════
         sec_about = make_section("О программе")
@@ -1509,7 +1689,11 @@ class UnifiedWindow(QMainWindow):
                 'server_enabled': bool(getattr(self, '_server_enabled', False)),
                 'wheel_changes_values': bool(getattr(self, '_wheel_changes_values', False)),
                 'video_software_render': bool(getattr(self, '_video_software_render', False)),
+                'video_hw_decode': bool(getattr(self, '_video_hw_decode', True)),
                 'siquester_tab_enabled': bool(getattr(self, '_siquester_tab_enabled', False)),
+                'shikimori_tab_enabled': bool(getattr(self, '_shikimori_tab_enabled', False)),
+                'shikimori': self._collect_shikimori_settings(),
+                'prompt_tab_enabled': bool(getattr(self, '_prompt_tab_enabled', False)),
                 'priority': tm.c_priority.currentText() if hasattr(tm, 'c_priority') else 'Обычный',
                 'prompt_file': getattr(getattr(self, 'tab_prompt', None), '_prompt_path', '') or '',
                 'tab_order': list(getattr(self, '_tab_order', [])),
@@ -1518,8 +1702,18 @@ class UnifiedWindow(QMainWindow):
         except Exception: return {}
 
     def _save_settings_now(self):
-        try: save_settings(self._collect_settings())
-        except Exception as e: self.log(f"save settings error: {e}")
+        try:
+            data = self._collect_settings()
+            # _collect_settings возвращает {} при любой ошибке (напр. после
+            # изменения кода обращение к ещё не созданному виджету). НЕ пишем
+            # пустой словарь — иначе settings.json затирается, и при следующем
+            # запуске папка загрузчика и прочие настройки сбрасываются к дефолту.
+            if not data:
+                self.log("save settings: пустой результат сборки — пропуск (файл не затёрт)")
+                return
+            save_settings(data)
+        except Exception as e:
+            self.log(f"save settings error: {e}")
 
     def _attach_save_handlers(self):
         try:
@@ -1574,6 +1768,17 @@ class UnifiedWindow(QMainWindow):
         except Exception: pass
 
     def update_global_progress(self, val, text):
+        # val < 0 → неопределённый («busy») режим: полоса пульсирует. Нужен для
+        # фаз, где реального процента нет (перемотка декодера до точки реза при
+        # обрезке с перекодированием), чтобы полоса не выглядела зависшей на 0%.
+        if val is None or val < 0:
+            if self.pbar.maximum() != 0:
+                self.pbar.setRange(0, 0)
+            self.pbar.setFormat(text)
+            self.set_taskbar_progress(0, 0)   # indeterminate в панели задач
+            return
+        if self.pbar.maximum() == 0:          # вернуть из busy в обычный режим
+            self.pbar.setRange(0, 100)
         self.pbar.setValue(val); self.pbar.setFormat(text)
         # Зеркалим прогресс перекодирования на иконку в панели задач
         if val >= 100:
@@ -1606,8 +1811,10 @@ class UnifiedWindow(QMainWindow):
             is_edit = cur is self.tab_edit
             tsq = getattr(self, "tab_siquester", None)
             is_siq = tsq is not None and cur is tsq
-            self.console_panel.setVisible(not (is_edit or is_siq))
-            self.pbar.setVisible(not is_siq)
+            tsh = getattr(self, "tab_shikimori", None)
+            is_shiki = tsh is not None and cur is tsh
+            self.console_panel.setVisible(not (is_edit or is_siq or is_shiki))
+            self.pbar.setVisible(not (is_siq or is_shiki))
         except Exception:
             pass
 
@@ -1665,8 +1872,11 @@ class UnifiedWindow(QMainWindow):
         if btn is None:
             return
         try:
-            vp = self.txt_log.viewport()
-            x = vp.width() - btn.width() - 4
+            # Якоримся к ПРАВОМУ краю txt_log за вычетом ширины видимого
+            # вертикального скроллбара — иначе он перекрывает кнопку.
+            sb = self.txt_log.verticalScrollBar()
+            sbw = sb.width() if (sb is not None and sb.isVisible()) else 0
+            x = self.txt_log.width() - sbw - btn.width() - 6
             btn.move(max(0, x), 4)
             btn.raise_()
         except Exception:
@@ -1767,6 +1977,12 @@ class UnifiedWindow(QMainWindow):
             except Exception:
                 pass
             try:
+                tsh = getattr(self, "tab_shikimori", None)
+                if tsh is not None:
+                    tsh.cleanup()
+            except Exception:
+                pass
+            try:
                 self._stop_browser_http_server()
             except Exception:
                 pass
@@ -1784,7 +2000,74 @@ class UnifiedWindow(QMainWindow):
         super().closeEvent(ev)
 
 
+def _install_crash_handler():
+    """Глобальный обработчик необработанных исключений: пишет трейсбек в
+    crash.log, показывает пользователю диалог с ошибкой и аккуратно завершает
+    программу. Так падение не «исчезает в никуда», а видно пользователю."""
+    import traceback as _tb
+    import datetime as _dt
+    crash_log = os.path.join(CONFIG_DIR, "crash.log")
+    _already = {"shown": False}
+
+    def _handle(exc_type, exc_value, exc_tb):
+        # Ctrl+C — стандартное поведение, не показываем диалог
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        tb_text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+        # Защита от рекурсии: если падение случилось при показе диалога
+        if _already["shown"]:
+            try:
+                sys.stderr.write(tb_text)
+            except Exception:
+                pass
+            os._exit(1)
+        _already["shown"] = True
+        try:
+            with open(crash_log, "a", encoding="utf-8") as f:
+                f.write(f"\n===== {_dt.datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
+                f.write(tb_text)
+        except Exception:
+            pass
+        try:
+            if sys.stderr is not None:
+                sys.stderr.write(tb_text)
+                sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            from PyQt6.QtWidgets import QMessageBox
+            box = QMessageBox()
+            box.setIcon(QMessageBox.Icon.Critical)
+            box.setWindowTitle("SI-HYX — критическая ошибка")
+            box.setText("Произошла непредвиденная ошибка, программа будет закрыта.")
+            box.setInformativeText(f"{exc_type.__name__}: {exc_value}")
+            box.setDetailedText(tb_text)
+            try:
+                if APP_ICON:
+                    box.setWindowIcon(QIcon(APP_ICON))
+            except Exception:
+                pass
+            box.exec()
+        except Exception:
+            pass
+        os._exit(1)
+
+    sys.excepthook = _handle
+
+
 def main():
+    # AppUserModelID задаём САМЫМ ПЕРВЫМ — до QLocalSocket, QApplication и любого
+    # обращения к панели задач. Иначе Windows успевает связать кнопку на панели
+    # задач с хост-процессом python.exe (его иконкой), и наша иконка окна больше
+    # не подхватывается (баг «иконка пропала при запуске main.py»).
+    if IS_WIN:
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GoldensFire.SI-HYX")
+        except Exception:
+            pass
+
     # Парсим аргументы один раз
     cli_files = [f for f in sys.argv[1:] if os.path.exists(f)]
 
@@ -1802,20 +2085,27 @@ def main():
         except Exception: pass
         # Сервер не найден — запускаем нормально и загружаем файлы
 
-    # На Windows задаём AppUserModelID, иначе на панели задач показывается
-    # стандартная иконка Python, а не иконка программы.
-    if IS_WIN:
-        try:
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GoldensFire.SI-HYX")
-        except Exception:
-            pass
-
     qInstallMessageHandler(_qt_message_filter)
+    _install_crash_handler()
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    # Русификация стандартных кнопок диалогов Qt (QMessageBox и др.): без
+    # переводчика «Да/Нет/ОК/Отмена» рисуются по-английски (Yes/No/OK/Cancel),
+    # из-за чего окна подтверждения в «Монтаже» были на английском.
+    try:
+        _qt_translator = QTranslator(app)
+        _tr_path = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+        if _qt_translator.load(QLocale("ru"), "qtbase", "_", _tr_path) or \
+           _qt_translator.load("qtbase_ru", _tr_path):
+            app.installTranslator(_qt_translator)
+            app._qt_translator = _qt_translator  # держим ссылку от сборщика мусора
+    except Exception:
+        pass
     app.setStyleSheet(STYLESHEET)
+    # Стабильные подсказки без мерцания (тот же попап, что у значков ⓘ) для всех
+    # виджетов с setToolTip — заменяет системный QToolTip (см. widgets.py).
+    install_hover_tips(app)
     if APP_ICON:
         app.setWindowIcon(QIcon(APP_ICON))
 

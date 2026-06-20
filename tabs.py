@@ -122,7 +122,8 @@ class YtdlpTab(QWidget):
         # URL + кнопки скачивания — слева (это «добавление»)
         left.addWidget(QLabel("Ссылка для скачивания:"))
         left.addLayout(h)
-        fl.addRow("Папка:", ho)
+        fl.addRow(label_with_info("Папка:", "Папка, куда сохраняются скачанные видео и аудио. "
+                                  "Значение запоминается между запусками. Кнопка справа — выбрать папку."), ho)
         fl.addRow(label_with_info("Cookies:", "Файл cookies.txt для приватных/возрастных видео. Для YouTube обычно не требуется (скачивание идёт через клиент tv + Deno)."), ho_ck)
         fl.addRow(label_with_info("Прокси:", "Прокси для скачивания (yt-dlp). Помогает при блокировке YouTube провайдером. "
                                   "Браузерный VPN тут не работает — нужен именно прокси. Примеры: http://127.0.0.1:8080, socks5://127.0.0.1:1080"), ho_px)
@@ -138,8 +139,12 @@ class YtdlpTab(QWidget):
         opt = QGroupBox("Опции"); ho = QHBoxLayout()
         self.c_q = QComboBox(); self.c_q.addItems(list(FORMAT_OPTIONS.keys())); self.c_q.setCurrentText("1080p")
         self.c_c = QComboBox(); self.c_c.addItems(MERGE_OPTIONS)
-        self.c_s = QComboBox(); self.c_s.addItems(SUB_OPTIONS)
-        self.c_a = QComboBox(); self.c_a.addItems(AUDIO_OPTIONS)
+        # Списки субтитров/языка пусты, пока не добавлено видео. Заполняются
+        # реально доступными дорожками после пробы метаданных (см.
+        # _on_info_success/_populate_lang_combos). Так в них не висят ru/en/…,
+        # когда видео ещё не добавлено или других дорожек у него нет.
+        self.c_s = QComboBox()
+        self.c_a = QComboBox()
         # компактные комбобоксы опций — чтобы ряд Кач./Конт. не распирал панель
         self.c_q.setMaximumWidth(96); self.c_c.setMaximumWidth(72)
         self.c_s.setMaximumWidth(84); self.c_a.setMaximumWidth(120)
@@ -214,6 +219,12 @@ class YtdlpTab(QWidget):
         self.tree = QTreeWidget(); self.tree.setHeaderLabels(["URL", "Размер", "Инфо", "Статус"])
         self.tree.setColumnWidth(0, 380); self.tree.setColumnWidth(3, 100)
         self.tree.setIconSize(QSize(160,90)); self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        # Список плоский (вложенности нет) — убираем отступ-«ветку» и стрелку
+        # раскрытия слева, из-за которых у строк появлялась пустая область слева.
+        self.tree.setIndentation(0); self.tree.setRootIsDecorated(False)
+        # Цветовая подсветка строк по статусу (синий — качается, зелёный — готово,
+        # красный — ошибка) + видимое выделение при клике — как на странице обработки.
+        self.tree.setItemDelegate(StatusColorDelegate(self.tree))
         self.tree.customContextMenuRequested.connect(self.ctx)
         left.addWidget(self.tree, 1)
         # Клавиша Delete — удалить выделенные загрузки из списка
@@ -325,7 +336,7 @@ class YtdlpTab(QWidget):
         except Exception as e:
             self.main.log(f"_populate_kodik error: {e}")
 
-    def _on_info_success(self, duration, thumb_url):
+    def _on_info_success(self, duration, thumb_url, sub_langs=None, audio_langs=None):
         self.main.log(f"Длительность получена: {duration} сек.")
         try:
             if duration > 0:
@@ -333,6 +344,32 @@ class YtdlpTab(QWidget):
                 self.slider_start.setValue(0); self.slider_end.setValue(duration)
                 self._slider_to_spins()
         except Exception: pass
+        try:
+            self._populate_lang_combos(sub_langs or [], audio_langs or [])
+        except Exception: pass
+
+    def _populate_lang_combos(self, sub_langs, audio_langs):
+        """Заполняет «Суб.» и «Язык» реально доступными дорожками видео.
+        Субтитры показываем, только если они есть; «Язык» — только если у видео
+        больше одной аудиодорожки (иначе выбирать нечего → список пуст)."""
+        # Субтитры
+        cur_s = self.c_s.currentText()
+        self.c_s.blockSignals(True); self.c_s.clear()
+        if sub_langs:
+            items = ["Выкл", "all"] + list(sub_langs)
+            self.c_s.addItems(items)
+            if cur_s in items:
+                self.c_s.setCurrentText(cur_s)
+        self.c_s.blockSignals(False)
+        # Язык (аудиодорожка)
+        cur_a = self.c_a.currentText()
+        self.c_a.blockSignals(True); self.c_a.clear()
+        if len(audio_langs) > 1:
+            items = ["Original"] + list(audio_langs)
+            self.c_a.addItems(items)
+            if cur_a in items:
+                self.c_a.setCurrentText(cur_a)
+        self.c_a.blockSignals(False)
 
     def _on_info_error(self, err_msg):
         self.main.log(f"[Ошибка метаданных] {err_msg}")
@@ -407,10 +444,16 @@ class YtdlpTab(QWidget):
     def _connect_worker_signals(self, w: 'YtdlpWorker', iid: str):
         """Подключает стандартные сигналы воркера к обработчикам дерева."""
         def on_prog(iid_, p, t):
+            # Опоздавший тик уже завершённого воркера (его watchdog мог эмитнуть
+            # «Скачивание…» в момент гибели процесса) не должен воскрешать строку
+            # и индикатор в панели задач после ошибки/остановки.
+            if iid_ not in self.active_workers:
+                return
             item = self.items.get(iid_, {}).get('item')
             if item:
-                # p < 0 — индикатор активности без реального % (download-sections/ffmpeg)
-                item.setText(1, "…" if p < 0 else f"{p:.1f}%"); item.setText(3, t)
+                # p <= 0 — индикатор активности без реального % (подготовка/повторы
+                # извлечения/тихий ffmpeg); реальный процент показываем от >0.
+                item.setText(1, "…" if p <= 0 else f"{p:.1f}%"); item.setText(3, t)
             self._dl_pct[iid_] = p
             self._update_dl_taskbar()
 
@@ -418,14 +461,14 @@ class YtdlpTab(QWidget):
             self._dl_pct.pop(iid_, None); self._update_dl_taskbar()
             item = self.items.get(iid_, {}).get('item')
             if item:
-                item.setIcon(3, get_icon('fa5s.check-circle', color='#a6e3a1'))
                 item.setText(3, status)
-                for col in range(self.tree.columnCount()):
-                    item.setBackground(col, QBrush(COLOR_DONE))
+                # Зелёная подсветка строки — как на странице обработки (делегат
+                # StatusColorDelegate рисует фон по статусу из 0-й колонки).
+                item.setData(0, ITEM_STATUS_ROLE, 'done')
                 self.tree.viewport().update()
                 if file_path and os.path.exists(file_path):
                     try:
-                        dur, br_str, size, a_br = get_media_info(file_path)
+                        dur, br_str, size, a_br, _a_codec = get_media_info(file_path)
                         item.setText(1, human_size(size))
                         item.setText(2, clean_info if clean_info and clean_info != "Unknown" else br_str)
                         self.main.log(f"Загружено: {file_path} ({human_size(size)}, {a_br})")
@@ -437,8 +480,9 @@ class YtdlpTab(QWidget):
                 item = self.items.get(iid_, {}).get('item')
                 if not item: return
                 item.setText(3, "Ошибка"); item.setToolTip(3, msg)
-                for col in range(self.tree.columnCount()):
-                    item.setBackground(col, QBrush(COLOR_ERR))
+                # Красная подсветка строки — как на странице обработки.
+                item.setData(0, ITEM_STATUS_ROLE, 'err')
+                self.tree.viewport().update()
             except RuntimeError:
                 pass  # QTreeWidgetItem уже удалён пользователем
 
@@ -466,6 +510,7 @@ class YtdlpTab(QWidget):
             it = QTreeWidgetItem(self.tree)
             it.setText(0, url); it.setText(1, "-"); it.setText(2, "-"); it.setText(3, "В очереди")
             it.setData(0, Qt.ItemDataRole.UserRole, iid)
+            it.setData(0, ITEM_STATUS_ROLE, 'proc')  # синяя подсветка «в работе»
             self.items[iid] = {'item': it, 'url': url, 'audio_only': bool(audio_only)}
 
             config = {
@@ -497,19 +542,9 @@ class YtdlpTab(QWidget):
             it = QTreeWidgetItem(self.tree)
             it.setText(0, url); it.setText(1, "-"); it.setText(2, "-"); it.setText(3, "В очереди")
             it.setData(0, Qt.ItemDataRole.UserRole, iid)
+            it.setData(0, ITEM_STATUS_ROLE, 'proc')  # синяя подсветка «в работе»
             self.items[iid] = {'item': it, 'url': url, 'audio_only': bool(audio_only)}
-            config = {
-                'iid': iid, 'url': url, 'fmt': FORMAT_OPTIONS.get(self.c_q.currentText(), 'best'),
-                'outdir': self.out.text(), 'merge': self.c_c.currentText(), 'sub_lang': self.c_s.currentText(),
-                'audio': self.c_a.currentText(), 'force_kf': self.chk_k.isChecked(),
-                'start_s': self.get_sec(self.ts) if any(x.value() for x in self.ts) else None,
-                'end_s': self.get_sec(self.te) if any(x.value() for x in self.te) else None,
-                'audio_only': bool(audio_only),
-                'cookie_path': self.cookie_edit.text().strip(),
-                'proxy': self.proxy_edit.text().strip(),
-                'kodik_episode': self._kodik_episode_value(),
-                'kodik_translation': (lambda t: "" if t in ("", "—") else t)(self.kodik_trans.currentText().strip()),
-            }
+            config = self._dl_config(iid, url, audio_only)
             w = YtdlpWorker(config)
             self.active_workers[iid] = w
             w.finished.connect(lambda _=None, i=iid: self._remove_worker(i))
@@ -525,18 +560,20 @@ class YtdlpTab(QWidget):
         except Exception: pass
 
     def _update_dl_taskbar(self):
-        """Сводный прогресс загрузок на иконке в панели задач: среднее по
-        активным элементам. Если все в «неопределённом» режиме (—1) — бегущая
-        полоса; если активных нет — снять индикатор."""
+        """Сводный прогресс загрузок на иконке в панели задач:
+          • есть реальный % (v>0) — средний % (обычный режим);
+          • идёт загрузка, но % неизвестен (тихий ffmpeg, v==-1) — бегущая полоса;
+          • только подготовка/извлечение (v==0) или активных нет — снять индикатор,
+            чтобы падающее извлечение не выглядело как «что-то грузится»."""
         try:
-            vals = list(self._dl_pct.values())
-            if not vals:
-                self.main.clear_taskbar_progress(); return
-            real = [v for v in vals if v is not None and v >= 0]
+            vals = [v for v in self._dl_pct.values() if v is not None]
+            real = [v for v in vals if v > 0]
             if real:
                 self.main.set_taskbar_progress(int(sum(real) / len(real)), 100)
-            else:
+            elif any(v < 0 for v in vals):
                 self.main.set_taskbar_progress(0, 100)  # 0 → неопределённый режим
+            else:
+                self.main.clear_taskbar_progress()
         except Exception:
             pass
 
@@ -551,10 +588,27 @@ class YtdlpTab(QWidget):
         self._update_dl_taskbar()
         self._update_stop_btn()
 
+    def _dl_config(self, iid, url, audio_only):
+        """Конфиг загрузки из текущих настроек вкладки. Общий для add_dl и
+        перезапуска (redownload), чтобы режимы не расходились."""
+        return {
+            'iid': iid, 'url': url, 'fmt': FORMAT_OPTIONS.get(self.c_q.currentText(), 'best'),
+            'outdir': self.out.text(), 'merge': self.c_c.currentText(), 'sub_lang': self.c_s.currentText(),
+            'audio': self.c_a.currentText(), 'force_kf': self.chk_k.isChecked(),
+            'start_s': self.get_sec(self.ts) if any(x.value() for x in self.ts) else None,
+            'end_s': self.get_sec(self.te) if any(x.value() for x in self.te) else None,
+            'audio_only': bool(audio_only),
+            'cookie_path': self.cookie_edit.text().strip(),
+            'proxy': self.proxy_edit.text().strip(),
+            'kodik_episode': self._kodik_episode_value(),
+            'kodik_translation': (lambda t: "" if t in ("", "—") else t)(self.kodik_trans.currentText().strip()),
+        }
+
     def redownload_sel(self):
-        """Скачать выбранные элементы заново. Берём URL из элемента и тот же режим
-        (видео/аудио), что был выбран изначально, и запускаем новую загрузку с
-        текущими настройками вкладки (качество, формат, cookies, прокси)."""
+        """Скачать выбранные заново В ТОЙ ЖЕ строке — без дубля в списке.
+        Если по элементу ещё идёт воркер, СНАЧАЛА останавливаем его: иначе два
+        процесса пишут один и тот же выходной файл и падают с WinError 32
+        («файл занят другим процессом», 'X.m4a'->'X.m4a')."""
         for it in list(self.tree.selectedItems()):
             try:
                 iid = it.data(0, Qt.ItemDataRole.UserRole)
@@ -562,9 +616,27 @@ class YtdlpTab(QWidget):
                 url = (entry.get('url') if isinstance(entry, dict) else "") or it.text(0)
                 if not (url and url.strip().startswith('http')):
                     continue
+                url = url.strip()
                 audio_only = bool(entry.get('audio_only', False)) if isinstance(entry, dict) else False
-                self.url_edit.setText(url.strip())
-                self.add_dl(audio_only)
+                # Гасим прежний воркер этого же элемента (если ещё активен) —
+                # не плодим второй процесс на тот же файл.
+                old = self.active_workers.pop(iid, None)
+                if old:
+                    try: old.stop()
+                    except Exception: pass
+                # Сброс строки в исходное состояние «в очереди»
+                it.setText(1, "-"); it.setText(2, "-"); it.setText(3, "В очереди")
+                it.setToolTip(3, "")
+                it.setData(0, ITEM_STATUS_ROLE, 'proc')
+                self.tree.viewport().update()
+                self.items[iid] = {'item': it, 'url': url, 'audio_only': audio_only}
+                w = YtdlpWorker(self._dl_config(iid, url, audio_only))
+                self.active_workers[iid] = w
+                w.finished.connect(lambda _=None, i=iid: self._remove_worker(i))
+                self._connect_worker_signals(w, iid)
+                w.start()
+                self._update_stop_btn()
+                self.main.log(f"Повторная загрузка: {url}")
             except Exception as e:
                 self.main.log(f"redownload error: {e}")
 
@@ -591,6 +663,8 @@ class YtdlpTab(QWidget):
 
 class MediaTab(QWidget):
     thumb_sig = pyqtSignal(str, QIcon)
+    media_info_sig = pyqtSignal(str, str, str, float)  # iid, размер, битрейт, длительность(с)
+    media_lufs_sig = pyqtSignal(str, object)           # iid, LUFS до (или None)
     def __init__(self, main_win):
         super().__init__()
         self.main = main_win
@@ -602,6 +676,8 @@ class MediaTab(QWidget):
         self.setAcceptDrops(True)
         self.setup_ui()
         self.thumb_sig.connect(self.set_thumb)
+        self.media_info_sig.connect(self._apply_media_info)
+        self.media_lufs_sig.connect(self._apply_media_lufs)
         self.worker = None
 
     def _find_item(self, iid) -> 'QTreeWidgetItem | None':
@@ -636,9 +712,13 @@ class MediaTab(QWidget):
             "Добавляйте файлы сюда\n\n"
             "Перетащите видео, аудио или изображения в это окно\n"
             "или нажмите «Добавить файлы»")
-        self.tree.setHeaderLabels(["Превью", "", "Размер", "Битрейт", "LUFS", "Статус"])
+        self.tree.setHeaderLabels(["Превью", "", "Размер", "Битрейт", "LUFS", "Длительность", "Статус"])
         self.tree.setRootIsDecorated(False)
         self.tree.setItemDelegate(StatusColorDelegate(self.tree))  # цветовая подсветка строк
+        # 0-я колонка: миниатюра + имя файла под ней (одной строкой, с многоточием).
+        self._preview_delegate = PreviewNameDelegate(self.tree)
+        self._preview_delegate.compare_clicked.connect(self._on_compare_clicked)
+        self.tree.setItemDelegateForColumn(0, self._preview_delegate)
         self.tree.setIconSize(QSize(160,90)); self.tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.ctx)
@@ -652,7 +732,9 @@ class MediaTab(QWidget):
         self.tree.verticalScrollBar().setSingleStep(24)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.tree.header().resizeSection(0, 180)
-        for i in range(1, 6): self.tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        for i in range(1, 7): self.tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        # Колонка 1 — только метки «Было/Стало» (имя файла переехало под превью),
+        # поэтому ширину отдаём по содержимому (ResizeToContents выше).
 
         h = QHBoxLayout()
         b1 = _icon_btn("Добавить файлы", 'fa5s.plus'); b1.clicked.connect(self.add)
@@ -832,12 +914,17 @@ class MediaTab(QWidget):
         fv.addRow(row_with_info(self.ck_vfade_in, "Плавное появление картинки из чёрного экрана в начале (секунды)"), self.s_vfade_in)
         fv.addRow(row_with_info(self.ck_vfade_out, "Плавный уход картинки в чёрный экран в конце (секунды)"), self.s_vfade_out)
 
+        # Обрезка чёрных полос (cropdetect) — убирает letterbox/pillarbox при перекоде
+        self.ck_crop_black = QCheckBox("Обрезать чёрные полосы"); self.ck_crop_black.setChecked(False)
+        self._crop_black_row = row_with_info(self.ck_crop_black, "Автоматически определяет и вырезает чёрные поля (letterbox/pillarbox) при перекодировании. Рамка определяется по началу видео через cropdetect.")
+        fv.addRow(self._crop_black_row)
+
         gv.setLayout(fv); rv_inner.addWidget(gv)
         # Скрываем строки видео если перекодирование выключено
         self._video_enc_rows = [self.btn_mode_std, self.btn_mode_dark,
                                  self.s_crf, self.s_pre, self.c_res, self.c_fps,
                                  self._badge_crf,
-                                 self.s_vfade_in, self.s_vfade_out]
+                                 self.s_vfade_in, self.s_vfade_out, self._crop_black_row]
         def _update_video_enc(checked):
             for w in self._video_enc_rows:
                 w.setVisible(checked)
@@ -1058,12 +1145,13 @@ class MediaTab(QWidget):
             entry = self._item_data_map.get(iid)
             if entry:
                 entry['is_done'] = False
-            i.setText(5, "Ожидание")
+            i.setText(6, "Ожидание")
             # Сброс «новых» данных — оставляем только исходные (верхняя строка «было»)
             self._set_pair(i, 2, bottom="—")   # Размер: стало
             self._set_pair(i, 3, bottom="—")   # Битрейт: итог
             self._set_pair(i, 4, bottom="—")   # LUFS: после
             i.setData(0, ITEM_STATUS_ROLE, None)
+            i.setData(0, ITEM_COMPARE_ROLE, None)   # снять значок «сравнить»
         self.tree.viewport().update()
 
     def dragEnterEvent(self, event):
@@ -1152,12 +1240,21 @@ class MediaTab(QWidget):
                 self._item_data_map[iid] = item_data
 
                 it = QTreeWidgetItem(self.tree)
-                it.setToolTip(0, f"{os.path.basename(p)}\n{p}")
-                it.setText(1, "Было\nСтало")              # метка двух строк
-                it.setText(2, f"{human_size(size)}\n—")   # Размер: было(исх) / стало(нов)
-                it.setText(3, "—\n—")                     # Битрейт: исх / итог
-                it.setText(4, "—\n—")                     # LUFS: до / после
-                it.setText(5, "Ожидание")                 # Статус
+                name = os.path.basename(p)
+                # Колонка 0 (Превью): миниатюра + имя файла под ней (рисует
+                # PreviewNameDelegate, длинное имя обрезается многоточием).
+                # Полное имя — в тултипе.
+                it.setText(0, name)
+                it.setToolTip(0, f"{name}\n{p}")
+                # Колонка 1: только метки Было/Стало для строк ниже (1-я строка
+                # пустая для выравнивания). Остальные ячейки — 3 строки
+                # [пусто, было, стало].
+                it.setText(1, "\nБыло\nСтало")
+                it.setText(2, f"\n{human_size(size)}\n—")   # Размер: было(исх) / стало
+                it.setText(3, "\n—\n—")                     # Битрейт: исх / итог
+                it.setText(4, "\n—\n—")                     # LUFS: до / после
+                it.setText(5, "\n—\n—")                     # Длительность: исх / итог
+                it.setText(6, "Ожидание")                   # Статус (одна строка)
                 it.setData(0, Qt.ItemDataRole.UserRole, iid)
                 self._item_map[iid] = it
                 self.tree.scrollToItem(it)
@@ -1165,22 +1262,22 @@ class MediaTab(QWidget):
 
                 if ft == "MEDIA":
                     def _bg(path_local, iid_local):
-                        # ffprobe + loudness — всё в фоне, UI не блокируем
+                        # ffprobe + loudness — всё в фоне, UI не блокируем.
+                        # Результат отдаём в GUI-поток через сигналы: QTimer.singleShot
+                        # из обычного threading.Thread (без Qt event loop) НЕ
+                        # срабатывает — из-за этого битрейт и длительность не
+                        # появлялись при добавлении файла.
                         try:
-                            dur_r, br_r, size_r, a_br_r = get_media_info(path_local)
-                            def _apply_info():
-                                d = self._item_data_map.get(iid_local)
-                                if d: d['dur'] = dur_r
-                                item = self._find_item(iid_local)
-                                if item:
-                                    self._set_pair(item, 2, top=human_size(size_r))
-                                    self._set_pair(item, 3, top=(a_br_r or br_r or "—"))
-                            QTimer.singleShot(0, _apply_info)
+                            dur_r, br_r, size_r, a_br_r, a_codec_r = get_media_info(path_local)
+                            self.media_info_sig.emit(
+                                iid_local, human_size(size_r),
+                                fmt_bitrate_with_codec(a_codec_r, a_br_r or br_r),
+                                float(dur_r or 0.0))
                         except Exception: pass
                         try:
                             val = measure_loudness(path_local)
                         except Exception: val = None
-                        QTimer.singleShot(0, lambda: self.update_lufs_columns(iid_local, val, None))
+                        self.media_lufs_sig.emit(iid_local, val)
                     threading.Thread(target=_bg, args=(p, iid), daemon=True).start()
 
             except Exception as e:
@@ -1193,16 +1290,46 @@ class MediaTab(QWidget):
                 item.setIcon(0, icon)
         except Exception: pass
 
+    def _apply_media_info(self, iid, size_str, bitrate, dur):
+        """GUI-поток: исходные размер/битрейт/длительность из ffprobe (верхняя
+        строка «Было»). Вызывается через media_info_sig из фонового потока."""
+        try:
+            d = self._item_data_map.get(iid)
+            if d: d['dur'] = dur
+            item = self._find_item(iid)
+            if item:
+                if size_str:
+                    self._set_pair(item, 2, top=size_str)
+                self._set_pair(item, 3, top=(bitrate if bitrate and bitrate != "-" else "—"))
+                self._set_pair(item, 5, top=self._fmt_dur(dur))
+        except Exception: pass
+
+    def _apply_media_lufs(self, iid, val):
+        """GUI-поток: исходный LUFS (через media_lufs_sig из фонового потока)."""
+        self.update_lufs_columns(iid, val, None)
+
     @staticmethod
     def _set_pair(item, col, top=None, bottom=None):
-        """Двустрочная ячейка: верх = исходное, низ = новое. Меняет только
-        переданную часть (top/bottom), сохраняя вторую."""
+        """Ячейка из 3 строк: [метка/пусто, было, стало]. Меняет только было/стало
+        (top/bottom), сохраняя 1-ю строку (метку имени или пустую заглушку
+        выравнивания)."""
         cur = (item.text(col) or "").split("\n")
-        t = cur[0] if cur and cur[0] else "—"
-        b = cur[1] if len(cur) > 1 and cur[1] else "—"
+        head = cur[0] if len(cur) >= 1 else ""
+        t = cur[1] if len(cur) > 1 and cur[1] else "—"
+        b = cur[2] if len(cur) > 2 and cur[2] else "—"
         if top is not None: t = top
         if bottom is not None: b = bottom
-        item.setText(col, f"{t}\n{b}")
+        item.setText(col, f"{head}\n{t}\n{b}")
+
+    @staticmethod
+    def _fmt_dur(sec):
+        """Длительность для колонки: «5.72 с» (<1 мин) или «M:SS.ss»."""
+        try: sec = float(sec)
+        except Exception: return "—"
+        if sec <= 0: return "—"
+        if sec < 60: return f"{sec:.2f} с"
+        m = int(sec // 60); s = sec - m * 60
+        return f"{m}:{s:05.2f}"
 
     def update_item_info(self, iid, size_new, bitrate_result):
         try:
@@ -1211,7 +1338,43 @@ class MediaTab(QWidget):
                 self._set_pair(item, 2, bottom=size_new)          # Размер: стало
                 self._set_pair(item, 3, bottom=bitrate_result)    # Битрейт: итог
                 item.setData(0, ITEM_STATUS_ROLE, 'done')
+                # Для обработанной картинки включаем значок «сравнить» на превью.
+                entry = self._item_data_map.get(iid)
+                if entry and entry.get('type') == 'IMG':
+                    item.setData(0, ITEM_COMPARE_ROLE, True)
+                    item.setToolTip(0, (item.toolTip(0) or "")
+                                    + "\n\nЗначок в углу превью — сравнить исходник и результат.")
                 self.tree.viewport().update()
+        except Exception: pass
+
+    def _on_compare_clicked(self, index):
+        """Клик по значку «сравнить» на превью обработанной картинки: открывает
+        полноэкранное сравнение исходника и результата (ориентация — по форме
+        картинок). Если оригинал/результат недоступны — показывает то, что есть."""
+        try:
+            iid = index.data(Qt.ItemDataRole.UserRole)
+            entry = self._item_data_map.get(iid)
+            if not entry:
+                return
+            src = entry.get('path', '')
+            out = entry.get('out_path', '')
+            src_ok = bool(src) and os.path.exists(src)
+            out_ok = bool(out) and os.path.exists(out)
+            if src_ok and out_ok and os.path.abspath(src) != os.path.abspath(out):
+                show_image_compare(src, out, self)
+            elif out_ok:
+                show_image_fullscreen(out, self)
+            elif src_ok:
+                show_image_fullscreen(src, self)
+        except Exception as e:
+            self.main.log(f"Сравнение: {e}")
+
+    def update_item_dur(self, iid, dur_str):
+        """Длительность итогового файла (после перекодирования) — нижняя строка."""
+        try:
+            item = self._find_item(iid)
+            if item:
+                self._set_pair(item, 5, bottom=self._fmt_dur(dur_str))
         except Exception: pass
 
     def update_lufs_columns(self, iid, before, after):
@@ -1272,7 +1435,8 @@ class MediaTab(QWidget):
                 'pre': int(self.s_pre.value()), 'res': strip_default_tag(self.c_res.currentText()), 'fps': self.c_fps.currentText().strip().replace(',', '.'),
                 'preset_mode': 'dark' if self.btn_mode_dark.isChecked() else 'std',
                 'vfade_in': bool(self.ck_vfade_in.isChecked()), 'vfade_in_d': float(self.s_vfade_in.value()),
-                'vfade_out': bool(self.ck_vfade_out.isChecked()), 'vfade_out_d': float(self.s_vfade_out.value())
+                'vfade_out': bool(self.ck_vfade_out.isChecked()), 'vfade_out_d': float(self.s_vfade_out.value()),
+                'crop_black': bool(self.ck_crop_black.isChecked())
             },
             'avif': {
                 'limit': int(self.s_lim.value()) if self.ck_lim.isChecked() else 0,
@@ -1291,6 +1455,7 @@ class MediaTab(QWidget):
         self.worker.log.connect(self.main.log); self.worker.finished_all.connect(self.done)
         self.worker.global_progress.connect(self.main.update_global_progress)
         self.worker.update_item_sig.connect(self.update_item_info); self.worker.update_lufs_sig.connect(self.update_lufs_columns)
+        self.worker.update_dur_sig.connect(self.update_item_dur)
         self.worker.active_threads.connect(self._on_active_threads)
 
         try:
@@ -1316,7 +1481,7 @@ class MediaTab(QWidget):
             i = self._find_item(iid)
             if i:
                 i.setData(0, ITEM_STATUS_ROLE, code)
-                i.setText(5, txt)
+                i.setText(6, txt)
                 self.tree.viewport().update()
         except Exception: pass
 
@@ -1324,7 +1489,7 @@ class MediaTab(QWidget):
         try:
             i = self._find_item(iid)
             if i:
-                i.setText(5, "Готово" if val >= 100 else f"{val}%")
+                i.setText(6, "Готово" if val >= 100 else f"{val}%")
         except Exception: pass
 
     def _on_active_threads(self, n, m):
@@ -1915,56 +2080,55 @@ class PhotoMergerTab(QWidget):
         root = QHBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(8)
-        # ЛЕВО — добавление + список + превью результата
+        # ЛЕВО (1/3) — список файлов + настройки + кнопка объединения.
+        # ПРАВО (2/3) — крупный просмотр результата.
         left_w = QWidget(); left = QVBoxLayout(left_w)
         left.setContentsMargins(0, 0, 0, 0); left.setSpacing(8)
-        # ПРАВО — настройки (как в 1-й вкладке)
-        right_scroll = QScrollArea(); right_scroll.setWidgetResizable(True)
-        right_scroll.setFixedWidth(460)                       # всегда полноразмерно, как в 1-й вкладке
-        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        left_w.setMinimumWidth(140)
+        left_w.setMinimumWidth(220)
         right_w = QWidget(); right = QVBoxLayout(right_w)
-        right.setContentsMargins(6, 4, 6, 4); right.setSpacing(8)
-        right_scroll.setWidget(right_w)
-        root.addWidget(left_w, 1); root.addWidget(right_scroll, 0)
+        right.setContentsMargins(0, 0, 0, 0); right.setSpacing(8)
+        # Пропорция ~1/3 : 2/3.
+        root.addWidget(left_w, 1); root.addWidget(right_w, 2)
 
         # ── Status bar ─────────────────────────────────────
+        # Только подсказка статуса; кнопки добавления/удаления вынесены ВНИЗ,
+        # под список файлов.
         top = QHBoxLayout()
         self.lbl_status = QLabel("")
         self.lbl_status.setStyleSheet("color: #a6e3a1; font-weight: bold; font-size: 13px;")
-        # Подсказка уступает место кнопкам (иначе её длинный текст распирает ряд
-        # и подписи кнопок обрезаются).
         self.lbl_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-
-        # Без setFixedWidth — крупный шрифт обрезал подписи («Добави…», «Очистить вс…»).
-        # Кнопки берут ширину по содержимому; статус-лейбл (stretch=1) отдаёт им место.
-        btn_open = _icon_btn("Добавить файлы", 'fa5s.folder-open')
-        btn_open.clicked.connect(self._open_files)
-
-        btn_clear_sel = _icon_btn("Удалить выбранные", 'fa5s.times')
-        btn_clear_sel.clicked.connect(self._remove_selected)
-
-        btn_clear_all = _icon_btn("Очистить всё", 'fa5s.trash', color='#1e1e2e')
-        btn_clear_all.setObjectName("b_stop")
-        btn_clear_all.clicked.connect(self._clear_all)
-
         top.addWidget(self.lbl_status, 1)
-        top.addWidget(btn_open)
-        top.addWidget(btn_clear_sel)
-        top.addWidget(btn_clear_all)
         left.addLayout(top)
 
-        # ── File list ───────────────────────────────────────
+        # ── File list (зона, куда кидать файлы) ──────────────
         self.file_list = PhotoDragList()
-        left.addWidget(self.file_list, 3)
+        left.addWidget(self.file_list, 1)
         # Клавиша Delete — удалить выделенные фото из списка
         self._sc_delete = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.file_list)
         self._sc_delete.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self._sc_delete.activated.connect(self._remove_selected)
 
-        # ── ПРАВО: настройки объединения ──────────────────────
+        # ── Кнопки добавления/удаления (ПОД списком) ─────────
+        # Без setFixedWidth — крупный шрифт обрезал подписи («Добави…», «Очистить вс…»).
+        # Кнопки берут ширину по содержимому; замыкающий stretch держит их слева.
+        btns = QHBoxLayout()
+        btn_open = _icon_btn("Добавить", 'fa5s.folder-open')
+        btn_open.clicked.connect(self._open_files)
+
+        btn_clear_sel = _icon_btn("Удалить", 'fa5s.times')
+        btn_clear_sel.clicked.connect(self._remove_selected)
+
+        btn_clear_all = _icon_btn("Очистить", 'fa5s.trash', color='#1e1e2e')
+        btn_clear_all.setObjectName("b_stop")
+        btn_clear_all.clicked.connect(self._clear_all)
+
+        btns.addWidget(btn_open)
+        btns.addWidget(btn_clear_sel)
+        btns.addWidget(btn_clear_all)
+        btns.addStretch()
+        left.addLayout(btns)
+
+        # ── Настройки объединения (под списком) ──────────────
         grp_set = QGroupBox("Настройки"); set_l = QVBoxLayout(grp_set)
         self.rb_horiz = _icon_btn("Горизонт.", 'fa5s.arrow-right')
         self.rb_vert  = _icon_btn("Вертикал.", 'fa5s.arrow-down')
@@ -1973,43 +2137,96 @@ class PhotoMergerTab(QWidget):
         self.rb_horiz.clicked.connect(lambda: self.rb_vert.setChecked(False))
         self.rb_vert.clicked.connect(lambda: self.rb_horiz.setChecked(False))
         row_mode = QHBoxLayout(); row_mode.addWidget(QLabel("Режим:"))
-        row_mode.addWidget(self.rb_horiz); row_mode.addWidget(self.rb_vert); row_mode.addStretch()
+        row_mode.addWidget(self.rb_horiz); row_mode.addWidget(self.rb_vert)
+        row_mode.addWidget(info_badge(
+            "Как складывать картинки: «Горизонт.» — в ряд слева направо "
+            "(выравниваются по высоте), «Вертикал.» — стопкой сверху вниз "
+            "(выравниваются по ширине)."))
+        row_mode.addStretch()
         set_l.addLayout(row_mode)
 
         self.cmb_fmt = QComboBox()
         self.cmb_fmt.addItems(["TIFF", "JPEG", "PNG", "WEBP"])
         self.cmb_fmt.setFixedWidth(90)
         row_fmt = QHBoxLayout(); row_fmt.addWidget(QLabel("Формат:"))
-        row_fmt.addWidget(self.cmb_fmt); row_fmt.addStretch()
+        row_fmt.addWidget(self.cmb_fmt)
+        row_fmt.addWidget(info_badge(
+            "Формат сохранения склейки: TIFF — без потерь (крупный файл); "
+            "PNG — без потерь со сжатием; JPEG/WEBP — с потерями, файл меньше."))
+        row_fmt.addStretch()
         set_l.addLayout(row_fmt)
-        right.addWidget(grp_set)
 
-        self.btn_merge_new = _icon_btn("Объединить новые", 'fa5s.object-group', color='#1e1e2e')
+        # SVG обычно имеет прозрачный фон — при объединении прозрачность заливается
+        # чёрным. Галочка заливает прозрачный фон SVG белым перед склейкой.
+        self.ck_svg_white = QCheckBox("SVG: сделать белым фон")
+        self.ck_svg_white.setChecked(True)
+        row_svg = QHBoxLayout(); row_svg.addWidget(self.ck_svg_white)
+        row_svg.addWidget(info_badge(
+            "Только для SVG: прозрачный фон вектора заливается белым перед "
+            "объединением (иначе прозрачные области становятся чёрными)."))
+        row_svg.addStretch()
+        set_l.addLayout(row_svg)
+        left.addWidget(grp_set)
+
+        # Одна кнопка на всё: объединяет ВСЕ файлы из списка.
+        self.btn_merge_new = _icon_btn("Объединить", 'fa5s.object-group', color='#1e1e2e')
         self.btn_merge_new.setObjectName("b_run")
-        self.btn_merge_new.clicked.connect(lambda: self._do_merge(force_all=False))
-        self.btn_merge_all = _icon_btn("Переобъединить всё", 'fa5s.redo', color='#1e1e2e')
-        self.btn_merge_all.setObjectName("b_restart")
-        self.btn_merge_all.clicked.connect(lambda: self._do_merge(force_all=True))
-        right.addWidget(self.btn_merge_new)
-        right.addWidget(self.btn_merge_all)
-        right.addStretch()
+        self.btn_merge_new.clicked.connect(lambda: self._do_merge(force_all=True))
+        left.addWidget(self.btn_merge_new)
 
-        # ── Preview ─────────────────────────────────────────
+        # ── ПРАВО: крупный просмотр результата (2/3) ─────────
         grp_prev = QGroupBox("Результат последнего объединения")
         prev_l = QVBoxLayout(grp_prev)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFixedHeight(220)
         scroll.setStyleSheet("background-color: #181825; border: 1px solid #45475a; border-radius:4px;")
         self.lbl_preview = QLabel("Здесь появится результат")
         self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_preview.setStyleSheet("color: #585b70; font-size: 13px;")
         scroll.setWidget(self.lbl_preview)
         prev_l.addWidget(scroll)
-        left.addWidget(grp_prev, 2)
+        right.addWidget(grp_prev, 1)
+
+        # Плавающая кнопка «на весь экран» в правом нижнем углу превью результата.
+        self._preview_scroll = scroll
+        self._last_result_path = ""
+        self.btn_preview_fs = QToolButton(scroll)
+        self.btn_preview_fs.setIcon(get_icon('fa5s.expand'))
+        self.btn_preview_fs.setToolTip("Открыть результат на весь экран")
+        self.btn_preview_fs.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_preview_fs.setFixedSize(34, 34)
+        self.btn_preview_fs.setIconSize(QSize(18, 18))
+        self.btn_preview_fs.setStyleSheet(
+            "QToolButton{background:rgba(24,24,37,210);border:1px solid #45475a;"
+            "border-radius:6px;} QToolButton:hover{background:rgba(49,50,68,235);"
+            "border:1px solid #585b70;}")
+        self.btn_preview_fs.clicked.connect(self._open_result_fullscreen)
+        self.btn_preview_fs.hide()
+        scroll.installEventFilter(self)
 
         # ── Accept drops on the whole widget ───────────────
         self.setAcceptDrops(True)
+
+    def eventFilter(self, obj, ev):
+        if obj is getattr(self, '_preview_scroll', None) and ev.type() == QEvent.Type.Resize:
+            self._reposition_preview_fs()
+        return super().eventFilter(obj, ev)
+
+    def _reposition_preview_fs(self):
+        """Держит плавающую кнопку в правом нижнем углу области превью."""
+        try:
+            s = self._preview_scroll
+            m = 12
+            self.btn_preview_fs.move(s.width() - self.btn_preview_fs.width() - m,
+                                     s.height() - self.btn_preview_fs.height() - m)
+            self.btn_preview_fs.raise_()
+        except Exception:
+            pass
+
+    def _open_result_fullscreen(self):
+        p = getattr(self, '_last_result_path', "")
+        if p and os.path.exists(p):
+            show_image_fullscreen(p, self)
 
     # ── Drag-and-drop forwarding ────────────────────────────
     def dragEnterEvent(self, event):
@@ -2029,7 +2246,7 @@ class PhotoMergerTab(QWidget):
     # ── Helpers ─────────────────────────────────────────────
     def add_paths(self, paths):
         _img = {'.png','.jpg','.jpeg','.bmp','.gif','.tiff','.tif',
-                '.webp','.avif','.heic','.heif','.ico'}
+                '.webp','.avif','.heic','.heif','.ico','.svg'}
         valid = [p for p in paths if os.path.splitext(p)[1].lower() in _img]
         if valid:
             self.file_list.add_files(valid)
@@ -2037,7 +2254,7 @@ class PhotoMergerTab(QWidget):
     def _open_files(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Выбрать изображения", "",
-            "Изображения (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp *.avif *.heic *.heif *.ico)"
+            "Изображения (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp *.avif *.heic *.heif *.ico *.svg)"
         )
         if files:
             self.file_list.add_files(files)
@@ -2053,6 +2270,8 @@ class PhotoMergerTab(QWidget):
         self.lbl_preview.clear()
         self.lbl_preview.setText("Здесь появится результат")
         self.lbl_status.setText("Список очищен")
+        self._last_result_path = ""
+        self.btn_preview_fs.hide()
 
     # ── Core merge ──────────────────────────────────────────
     def _do_merge(self, force_all: bool):
@@ -2063,17 +2282,43 @@ class PhotoMergerTab(QWidget):
         items = self.file_list.get_all_items() if force_all else self.file_list.get_new_items()
 
         if not items:
-            if force_all:
-                self.lbl_status.setText("Список пуст!")
-            else:
-                self.lbl_status.setText("Нет новых файлов. Нажмите «Переобъединить всё».")
+            self.lbl_status.setText("Список пуст!")
             return
 
         try:
             paths = [it.data(0, Qt.ItemDataRole.UserRole) for it in items]
-            imgs = [Image.open(p) for p in paths]
+            svg_white = self.ck_svg_white.isChecked()
+            imgs = []
+            for p in paths:
+                im = open_image_any(p)
+                # Прозрачный фон SVG по умолчанию станет чёрным при склейке —
+                # по галочке заливаем его белым.
+                if (svg_white and os.path.splitext(p)[1].lower() == '.svg'
+                        and im.mode in ('RGBA', 'LA', 'PA', 'La', 'RGBa')):
+                    rgba = im.convert('RGBA')
+                    bg = Image.new('RGB', rgba.size, (255, 255, 255))
+                    bg.paste(rgba, mask=rgba.split()[3])
+                    im = bg
+                imgs.append(im)
 
             vertical = self.rb_vert.isChecked()
+
+            # Сохраняем прозрачность, если ВЫХОДНОЙ формат её поддерживает
+            # (PNG/WEBP/TIFF) и хотя бы у одной картинки есть альфа. Тогда холст —
+            # RGBA с прозрачным фоном. Иначе RGB на чёрном фоне (как раньше; JPEG
+            # альфу не умеет).
+            ext, pil_fmt, save_kwargs = self._FMT_MAP[self.cmb_fmt.currentIndex()]
+
+            def _has_alpha(im):
+                return (im.mode in ('RGBA', 'LA', 'PA', 'La', 'RGBa')
+                        or (im.mode == 'P' and 'transparency' in im.info))
+
+            keep_alpha = (pil_fmt in ('PNG', 'WEBP', 'TIFF')
+                          and any(_has_alpha(im) for im in imgs))
+            cmode = 'RGBA' if keep_alpha else 'RGB'
+            bg = (0, 0, 0, 0) if keep_alpha else (0, 0, 0)
+            # Приводим к режиму холста ДО ресайза (ресайз RGBA сохраняет альфу).
+            imgs = [im if im.mode == cmode else im.convert(cmode) for im in imgs]
 
             if vertical:
                 max_w = max(im.width for im in imgs)
@@ -2084,10 +2329,9 @@ class PhotoMergerTab(QWidget):
                     new_h = int(im.height * r)
                     processed.append(im.resize((max_w, new_h), Image.Resampling.LANCZOS))
                     total_h += new_h
-                canvas = Image.new('RGB', (max_w, total_h), (0, 0, 0))
+                canvas = Image.new(cmode, (max_w, total_h), bg)
                 y = 0
                 for im in processed:
-                    if im.mode != 'RGB': im = im.convert('RGB')
                     canvas.paste(im, (0, y)); y += im.height
             else:
                 max_h = max(im.height for im in imgs)
@@ -2098,22 +2342,19 @@ class PhotoMergerTab(QWidget):
                     new_w = int(im.width * r)
                     processed.append(im.resize((new_w, max_h), Image.Resampling.LANCZOS))
                     total_w += new_w
-                canvas = Image.new('RGB', (total_w, max_h), (0, 0, 0))
+                canvas = Image.new(cmode, (total_w, max_h), bg)
                 x = 0
                 for im in processed:
-                    if im.mode != 'RGB': im = im.convert('RGB')
                     canvas.paste(im, (x, 0)); x += im.width
 
             # ── Output path: всегда рядом с исходными файлами ──
             out_dir = os.path.dirname(paths[0]) or "."
 
-            ext, pil_fmt, save_kwargs = self._FMT_MAP[self.cmb_fmt.currentIndex()]
             out_path = os.path.join(out_dir, f"merged_{random.randint(1000, 9999)}.{ext}")
             canvas.save(out_path, format=pil_fmt, **save_kwargs)
 
             # ── Mark items ─────────────────────────────────
-            r = random.randint(30, 90); g = random.randint(30, 90); b = random.randint(30, 90)
-            self.file_list.mark_processed(items, QColor(r, g, b))
+            self.file_list.mark_processed(items)
 
             # ── Preview ────────────────────────────────────
             pix = QPixmap(out_path)
@@ -2121,6 +2362,10 @@ class PhotoMergerTab(QWidget):
             if prev_w < 80: prev_w = 80
             self.lbl_preview.setPixmap(
                 pix.scaledToWidth(prev_w, Qt.TransformationMode.SmoothTransformation))
+            # Запоминаем результат и показываем кнопку «на весь экран».
+            self._last_result_path = out_path
+            self.btn_preview_fs.show()
+            self._reposition_preview_fs()
 
             self.lbl_status.setText(status_html('fa5s.check-circle',
                 f"Готово! {len(imgs)} фото → {os.path.basename(out_path)}", '#a6e3a1'))
@@ -2138,6 +2383,8 @@ class PhotoMergerTab(QWidget):
             except Exception: pass
 
         except Exception as exc:
+            try: self.file_list.mark_failed(items)
+            except Exception: pass
             self.lbl_status.setText(status_html('fa5s.times-circle', f"Ошибка: {exc}", '#f38ba8'))
             self.main.log(f"[Фото] Ошибка объединения: {exc}")
         finally:

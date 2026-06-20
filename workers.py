@@ -13,7 +13,8 @@ from utils import _cookie_matches_domain, _RE_DIGITS
 
 
 class InfoWorker(QThread):
-    success = pyqtSignal(int, str)
+    # duration, thumbnail, доступные языки субтитров, доступные языки аудиодорожек
+    success = pyqtSignal(int, str, list, list)
     error = pyqtSignal(str)
 
     def __init__(self, url, proxy=""):
@@ -22,6 +23,40 @@ class InfoWorker(QThread):
         self.proxy = (proxy or "").strip()
         self.cancelled = False
         self._proc = None
+
+    @staticmethod
+    def _parse_sub_langs(raw: str) -> list:
+        """Языки РУЧНЫХ субтитров из JSON-поля subtitles (%(subtitles)j).
+        Автосубтитры (automatic_captions) намеренно не берём — у YouTube там
+        сотни авто-переводов, которые засорили бы список."""
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return sorted(k for k in data.keys() if k and k != "live_chat")
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def _parse_audio_langs(raw: str) -> list:
+        """Различные языки аудиодорожек из JSON-поля formats. Берём форматы с
+        аудио (acodec != none) и непустым language."""
+        try:
+            formats = json.loads(raw)
+            if not isinstance(formats, list):
+                return []
+            langs = []
+            for f in formats:
+                if not isinstance(f, dict):
+                    continue
+                if (f.get("acodec") or "none") == "none":
+                    continue
+                lang = f.get("language")
+                if lang and lang not in ("none", "NA") and lang not in langs:
+                    langs.append(lang)
+            return sorted(langs)
+        except Exception:
+            return []
 
     def run(self):
         base = ytdlp_base_cmd()
@@ -32,7 +67,12 @@ class InfoWorker(QThread):
             cmd = base + [
                 "--no-playlist", "--no-warnings", "--skip-download",
                 "--socket-timeout", "15", "--no-check-certificate",
-                "--print", "%(duration)s\t%(thumbnail)s",
+                # Каждая строка с префиксом-маркером — парсим по нему, не по позиции
+                # (JSON-строки могут быть длинными). subtitles/formats нужны, чтобы
+                # заполнить списки «Суб.»/«Язык» реально доступными дорожками.
+                "--print", "@@DT@@%(duration)s\t%(thumbnail)s",
+                "--print", "@@SB@@%(subtitles)j",
+                "--print", "@@FM@@%(formats)j",
             ]
             c_path = get_cookies_path(self.url)
             if os.path.exists(c_path):
@@ -45,24 +85,47 @@ class InfoWorker(QThread):
                 cmd += ["--referer", "https://www.bilibili.com/", "--user-agent", USER_AGENT]
             cmd += [self.url]
 
-            if self.cancelled: return
-            self._proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace",
-                creationflags=CREATE_NO_WINDOW, env=subprocess_env())
-            out, _err = self._proc.communicate(timeout=60)
-            if self.cancelled: return
-
+            # TikTok отдаёт challenge-страницу без данных в ~50-80% запусков
+            # («rehydration» ЛИБО «Unexpected response»), НЕЗАВИСИМО от UA/cookies;
+            # сбой не-retryable внутри yt-dlp, но НОВЫЙ процесс снова имеет шанс —
+            # перезапускаем процесс до 12 раз (только TikTok). Иначе превью/метаданные
+            # так же мигали бы ошибкой.
+            is_tt = host_matches(self.url, 'tiktok.com')
+            max_tries = 12 if is_tt else 1
             duration, thumb = 0, ""
-            for line in (out or "").splitlines():
-                if "\t" in line:
-                    d, t = line.split("\t", 1)
-                    try: duration = int(float(d)) if d and d != "NA" else 0
-                    except Exception: duration = 0
-                    thumb = "" if t.strip() in ("", "NA") else t.strip()
+            sub_langs, audio_langs = [], []
+            for attempt in range(max_tries):
+                if self.cancelled: return
+                self._proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, encoding="utf-8", errors="replace",
+                    creationflags=CREATE_NO_WINDOW, env=subprocess_env())
+                out, err = self._proc.communicate(timeout=60)
+                if self.cancelled: return
+
+                for line in (out or "").splitlines():
+                    if line.startswith("@@DT@@"):
+                        payload = line[len("@@DT@@"):]
+                        d, _, t = payload.partition("\t")
+                        try: duration = int(float(d)) if d and d != "NA" else 0
+                        except Exception: duration = 0
+                        thumb = "" if t.strip() in ("", "NA") else t.strip()
+                    elif line.startswith("@@SB@@"):
+                        sub_langs = self._parse_sub_langs(line[len("@@SB@@"):])
+                    elif line.startswith("@@FM@@"):
+                        audio_langs = self._parse_audio_langs(line[len("@@FM@@"):])
+                if duration or thumb or sub_langs or audio_langs:
                     break
-            if duration or thumb:
-                self.success.emit(duration, thumb)
+                # Пусто. Повторяем на ЛЮБОЙ флапающей ошибке извлечения TikTok
+                # (rehydration / universal data / unexpected response).
+                low = (err or "").lower()
+                if not (is_tt and attempt + 1 < max_tries
+                        and ("rehydration" in low or "universal data" in low
+                             or "unexpected response" in low)):
+                    break
+
+            if duration or thumb or sub_langs or audio_langs:
+                self.success.emit(duration, thumb, sub_langs, audio_langs)
             else:
                 self.error.emit("Не удалось извлечь информацию.")
         except subprocess.TimeoutExpired:
@@ -91,21 +154,46 @@ class YtdlpWorker(QThread):
         self._dl_start_ts = None
         self._last_real_progress = 0.0
         self._last_pct = 0.0
+        # Реальная загрузка началась (виден before_dl/@@META@@ или кадр прогресса).
+        # До этого идёт ИЗВЛЕЧЕНИЕ — оно может падать (нестабильный TikTok-challenge),
+        # и его нельзя выдавать за «Скачивание…».
+        self._download_phase = False
+        self._dl_phase_ts = None
 
-    def _watchdog(self):
-        """Пока идёт скачивание, а yt-dlp молчит (например download-sections через
-        ffmpeg даёт 0% и тишину на минуты) — тикаем «Скачивание… mm:ss», чтобы
-        строка не висела на «Подготовка…»/0%. Настоящий прогресс имеет приоритет."""
-        while self.is_running:
-            p = self._proc
-            if p is None or p.poll() is not None:
-                return
+    def _enter_download_phase(self):
+        """Отмечаем переход «извлечение → реальная загрузка». До этого момента
+        watchdog не тикает «Скачивание…», а в панели задач нет индикатора — чтобы
+        провалившееся извлечение не выглядело как идущая загрузка."""
+        if not self._download_phase:
+            self._download_phase = True
+            self._dl_phase_ts = time.time()
+
+    def _watchdog(self, proc):
+        """Пока РЕАЛЬНО идёт скачивание, а yt-dlp молчит (например download-sections
+        через ffmpeg даёт 0% и тишину на минуты) — тикаем «Скачивание… mm:ss», чтобы
+        строка не висела на «Подготовка…»/0%. Настоящий прогресс имеет приоритет.
+
+        ВАЖНО:
+          • тикаем ТОЛЬКО после начала загрузки (self._download_phase). На этапе
+            извлечения (которое у TikTok нестабильно и часто падает) «Скачивание…»
+            выдавать нельзя — иначе провалившаяся попытка выглядит как загрузка;
+          • следим за СВОИМ процессом (proc) и перепроверяем его ПОСЛЕ сна. Иначе
+            «опоздавший» тик мог прилететь уже после ошибки и навсегда повесить
+            строку на «Скачивание…», а иконку в панели задач — на «бегущую полосу»
+            (воркер уже завершён, снять их некому). Каждая повторная попытка
+            запускает свой watchdog — проверка `proc is self._proc` гасит чужие."""
+        while self.is_running and proc.poll() is None:
             time.sleep(1.0)
-            if not self.is_running:
+            # Перепроверяем после сна: процесс мог завершиться (ошибкой/успехом),
+            # могла стартовать новая попытка (proc != self._proc) или прийти стоп.
+            if (not self.is_running or proc.poll() is not None
+                    or proc is not self._proc):
                 return
+            if not self._download_phase or not self._dl_phase_ts:
+                continue
             now = time.time()
-            if self._dl_start_ts and (now - self._last_real_progress) > 2.0:
-                el = int(now - self._dl_start_ts)
+            if (now - self._last_real_progress) > 2.0:
+                el = int(now - self._dl_phase_ts)
                 # pct=-1 → UI покажет «…» вместо ложного «0.0%»
                 self.progress_sig.emit(self._iid, -1.0,
                                        f"Скачивание… {el // 60}:{el % 60:02d}")
@@ -116,6 +204,13 @@ class YtdlpWorker(QThread):
         if p and p.poll() is None:
             try: p.kill()
             except Exception: pass
+
+    def _sleep_interruptible(self, seconds):
+        """Пауза, прерываемая кнопкой СТОП: спим мелкими квантами и выходим, как
+        только is_running сброшен."""
+        end = time.time() + max(0.0, seconds)
+        while self.is_running and time.time() < end:
+            time.sleep(0.1)
 
     # ─── ДОБАВИТЬ В YtdlpWorker ───────────────────────────────────────────────────
 
@@ -131,12 +226,15 @@ class YtdlpWorker(QThread):
 
         self._dl_start_ts = time.time()
         self._last_real_progress = time.time()
+        # Новая попытка снова начинается с извлечения — сбрасываем фазу загрузки.
+        self._download_phase = False
+        self._dl_phase_ts = None
 
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             creationflags=CREATE_NO_WINDOW, bufsize=1, env=subprocess_env())
-        threading.Thread(target=self._watchdog, daemon=True).start()
+        threading.Thread(target=self._watchdog, args=(self._proc,), daemon=True).start()
 
         for raw in self._proc.stdout:
             if not self.is_running:
@@ -148,6 +246,8 @@ class YtdlpWorker(QThread):
                 self._parse_progress(line[3:])
                 continue
             if "@@META@@" in line:
+                # before_dl: извлечение прошло, начинается реальная загрузка.
+                self._enter_download_phase()
                 try:
                     th, w, h, abr = (line.split("@@META@@", 1)[1].split("\t") + ["", "", "", ""])[:4]
                     if th and th != "NA":
@@ -166,6 +266,13 @@ class YtdlpWorker(QThread):
             tail.append(line)
             self.log_sig.emit(line)
             low = line.lower()
+            if not out_fullpath and "has already been downloaded" in low:
+                # Файл уже на месте — yt-dlp пропускает скачивание и НЕ печатает
+                # after_move (@@PATH@@). Достаём путь из самой строки, иначе
+                # «успех без файла» → ложное «файл не найден».
+                m = re.search(r"\[download\]\s+(.+?)\s+has already been downloaded", line)
+                if m and os.path.exists(m.group(1).strip()):
+                    out_fullpath = m.group(1).strip()
             if "[merger]" in low or "[extractaudio]" in low or "merging formats" in low:
                 self.progress_sig.emit(iid, 100.0, "Обработка...")
 
@@ -174,27 +281,21 @@ class YtdlpWorker(QThread):
 
 
     @staticmethod
-    def _strip_tiktok_headers(cmd: list, ua: str, header_values: set) -> list:
-        """
-        Удаляет из cmd именно TikTok-специфичные пары аргументов:
-          --user-agent  <ua>
-          --add-header  <значение из header_values>
-        Все остальные аргументы оставляет нетронутыми.
-        Нужен для сборки fallback-команды без кастомных заголовков.
-        """
-        result = []
-        i = 0
-        while i < len(cmd):
-            tok = cmd[i]
-            if tok == "--user-agent" and i + 1 < len(cmd) and cmd[i + 1] == ua:
-                i += 2
-                continue
-            if tok == "--add-header" and i + 1 < len(cmd) and cmd[i + 1] in header_values:
-                i += 2
-                continue
-            result.append(tok)
-            i += 1
-        return result
+    def _inject_tiktok_headers(cmd: list, ua: str, header_values) -> list:
+        """Копия cmd с добавленным Desktop-UA (Chrome 125) и браузерными
+        заголовками TikTok, вставленными ПЕРЕД URL (последний элемент cmd).
+
+        Это ЗАПАСНОЙ режим: первый проход идёт НАТИВНЫМ экстрактором yt-dlp (его
+        JS challenge-solver сам ставит правильный UA). Навязывать Chrome-UA на
+        первом проходе нельзя — он ломает challenge и yt-dlp падает с «Unable to
+        extract universal data for rehydration». UA нужен только если нативный
+        путь упёрся в TLS-фингерпринт (пустой ответ → status 0 / JSONDecodeError)."""
+        extra = ["--user-agent", ua]
+        for h in header_values:
+            extra += ["--add-header", h]
+        if not cmd:
+            return list(extra)
+        return list(cmd[:-1]) + extra + [cmd[-1]]
 
 
     @staticmethod
@@ -206,6 +307,10 @@ class YtdlpWorker(QThread):
     def run(self):
         iid = self.c.get('iid', '')
         self._iid = iid
+        # Старт ВСЕГО задания (а не отдельной попытки): по нему ищем итоговый файл,
+        # чтобы найти его, даже если он скачался на ранней попытке, а @@PATH@@ не
+        # пришёл (mtime-порог переживает повторы).
+        self._job_start_ts = time.time()
         self.progress_sig.emit(iid, 0.0, "Подготовка...")
         try:
             raw_url = self.c.get('url', '')
@@ -307,7 +412,13 @@ class YtdlpWorker(QThread):
                 cmd += ["--add-header", f"Referer:{kodik['referer']}"]
 
             if is_audio_only:
-                cmd += ["-f", "bestaudio/best", "-x", "--audio-format", "m4a", "--audio-quality", "0"]
+                # ТОЛЬКО аудио: берём ЧИСТЫЙ аудиопоток (vcodec=none) — иначе на сайтах
+                # без отдельной аудиодорожки fallback `best` тащит ВИДЕО. `--audio-format
+                # best` сохраняет исходный кодек (m4a→m4a, opus→opus идут БЕЗ
+                # перекодирования: быстрее, без потерь, меньше размер) и не упирается в
+                # баг самоперемещения 'X.m4a'->'X.m4a' при совпадении форматов.
+                cmd += ["-f", "bestaudio[vcodec=none]/bestaudio/best",
+                        "-x", "--audio-format", "best", "--audio-quality", "0"]
             elif kodik:
                 # одиночный m3u8 — берём лучшее из манифеста (качество уже выбрано)
                 cmd += ["-f", "best", "--merge-output-format", merge]
@@ -315,8 +426,8 @@ class YtdlpWorker(QThread):
                 cmd += ["-f", self.c.get('fmt') or "bestvideo+bestaudio/best",
                         "--merge-output-format", merge]
 
-            # Константы выбраны глобально в блоке, чтобы _strip_tiktok_headers
-# точно знал, что именно вырезать при fallback.
+            # Константы заданы здесь, чтобы _inject_tiktok_headers знал, какой UA и
+            # какие заголовки добавлять в запасном Desktop-режиме (см. ниже).
             _is_tiktok = host_matches(url, 'tiktok.com')
             _TIKTOK_UA = (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -333,16 +444,15 @@ class YtdlpWorker(QThread):
             }
 
             if _is_tiktok:
-                self.log_sig.emit("TikTok обнаружен: Desktop Browser Mode (Chrome 125 / Windows 11)...")
-                cmd += ["--user-agent", _TIKTOK_UA]
-                for _hdr in _TIKTOK_EXTRA_HEADERS:
-                    cmd += ["--add-header", _hdr]
-                # ВАЖНО: --extractor-args с api_hostname=api22-normal-c-useast2a.tiktokv.com
-                # НАМЕРЕННО убран. Этот Mobile API с 2024 г. требует динамических подписей
-                # X-Gorgon + X-Khronos (HMAC, генерируется в нативном коде TikTok-app).
-                # Без подписей → TCP RST до HTTP-ответа → пустая строка → JSONDecodeError
-                # → "status code 0". yt-dlp без extractor-args использует веб-скрейпинг,
-                # которому подписи не нужны — достаточно cookies + браузерного UA.
+                # TikTok качаем НАТИВНЫМ экстрактором yt-dlp: его JS challenge-solver
+                # сам выставляет нужный UA/заголовки и решает challenge. Навязанный
+                # Chrome-UA ЛОМАЛ этот путь → «Unable to extract universal data for
+                # rehydration» (воспроизведено: с нашим UA — ошибка, без него — успех).
+                # Поэтому Desktop-UA здесь НЕ добавляем — он остаётся ЗАПАСНЫМ
+                # вариантом ниже (если нативный путь упрётся в TLS-фингерпринт:
+                # пустой ответ → status 0 / JSONDecodeError). api_hostname (Mobile
+                # API) тоже не трогаем — без подписей X-Gorgon/X-Khronos он даёт RST.
+                self.log_sig.emit("TikTok обнаружен: нативный экстрактор yt-dlp (JS challenge-solver)...")
 
             if host_matches(url, 'youtube.com', 'youtu.be'):
                 self.log_sig.emit("YouTube: клиенты default + web_safari (n-challenge через Deno)...")
@@ -388,54 +498,82 @@ class YtdlpWorker(QThread):
 
             rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(cmd, iid, is_audio_only)
 
-            # ── TikTok fallback ────────────────────────────────────────────────────────────
-            # Если Desktop-UA тоже дал пустой ответ (JSONDecodeError / status code 0),
-            # пробуем ещё раз — без КАКИХ-ЛИБО кастомных заголовков.
-            # Иногда дефолтный UA yt-dlp проходит там, где «умный» Chrome UA
-            # срабатывает как триггер enhanced TLS-fingerprinting (Akamai / Cloudflare).
-            if _is_tiktok and rc != 0 and self.is_running:
-                _TT_ERROR_MARKERS = ("failed to parse json", "status code 0", "video not available")
-                _tt_triggered = any(
-                    any(m in ln.lower() for m in _TT_ERROR_MARKERS) for ln in tail
-                )
-                if _tt_triggered:
-                    # ── Отладочный вывод: показываем сырые строки, вызвавшие fallback ──
-                    for ln in tail:
-                        ll = ln.lower()
-                        if "failed to parse json" in ll:
-                            self.log_sig.emit(
-                                f"[DEBUG TikTok] JSONDecodeError — тело ответа пустое (len=0).\n"
-                                f"  Полная строка yt-dlp: {ln}"
-                            )
-                        elif "status code 0" in ll:
-                            self.log_sig.emit(
-                                f"[DEBUG TikTok] status_code=0 — TCP RST до HTTP-ответа.\n"
-                                f"  Тип сбоя: Connection Reset (сервер TikTok оборвал TLS до отправки данных).\n"
-                                f"  Строка yt-dlp: {ln}"
-                            )
+            # ── TikTok: ДОБИВАЕМСЯ файла повторами процесса ─────────────────────
+            # JS-challenge у TikTok НЕСТАБИЛЕН: каждый запуск НЕЗАВИСИМО от UA и
+            # cookies (замеры: успех ~50%, в плохие минуты ~17%) либо отдаёт данные,
+            # либо страницу-заглушку → «Unable to extract universal data for
+            # rehydration» ЛИБО «Unexpected response from webpage request». Внутри
+            # одного yt-dlp это НЕ-retryable (--extractor-retries не помогает: сбой
+            # «липнет» к процессу — подтверждено), но КАЖДЫЙ НОВЫЙ процесс снова
+            # имеет шанс. Встречается и «успех без файла» (rc=0, но after_move/@@PATH@@
+            # не пришёл или CDN отдал пусто) — его тоже лечит новый процесс. Поэтому
+            # крутим до 20 раз, ПОКА не получим реальный файл. Сбой — на ЭКСТРАКЦИИ
+            # (до загрузки): попытки быстрые (~3с) и без .part-файлов.
+            def _tt_flaky(lines):
+                j = " ".join(lines or []).lower()
+                return ("rehydration" in j or "universal data" in j
+                        or "unexpected response" in j)
+            # Пустой ответ из-за TLS-фингерпринта (status 0 / JSONDecodeError) — это
+            # НЕ флапающий challenge; его лечит ТОЛЬКО Desktop-режим (ниже).
+            def _tt_tls_block(lines):
+                j = " ".join(lines or []).lower()
+                return ("status code 0" in j or "failed to parse json" in j
+                        or "jsondecodeerror" in j or "expecting value" in j)
 
-                    self.log_sig.emit(
-                        "TikTok fallback: Desktop UA заблокирован — "
-                        "повторяю через дефолтный yt-dlp (без кастомных заголовков)..."
-                    )
-                    cmd_fallback = self._strip_tiktok_headers(cmd, _TIKTOK_UA, _TIKTOK_EXTRA_HEADERS)
-                    rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(
-                        cmd_fallback, iid, is_audio_only
-                    )
+            def _resolved():
+                """Готовый файл этой загрузки: путь из @@PATH@@, иначе свежий
+                медиафайл задания (если @@PATH@@ не пришёл, но файл реально скачан).
+                Поиск скоупится по mtime ≥ старта задания — чужой .siq не подхватится."""
+                if out_fullpath and os.path.exists(out_fullpath):
+                    return out_fullpath
+                if rc in (0, None):
+                    return self._find_recent_output(out_dir)
+                return ""
+
+            TT_MAX = 20
+            tt_try = 0
+            # Повторяем, ПОКА нет готового файла И сбой лечится повтором: флапающий
+            # challenge ЛИБО «успех без файла» (rc=0/None, но файла нет).
+            while (_is_tiktok and self.is_running and not _resolved()
+                   and (_tt_flaky(tail) or rc in (0, None)) and tt_try < TT_MAX):
+                tt_try += 1
+                self.log_sig.emit(
+                    f"TikTok: нестабильный ответ сервера — повтор {tt_try}/{TT_MAX}…")
+                # pct=0 → строка показывает прогресс повторов, но размер/таскбар не
+                # выглядят как идущая загрузка (это всё ещё извлечение).
+                self.progress_sig.emit(iid, 0.0, f"Повтор {tt_try}/{TT_MAX}…")
+                # Бэкофф: первые попытки — без пауз (обычную флапу ловим быстро),
+                # дальше короткая пауза. Учащённый долбёж только продлевает
+                # троттлинг TikTok; пауза даёт ограничению «остыть».
+                if tt_try > 3:
+                    self._sleep_interruptible(2.0)
+                    if not self.is_running:
+                        break
+                rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(
+                    cmd, iid, is_audio_only)
+
+            # Desktop Browser (Chrome 125 UA + браузерные заголовки) — ТОЛЬКО для
+            # TLS-блокировки. Для флапающего challenge он ВРЕДЕН: навязанный Chrome-UA
+            # ломает challenge и даёт HTTP 403 (воспроизведено), поэтому на _tt_flaky
+            # его НЕ запускаем.
+            if (_is_tiktok and self.is_running and not _resolved()
+                    and _tt_tls_block(tail) and not _tt_flaky(tail)):
+                self.log_sig.emit(
+                    "TikTok fallback: режим Desktop Browser (Chrome 125 / Windows 11)…")
+                cmd_fallback = self._inject_tiktok_headers(
+                    cmd, _TIKTOK_UA, _TIKTOK_EXTRA_HEADERS)
+                rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(
+                    cmd_fallback, iid, is_audio_only)
 
             if not self.is_running:
                 raise Exception("Загрузка остановлена пользователем")
 
-            # Фолбэк-поиск файла — ТОЛЬКО при успешном завершении (rc==0).
-            # Иначе при ошибке yt-dlp подхватил бы случайный свежий файл из
-            # папки загрузок (напр. чужой .siq) и выдал бы его за «скачанное».
-            if (not out_fullpath or not os.path.exists(out_fullpath)) and rc in (0, None):
-                out_fullpath = self._find_recent_output(out_dir)
-
-            if not out_fullpath or not os.path.exists(out_fullpath):
+            final_path = _resolved()
+            if not final_path or not os.path.exists(final_path):
                 if rc not in (0, None):
                     raise Exception("\n".join(tail) or f"yt-dlp завершился с кодом {rc}")
                 raise Exception("yt-dlp завершил работу, но файл не найден (ошибка скачивания)")
+            out_fullpath = final_path
 
             try: self._cleanup_partials(out_dir, out_fullpath)
             except Exception: pass
@@ -487,6 +625,7 @@ class YtdlpWorker(QThread):
                 except Exception: msg = speed
             else:
                 msg = f"{speed} ETA: {eta}"
+            self._enter_download_phase()  # реальный кадр прогресса = загрузка идёт
             self._last_real_progress = time.time()
             self._last_pct = pct
             self.progress_sig.emit(self._iid, pct, msg)
@@ -498,10 +637,14 @@ class YtdlpWorker(QThread):
 
     def _find_recent_output(self, out_dir):
         """Фолбэк, когда yt-dlp не напечатал итоговый путь. Берём ТОЛЬКО
-        медиафайл, изменённый в ходе этой загрузки (mtime ≥ старта), чтобы не
-        подхватить чужой файл из папки (напр. .siq) и не выдать его за скачанное."""
+        медиафайл, изменённый в ходе ЭТОГО задания (mtime ≥ старта задания, не
+        отдельной попытки — иначе файл с ранней попытки «пропадает» при повторах),
+        чтобы не подхватить чужой файл из папки (напр. .siq)."""
         try:
-            floor = getattr(self, "_dl_start_ts", 0) - 2
+            floor = getattr(self, "_job_start_ts", None)
+            if floor is None:
+                floor = getattr(self, "_dl_start_ts", 0)
+            floor -= 2
             cands = [
                 os.path.join(out_dir, fn) for fn in os.listdir(out_dir)
                 if os.path.isfile(os.path.join(out_dir, fn))
@@ -544,6 +687,15 @@ class YtdlpWorker(QThread):
                 "  3) Обновите yt-dlp: pip install -U yt-dlp  (экстрактор TikTok меняется часто)."
             )
 
+        elif ("tiktok" in low and ("unexpected response" in low
+                                   or "rehydration" in low or "universal data" in low)):
+            self.log_sig.emit(
+                "СОВЕТ: TikTok временно ограничил запросы (anti-bot/throttling) — это НЕ "
+                "ошибка программы, а защита сайта после частых обращений.")
+            self.log_sig.emit(
+                "  Подождите 2–5 минут и повторите — после паузы обычно качается с "
+                "1–2 попытки. Ускорить помогает VPN/смена IP. Долбить подряд не нужно: "
+                "это только продлевает ограничение.")
         elif "Forbidden" in err_msg or "403" in err_msg:
             u = self.c.get("url", "")
             if host_matches(u, "tiktok.com"):
@@ -605,6 +757,7 @@ class ProcessWorker(QThread):
     finished_all = pyqtSignal()
     update_item_sig = pyqtSignal(str, str, str)
     update_lufs_sig = pyqtSignal(str, object, object)
+    update_dur_sig = pyqtSignal(str, str)   # iid, длительность итогового файла (сек, строкой)
     active_threads = pyqtSignal(int, int)  # (активных воркеров, максимум) — счётчик в UI
 
     def __init__(self, queue_ref, settings):
@@ -705,19 +858,59 @@ class ProcessWorker(QThread):
             return False
 
     @staticmethod
+    def _detect_crop(path: str, dur: float = 0.0):
+        """Определяет рамку видео без чёрных полос через ffmpeg cropdetect.
+        Возвращает строку 'w:h:x:y' для фильтра crop или None, если полос нет
+        (детектированная рамка совпадает с исходным кадром).
+
+        Пропускаем первые ~10% (интро/логотипы часто на чёрном фоне дают ложный
+        full-frame), анализируем ограниченный отрезок — детект быстрый и не читает
+        весь файл. round=2 — чётные размеры (требование SVT-AV1)."""
+        try:
+            ss = ["-ss", f"{dur * 0.1:.2f}"] if dur and dur > 12 else []
+            cmd = [FFMPEG, "-hide_banner"] + ss + [
+                "-i", path, "-t", "12",
+                "-vf", "cropdetect=limit=24:round=2:reset=0",
+                "-an", "-sn", "-f", "null", "-",
+            ]
+            p = subprocess.run(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+            )
+            import re as _re
+            matches = _re.findall(r"crop=(\d+):(\d+):(-?\d+):(-?\d+)", p.stderr or "")
+            if not matches:
+                return None
+            w, h, x, y = matches[-1]
+            w, h, x, y = int(w), int(h), int(x), int(y)
+            if w <= 0 or h <= 0:
+                return None
+            # Исходные размеры — чтобы не применять crop-«пустышку» (рамка == кадр)
+            try:
+                pr = subprocess.run(
+                    [FFPROBE, "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=width,height",
+                     "-of", "csv=p=0:s=x", path],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, creationflags=CREATE_NO_WINDOW,
+                )
+                iw, ih = (int(v) for v in pr.stdout.strip().split("x")[:2])
+                # Полосы реально есть только если рамка заметно меньше кадра
+                if w >= iw - 2 and h >= ih - 2:
+                    return None
+            except Exception:
+                pass
+            return f"{w}:{h}:{x}:{y}"
+        except Exception:
+            return None
+
+    @staticmethod
     def _choose_pix_fmt(has_alpha: bool, ten_bit: bool = False) -> str:
         """Возвращает pix_fmt с учётом альфа-канала."""
         if has_alpha:
             return "yuva420p10le" if ten_bit else "yuva420p"
         return "yuv420p10le" if ten_bit else "yuv420p"
-
-    @staticmethod
-    def _avif_encoder_for_alpha() -> str:
-        """Для AVIF с альфой нужен libaom-av1 — libsvtav1 alpha не поддерживает."""
-        encs = detect_ffmpeg_encoders()
-        if 'libaom-av1' in encs:
-            return 'libaom-av1'
-        return 'libsvtav1'  # fallback — альфа потеряется, но хоть не упадёт
 
     def run_ffmpeg_capture(self, cmd, total_est_sec, percent_callback, label=None):
         si = subprocess.STARTUPINFO() if IS_WIN else None
@@ -765,7 +958,7 @@ class ProcessWorker(QThread):
     def get_target_bitrate_str(self, path, sel_val):
         if str(sel_val).lower() == 'auto':
             try:
-                _, _, _, a_br_str = get_media_info(path)
+                _, _, _, a_br_str, _ = get_media_info(path)
                 if a_br_str and a_br_str != "-":
                     m = _RE_DIGITS.findall(a_br_str)
                     if m:
@@ -864,7 +1057,52 @@ class ProcessWorker(QThread):
             def _opus_af(filters):
                 return ",".join(list(filters) + [opus_layout_fix])
             is_hevc = (vcodec and ('hevc' in vcodec or 'h265' in vcodec))
-            step1_needed = is_hevc or bool(audio_filters) or (is_video and abs(speed_factor - 1.0) > 0.01)
+            # Когда видео ВСЁ РАВНО перекодируется (step2), отдельный Pass-1 (аудио +
+            # copy видео в .mkv) ВРЕДЕН: круговой проход через .mkv ломает тайминги —
+            # видео становится CFR-30 (длиннее исходника), а задержка loudnorm/opus
+            # превращается в стартовый сдвиг аудио (баг «итог длиннее исходника»).
+            # Поэтому при перекодировании видео делаем ОДИН проход (аудиофильтры — в
+            # step2). Pass-1 нужен только для аудио-онли/копии видео (вывод формирует
+            # ветка else ниже).
+            single_pass_video = bool(is_video and video_enabled)
+            # Видео-КОПИЯ (перекодирование ВЫКЛ) с аудиофильтрами тоже обязана идти
+            # ОДНИМ прямым проходом в .mp4. Прогон через .mkv-посредник ретаймит
+            # видео в CFR-30 (177к×1/30=5.900 вместо VFR 5.702 → итог длиннее) и
+            # навешивает opus CodecDelay на старт аудио (start_time=0.194 →
+            # контейнер 6.02). Прямой `-c:v copy` mp4→mp4 сохраняет исходные PTS
+            # пакетов, а aresample=async=1 подрезает хвост loudnorm до длины
+            # источника. Только при нормальной скорости: смена скорости требует
+            # setpts и несовместима с копией видео.
+            single_pass_copy = bool(is_video and not video_enabled
+                                    and abs(speed_factor - 1.0) <= 0.01)
+            step1_needed = (not single_pass_video) and (not single_pass_copy) and (
+                is_hevc or bool(audio_filters) or (is_video and abs(speed_factor - 1.0) > 0.01))
+            # Сохранять исходный тайминг кадров: VFR-источники (TikTok, записи экрана)
+            # иначе растягиваются кодером до CFR-30 и итог становится длиннее. Только
+            # при нормальной скорости и без принудительного fps.
+            keep_timing = ((single_pass_video or single_pass_copy)
+                           and abs(speed_factor - 1.0) <= 0.01
+                           and str(sv.get('fps', 'Исходный')) == 'Исходный')
+
+            # Кап длительности вывода = длине источника. Звук после loudnorm +
+            # добивки Opus-кадров оказывается на ~50–70 мс длиннее видеодорожки
+            # (audio.start_time 0.014 + dur 12.606 = 12.62 при video 12.554), и
+            # контейнер (max по дорожкам) растёт. `-t` обрезает только лишний
+            # аудиохвост: последний видеокадр PTS < длительности, поэтому видео не
+            # теряется. Применяем, когда тайминг сохраняем и звук реально
+            # перекодируется с фильтрами (без фильтров аудио копируется — роста нет).
+            # Гейтим по СКОРОСТИ (не keep_timing): при изменённой скорости длина
+            # вывода = src/speed ≠ src, поэтому -t src_dur был бы неверным. При
+            # нормальной скорости итог обязан равняться источнику — даже если сменили
+            # fps. Это вторая линия обороны к aresample=async=1 (тот даёт точную
+            # длину, -t лишь срезает грубый выброс на кванте opus-кадра).
+            normal_speed = abs(speed_factor - 1.0) <= 0.01
+            src_dur_cap = item.get('dur') or 0.0
+            if src_dur_cap <= 0.0:
+                try: src_dur_cap, *_ = get_media_info(path)
+                except Exception: src_dur_cap = 0.0
+            dur_cap = (["-t", f"{float(src_dur_cap):.3f}"]
+                       if (normal_speed and audio_filters and src_dur_cap > 0) else [])
 
             if step1_needed:
                 # Промежуточный контейнер для видео — Matroska: он принимает копию
@@ -896,12 +1134,42 @@ class ProcessWorker(QThread):
 
             if is_video and video_enabled:
                 if not self.svt_available: raise Exception("libsvtav1 отсутствует — отмена перекодирования.")
+                # Аудио в одно-проходном режиме (Pass-1 пропущен): применяем
+                # фильтры и кодируем opus прямо здесь. aresample=async=1 + отсутствие
+                # .mkv-кругового прохода убирают сдвиг/удлинение аудио. Без фильтров —
+                # копируем исходную дорожку без потерь.
+                if single_pass_video and audio_filters:
+                    af_chain = list(audio_filters)
+                    if abs(speed_factor - 1.0) <= 0.01:
+                        # Выравниваем длину аудио к длине входной дорожки — убирает
+                        # «хвост» от latency loudnorm + добивки opus-кадров (иначе
+                        # audio.end > video.end и контейнер растёт: 12.55→12.62).
+                        # ВАЖНО: завязка только на скорость, НЕ на keep_timing/fps —
+                        # тримминг хвоста нужен и когда сменили fps. При смене скорости
+                        # НЕ трогаем: длину задаёт atempo, async лишь помешал бы.
+                        af_chain.append("aresample=async=1")
+                    af_chain.append(opus_layout_fix)
+                    step2_audio = ["-af", ",".join(af_chain),
+                                   "-c:a", audio_codec, "-b:a", audio_bitrate]
+                else:
+                    step2_audio = ["-c:a", "copy"]
+                timing_args = ["-fps_mode", "passthrough"] if keep_timing else []
                 # Только видео+аудио (см. step1): субтитры/вложения не маппим,
                 # чтобы не падать на контейнерах, которые их не поддерживают.
-                cmd_step2 = [FFMPEG, "-y", "-i", current_input, "-map", "0:V?", "-map", "0:a?"]
+                cmd_step2 = [FFMPEG, "-y", "-i", current_input, "-map", "0:V?", "-map", "0:a?"] + timing_args
 
                 res_sel = sv.get('res', 'Исходное') or 'Исходное'
                 vf_list = []
+
+                # Обрезка чёрных полос — ПЕРВЫМ фильтром (до scale/fade), чтобы
+                # масштаб и фейды считались уже от обрезанного кадра.
+                if sv.get('crop_black'):
+                    crop = self._detect_crop(current_input, item.get('dur') or 0.0)
+                    if crop:
+                        vf_list.append(f"crop={crop}")
+                        self.log.emit(f"✂ Обрезка чёрных полос: crop={crop}")
+                    else:
+                        self.log.emit("✂ Чёрные полосы не обнаружены — обрезка пропущена")
 
                 if abs(speed_factor - 1.0) > 0.01:
                     vf_list.append(f"setpts={1.0/speed_factor}*PTS")
@@ -973,13 +1241,14 @@ class ProcessWorker(QThread):
 
                     cmd_dark = [
                         FFMPEG, "-y", "-i", current_input, "-map", "0:V?", "-map", "0:a?",
+                    ] + timing_args + [
                         "-c:v", "libsvtav1", "-crf", str(crf), "-preset", preset_val,
                         "-svtav1-params", svt_params,
                         "-pix_fmt", pix_fmt,
                     ]
                     if vf_list:
                         cmd_dark += ["-vf", ",".join(vf_list)]
-                    cmd_dark += ["-threads", "0", "-c:a", "copy", attempted_out]
+                    cmd_dark += ["-threads", "0"] + step2_audio + dur_cap + [attempted_out]
 
                     self.log.emit("🌑 Тёмные сцены: кодирование (AV1 10-бит, CRF)...")
                     self.run_ffmpeg_capture(cmd_dark, est, cb, label="AV1 кодирование (тёмные сцены)")
@@ -1008,7 +1277,7 @@ class ProcessWorker(QThread):
                                       "-pix_fmt", pix_fmt]
 
                     if vf_list: cmd_step2 += ["-vf", ",".join(vf_list)]
-                    cmd_step2 += ["-threads", "0", "-c:a", "copy", attempted_out]
+                    cmd_step2 += ["-threads", "0"] + step2_audio + dur_cap + [attempted_out]
 
                     est = max(1, int(os.path.getsize(current_input)/400000)) if os.path.exists(current_input) else 10
                     self.run_ffmpeg_capture(cmd_step2, est, cb, label="Pass 2 (Video)")
@@ -1030,18 +1299,42 @@ class ProcessWorker(QThread):
                             max(1, int(os.path.getsize(current_input) / 1000000)),
                             cb, label=None)
                 else:
+                    # Один прямой проход (видео-копия с аудиофильтрами или аудио-онли).
+                    # Для видео-копии (single_pass_copy): passthrough сохраняет VFR-
+                    # тайминг при `-c:v copy`, а aresample=async=1 убирает хвост
+                    # loudnorm/опус-сдвиг — итог точно равен длине источника.
+                    if is_video and normal_speed and audio_filters:
+                        af_direct = ",".join(list(audio_filters)
+                                             + ["aresample=async=1", opus_layout_fix])
+                    else:
+                        af_direct = _opus_af(audio_filters)
                     cmd_direct = [FFMPEG, "-y", "-i", path, "-map", "0:V?", "-map", "0:a?"]
-                    cmd_direct += ["-af", _opus_af(audio_filters)]
+                    if is_video and keep_timing:
+                        cmd_direct += ["-fps_mode", "passthrough"]
+                    cmd_direct += ["-af", af_direct]
                     cmd_direct += ["-c:a", audio_codec, "-b:a", audio_bitrate]
                     if is_video: cmd_direct += ["-c:v", "copy"]
                     else: cmd_direct += ["-vn"]
+                    # Видео-КОПИЯ + аудиофильтры: loudnorm/opus добавляют «хвост»,
+                    # из-за которого итог длиннее источника. dur_cap (-t = длине
+                    # источника) обрезает лишний аудиохвост — см. определение выше.
+                    cmd_direct += dur_cap
                     cmd_direct += [out]
                     self.run_ffmpeg_capture(cmd_direct, max(1, int(os.path.getsize(path)/1000000)), cb, label=None)
 
             if os.path.exists(out):
+                # «После» LUFS: в одно-проходном режиме Pass-1 (где раньше мерили)
+                # пропущен — меряем по готовому файлу.
+                if (single_pass_video or single_pass_copy) and sa.get('norm'):
+                    try:
+                        after_norm = self.measure_loudness(out)
+                        self.update_lufs_sig.emit(item['iid'], before_lufs, after_norm)
+                    except Exception: pass
                 size_new = os.path.getsize(out)
-                _, br_str, _, a_br = get_media_info(out)
-                self.update_item_sig.emit(item['iid'], human_size(size_new), a_br or br_str or "-")
+                dur_new, br_str, _, a_br, a_codec = get_media_info(out)
+                self.update_item_sig.emit(item['iid'], human_size(size_new),
+                                          fmt_bitrate_with_codec(a_codec, a_br or br_str))
+                self.update_dur_sig.emit(item['iid'], str(dur_new or 0.0))
                 return out
             else:
                 raise Exception("Output file не найден после ffmpeg (возможная ошибка записи).")
@@ -1262,62 +1555,59 @@ class ProcessWorker(QThread):
                     if os.path.exists(t): os.remove(t)
                 except Exception: pass
 
-        # Альфа-канал → только WebP с прозрачностью, лимит в KB соблюдается
-        if has_alpha and Image:
-            try:
-                self.log.emit("Альфа-канал → WebP (RGBA)")
-                cb(0, "Конвертация картинки")
+        # Прозрачность теперь идёт в AVIF (а не принудительно в WebP, как раньше):
+        # альфу выносим в отдельный gray-поток (alphaextract) и муксим avif-
+        # муксером — прямой `-pix_fmt yuva420p` libaom в этой сборке альфу молча
+        # теряет. Команду собирает _encode_to при has_alpha=True. WebP оставлен
+        # как РЕЗЕРВ — на случай, если конкретная сборка ffmpeg альфу не закодирует.
+        def _alpha_webp_fallback():
+            self.log.emit("AVIF с альфой не удался → резерв: WebP (RGBA)")
+            cb(0, "Конвертация картинки")
 
-                def _on_pass_a(n, total):
-                    cb(int((n - 1) / total * 100), f"Конвертация картинки {n}/{total}")
+            def _on_pass_a(n, total):
+                cb(int((n - 1) / total * 100), f"Конвертация картинки {n}/{total}")
 
-                with Image.open(path) as im:
-                    if ImageOps: im = ImageOps.exif_transpose(im)
-                    im = im.convert('RGBA')
-                    if adim and adim > 0 and max(im.width, im.height) > adim:
-                        scale = adim / max(im.width, im.height)
-                        im = im.resize(
-                            (max(1, int(im.width * scale)), max(1, int(im.height * scale))),
-                            Image.LANCZOS)
+            with Image.open(path) as im:
+                if ImageOps: im = ImageOps.exif_transpose(im)
+                im = im.convert('RGBA')
+                if adim and adim > 0 and max(im.width, im.height) > adim:
+                    scale = adim / max(im.width, im.height)
+                    im = im.resize(
+                        (max(1, int(im.width * scale)), max(1, int(im.height * scale))),
+                        Image.LANCZOS)
 
-                    out_webp = os.path.splitext(out)[0] + ".webp"
-                    limit_kb = int(av.get('limit', 0) or 0)
+                out_webp = os.path.splitext(out)[0] + ".webp"
+                limit_kb_l = int(av.get('limit', 0) or 0)
 
-                    if limit_kb > 0:
-                        def _save_webp_a(q):
-                            t = os.path.join(TEMP_DIR, f"wp_{uuid.uuid4().hex}.webp")
-                            im.save(t, format="WEBP", quality=q, lossless=False)
-                            return t
-                        chosen_quality = self._search_quality_under_limit(
-                            _save_webp_a, limit_kb, av.get('fit_passes', 4), q_lo=10, q_hi=85,
-                            on_pass=_on_pass_a)
-                        im.save(out_webp, format="WEBP", quality=chosen_quality, lossless=False)
-                    else:
-                        cb(50, "Конвертация картинки")
-                        im.save(out_webp, format="WEBP", quality=85, lossless=False)
+                if limit_kb_l > 0:
+                    def _save_webp_a(q):
+                        t = os.path.join(TEMP_DIR, f"wp_{uuid.uuid4().hex}.webp")
+                        im.save(t, format="WEBP", quality=q, lossless=False)
+                        return t
+                    chosen_quality = self._search_quality_under_limit(
+                        _save_webp_a, limit_kb_l, av.get('fit_passes', 4), q_lo=10, q_hi=85,
+                        on_pass=_on_pass_a)
+                    im.save(out_webp, format="WEBP", quality=chosen_quality, lossless=False)
+                else:
+                    cb(50, "Конвертация картинки")
+                    im.save(out_webp, format="WEBP", quality=85, lossless=False)
 
-                cb(100, "Конвертация картинки")
-                size_new = os.path.getsize(out_webp)
-                self.update_item_sig.emit(item['iid'], human_size(size_new), "-")
-                _cleanup(tried_tmp_files)
-                # Удаляем старый .avif если он остался от предыдущего запуска
-                if os.path.exists(out) and out != out_webp:
-                    try: os.remove(out)
-                    except Exception: pass
-                return out_webp   # ← выходим, AVIF не создаётся
-            except Exception as e:
-                self.log.emit(f"WebP alpha failed ({e}) — пробуем FFmpeg")
+            cb(100, "Конвертация картинки")
+            size_new = os.path.getsize(out_webp)
+            self.update_item_sig.emit(item['iid'], human_size(size_new), "-")
+            _cleanup(tried_tmp_files)
+            if os.path.exists(out) and out != out_webp:
+                try: os.remove(out)
+                except Exception: pass
+            return out_webp
 
-        if not self.svt_available:
-            if not has_alpha or 'libaom-av1' not in detect_ffmpeg_encoders():
-                raise Exception("libsvtav1 не доступен — AVIF конвертация поддерживается только через SVT.")
+        if 'libaom-av1' not in detect_ffmpeg_encoders():
+            raise Exception("libaom-av1 не доступен в вашей сборке ffmpeg — AVIF перекодирование настроено работать ТОЛЬКО через libaom (libaom-av1).")
         limit_kb = int(av.get('limit', 0) or 0)
 
+        avif_enc = 'libaom-av1'
         if has_alpha:
-            avif_enc = self._avif_encoder_for_alpha()
-            self.log.emit(f"Альфа-канал обнаружен → используется энкодер: {avif_enc}")
-        else:
-            avif_enc = 'libsvtav1'
+            self.log.emit("Альфа-канал обнаружен → AVIF с прозрачностью (alphaextract, libaom-av1)")
 
         # Подбор под лимит — несколько проб (подборов). Прогресс масштабируем в
         # долю текущей пробы: во время пробы n из total процент не превышает
@@ -1338,18 +1628,31 @@ class ProcessWorker(QThread):
 
         def _encode_to(tmp_out, crf_val, vf_override=None):
             pass_state['n'] += 1
-            cmd = [FFMPEG, "-y", "-i", path]
-            if vf_override: cmd += ["-vf", vf_override]
-            elif vf: cmd += ["-vf", vf]
-            if avif_enc == 'libaom-av1':
+            scale_vf = vf_override if vf_override is not None else vf
+            if has_alpha:
+                # AVIF с альфой: цвет (yuva420p) и извлечённая альфа (gray) — два
+                # av1-потока, avif-муксер сшивает их в файл с прозрачностью.
+                # ВАЖНО: split ДО scale — если масштабировать перед split, ffmpeg
+                # при согласовании форматов роняет альфу (alphaextract «could not
+                # choose format»). Поэтому делим из yuva420p, затем масштабируем
+                # каждую ветку отдельно (цвет и альфа имеют одинаковые размеры).
+                if scale_vf:
+                    fc = (f"[0:v]format=yuva420p,split[c][a];"
+                          f"[c]{scale_vf}[main];[a]alphaextract,{scale_vf}[alf]")
+                else:
+                    fc = "[0:v]format=yuva420p,split[main][a];[a]alphaextract[alf]"
+                cmd = [FFMPEG, "-y", "-i", path, "-filter_complex", fc,
+                       "-map", "[main]", "-map", "[alf]",
+                       "-c:v", "libaom-av1", "-crf", str(crf_val),
+                       "-cpu-used", str(max(0, min(8, aspd))),
+                       "-still-picture", "1", "-threads", "0", tmp_out]
+            else:
+                cmd = [FFMPEG, "-y", "-i", path]
+                if scale_vf: cmd += ["-vf", scale_vf]
                 cmd += ["-frames:v", "1", "-c:v", "libaom-av1",
                         "-crf", str(crf_val), "-cpu-used", str(max(0, min(8, aspd))),
                         "-pix_fmt", pix_fmt_avif,
                         "-threads", "0", tmp_out]
-            else:
-                cmd += ["-frames:v", "1", "-c:v", "libsvtav1",
-                        "-crf", str(crf_val), "-preset", str(max(0, min(8, aspd))),
-                        "-pix_fmt", pix_fmt_avif, "-threads", "0", tmp_out]
             try:
                 orig_size = os.path.getsize(path) if os.path.exists(path) else 1
                 est_seconds = max(1, int(orig_size / 400_000))
@@ -1366,6 +1669,8 @@ class ProcessWorker(QThread):
                     if os.path.exists(tmp):
                         try: os.remove(tmp)
                         except Exception: pass
+                    if has_alpha and Image:
+                        return _alpha_webp_fallback()
                     raise Exception(f"AVIF conversion failed: {err}")
                 if os.path.exists(out):
                     try: os.remove(out)
@@ -1518,6 +1823,8 @@ class ProcessWorker(QThread):
                     os.remove(out)
                     self.log.emit(f"Удалён повреждённый AVIF: {out}")
                 except Exception: pass
+            if has_alpha and Image:
+                return _alpha_webp_fallback()
             raise Exception(f"AVIF conversion failed: {stderr_tail[:4000]}")
         except Exception:
             _cleanup(tried_tmp_files)
@@ -1526,6 +1833,8 @@ class ProcessWorker(QThread):
                     os.remove(out)
                     self.log.emit(f"Удалён повреждённый AVIF: {out}")
                 except Exception: pass
+            if has_alpha and Image:
+                return _alpha_webp_fallback()
             raise
 
     def _fmt_eta(self, fraction, start):
@@ -1537,6 +1846,26 @@ class ProcessWorker(QThread):
         if elapsed < 1.0 or fraction <= 0.0:
             return "..."
         rem = max(0, elapsed * (1.0 / fraction - 1.0))
+        rh = int(rem // 3600); rm = int((rem % 3600) // 60); rs = int(rem % 60)
+        return f"{rh:02}:{rm:02}:{rs:02}"
+
+    def _fmt_eta_rate(self, fraction, anchor_t, anchor_frac):
+        """ETA по скорости в ОКНЕ [anchor_t, anchor_frac] → сейчас. В отличие от
+        _fmt_eta, не привязана к общему старту: при двухпроходном кодировании
+        Pass 1 (анализ) проходит почти мгновенно и доводит долю до ~50% за
+        секунды; линейная оценка от старта принимала бы это за «всё быстро» и
+        затем во время медленного Pass 2 ETA постоянно росла. Переякоривая окно
+        на начало текущего прохода, оцениваем остаток по реальной скорости
+        именно этого прохода. При anchor_frac=0 и anchor_t=start идентична
+        _fmt_eta (обратная совместимость для однопроходных задач)."""
+        fraction = min(1.0, max(0.0, fraction))
+        if fraction >= 1.0:
+            return "00:00:00"
+        dt = time.time() - anchor_t
+        df = fraction - anchor_frac
+        if dt < 1.0 or df <= 1e-6:
+            return "..."
+        rem = max(0, (1.0 - fraction) * dt / df)
         rh = int(rem // 3600); rm = int((rem % 3600) // 60); rs = int(rem % 60)
         return f"{rh:02}:{rm:02}:{rs:02}"
 
@@ -1603,6 +1932,11 @@ class ProcessWorker(QThread):
         self._inc_active(weight)
         max_frac_seen = [0.0]
         last_label = [None]
+        # Окно для ETA по скорости текущего прохода: [время, доля]. По умолчанию
+        # совпадает с общим стартом (тогда оценка идентична старой _fmt_eta), но
+        # при смене прохода (Pass 1 → Pass 2) переякоривается на текущий момент,
+        # чтобы быстрый Pass 1 не занижал оценку и ETA во время Pass 2 не «росла».
+        eta_anchor = [start, 0.0]
 
         def item_prog(pct, pass_label=None):
             try:
@@ -1622,7 +1956,8 @@ class ProcessWorker(QThread):
                 else:
                     display_pct = pct
                 self.progress.emit(iid, display_pct)
-                if pass_label and pct < 100 and pass_label != last_label[0]:
+                label_changed = bool(pass_label) and pass_label != last_label[0]
+                if label_changed and pct < 100:
                     last_label[0] = pass_label
                     self.status.emit(iid, pass_label, "proc")
                 with self._prog_lock:
@@ -1630,9 +1965,15 @@ class ProcessWorker(QThread):
                 fraction = (base + display_pct / 100.0) / self._total_now()
                 fraction = max(min(1.0, fraction), max_frac_seen[0])
                 max_frac_seen[0] = fraction
+                # Новый проход → переякориваем окно ETA на «здесь и сейчас».
+                if label_changed:
+                    eta_anchor[0] = time.time()
+                    eta_anchor[1] = fraction
                 gl_pct = int(min(100, fraction * 100))
                 label = pass_label if pass_label else "Processing"
-                self.global_progress.emit(gl_pct, f"{label} ETA: {self._fmt_eta(fraction, start)}")
+                self.global_progress.emit(
+                    gl_pct,
+                    f"{label} ETA: {self._fmt_eta_rate(fraction, eta_anchor[0], eta_anchor[1])}")
             except Exception:
                 pass
 
@@ -1702,8 +2043,7 @@ class ProcessWorker(QThread):
             if others:
                 self._max_threads = cpu
                 if not self._logged_cpu_msg:
-                    self.log.emit(f"Кодирование видео/аудио: SVT-AV1 задействует все {cpu} лог. ядра ЦП "
-                                  f"(файлы обрабатываются по одному, каждый — на всех ядрах).")
+                    self.log.emit("Кодирование видео/аудио: SVT-AV1.")
                     self._logged_cpu_msg = True
                 for it in others:
                     if self.stop_flag:

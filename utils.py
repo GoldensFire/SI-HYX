@@ -229,6 +229,16 @@ def save_settings(settings: dict):
     # завершение процесса (апдейтер делает os._exit) могло обрезать settings.json
     # → при следующем запуске load_settings возвращал {} и ВСЕ настройки
     # (включая папки) сбрасывались к значениям по умолчанию.
+    # Защита от затирания: пустой/нестрока-словарь НЕ должен перезаписывать уже
+    # сохранённые настройки (иначе разовая ошибка сборки настроек сбрасывала бы
+    # папки и прочее к значениям по умолчанию). Пишем только осмысленный словарь.
+    try:
+        if not settings:
+            for p in (SETTINGS_FILE, SETTINGS_FILE + ".bak"):
+                if os.path.exists(p) and os.path.getsize(p) > 2:
+                    return
+    except Exception:
+        pass
     try:
         os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
         tmp = SETTINGS_FILE + ".tmp"
@@ -837,14 +847,48 @@ def check_ffmpeg():
         return False
 
 
+def pretty_audio_codec(name):
+    """Человекочитаемое имя аудиокодека для колонки «Битрейт» (слева от цифр).
+    ffprobe отдаёт codec_name в нижнем регистре (aac/opus/mp3…) — приводим к
+    привычным меткам, незнакомые просто капсим."""
+    if not name:
+        return ""
+    n = str(name).strip().lower()
+    table = {
+        'aac': 'AAC', 'opus': 'Opus', 'libopus': 'Opus', 'mp3': 'MP3',
+        'mp2': 'MP2', 'vorbis': 'Vorbis', 'libvorbis': 'Vorbis',
+        'flac': 'FLAC', 'alac': 'ALAC', 'ac3': 'AC3', 'eac3': 'E-AC3',
+        'dts': 'DTS', 'wmav1': 'WMA', 'wmav2': 'WMA', 'amr_nb': 'AMR',
+        'truehd': 'TrueHD',
+    }
+    if n in table:
+        return table[n]
+    if n.startswith('pcm'):
+        return 'PCM'
+    return n.upper()
+
+
+def fmt_bitrate_with_codec(codec, br):
+    """«AAC 153 кбит/с». Кодек слева от цифр; если кодек неизвестен — только битрейт,
+    если битрейт неизвестен — только кодек (или «—»)."""
+    c = pretty_audio_codec(codec)
+    has_br = bool(br) and br not in ("-", "—")
+    if c and has_br:
+        return f"{c} {br}"
+    if has_br:
+        return br
+    return c or "—"
+
+
 def get_media_info(path):
-    """Возвращает (duration, bitrate_str, size, audio_bitrate_str).
+    """Возвращает (duration, bitrate_str, size, audio_bitrate_str, audio_codec).
     Один вызов ffprobe с JSON-выводом — поля именованные, порядок не важен.
     """
     dur = 0.0
     size = 0
     br_str = "-"
     a_br = "-"
+    a_codec = None
     try:
         size = os.path.getsize(path)
     except Exception:
@@ -853,7 +897,7 @@ def get_media_info(path):
         p = subprocess.run(
             [FFPROBE, "-v", "error",
              "-show_entries",
-             "format=duration,bit_rate:stream=bit_rate,sample_rate,channels,bits_per_sample",
+             "format=duration,bit_rate:stream=bit_rate,sample_rate,channels,bits_per_sample,codec_name",
              "-select_streams", "a:0",
              "-of", "json",
              path],
@@ -878,6 +922,7 @@ def get_media_info(path):
         streams = data.get("streams", [])
         if streams:
             s0 = streams[0]
+            a_codec = s0.get("codec_name") or None
             try:
                 abr = int(s0.get("bit_rate", 0) or 0)
                 if abr > 0:
@@ -897,6 +942,25 @@ def get_media_info(path):
                         br_str = a_br
                 except Exception:
                     pass
+            # Нет тега bit_rate (частый случай для opus и ряда mp4) — считаем по
+            # сумме размеров аудиопакетов за длительность: точнее format.bit_rate
+            # (тот включает видео) и ВСЕГДА даёт значение, а не прочерк.
+            if a_br == "-" and dur > 0:
+                try:
+                    pk = subprocess.run(
+                        [FFPROBE, "-v", "error", "-select_streams", "a:0",
+                         "-show_entries", "packet=size", "-of", "csv=p=0", path],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, encoding="utf-8", errors="replace",
+                        creationflags=CREATE_NO_WINDOW)
+                    total = sum(int(x) for x in pk.stdout.replace(",", " ").split() if x.isdigit())
+                    if total > 0:
+                        kbps = int(round(total * 8 / dur / 1000))
+                        if kbps > 0:
+                            a_br = f"{kbps} кбит/с"
+                            br_str = a_br
+                except Exception:
+                    pass
             # Последний резерв: format.bit_rate (работает для opus, mp3, m4a…)
             if a_br == "-" and fmt_br > 0:
                 a_br = f"{fmt_br // 1000} кбит/с"
@@ -912,7 +976,7 @@ def get_media_info(path):
                 a_br = br_str
     except Exception:
         pass
-    return dur, br_str, size, a_br
+    return dur, br_str, size, a_br, a_codec
 
 
 def get_fps_float(path):
@@ -963,6 +1027,124 @@ def play_done_sound():
     except Exception: pass
 
 
+def rasterize_svg(path, max_dim=2048):
+    """Растеризует SVG-файл в PIL.Image (RGBA) через QtSvg. PIL не умеет SVG,
+    поэтому рисуем вектор в QImage и переводим в PIL. Возвращает None при ошибке
+    или если QtSvg/PIL недоступны."""
+    if not Image:
+        return None
+    try:
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtCore import QBuffer
+    except Exception:
+        return None
+    try:
+        renderer = QSvgRenderer(path)
+        if not renderer.isValid():
+            return None
+        size = renderer.defaultSize()
+        w, h = size.width(), size.height()
+        if w <= 0 or h <= 0:
+            w = h = 1024
+        # Векторную картинку растеризуем покрупнее, чтобы при объединении она
+        # была чёткой (но не больше max_dim по большей стороне).
+        scale = max(1.0, 1024 / max(w, h))
+        w2, h2 = int(round(w * scale)), int(round(h * scale))
+        if max(w2, h2) > max_dim:
+            k = max_dim / max(w2, h2)
+            w2, h2 = int(round(w2 * k)), int(round(h2 * k))
+        qimg = QtGuiImage(w2, h2, QtGuiImage.Format.Format_ARGB32)
+        qimg.fill(0)  # прозрачный фон
+        p = QPainter(qimg)
+        renderer.render(p)
+        p.end()
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QBuffer.OpenModeFlag.WriteOnly)
+        qimg.save(buf, 'PNG')
+        buf.close()
+        return Image.open(io.BytesIO(bytes(ba))).convert('RGBA')
+    except Exception:
+        return None
+
+
+def open_image_any(path):
+    """Открывает изображение как PIL.Image, поддерживая в т.ч. SVG (через
+    растеризацию QtSvg). Возвращает PIL.Image. Бросает исключение, как Image.open,
+    если формат не распознан."""
+    if os.path.splitext(path)[1].lower() == '.svg':
+        im = rasterize_svg(path)
+        if im is None:
+            raise ValueError(f"Не удалось растеризовать SVG: {path}")
+        return im
+    return Image.open(path)
+
+
+def load_pixmap_any(path, max_dim=1024):
+    """QPixmap из любого файла, включая SVG (растеризуется через QtSvg).
+    Пустой QPixmap при ошибке."""
+    if os.path.splitext(path)[1].lower() == '.svg':
+        try:
+            from PyQt6.QtSvg import QSvgRenderer
+            renderer = QSvgRenderer(path)
+            if renderer.isValid():
+                size = renderer.defaultSize()
+                w, h = size.width(), size.height()
+                if w <= 0 or h <= 0:
+                    w = h = max_dim
+                scale = min(1.0, max_dim / max(w, h))
+                qimg = QtGuiImage(int(w * scale) or 1, int(h * scale) or 1,
+                                  QtGuiImage.Format.Format_ARGB32)
+                qimg.fill(0)
+                p = QPainter(qimg)
+                renderer.render(p)
+                p.end()
+                return QPixmap.fromImage(qimg)
+        except Exception:
+            pass
+        return QPixmap()
+    # Сначала пробуем штатный загрузчик Qt.
+    pix = QPixmap(path)
+    if not pix.isNull():
+        return pix
+    # Qt не открыл (нет плагина — частый случай для avif/heic): пробуем через
+    # Pillow (avif/heic регистрируются pillow-heif) и переводим в QPixmap.
+    if Image:
+        try:
+            with Image.open(path) as im:
+                if ImageOps:
+                    im = ImageOps.exif_transpose(im)
+                im = im.convert("RGBA")
+                bio = io.BytesIO(); im.save(bio, format="PNG")
+                p2 = QPixmap()
+                if p2.loadFromData(QByteArray(bio.getvalue())):
+                    return p2
+        except Exception:
+            pass
+    # Последний резерв — bundled ffmpeg. Критично для сравнения «исходник/
+    # результат»: результат у нас обычно AVIF, а в собранном .exe ни Qt, ни
+    # Pillow могут не уметь его декодировать (нет плагина/кодека). ffmpeg с
+    # libaom в комплекте точно открывает AVIF/HEIC (он же их и создаёт), поэтому
+    # рендерим один кадр в PNG и грузим его — иначе панель «Результат» пустая.
+    try:
+        tmp = os.path.join(TEMP_DIR, f"ym_pix_{uuid.uuid4().hex}.png")
+        cmd = [FFMPEG, "-y", "-i", path, "-frames:v", "1"]
+        if max_dim:
+            cmd += ["-vf", f"scale='min({int(max_dim)},iw)':-1"]
+        cmd.append(tmp)
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       creationflags=CREATE_NO_WINDOW, timeout=20)
+        if os.path.exists(tmp):
+            p3 = QPixmap(tmp)
+            try: os.remove(tmp)
+            except Exception: pass
+            if not p3.isNull():
+                return p3
+    except Exception:
+        pass
+    return pix
+
+
 def pil_to_qicon(img):
     if not Image or img is None: return QIcon()
     try:
@@ -978,6 +1160,63 @@ def pil_to_qicon(img):
             return QIcon(QPixmap.fromImage(qimg))
     except Exception:
         return QIcon()
+
+
+def move_to_trash(path):
+    """Отправляет файл в Корзину (Windows) БЕЗ системного диалога подтверждения.
+    Возвращает True при успехе. Реализовано через WinAPI SHFileOperationW с
+    флагом FOF_ALLOWUNDO — это кладёт файл в Корзину (откуда его можно вернуть),
+    а не удаляет безвозвратно; стороннюю зависимость (send2trash) не тянем."""
+    try:
+        path = os.path.abspath(path)
+    except Exception:
+        return False
+    if not os.path.exists(path):
+        return True
+    if os.name == 'nt':
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _SHFILEOPSTRUCTW(ctypes.Structure):
+                _fields_ = [
+                    ("hwnd", wintypes.HWND),
+                    ("wFunc", wintypes.UINT),
+                    ("pFrom", wintypes.LPCWSTR),
+                    ("pTo", wintypes.LPCWSTR),
+                    ("fFlags", ctypes.c_uint16),          # FILEOP_FLAGS = WORD
+                    ("fAnyOperationsAborted", wintypes.BOOL),
+                    ("hNameMappings", wintypes.LPVOID),
+                    ("lpszProgressTitle", wintypes.LPCWSTR),
+                ]
+
+            FO_DELETE = 0x0003
+            FOF_SILENT = 0x0004           # без индикатора прогресса
+            FOF_NOCONFIRMATION = 0x0010   # без вопросов «вы уверены?»
+            FOF_ALLOWUNDO = 0x0040        # → Корзина, а не безвозвратно
+            FOF_NOERRORUI = 0x0400        # без окон об ошибках
+
+            op = _SHFILEOPSTRUCTW()
+            op.hwnd = None
+            op.wFunc = FO_DELETE
+            # pFrom — список путей, оканчивающийся ДВОЙНЫМ NUL.
+            op.pFrom = path + '\x00\x00'
+            op.pTo = None
+            op.fFlags = (FOF_ALLOWUNDO | FOF_NOCONFIRMATION
+                         | FOF_SILENT | FOF_NOERRORUI)
+            shell32 = ctypes.windll.shell32
+            shell32.SHFileOperationW.argtypes = [ctypes.c_void_p]
+            shell32.SHFileOperationW.restype = ctypes.c_int
+            res = shell32.SHFileOperationW(ctypes.byref(op))
+            return res == 0 and not op.fAnyOperationsAborted
+        except Exception:
+            return False
+    # Не-Windows: системной Корзины под рукой нет — обычное удаление.
+    try:
+        os.remove(path)
+        return True
+    except Exception:
+        return False
 
 
 @functools.lru_cache(maxsize=None)

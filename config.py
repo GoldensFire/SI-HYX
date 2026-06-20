@@ -66,16 +66,9 @@ from pathlib import Path
 from collections import deque
 
 
-# Программное декодирование видео в QtMultimedia (бэкенд ffmpeg).
-# На встроенных видеоядрах (напр. Vega у Ryzen 5600H) аппаратного декодера AV1
-# нет: бэкенд пытается d3d11-hwaccel, не может и показывает чёрный экран —
-# играет только звук («Your platform doesn't support hardware accelerated AV1
-# decoding» / «Get current frame error»). Пустой список HW-устройств = плеер
-# декодирует на ЦП и AV1 (и прочие неподдерживаемые кодеки) воспроизводятся.
-# Qt читает эту переменную один раз на процесс при первом декодировании, поэтому
-# ставим её здесь — config.py импортируется раньше любого QtMultimedia-плеера
-# (и вкладки «Монтаж», и вкладки SiQuesterHYX).
-os.environ.setdefault("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", "")
+# Аппаратное декодирование видео в QtMultimedia (бэкенд ffmpeg) настраивается
+# ниже, ПОСЛЕ определения SETTINGS_FILE (нужно прочитать настройку
+# video_hw_decode). См. блок «Аппаратное декодирование видео».
 
 
 # PyQt6 imports
@@ -99,8 +92,8 @@ try:
         QStackedWidget
     )
     from PyQt6.QtCore import (
-        Qt, QThread, pyqtSignal, QSize, QRunnable, QThreadPool, QByteArray, QTimer,
-        QObject, QEvent
+        Qt, QThread, pyqtSignal, QSize, QRect, QRectF, QPoint, QPointF,
+        QRunnable, QThreadPool, QByteArray, QTimer, QObject, QEvent
     )
     from PyQt6.QtGui import (
         QAction, QColor, QFont, QIcon, QPixmap, QBrush, QImage as QtGuiImage,
@@ -258,6 +251,33 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 
 
+# ── Аппаратное декодирование видео (H.264 / HEVC) в QtMultimedia ─────────────
+# По умолчанию ВКЛЮЧЕНО: H.264/HEVC декодируются на GPU (D3D11VA/DXVA2) — тяжёлые
+# файлы в «Монтаже» играют плавно (как в Filmora), а не упираются в ЦП.
+# AV1 в «Монтаже» ВСЕГДА перегоняется в H.264-прокси ДО плеера, поэтому ускорение
+# его не ломает. ОДНАКО на iGPU без аппаратного AV1-декодера (напр. Vega у
+# Ryzen 5600H) ПРЯМОЕ воспроизведение AV1 (вкладка SiQuesterHYX) при включённом
+# ускорении может дать чёрный экран — тогда снимите галку «Аппаратное ускорение
+# видео» в Настройках. Программный рендер видео несовместим с HW-декодером —
+# при нём ускорение тоже выключается.
+# Qt читает переменную один раз на процесс при первом декодировании, поэтому
+# ставим её здесь — config.py импортируется раньше любого QtMultimedia-плеера
+# (и вкладки «Монтаж», и вкладки SiQuesterHYX).
+def _hw_decode_device_types():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as _f:
+            _s = json.load(_f)
+        if _s.get("video_software_render", False):
+            return ""                       # программный рендер → только ЦП
+        if not _s.get("video_hw_decode", True):
+            return ""                       # пользователь выключил ускорение
+    except Exception:
+        pass
+    return "d3d11va,dxva2"
+
+os.environ.setdefault("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", _hw_decode_device_types())
+
+
 COOKIE_PATHS = {
     'youtube':   os.path.join(CONFIG_DIR, "cookies_youtube.txt"),
     'instagram': os.path.join(CONFIG_DIR, "cookies_instagram.txt"),
@@ -403,9 +423,18 @@ COLOR_ERR  = QColor(231, 76,  60,  210)  # Красный — ошибка
 
 # Кастомная роль для хранения статуса строки
 ITEM_STATUS_ROLE = Qt.ItemDataRole.UserRole + 10
+# Кастомная роль: на странице обработки помечает обработанную картинку, у которой
+# можно сравнить исходник и результат (значок-«сравнение» на превью).
+ITEM_COMPARE_ROLE = Qt.ItemDataRole.UserRole + 11
 
 
 ALLOWED_IMG = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp', '.gif', '.avif'}
+
+
+# Изображения для ленты последних файлов (сверху). SVG показываем в ленте
+# (растеризуется через QtSvg), но в очередь обработки он не попадает — pipeline
+# на Pillow его не открывает, поэтому ALLOWED_IMG расширять нельзя.
+RIBBON_IMG = ALLOWED_IMG | {'.svg'}
 
 
 ALLOWED_MEDIA = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.mp3', '.wav', '.aac', '.m4a', '.flac', '.ogg', '.opus', '.wma'}

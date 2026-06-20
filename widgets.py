@@ -9,6 +9,21 @@
 # widgets.py — кастомные виджеты, делегаты, превью, info-подсказки
 from config import *
 from utils import *
+from PyQt6.QtWidgets import QSizePolicy
+
+
+class SmallIconDelegate(QStyledItemDelegate):
+    """Делегат для колонок со статус-иконкой. Дерево загрузок выставляет
+    крупный iconSize (160×90) для превью в 0-й колонке — без этого делегата
+    значок статуса («галочка Готово») наследовал бы тот же размер и раздувался
+    на всю строку. Здесь принудительно ограничиваем размер декорации."""
+    def __init__(self, size=20, parent=None):
+        super().__init__(parent)
+        self._sz = QSize(size, size)
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        option.decorationSize = self._sz
 
 
 class StatusColorDelegate(QStyledItemDelegate):
@@ -21,7 +36,10 @@ class StatusColorDelegate(QStyledItemDelegate):
     _SEL_BG  = QColor(0x45, 0x47, 0x5a)   # обычное выделение (#45475a)
     _HOV_BG  = QColor(0x31, 0x32, 0x44)   # hover (#313244)
 
-    def paint(self, painter, option, index):
+    def _paint_bg(self, painter, option, index):
+        """Рисует фон строки (статус-цвет / выделение / hover). Вынесено отдельно,
+        чтобы наследники (PreviewNameDelegate) рисовали тот же фон под своей
+        кастомной разметкой."""
         src = index.sibling(index.row(), 0)
         status = src.data(ITEM_STATUS_ROLE)
         color  = self._colors.get(status)
@@ -54,11 +72,193 @@ class StatusColorDelegate(QStyledItemDelegate):
                 painter.fillRect(option.rect, self._HOV_BG)
                 painter.restore()
 
+    def paint(self, painter, option, index):
+        self._paint_bg(painter, option, index)
+
         # Рисуем текст / иконку поверх нашего фона
         super().paint(painter, option, index)
 
         # Выделение цветной строки показано осветлением фона выше — резкую
         # белую рамку не рисуем.
+
+
+class PreviewNameDelegate(StatusColorDelegate):
+    """Колонка «Превью» на странице обработки: миниатюра сверху, имя файла —
+    под ней одной строкой с многоточием при нехватке ширины. Полное имя
+    остаётся в тултипе ячейки.
+
+    Для обработанных картинок (роль ITEM_COMPARE_ROLE) рисует в правом нижнем
+    углу превью значок «сравнить» — по клику открывается сравнение исходника и
+    результата (сигнал compare_clicked)."""
+    _NAME_COLOR = QColor(0xcd, 0xd6, 0xf4)  # #cdd6f4
+    _BADGE = 24                              # сторона значка-сравнения, px
+
+    compare_clicked = pyqtSignal(object)     # QModelIndex обработанной картинки
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Анимация наведения на значок «сравнить»: _hover_iid — id строки, чей
+        # значок под курсором; _hover_t (0..1) — фаза, гонится таймером к цели.
+        self._hover_iid = None
+        self._hover_t = 0.0
+        self._hover_target = 0.0
+        self._anim_timer = QTimer(self)
+        self._anim_timer.setInterval(16)
+        self._anim_timer.timeout.connect(self._tick_hover)
+
+    def set_badge_hover(self, iid):
+        """Дерево сообщает, над чьим значком сравнения курсор (или None)."""
+        if iid == self._hover_iid:
+            return
+        self._hover_iid = iid
+        self._hover_target = 1.0 if iid is not None else 0.0
+        if not self._anim_timer.isActive():
+            self._anim_timer.start()
+
+    def _tick_hover(self):
+        step = 0.16
+        if self._hover_t < self._hover_target:
+            self._hover_t = min(self._hover_target, self._hover_t + step)
+        elif self._hover_t > self._hover_target:
+            self._hover_t = max(self._hover_target, self._hover_t - step)
+        else:
+            self._anim_timer.stop()
+        v = self.parent()
+        if v is not None and hasattr(v, 'viewport'):
+            v.viewport().update()
+
+    @classmethod
+    def _badge_rect(cls, rect, fm):
+        """Квадрат значка «сравнить» в правом нижнем углу области превью.
+        Считается так же, как геометрия картинки в paint(), чтобы клик попадал
+        ровно по нарисованному значку."""
+        pad = 4
+        text_h = (fm.height() + 2)
+        icon_h = max(0, rect.height() - 2 * pad - text_h)
+        bx = rect.left() + rect.width() - pad - cls._BADGE - 2
+        by = rect.top() + pad + icon_h - cls._BADGE - 2
+        return QRect(int(bx), int(by), cls._BADGE, cls._BADGE)
+
+    def paint(self, painter, option, index):
+        self._paint_bg(painter, option, index)
+        painter.save()
+        rect = option.rect
+        pad  = 4
+        fm   = option.fontMetrics
+        name = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        text_h = (fm.height() + 2) if name else 0
+
+        icon = index.data(Qt.ItemDataRole.DecorationRole)
+        icon_h = max(0, rect.height() - 2 * pad - text_h)
+        # Низ картинки — чтобы подпись шла сразу под ней (без большого зазора).
+        img_bottom = rect.top() + pad
+        if isinstance(icon, QIcon) and not icon.isNull() and icon_h > 0:
+            pm = icon.pixmap(QSize(rect.width() - 2 * pad, icon_h))
+            if not pm.isNull():
+                # ВАЖНО: pm.width()/height() — в ФИЗИЧЕСКИХ пикселях (на HiDPI
+                # экране в devicePixelRatio раз больше логических), а painter
+                # рисует в ЛОГИЧЕСКИХ. Раньше центрирование считалось по
+                # физическому размеру → картинка съезжала влево/вверх и
+                # «налезала» на соседнюю строку. Берём логический размер.
+                dpr = pm.devicePixelRatio() or 1.0
+                w = int(round(pm.width() / dpr))
+                h = int(round(pm.height() / dpr))
+                x = rect.left() + (rect.width() - w) // 2
+                y = rect.top() + pad + (icon_h - h) // 2
+                painter.drawPixmap(QRect(x, y, w, h), pm)
+                img_bottom = y + h
+
+        if name:
+            # Подпись — сразу под картинкой (не приклеена ко дну ячейки).
+            ty = min(img_bottom + 2, rect.bottom() - text_h - pad)
+            avail = rect.width() - 2 * pad
+            fits = fm.horizontalAdvance(name) <= avail
+            painter.setPen(self._NAME_COLOR)
+            if fits:
+                # Помещается целиком — центрируем.
+                tr = QRect(rect.left() + pad, ty, avail, text_h)
+                painter.drawText(tr, int(Qt.AlignmentFlag.AlignHCenter
+                                         | Qt.AlignmentFlag.AlignVCenter), name)
+            else:
+                # Длинное имя — от самого левого края, почти без отступа, с «…».
+                tr = QRect(rect.left() + 1, ty, rect.width() - 2, text_h)
+                elided = fm.elidedText(name, Qt.TextElideMode.ElideRight, tr.width())
+                painter.drawText(tr, int(Qt.AlignmentFlag.AlignLeft
+                                         | Qt.AlignmentFlag.AlignVCenter), elided)
+
+        # Значок «сравнить» в углу превью обработанной картинки. При наведении
+        # на него (см. дерево → set_badge_hover) значок слегка увеличивается и
+        # подсвечивается синим акцентом — небольшая анимация интерактивности.
+        if index.data(ITEM_COMPARE_ROLE):
+            br = self._badge_rect(rect, fm)
+            iid = index.data(Qt.ItemDataRole.UserRole)
+            t = self._hover_t if (self._hover_iid is not None
+                                  and iid == self._hover_iid) else 0.0
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            if t > 0.001:
+                grow = int(round(2.0 * t))
+                br = br.adjusted(-grow, -grow, grow, grow)
+            pen_c = QColor(int(0x58 + (0x89 - 0x58) * t),
+                           int(0x5b + (0xb4 - 0x5b) * t),
+                           int(0x70 + (0xfa - 0x70) * t))
+            painter.setPen(QPen(pen_c))
+            painter.setBrush(QColor(24, 24, 37, int(215 + 40 * t)))
+            painter.drawRoundedRect(br, 5, 5)
+            ic = 14 + int(round(3 * t))
+            icol = QColor(int(0xcd + (0x89 - 0xcd) * t),
+                          int(0xd6 + (0xb4 - 0xd6) * t),
+                          int(0xf4 + (0xfa - 0xf4) * t))
+            pm = get_icon_pixmap('fa5s.columns', ic, icol.name())
+            if not pm.isNull():
+                px = br.left() + (br.width() - ic) // 2
+                py = br.top() + (br.height() - ic) // 2
+                painter.drawPixmap(QRect(px, py, ic, ic), pm)
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index):
+        # Клик по значку «сравнить» в углу превью → сигнал в MediaTab.
+        try:
+            if (event.type() == QEvent.Type.MouseButtonRelease
+                    and index.data(ITEM_COMPARE_ROLE)
+                    and event.button() == Qt.MouseButton.LeftButton):
+                pos = event.position().toPoint()
+                if self._badge_rect(option.rect, option.fontMetrics).contains(pos):
+                    self.compare_clicked.emit(index)
+                    return True
+        except Exception:
+            pass
+        return super().editorEvent(event, model, option, index)
+
+    def sizeHint(self, option, index):
+        s = super().sizeHint(option, index)
+        extra = option.fontMetrics.height() + 2 + 8  # строка имени + отступы
+        return QSize(s.width(), max(s.height(), 90) + extra)
+
+
+class LatinKeySequenceEdit(QKeySequenceEdit):
+    """QKeySequenceEdit, который пишет буквы/цифры по ФИЗИЧЕСКОЙ клавише
+    (латиница), а не по текущей раскладке: Shift+Y на русской раскладке даёт
+    «Shift+Y», а не «Shift+Н». Для остальных клавиш (F-ряд, стрелки и пр.) —
+    штатное поведение базового класса."""
+    _MODS = (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt, Qt.Key.Key_Meta)
+    _KBD = (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier)
+
+    def keyPressEvent(self, ev):
+        # Windows VK: 0x30..0x39 = '0'..'9', 0x41..0x5A = 'A'..'Z' — не зависят от
+        # раскладки. Берём латинский символ напрямую по физической клавише.
+        vk = ev.nativeVirtualKey()
+        latin = chr(vk) if (0x41 <= vk <= 0x5A or 0x30 <= vk <= 0x39) else None
+        if latin is not None and ev.key() not in self._MODS:
+            try:
+                key_enum = getattr(Qt.Key, f"Key_{latin}")
+                mods = ev.modifiers() & self._KBD
+                self.setKeySequence(QKeySequence(int(mods.value) | int(key_enum.value)))
+                ev.accept()
+                return
+            except Exception:
+                pass
+        super().keyPressEvent(ev)
 
 
 # --- Custom ComboBox для инвертированного скролла битрейта ---
@@ -149,6 +349,62 @@ class _InfoTipPopup(QLabel):
         except Exception:
             pass
         self.move(x, y); self.show(); self.raise_()
+
+    def show_at(self, global_point, text):
+        """Показывает подсказку у заданной глобальной точки (напр. у курсора над
+        ячейкой дерева). Тот же стабильный попап, что и у значков ⓘ."""
+        if not text:
+            return
+        self.setText(text)
+        self.adjustSize()
+        x, y = global_point.x() + 16, global_point.y() + 18
+        try:
+            scr = QApplication.screenAt(global_point)
+            sg = scr.availableGeometry() if scr else None
+            if sg is not None:
+                if x + self.width() > sg.right(): x = sg.right() - self.width() - 4
+                if x < sg.left(): x = sg.left() + 4
+                if y + self.height() > sg.bottom(): y = global_point.y() - self.height() - 6
+        except Exception:
+            pass
+        self.move(x, y); self.show(); self.raise_()
+
+
+class HoverTipManager(QObject):
+    """Глобальный фильтр событий: заменяет системные QToolTip на тот же
+    стабильный фирменный попап, что и у значков ⓘ (_InfoTipPopup). QToolTip
+    реагирует на каждое микродвижение мыши и потому мерцает/подлагивает; здесь
+    же попап показывается один раз по событию ToolTip и прячется по уходу
+    курсора — без мерцания. Достаточно установить на QApplication, и ВСЕ
+    виджеты с setToolTip(...) автоматически получают стабильную подсказку."""
+
+    def eventFilter(self, obj, ev):
+        try:
+            et = ev.type()
+            if et == QEvent.Type.ToolTip:
+                tip = obj.toolTip() if isinstance(obj, QWidget) else ""
+                if tip:
+                    _InfoTipPopup.instance().show_for(obj, tip)
+                    return True  # подавляем системный QToolTip (источник мерцания)
+                # Пустая подсказка (напр. значок ⓘ управляет попапом сам) — не трогаем.
+                return False
+            if et in (QEvent.Type.Leave, QEvent.Type.MouseButtonPress,
+                      QEvent.Type.Wheel, QEvent.Type.Hide,
+                      QEvent.Type.WindowDeactivate):
+                _InfoTipPopup.instance().hide()
+        except Exception:
+            pass
+        return False
+
+
+def install_hover_tips(app):
+    """Ставит HoverTipManager на приложение (один экземпляр живёт с приложением)."""
+    try:
+        mgr = HoverTipManager(app)
+        app._hover_tip_mgr = mgr  # держим ссылку, чтобы не собрался GC
+        app.installEventFilter(mgr)
+    except Exception:
+        pass
 
 
 class _InfoBadge(QLabel):
@@ -355,7 +611,19 @@ class _RecentThumbWorker(QRunnable):
         dur_str = ""
         try:
             ext = os.path.splitext(self.path)[1].lower()
-            if ext in ALLOWED_IMG and Image:
+            if ext == '.svg':
+                # PIL не умеет SVG — растеризуем вектор через QtSvg (QImage, не
+                # QPixmap — допустимо вне GUI-потока) и отдаём байты PNG.
+                try:
+                    im = rasterize_svg(self.path, max_dim=256)
+                    if im is not None:
+                        im.thumbnail((96, 72))
+                        bio = io.BytesIO()
+                        im.convert("RGBA").save(bio, "PNG")
+                        data = bio.getvalue()
+                except Exception:
+                    pass
+            elif ext in ALLOWED_IMG and Image:
                 try:
                     with Image.open(self.path) as im:
                         im.thumbnail((96, 72))
@@ -430,7 +698,7 @@ class RecentFileThumb(QWidget):
         self._has_thumb = False     # получена ли настоящая миниатюра
 
         ext = os.path.splitext(path)[1].lower()
-        is_img   = ext in ALLOWED_IMG
+        is_img   = ext in RIBBON_IMG
         is_video = not is_img and ext in {'.mp4', '.mkv', '.avi', '.mov', '.webm',
                                            '.flv', '.wmv', '.m4v', '.ts', '.mts',
                                            '.m2ts', '.vob', '.ogv', '.3gp'}
@@ -454,7 +722,11 @@ class RecentFileThumb(QWidget):
         self._thumb_lbl.setFixedSize(96, 72)
         self._thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._thumb_lbl.setTextFormat(Qt.TextFormat.RichText)
-        self._thumb_lbl.setStyleSheet("background:#1e1e1e;border-radius:3px;")
+        # Прозрачный фон: у миниатюр с «неподходящим» соотношением сторон (не 4:3)
+        # пиксмап масштабируется с сохранением пропорций и не заполняет 96×72 —
+        # раньше по бокам/сверху проступал серый прямоугольник #1e1e1e. Теперь
+        # незаполненная область прозрачна и сливается с карточкой.
+        self._thumb_lbl.setStyleSheet("background:transparent;border-radius:3px;")
         self._thumb_lbl.setText(self._placeholder_html())  # значок типа + расширение, пока нет превью
         tc_layout.addWidget(self._thumb_lbl)
 
@@ -689,17 +961,16 @@ class RecentFileThumb(QWidget):
             QMessageBox.warning(self, "Переименование", f"Не удалось переименовать:\n{ex}")
 
     def _action_delete(self):
+        # Без подтверждения: файл уходит в Корзину (откуда его можно вернуть),
+        # поэтому диалог «вы уверены?» не нужен.
         try:
-            r = QMessageBox.question(
-                self, "Удалить файл",
-                f"Удалить файл безвозвратно?\n\n{os.path.basename(self.path)}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if r != QMessageBox.StandardButton.Yes:
-                return
-            os.remove(self.path)
-            # Карточку уберёт автообновление стрипа (poll), а саму скрываем сразу.
-            self.hide()
+            if move_to_trash(self.path):
+                # Карточку уберёт автообновление стрипа (poll), а саму скрываем сразу.
+                self.hide()
+            else:
+                QMessageBox.warning(self, "Удаление",
+                                    f"Не удалось отправить файл в Корзину:\n"
+                                    f"{os.path.basename(self.path)}")
         except Exception as ex:
             QMessageBox.warning(self, "Удаление", f"Не удалось удалить:\n{ex}")
 
@@ -720,6 +991,12 @@ class RecentFilesStrip(QWidget):
         self.media_tab = media_tab
         self._mode = mode
         self._folder = ""
+        self._default_folder = ""   # папка загрузки (из вкладки «Загрузчик»)
+        self._custom_folder = ""    # выбранная пользователем папка-источник (приоритет)
+        try:
+            self._custom_folder = (load_settings().get('recent_folders', {}) or {}).get(mode, "") or ""
+        except Exception:
+            self._custom_folder = ""
         self._known_paths: list = []  # текущий список путей (актуальный снимок)
         self.setFixedHeight(128)
 
@@ -739,7 +1016,21 @@ class RecentFilesStrip(QWidget):
         self._scroll.setWidget(self._inner)
         outer.addWidget(self._scroll)
 
-        self._lbl_empty = QLabel("Нет медиафайлов в папке загрузок")
+        # Правая колонка (сверху справа): выбор папки-источника ленты.
+        ctl = QVBoxLayout(); ctl.setContentsMargins(2, 2, 4, 2); ctl.setSpacing(2)
+        self._btn_folder = QToolButton(); self._btn_folder.setAutoRaise(True)
+        self._btn_folder.setIcon(get_icon('fa5s.folder-open'))
+        self._btn_folder.clicked.connect(self._choose_folder)
+        self._btn_folder_reset = QToolButton(); self._btn_folder_reset.setAutoRaise(True)
+        self._btn_folder_reset.setIcon(get_icon('fa5s.undo'))
+        self._btn_folder_reset.setToolTip("Сбросить — брать из папки загрузки")
+        self._btn_folder_reset.clicked.connect(self._reset_folder)
+        ctl.addWidget(self._btn_folder, 0, Qt.AlignmentFlag.AlignTop)
+        ctl.addWidget(self._btn_folder_reset, 0, Qt.AlignmentFlag.AlignTop)
+        ctl.addStretch()
+        outer.addLayout(ctl)
+
+        self._lbl_empty = QLabel("Нет медиафайлов в папке")
         self._lbl_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._lbl_empty.setStyleSheet("color:#666;font-size:10px;")
         self._row.insertWidget(0, self._lbl_empty)
@@ -750,6 +1041,11 @@ class RecentFilesStrip(QWidget):
         self._timer.timeout.connect(self._poll)
         self._timer.start()
 
+        self._update_folder_btn()
+        if self._custom_folder:        # своя папка задана — показываем сразу, до refresh()
+            self._folder = self._effective_folder()
+            self._apply(self._scan())
+
     def wheelEvent(self, event):
         """Колесо мыши — горизонтальная прокрутка стрипа."""
         bar = self._scroll.horizontalScrollBar()
@@ -759,7 +1055,7 @@ class RecentFilesStrip(QWidget):
     @classmethod
     def _get_all_ext(cls):
         if cls._ALL_EXT is None:
-            cls._ALL_EXT = ALLOWED_MEDIA | ALLOWED_IMG
+            cls._ALL_EXT = ALLOWED_MEDIA | RIBBON_IMG
         return cls._ALL_EXT
 
     def _scan(self) -> list:
@@ -814,10 +1110,60 @@ class RecentFilesStrip(QWidget):
                 w.recheck_pending()
 
     def refresh(self, folder: str):
-        """Вызывается вручную при смене папки."""
-        self._folder = folder
-        new_paths = self._scan()
-        self._apply(new_paths)
+        """Папка загрузки сменилась (вкладка «Загрузчик»). Если своя папка не
+        задана — лента берёт её; иначе остаётся на пользовательской."""
+        self._default_folder = folder or ""
+        self._folder = self._effective_folder()
+        self._apply(self._scan())
+
+    def _effective_folder(self) -> str:
+        """Своя папка пользователя приоритетнее; иначе — папка загрузки."""
+        if self._custom_folder and os.path.isdir(self._custom_folder):
+            return self._custom_folder
+        return self._default_folder
+
+    def _choose_folder(self):
+        start = self._effective_folder() or default_download_dir()
+        d = QFileDialog.getExistingDirectory(self, "Папка-источник ленты", start)
+        if not d:
+            return
+        self._custom_folder = d
+        self._persist_folder()
+        self._folder = self._effective_folder()
+        self._apply(self._scan())
+        self._update_folder_btn()
+
+    def _reset_folder(self):
+        self._custom_folder = ""
+        self._persist_folder()
+        self._folder = self._effective_folder()
+        self._apply(self._scan())
+        self._update_folder_btn()
+
+    def _persist_folder(self):
+        """Сохраняем выбор папки в настройках (по режиму ленты)."""
+        try:
+            s = load_settings()
+            folders = dict(s.get('recent_folders', {}) or {})
+            if self._custom_folder:
+                folders[self._mode] = self._custom_folder
+            else:
+                folders.pop(self._mode, None)
+            s['recent_folders'] = folders
+            save_settings(s)
+        except Exception:
+            pass
+
+    def _update_folder_btn(self):
+        custom = bool(self._custom_folder)
+        self._btn_folder_reset.setVisible(custom)
+        if custom:
+            self._btn_folder.setToolTip(
+                f"Папка-источник ленты:\n{self._custom_folder}\n(нажмите, чтобы сменить)")
+        else:
+            self._btn_folder.setToolTip(
+                "Выбрать папку-источник ленты.\n"
+                "По умолчанию — папка загрузки из вкладки «Загрузчик».")
 
     def _apply(self, paths: list):
         """Обновляет виджеты: добавляет только новые, удаляет исчезнувшие."""
@@ -901,9 +1247,71 @@ class DraggableTreeWidget(QTreeWidget):
     """QTreeWidget с поддержкой drag-and-drop файлов наружу (по tooltip = полный
     путь) и текстом-подсказкой по центру, когда список пуст."""
 
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        # Нужно для наведения на значок «сравнить» без зажатой кнопки.
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+
     def setPlaceholderText(self, text: str):
         self._placeholder = text or ""
         self.viewport().update()
+
+    def _badge_iid_at(self, pos):
+        """Если pos (в координатах viewport) попадает в значок «сравнить»
+        обработанной картинки — возвращает id строки, иначе None."""
+        if pos is None:
+            return None
+        deleg = self.itemDelegateForColumn(0)
+        if deleg is None or not hasattr(deleg, '_badge_rect'):
+            return None
+        idx = self.indexAt(pos)
+        if not idx.isValid():
+            return None
+        idx = idx.sibling(idx.row(), 0)
+        if not idx.data(ITEM_COMPARE_ROLE):
+            return None
+        br = deleg._badge_rect(self.visualRect(idx), self.fontMetrics())
+        if br.contains(pos):
+            return idx.data(Qt.ItemDataRole.UserRole)
+        return None
+
+    def _update_badge_hover(self, pos):
+        deleg = self.itemDelegateForColumn(0)
+        if deleg is None or not hasattr(deleg, 'set_badge_hover'):
+            return
+        iid = self._badge_iid_at(pos)
+        deleg.set_badge_hover(iid)
+
+    def viewportEvent(self, e):
+        # Тултип ячейки (полное имя/путь) показываем тем же стабильным попапом,
+        # что и значки ⓘ. Системный QToolTip на ячейках дерева мерцает —
+        # перехватываем событие и рисуем свой попап, не дёргающийся при
+        # микродвижениях мыши.
+        try:
+            et = e.type()
+            if et == QEvent.Type.ToolTip:
+                item = self.itemAt(e.pos())
+                # Над значком «сравнить» — подсказка о значке (БЕЗ имени файла);
+                # имя файла остаётся только при наведении на саму картинку.
+                if self._badge_iid_at(e.pos()) is not None:
+                    tip = "Сравнить исходник и результат"
+                else:
+                    tip = item.toolTip(0) if item else ""
+                if tip:
+                    _InfoTipPopup.instance().show_at(e.globalPos(), tip)
+                else:
+                    _InfoTipPopup.instance().hide()
+                e.accept()
+                return True
+            if et == QEvent.Type.MouseMove:
+                self._update_badge_hover(e.pos())
+            if et in (QEvent.Type.Leave, QEvent.Type.Wheel):
+                _InfoTipPopup.instance().hide()
+                self._update_badge_hover(None)
+        except Exception:
+            pass
+        return super().viewportEvent(e)
 
     def paintEvent(self, e):
         super().paintEvent(e)
@@ -986,7 +1394,7 @@ class PhotoDragList(QTreeWidget):
     """Список с drag-and-drop файлов извне + перестановка внутри."""
 
     VALID_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff',
-                  '.webp', '.avif', '.heic', '.heif', '.ico'}
+                  '.webp', '.avif', '.heic', '.heif', '.ico', '.svg'}
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1012,9 +1420,12 @@ class PhotoDragList(QTreeWidget):
                 border-radius: 6px;
             }
             QTreeWidget::item { padding: 4px 2px; min-height: 72px; }
-            QTreeWidget::item:selected { background-color: #45475a; }
-            QTreeWidget::item:hover    { background-color: #313244; }
+            QTreeWidget::item:selected { background-color: transparent; }
+            QTreeWidget::item:hover    { background-color: transparent; }
         """)
+        # Фон строки по статусу (зелёный — объединено, красный — ошибка) + видимое
+        # выделение/hover тем же делегатом, что в Обработке и Загрузчике.
+        self.setItemDelegate(StatusColorDelegate(self))
 
     # ── External drag-and-drop ──────────────────────────────
     def dragEnterEvent(self, event):
@@ -1047,8 +1458,8 @@ class PhotoDragList(QTreeWidget):
                 item.setData(0, Qt.ItemDataRole.UserRole, p)
                 item.setData(0, Qt.ItemDataRole.UserRole + 1, "new")  # state
 
-                # thumbnail
-                pix = QPixmap(p)
+                # thumbnail (SVG растеризуется через QtSvg)
+                pix = load_pixmap_any(p)
                 if not pix.isNull():
                     item.setIcon(0, QIcon(pix.scaled(80, 68, Qt.AspectRatioMode.KeepAspectRatio,
                                                      Qt.TransformationMode.SmoothTransformation)))
@@ -1064,10 +1475,379 @@ class PhotoDragList(QTreeWidget):
         return [it for it in self.get_all_items()
                 if it.data(0, Qt.ItemDataRole.UserRole + 1) == "new"]
 
-    def mark_processed(self, items, color: QColor):
+    def mark_processed(self, items):
+        """Успех: строка зелёная (как в Обработке), без значка-галочки."""
         for it in items:
             it.setData(0, Qt.ItemDataRole.UserRole + 1, "processed")
-            it.setIcon(2, get_icon('fa5s.check', color='#a6e3a1'))
-            it.setText(2, "готово")
+            it.setIcon(2, QIcon())          # убираем прежний значок «готово»
+            it.setText(2, "Готово")
+            it.setData(0, ITEM_STATUS_ROLE, 'done')
+            for col in range(3):            # снимаем старый произвольный фон
+                it.setBackground(col, QBrush())
+
+    def mark_failed(self, items):
+        """Ошибка объединения: строка красная. Файлы остаются «новыми» —
+        их можно объединить повторно."""
+        for it in items:
+            it.setIcon(2, QIcon())
+            it.setText(2, "Ошибка")
+            it.setData(0, ITEM_STATUS_ROLE, 'err')
             for col in range(3):
-                it.setBackground(col, QBrush(color))
+                it.setBackground(col, QBrush())
+
+
+# ─────────────────────────────────────────────────────────────
+#  Полноэкранный просмотр изображений (одиночный + сравнение)
+# ─────────────────────────────────────────────────────────────
+def _paint_checkerboard(painter, rect, cell=11):
+    """Рисует «шахматку» в прямоугольнике rect — фон под картинкой с
+    прозрачностью, чтобы прозрачные области были ВИДНЫ (как в Photoshop/GIMP),
+    а не сливались с тёмным фоном окна (иначе кажется, что прозрачность
+    потеряна). Под непрозрачной картинкой шахматка полностью скрыта — для них
+    визуально ничего не меняется."""
+    r = rect.toRect() if hasattr(rect, 'toRect') else rect
+    painter.save()
+    painter.setClipRect(r)
+    painter.fillRect(r, QColor(0x53, 0x55, 0x60))   # светлая клетка
+    dark = QColor(0x3a, 0x3c, 0x46)                  # тёмная клетка
+    x0, y0 = r.left(), r.top()
+    rows = (r.height() // cell) + 2
+    cols = (r.width() // cell) + 2
+    for iy in range(rows):
+        for ix in range(cols):
+            if (ix + iy) & 1:
+                painter.fillRect(x0 + ix * cell, y0 + iy * cell, cell, cell, dark)
+    painter.restore()
+
+
+class _ZoomImageLabel(QLabel):
+    """QLabel, который рисует QPixmap, вписанный в свой размер с сохранением
+    пропорций. Сам перерисовывается при изменении размера — так картинка
+    масштабируется под окно без растяжения. Под прозрачными картинками рисует
+    шахматку, чтобы прозрачность была видна."""
+    def __init__(self, pixmap, parent=None):
+        super().__init__(parent)
+        self._src = pixmap if (pixmap is not None and not pixmap.isNull()) else None
+        self._has_alpha = bool(self._src is not None and self._src.hasAlphaChannel())
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet("background:transparent;")
+        self.setMinimumSize(1, 1)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        if self._src is None:
+            self.setText("Не удалось загрузить изображение")
+            self.setStyleSheet("background:transparent;color:#a6adc8;font-size:14px;")
+
+    def _scaled(self):
+        if self._src is None:
+            return None
+        return self._src.scaled(
+            self.size(), Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation)
+
+    def paintEvent(self, e):
+        if self._src is None:
+            super().paintEvent(e)
+            return
+        pm = self._scaled()
+        if pm is None or pm.isNull():
+            super().paintEvent(e)
+            return
+        dpr = pm.devicePixelRatio() or 1.0
+        w = int(round(pm.width() / dpr)); h = int(round(pm.height() / dpr))
+        x = (self.width() - w) // 2; y = (self.height() - h) // 2
+        p = QPainter(self)
+        if self._has_alpha:
+            _paint_checkerboard(p, QRect(x, y, w, h))
+        p.drawPixmap(QRect(x, y, w, h), pm)
+        p.end()
+
+    def resizeEvent(self, e):
+        self.update()
+        super().resizeEvent(e)
+
+
+class ImageFullscreenViewer(QDialog):
+    """Полноэкранный просмотр одного изображения. Esc или двойной клик — закрыть."""
+    def __init__(self, path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(os.path.basename(path))
+        self.setStyleSheet("QDialog{background:#0e0e16;}")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
+        pix = load_pixmap_any(path, max_dim=4096)
+        lay.addWidget(_ZoomImageLabel(pix, self), 1)
+        _add_close_hint(self, lay)
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        self.close()
+
+
+class _CompareView(QWidget):
+    """Картинка с синхронным зумом (колесо) и панорамированием. Подпись
+    (исходник/результат · формат · размер) рисуется ПОВЕРХ изображения в углу,
+    а не отдельной строкой — так картинки занимают всю площадь панели. Зум/панораму
+    маршрутизируем через owner (диалог), чтобы ОБА вида всегда двигались вместе."""
+
+    def __init__(self, pixmap, caption, owner=None, parent=None):
+        super().__init__(parent)
+        self._src = pixmap if (pixmap is not None and not pixmap.isNull()) else None
+        self._has_alpha = bool(self._src is not None and self._src.hasAlphaChannel())
+        self._caption = caption
+        self._owner = owner             # ImageCompareViewer — синхронизирует виды
+        self._zoom = 1.0
+        self._off = QPointF(0.0, 0.0)   # смещение центра картинки в пикселях экрана
+        self._drag_last = None
+        self.setMinimumSize(1, 1)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMouseTracking(True)
+        self.setStyleSheet("background:#0e0e16;")
+
+    def _fit_scale(self):
+        if self._src is None:
+            return 1.0
+        w = self._src.width(); h = self._src.height()
+        if w <= 0 or h <= 0:
+            return 1.0
+        return min(self.width() / w, self.height() / h)
+
+    def set_view(self, zoom, off):
+        self._zoom = zoom
+        self._off = QPointF(off)
+        self._clamp()
+        self.update()
+
+    def _clamp(self):
+        if self._src is None or self._zoom <= 1.0:
+            self._off = QPointF(0.0, 0.0)
+            return
+        scale = self._fit_scale() * self._zoom
+        dw = self._src.width() * scale
+        dh = self._src.height() * scale
+        max_x = max(0.0, (dw - self.width()) / 2.0)
+        max_y = max(0.0, (dh - self.height()) / 2.0)
+        self._off = QPointF(
+            max(-max_x, min(max_x, self._off.x())),
+            max(-max_y, min(max_y, self._off.y())))
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(14, 14, 22))
+        if self._src is not None:
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            scale = self._fit_scale() * self._zoom
+            dw = self._src.width() * scale
+            dh = self._src.height() * scale
+            x = (self.width() - dw) / 2.0 + self._off.x()
+            y = (self.height() - dh) / 2.0 + self._off.y()
+            # Под прозрачной картинкой — шахматка, чтобы было видно, что
+            # прозрачность сохранена (а не «потеряна» на тёмном фоне окна).
+            if self._has_alpha:
+                _paint_checkerboard(p, QRectF(x, y, dw, dh).toRect())
+            p.drawPixmap(QRectF(x, y, dw, dh), self._src, QRectF(self._src.rect()))
+        else:
+            p.setPen(QColor("#a6adc8"))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter,
+                       "Не удалось загрузить изображение")
+        self._paint_caption(p)
+
+    def _paint_caption(self, p):
+        if not self._caption:
+            return
+        f = p.font(); f.setPointSize(11); f.setBold(True)
+        p.setFont(f)
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(self._caption)
+        th = fm.height()
+        pad = 7
+        rect = QRectF(10, 10, tw + pad * 2, th + pad)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 160))
+        p.drawRoundedRect(rect, 5, 5)
+        p.setPen(QColor("#ffffff"))
+        p.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._caption)
+
+    def _broadcast(self, zoom, off):
+        """Применяет зум/смещение к ОБОИМ видам через owner. Если owner нет —
+        двигаем только себя (запасной вариант)."""
+        if self._owner is not None and hasattr(self._owner, "_apply_view"):
+            self._owner._apply_view(zoom, off)
+        else:
+            self.set_view(zoom, off)
+
+    def wheelEvent(self, e):
+        # Колесо (без модификаторов) зумит ОБА вида одновременно — синхронизацию
+        # делает owner._apply_view. Ctrl не требуется: в полноэкранном сравнении
+        # прокручивать нечего, поэтому колесо = зум.
+        delta = e.angleDelta().y()
+        if delta == 0:
+            return
+        factor = 1.2 if delta > 0 else (1.0 / 1.2)
+        new_zoom = max(1.0, min(8.0, self._zoom * factor))
+        new_off = self._off
+        if self._zoom > 0:
+            r = new_zoom / self._zoom            # зум от центра — масштабируем смещение
+            new_off = QPointF(self._off.x() * r, self._off.y() * r)
+        self._broadcast(new_zoom, new_off)
+        e.accept()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self._zoom > 1.0:
+            self._drag_last = e.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        else:
+            e.ignore()   # без зума — отдаём клик диалогу (двойной клик закрывает)
+
+    def mouseMoveEvent(self, e):
+        if self._drag_last is not None:
+            d = e.position() - self._drag_last
+            self._drag_last = e.position()
+            new_off = QPointF(self._off.x() + d.x(), self._off.y() + d.y())
+            self._broadcast(self._zoom, new_off)   # панорама — тоже на оба вида
+
+    def mouseReleaseEvent(self, e):
+        self._drag_last = None
+        self.unsetCursor()
+
+
+class ImageCompareViewer(QDialog):
+    """Полноэкранное сравнение исходника и результата.
+
+    Ориентация выбирается по форме картинок: вертикальные (портрет) ставим
+    рядом (слева направо), горизонтальные (пейзаж) — стопкой (сверху вниз),
+    чтобы в каждом случае обе картинки оставались максимально крупными.
+    Слева/сверху всегда исходник, справа/снизу — перекодированный файл.
+    Колесо — зум обеих картинок одновременно; перетаскивание — панорама."""
+    def __init__(self, src_path, out_path, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Сравнение: исходник / результат")
+        self.setStyleSheet("QDialog{background:#0e0e16;}")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        src_pix = load_pixmap_any(src_path, max_dim=4096)
+        out_pix = load_pixmap_any(out_path, max_dim=4096)
+
+        def _aspect(p):
+            if p is None or p.isNull() or p.height() <= 0:
+                return 1.0
+            return p.width() / p.height()
+        avg = (_aspect(src_pix) + _aspect(out_pix)) / 2.0
+        # Портрет (avg < 1) → рядом; пейзаж/квадрат → стопкой.
+        side_by_side = avg < 1.0
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0); root.setSpacing(0)
+        body = QHBoxLayout() if side_by_side else QVBoxLayout()
+        # spacing/margins = 0 → между картинками нет тёмной полосы.
+        body.setContentsMargins(0, 0, 0, 0); body.setSpacing(0)
+
+        v_src = _CompareView(src_pix, self._caption("Исходник", src_path), owner=self)
+        v_out = _CompareView(out_pix, self._caption("Результат", out_path), owner=self)
+        self._views = [v_src, v_out]
+        body.addWidget(v_src, 1)
+        body.addWidget(v_out, 1)
+        root.addLayout(body, 1)
+
+        # Кнопка выхода — поверх картинок в правом верхнем углу.
+        self.btn_close = QPushButton(self)
+        self.btn_close.setIcon(get_icon('fa5s.times', '#ffffff'))
+        self.btn_close.setIconSize(QSize(18, 18))
+        self.btn_close.setFixedSize(38, 38)
+        self.btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_close.setToolTip("Выход (Esc)")
+        self.btn_close.setStyleSheet(
+            "QPushButton{background:rgba(24,24,37,190);border:1px solid #45475a;"
+            "border-radius:19px;}"
+            "QPushButton:hover{background:#f38ba8;border-color:#f38ba8;}")
+        self.btn_close.clicked.connect(self.close)
+        self.btn_close.raise_()
+
+    @staticmethod
+    def _caption(title, path):
+        try:
+            size_str = human_size(os.path.getsize(path))
+        except Exception:
+            size_str = ""
+        ext = os.path.splitext(path)[1].lstrip('.').upper() or "—"
+        return f"{title}   ·   {ext}" + (f"   ·   {size_str}" if size_str else "")
+
+    def _apply_view(self, zoom, off):
+        """Единая точка зума/панорамы: применяет одни и те же zoom/off к ОБОИМ
+        видам — поэтому зум одной картинки всегда зумит и вторую. Виды одного
+        размера, поэтому общий off корректен для обоих (set_view сам клампит)."""
+        for v in self._views:
+            v.set_view(zoom, off)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        btn = getattr(self, 'btn_close', None)
+        if btn is not None:
+            btn.move(self.width() - btn.width() - 14, 14)
+            btn.raise_()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.close()
+        else:
+            super().keyPressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        self.close()
+
+
+def _add_close_hint(dlg, layout):
+    """Подсказка-полоска «Esc — закрыть» снизу полноэкранного просмотрщика."""
+    hint = QLabel("Esc или двойной клик — закрыть")
+    hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    hint.setStyleSheet("color:#7f849c;font-size:11px;padding:2px;")
+    layout.addWidget(hint, 0)
+
+
+def _present_fullscreen(dlg, parent=None):
+    """Показывает диалог НА ВЕСЬ экран, перекрывая в том числе панель задач.
+
+    Обычный showFullScreen() у дочернего (parented) QDialog на Windows иногда
+    разворачивается лишь до рабочей области — панель задач остаётся видна, а у
+    правого/нижнего края появляется незакрытая полоса. Поэтому делаем окно
+    безрамочным «поверх всех» и явно выставляем геометрию во весь экран того
+    монитора, где находится родитель."""
+    scr = None
+    try:
+        host = parent.window() if parent is not None else None
+        if host is not None:
+            scr = host.screen()
+    except Exception:
+        scr = None
+    if scr is None:
+        scr = QApplication.primaryScreen()
+    dlg.setWindowFlags(dlg.windowFlags()
+                       | Qt.WindowType.FramelessWindowHint
+                       | Qt.WindowType.WindowStaysOnTopHint)
+    geo = scr.geometry() if scr is not None else None
+    if geo is not None:
+        dlg.setGeometry(geo)
+    dlg.show()
+    if geo is not None:
+        # После show некоторые WM сбрасывают геометрию — выставляем повторно.
+        dlg.setGeometry(geo)
+    dlg.raise_()
+    dlg.activateWindow()
+    return dlg
+
+
+def show_image_fullscreen(path, parent=None):
+    """Открывает одно изображение в полноэкранном просмотрщике."""
+    dlg = ImageFullscreenViewer(path, parent)
+    return _present_fullscreen(dlg, parent)
+
+
+def show_image_compare(src_path, out_path, parent=None):
+    """Открывает сравнение исходника и результата в полноэкранном просмотрщике."""
+    dlg = ImageCompareViewer(src_path, out_path, parent)
+    return _present_fullscreen(dlg, parent)
