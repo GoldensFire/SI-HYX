@@ -775,7 +775,7 @@ class MediaTab(QWidget):
         ga = QGroupBox("Аудио эффекты"); fa = QFormLayout()
         self.ck_norm = QCheckBox("Loudnorm"); self.ck_norm.setChecked(True)
         self.s_tgt = QDoubleSpinBox(); self.s_tgt.setValue(-20.0); self.s_tgt.setRange(-60.0, 20.0); self.s_tgt.setSingleStep(0.1)
-        self.s_lra = QDoubleSpinBox(); self.s_lra.setValue(20.0); self.s_lra.setRange(0.0, 50.0); self.s_lra.setSingleStep(0.1)
+        self.s_lra = QDoubleSpinBox(); self.s_lra.setValue(11.0); self.s_lra.setRange(0.0, 50.0); self.s_lra.setSingleStep(0.1)
         self.s_tp = QDoubleSpinBox(); self.s_tp.setValue(-1.5); self.s_tp.setRange(-60.0, 10.0); self.s_tp.setSingleStep(0.1)
         self.ck_fade = QCheckBox("Затухание (Fade Out)"); self.ck_fade.setChecked(False)
         self.s_fade = QDoubleSpinBox(); self.s_fade.setValue(1.0); self.s_fade.setRange(0.0, 60.0); self.s_fade.setSingleStep(0.1)

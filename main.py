@@ -343,7 +343,7 @@ class UnifiedWindow(QMainWindow):
             m = s.get("media", {}); a = m.get("audio", {})
             tm.ck_norm.setChecked(a.get("norm", True))
             tm.s_tgt.setValue(a.get("tgt", -20.0))
-            tm.s_lra.setValue(a.get("lra", 20.0))
+            tm.s_lra.setValue(a.get("lra", 11.0))
             tm.s_tp.setValue(a.get("tp", -1.5))
             tm.ck_fade.setChecked(a.get("fade", False))
             tm.s_fade.setValue(a.get("fade_d", 1.0))

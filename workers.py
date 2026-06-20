@@ -1015,7 +1015,7 @@ class ProcessWorker(QThread):
         audio_filters = []
         if sa.get('norm'):
             tgt_i = float(sa.get('tgt', -20.0))
-            lra = float(sa.get('lra', 20.0))
+            lra = float(sa.get('lra', 11.0))
             tp = float(sa.get('tp', -1.5))
             audio_filters.append(f"loudnorm=I={tgt_i}:LRA={lra}:TP={tp}")
         if sa.get('fade_in'):

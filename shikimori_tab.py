@@ -26,7 +26,7 @@ import time
 import webbrowser
 
 from PyQt6.QtCore import Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QSize, QRect
-from PyQt6.QtGui import QColor, QIcon, QPixmap
+from PyQt6.QtGui import QColor, QIcon, QPixmap, QValidator
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget,
@@ -55,6 +55,27 @@ try:
 except Exception as _e:  # pragma: no cover
     _HAS_API = False
     _IMPORT_ERROR = str(_e)
+
+
+class ClearableDoubleSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox, который МОЖНО очистить с клавиатуры (Backspace/Delete).
+
+    Обычный QDoubleSpinBox при стирании всего текста считает пустую строку
+    «промежуточной» (Intermediate) и при потере фокуса откатывается к прежнему
+    значению — поэтому очистить поле не получается. Здесь пустой ввод трактуется
+    как минимум диапазона: при заданном setSpecialValueText() поле показывает
+    спецтекст (например «любая»), то есть фильтр сбрасывается.
+    """
+
+    def validate(self, text, pos):  # type: ignore[override]
+        if text.strip() == "":
+            return (QValidator.State.Acceptable, text, pos)
+        return super().validate(text, pos)
+
+    def valueFromText(self, text):  # type: ignore[override]
+        if text.strip() == "":
+            return self.minimum()
+        return super().valueFromText(text)
 
 
 # Палитра (Catppuccin Mocha) — локальная копия, чтобы не тянуть QtMultimedia из
@@ -483,13 +504,17 @@ class ShikimoriTab(QWidget):
         filt.setHorizontalSpacing(8)
         filt.setVerticalSpacing(8)
 
-        self.sp_score_min = QDoubleSpinBox()
+        self.sp_score_min = ClearableDoubleSpinBox()
         self.sp_score_min.setRange(0.0, 10.0); self.sp_score_min.setSingleStep(0.5)
         self.sp_score_min.setDecimals(1)
         self.sp_score_min.setSpecialValueText("любая")
-        self.sp_score_max = QDoubleSpinBox()
+        self.sp_score_max = ClearableDoubleSpinBox()
         self.sp_score_max.setRange(0.0, 10.0); self.sp_score_max.setSingleStep(0.5)
-        self.sp_score_max.setDecimals(1); self.sp_score_max.setValue(10.0)
+        self.sp_score_max.setDecimals(1)
+        # Минимум (0) показываем как «любая» = без верхней границы; так очистка
+        # поля Backspace'ом осмысленна (сброс фильтра, а не «оценка ≤ 0»).
+        self.sp_score_max.setSpecialValueText("любая")
+        self.sp_score_max.setValue(10.0)
 
         self.cb_kind = QComboBox()
         self.cb_status = QComboBox()
@@ -675,7 +700,7 @@ class ShikimoriTab(QWidget):
             status=self.cb_status.currentData() or "",
             order=server_order,
             score_min=(smin if smin > 0 else None),
-            score_max=(smax if smax < 10.0 else None),
+            score_max=(smax if 0 < smax < 10.0 else None),
             year_from=(yf if yf > 0 else None),
             year_to=(yt if yt > 0 else None),
             episodes_min=(epmin if epmin > 0 else None),
