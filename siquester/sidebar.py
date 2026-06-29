@@ -96,7 +96,11 @@ class Sidebar(QWidget):
     def __init__(self,parent=None):
         super().__init__(parent)
         self.setMinimumWidth(0); self.setMaximumWidth(248)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        # НЕ ставим WA_OpaquePaintEvent: это «обещание» закрасить каждый пиксель,
+        # но прозрачные внутренние области (pane QTabWidget, угловой «+») его не
+        # выполняли — и при переключении вкладок SI-HYX там оставались СТАРЫЕ
+        # пиксели соседней вкладки (карточка аниме из ShikimoriHYX рядом с «Все»).
+        # Без этого флага Qt перерисовывает фон сайдбара каждый раз — артефакта нет.
         self.setAttribute(Qt.WidgetAttribute.WA_PendingMoveEvent, False)
         self.setStyleSheet("background:#11111b;border-right:1px solid #313244;")
         # Clip children so they don't paint outside our bounds during animation
@@ -112,13 +116,19 @@ class Sidebar(QWidget):
             mode=[SORT_COMPLETION,SORT_TRIES,SORT_RIGHT][len(self._sort_btns)]
             sb.clicked.connect(lambda _,m=mode: self._on_sort(m)); hl.addWidget(sb); self._sort_btns.append(sb)
         lay.addWidget(hdr)
-        self.tab_widget=QTabWidget(); self.tab_widget.tabBarDoubleClicked.connect(self._rename_tab)
+        self.tab_widget=QTabWidget()
+        # Непрозрачный фон панели вкладок сайдбара — иначе сквозь прозрачный pane
+        # просвечивали старые пиксели соседней вкладки SI-HYX (см. коммент выше).
+        self.tab_widget.setStyleSheet("QTabWidget::pane{background:#11111b;border:none;}")
+        self.tab_widget.tabBarDoubleClicked.connect(self._rename_tab)
         self.tab_widget.setCornerWidget(self._corner()); self.tab_widget.currentChanged.connect(lambda _: self.rebuild(self._datasets))
         lay.addWidget(self.tab_widget,stretch=1)
         self._rebuild_tabs()
 
     def _corner(self):
-        w=QWidget(); w.setStyleSheet(_SS_TRANSPARENT)
+        # Угловой виджет с «+» — непрозрачный фон (#11111b), иначе в его области
+        # (справа от «Все») оставались старые пиксели соседней вкладки SI-HYX.
+        w=QWidget(); w.setStyleSheet("background:#11111b;")
         lay=QHBoxLayout(w); lay.setContentsMargins(2,0,4,0)
         btn=AnimatedButton("＋"); btn.setObjectName("btn_tab_add"); btn.setFixedSize(22,22); btn.clicked.connect(self._add_tab); lay.addWidget(btn); return w
 

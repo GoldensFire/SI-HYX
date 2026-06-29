@@ -10,6 +10,143 @@
 from config import *
 from utils import *
 from utils import _cookie_matches_domain, _RE_DIGITS
+import re as _re_eta
+
+
+# Регэксп кадра из stderr ffmpeg ("frame=  123 fps= 45 ...").
+_RE_FFMPEG_FRAME = _re_eta.compile(r"frame=\s*(\d+)")
+
+
+class RealETACalculator:
+    """Адаптивный расчёт оставшегося времени кодирования «на лету».
+
+    Не привязан к мощности ЦП и настройкам кодека: скорость измеряется
+    скользящим окном последних `window_sec` секунд (collections.deque), поэтому
+    оценка реагирует на скачки FPS из-за сложных/простых сцен, смены пресета или
+    другого железа без инерции от начала видео.
+
+    Pass 1 (по кадрам):
+        fps   = Δкадров / Δвремени   (в окне)
+        ETA   = (всего − кадр) / fps
+        Если за этим проходом следует ещё один (has_second_pass=True), к остатку
+        добавляется прогноз второго прохода: всего / (fps / pass2_weight_coefficient),
+        т.к. второй проход обычно тяжелее (по умолчанию ×3.0).
+
+    Pass 2 (адаптивно под контент):
+        читает лог первого прохода и строит кумулятивную карту сложности 0..1.
+        В окне считается скорость прохождения СЛОЖНОСТИ в секунду, а не кадров:
+        ETA = (1.0 − текущая_доля_сложности) / скорость_сложности.
+
+    Потокобезопасен (внутренний Lock). Вся арифметика O(размер окна) —
+    выполняется в рабочем потоке ffmpeg, GUI не трогает, микрофризов не даёт.
+    """
+
+    # Гибкий парсер веса кадра: ловит tex/texture/complexity/bits/weight = N.
+    _WEIGHT_RE = _re_eta.compile(
+        r"(?:tex|texture|complexity|bits?|wt|weight)\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)",
+        _re_eta.IGNORECASE,
+    )
+
+    def __init__(self, total_frames, pass_num=1, pass2_weight_coefficient=3.0,
+                 has_second_pass=False, passlog_path=None, window_sec=15.0):
+        self.total_frames = max(1, int(total_frames or 0))
+        self.pass_num = int(pass_num)
+        self.coef = max(1.0, float(pass2_weight_coefficient))
+        self.has_second_pass = bool(has_second_pass)
+        self.window_sec = float(window_sec)
+        self._lock = threading.Lock()
+        self._win = deque()          # (t, x): x = кадр (P1) либо доля сложности (P2)
+        self._cum = None             # кумулятивная карта сложности 0..1 по кадрам
+        if self.pass_num == 2 and passlog_path:
+            self._cum = self._load_complexity_map(passlog_path)
+
+    # ── публичный API ───────────────────────────────────────────────────────
+    def update(self, frame_idx, now=None):
+        """Скормить номер текущего кадра. Возвращает ETA в секундах (float)
+        или None, если данных в окне ещё мало для оценки."""
+        now = time.time() if now is None else now
+        with self._lock:
+            if self.pass_num == 2 and self._cum:
+                x = self._frame_complexity(frame_idx)
+            else:
+                x = float(min(int(frame_idx), self.total_frames))
+            self._win.append((now, x))
+            # Выкидываем сэмплы старше окна, но всегда оставляем минимум два
+            # (нужны для разности Δ).
+            while len(self._win) > 2 and (now - self._win[0][0]) > self.window_sec:
+                self._win.popleft()
+            return self._eta(now)
+
+    # ── внутреннее ──────────────────────────────────────────────────────────
+    def _eta(self, now):
+        if len(self._win) < 2:
+            return None
+        t0, x0 = self._win[0]
+        t1, x1 = self._win[-1]
+        dt = t1 - t0
+        dx = x1 - x0
+        if dt <= 0.0 or dx <= 0.0:
+            return None
+        if self.pass_num == 2 and self._cum:
+            rate = dx / dt                       # доля сложности в секунду
+            return max(0.0, (1.0 - x1) / rate)
+        fps = dx / dt
+        remaining = max(0, self.total_frames - x1)
+        eta = remaining / fps
+        if self.has_second_pass:
+            eta += self.total_frames / (fps / self.coef)
+        return eta
+
+    def _load_complexity_map(self, path):
+        """Строит кумулятивную (0..1) карту сложности из лога первого прохода.
+
+        Путь определяется динамически: ffmpeg-двухпроходный лог обычно лежит как
+        `<passlogfile>-0.log`, поэтому пробуем и сам путь, и типовые суффиксы."""
+        candidates = []
+        if path and os.path.isfile(path):
+            candidates.append(path)
+        for suff in ("-0.log", ".log", "-0.log.temp"):
+            c = (path or "") + suff
+            if os.path.isfile(c):
+                candidates.append(c)
+        weights = []
+        for c in candidates:
+            try:
+                with open(c, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        m = self._WEIGHT_RE.search(line)
+                        if m:
+                            weights.append(float(m.group(1)))
+            except Exception:
+                continue
+            if weights:
+                break
+        if not weights:
+            return None
+        total = sum(weights) or 1.0
+        cum, acc = [], 0.0
+        for w in weights:
+            acc += w
+            cum.append(acc / total)
+        return cum
+
+    def _frame_complexity(self, frame_idx):
+        """Доля накопленной сложности к данному кадру (0..1). Длина карты может
+        не совпадать с total_frames — масштабируем пропорционально."""
+        n = len(self._cum)
+        if n == 0:
+            return 0.0
+        i = int(int(frame_idx) / self.total_frames * n) if self.total_frames else 0
+        i = min(max(i, 0), n - 1)
+        return self._cum[i]
+
+    @staticmethod
+    def fmt(eta_sec):
+        """Секунды → HH:MM:SS (или '...' если оценки ещё нет)."""
+        if eta_sec is None:
+            return "..."
+        rem = max(0, int(eta_sec))
+        return f"{rem // 3600:02}:{(rem % 3600) // 60:02}:{rem % 60:02}"
 
 
 class InfoWorker(QThread):
@@ -912,7 +1049,7 @@ class ProcessWorker(QThread):
             return "yuva420p10le" if ten_bit else "yuva420p"
         return "yuv420p10le" if ten_bit else "yuv420p"
 
-    def run_ffmpeg_capture(self, cmd, total_est_sec, percent_callback, label=None):
+    def run_ffmpeg_capture(self, cmd, total_est_sec, percent_callback, label=None, eta_calc=None):
         si = subprocess.STARTUPINFO() if IS_WIN else None
         if IS_WIN and si is not None: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         buf = deque(maxlen=8000)
@@ -922,6 +1059,10 @@ class ProcessWorker(QThread):
             raise Exception(f"Не удалось запустить ffmpeg: {e}")
         start = time.time()
         last_pct = -1
+        last_eta = None          # последнее посчитанное ETA (с)
+        last_emit_t = 0.0        # когда последний раз слали колбэк
+        last_frame = None        # последний разобранный номер кадра ffmpeg
+        total_frames = getattr(eta_calc, 'total_frames', 0) if eta_calc is not None else 0
         try:
             while True:
                 if self.stop_flag:
@@ -934,18 +1075,66 @@ class ProcessWorker(QThread):
                     raise Exception("StoppedByUser")
                 line = p.stderr.readline()
                 if line: buf.append(line)
-                elapsed = time.time() - start
-                pct = int(min(99, (elapsed / total_est_sec) * 99)) if total_est_sec and total_est_sec > 0 else int(min(98, elapsed * 15))
-                # Шлём колбэк только при смене целого процента — не флудим сигналами
-                if pct != last_pct:
-                    last_pct = pct
-                    try:
-                        percent_callback(pct, label)
-                    except Exception:
+                now = time.time()
+                elapsed = now - start
+                # ── Реальное ETA + кадр: вытаскиваем текущий кадр из строки ffmpeg
+                #    и скармливаем адаптивному калькулятору (если он передан). Вся
+                #    математика — здесь, в потоке ffmpeg; GUI не трогаем. ───────
+                if eta_calc is not None and line:
+                    m = _RE_FFMPEG_FRAME.search(line)
+                    if m:
+                        last_frame = int(m.group(1))
                         try:
-                            percent_callback(pct)
+                            val = eta_calc.update(last_frame)
+                            if val is not None:
+                                last_eta = val
                         except Exception:
                             pass
+                # ── Прогресс-бар ──────────────────────────────────────────────
+                # Временная формула (fallback): чисто по времени. Точна ровно
+                # настолько, насколько точен est, — для медленных пресетов упирается
+                # в 99% почти мгновенно.
+                pct_time = int(min(99, (elapsed / total_est_sec) * 99)) if total_est_sec and total_est_sec > 0 else int(min(98, elapsed * 15))
+                if total_frames > 0:
+                    # Калькулятор активен → ведём полосу по РЕАЛЬНОМУ прогрессу
+                    # кадров (frame/всего). Честно отражает медленные пресеты.
+                    if last_frame is not None:
+                        pct = int(min(99, last_frame / total_frames * 99))
+                    else:
+                        # Кадров ещё нет (SVT-AV1 буферизует look-ahead) — лёгкий
+                        # «прогрев», но НЕ даём временной формуле улететь в 99 и
+                        # потом прыгнуть вниз при первом кадре.
+                        pct = min(2, pct_time)
+                else:
+                    pct = pct_time
+                # Монотонность: полоса не едет назад (на стыке прогрев→кадры и при
+                # буферизации SVT-AV1, когда frame замирает).
+                if pct < last_pct and last_pct >= 0:
+                    pct = last_pct
+                # Колбэк шлём: (а) при смене целого процента ИЛИ (б) раз в ~1 с,
+                # пока есть реальное ETA. Без (б) ETA «замерзал», когда бар упирался
+                # в 99% (заниженный est) и pct переставал меняться. Это развязывает
+                # обновление ETA от движения полосы прогресса.
+                pct_changed = (pct != last_pct)
+                eta_tick = (eta_calc is not None and last_eta is not None
+                            and (now - last_emit_t) >= 1.0)
+                if pct_changed or eta_tick:
+                    if pct_changed: last_pct = pct
+                    last_emit_t = now
+                    eta_sec = last_eta if eta_calc is not None else None
+                    try:
+                        percent_callback(pct, label, eta_sec)
+                    except TypeError:
+                        # Обратная совместимость со старыми колбэками (без eta_sec).
+                        try:
+                            percent_callback(pct, label)
+                        except Exception:
+                            try:
+                                percent_callback(pct)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 if not line and p.poll() is not None: break
         except Exception:
             try: p.kill()
@@ -954,6 +1143,34 @@ class ProcessWorker(QThread):
         if p.returncode != 0:
             stderr_tail = ''.join(buf)
             raise subprocess.CalledProcessError(p.returncode, cmd, output=None, stderr=stderr_tail)
+
+    def _estimate_total_frames(self, src_path, speed_factor, cmd):
+        """Оценка числа ВЫХОДНЫХ кадров видео для знаменателя ETA.
+        Учитывает изменение скорости (setpts) и принудительный -r из cmd.
+        Возвращает 0, если оценить не удалось (тогда ETA-калькулятор не создаётся
+        и работает старая оценка по доле прогресса)."""
+        try:
+            dur = 0.0
+            try: dur, *_ = get_media_info(src_path)
+            except Exception: dur = 0.0
+            if not dur or dur <= 0:
+                return 0
+            sf = speed_factor if speed_factor and speed_factor > 0 else 1.0
+            out_dur = dur / sf
+            # Принудительный fps (-r N) перекрывает исходный.
+            out_fps = 0.0
+            try:
+                if "-r" in cmd:
+                    out_fps = float(cmd[cmd.index("-r") + 1])
+            except Exception:
+                out_fps = 0.0
+            if out_fps <= 0:
+                out_fps = get_fps_float(src_path) or 0.0
+            if out_fps <= 0:
+                return 0
+            return max(1, int(out_dur * out_fps))
+        except Exception:
+            return 0
 
     def get_target_bitrate_str(self, path, sel_val):
         if str(sel_val).lower() == 'auto':
@@ -1255,7 +1472,10 @@ class ProcessWorker(QThread):
                     cmd_dark += ["-threads", "0"] + step2_audio + dur_cap + [attempted_out]
 
                     self.log.emit("🌑 Тёмные сцены: кодирование (AV1 10-бит, CRF)...")
-                    self.run_ffmpeg_capture(cmd_dark, est, cb, label="AV1 кодирование (тёмные сцены)")
+                    # Адаптивное ETA по окну FPS (один проход CRF → has_second_pass=False).
+                    _tf = self._estimate_total_frames(current_input, speed_factor, cmd_dark)
+                    _calc = RealETACalculator(_tf, pass_num=1, has_second_pass=False) if _tf > 0 else None
+                    self.run_ffmpeg_capture(cmd_dark, est, cb, label="AV1 кодирование (тёмные сцены)", eta_calc=_calc)
 
                 else:
                     # Стандартный профиль
@@ -1284,7 +1504,10 @@ class ProcessWorker(QThread):
                     cmd_step2 += ["-threads", "0"] + step2_audio + dur_cap + [attempted_out]
 
                     est = max(1, int(os.path.getsize(current_input)/400000)) if os.path.exists(current_input) else 10
-                    self.run_ffmpeg_capture(cmd_step2, est, cb, label="Pass 2 (Video)")
+                    # Адаптивное ETA по скользящему окну FPS (одно-проходный CRF).
+                    _tf = self._estimate_total_frames(current_input, speed_factor, cmd_step2)
+                    _calc = RealETACalculator(_tf, pass_num=1, has_second_pass=False) if _tf > 0 else None
+                    self.run_ffmpeg_capture(cmd_step2, est, cb, label="Pass 2 (Video)", eta_calc=_calc)
 
             else:
                 if current_input != path:
@@ -1942,7 +2165,7 @@ class ProcessWorker(QThread):
         # чтобы быстрый Pass 1 не занижал оценку и ETA во время Pass 2 не «росла».
         eta_anchor = [start, 0.0]
 
-        def item_prog(pct, pass_label=None):
+        def item_prog(pct, pass_label=None, eta_sec=None):
             try:
                 if not smooth:
                     # Параллельная обработка изображений: НЕ шлём частые % -сигналы
@@ -1975,9 +2198,14 @@ class ProcessWorker(QThread):
                     eta_anchor[1] = fraction
                 gl_pct = int(min(100, fraction * 100))
                 label = pass_label if pass_label else "Processing"
-                self.global_progress.emit(
-                    gl_pct,
-                    f"{label} ETA: {self._fmt_eta_rate(fraction, eta_anchor[0], eta_anchor[1])}")
+                # Если активный шаг дал реальное ETA (адаптивный калькулятор по
+                # кадрам/сложности) — показываем его; иначе старая оценка по доле
+                # глобального прогресса (для шагов без покадрового парсинга).
+                if eta_sec is not None:
+                    eta_str = RealETACalculator.fmt(eta_sec)
+                else:
+                    eta_str = self._fmt_eta_rate(fraction, eta_anchor[0], eta_anchor[1])
+                self.global_progress.emit(gl_pct, f"{label} ETA: {eta_str}")
             except Exception:
                 pass
 
@@ -2023,28 +2251,26 @@ class ProcessWorker(QThread):
 
         cpu = max(1, cpu_thread_count())
 
-        # Обрабатываем очередь проходами: после каждого снова заглядываем в живой
-        # список self.queue. Файлы, доброшенные во время обработки, подхватываются
-        # следующим проходом — кодируем, пока очередь не опустеет.
+        # Обрабатываем очередь по схеме «продюсер-потребитель»: постоянно
+        # заглядываем в живой список self.queue, поэтому файлы, доброшенные во
+        # время обработки, тут же уходят в работу. Картинки кодируются параллельно
+        # в ОБЩЕМ пуле (cpu потоков) и НЕ блокируют диспетчеризацию через
+        # waitForDone — доброшенные картинки сразу занимают свободные потоки
+        # (просьба пользователя), не дожидаясь конца текущей пачки.
         while not self.stop_flag:
-            batch = [it for it in list(self.queue)
-                     if not it.get('is_done', False)
-                     and it.get('iid') not in self._processed_ids]
-            if not batch:
-                break
-            for it in batch:
-                self._processed_ids.add(it.get('iid'))
-
-            # Видео/аудио — по одному: каждый файл сам грузит все ядра кодеком (SVT-AV1).
-            # Изображения — параллельно по числу ядер через QThreadPool: одиночный кадр
-            # CPU не насыщает, а потоки Qt безопасны для сигналов и корректно очищаются.
-            images = [it for it in batch if it.get('type') == 'IMG']
-            others = [it for it in batch if it.get('type') != 'IMG']
+            pending = [it for it in list(self.queue)
+                       if not it.get('is_done', False)
+                       and it.get('iid') not in self._processed_ids]
+            images = [it for it in pending if it.get('type') == 'IMG']
+            others = [it for it in pending if it.get('type') != 'IMG']
 
             # Видео/аудио идут по одному файлу, но кодировщик SVT-AV1 сам нагружает
-            # ВСЕ логические ядра ЦП. Поэтому счётчик показывает занятые потоки ЦП
-            # (а не «1 файл»), иначе создаётся ложное впечатление загрузки в 1 поток.
+            # ВСЕ логические ядра ЦП → счётчик показывает занятые потоки ЦП. Перед
+            # видео дожидаемся ранее запущенных картинок, иначе они дрались бы за ЦП.
             if others:
+                if (self._img_pool is not None
+                        and self._img_pool.activeThreadCount() > 0):
+                    self._img_pool.waitForDone()
                 self._max_threads = cpu
                 if not self._logged_cpu_msg:
                     self.log.emit("Кодирование видео/аудио: SVT-AV1.")
@@ -2052,29 +2278,41 @@ class ProcessWorker(QThread):
                 for it in others:
                     if self.stop_flag:
                         break
+                    self._processed_ids.add(it.get('iid'))
                     self._process_item(it, True, start, weight=cpu)
+                continue
 
-            if images and not self.stop_flag:
-                nworkers = min(len(images), cpu)
-                # Знаменатель счётчика — всегда ВСЕ логические потоки ЦП машины (cpu),
-                # а не число воркеров. Иначе при 6 картинках показывалось «2/6» (хотя
-                # потоков 12), а в конце — «0/12»: знаменатель менялся и сбивал с толку.
-                # Теперь это честно «занято/всего», напр. 6 картинок = до «6/12».
-                self._max_threads = cpu
-                if nworkers > 1:
-                    self.log.emit(f"Параллельная обработка изображений: {nworkers} потоков")
+            if images:
+                # Одиночный кадр CPU не насыщает → шлём картинки в общий пул на cpu
+                # потоков. Знаменатель счётчика — всегда ВСЕ логические потоки ЦП
+                # машины (cpu), чтобы «занято/всего» не скакало по ходу обработки.
+                if self._img_pool is None:
                     self._img_pool = QThreadPool()
-                    self._img_pool.setMaxThreadCount(nworkers)
-                    for itm in images:
-                        if self.stop_flag:
-                            break
-                        self._img_pool.start(_ImgRunnable(self, itm, start))
-                    self._img_pool.waitForDone()
-                else:
-                    for it in images:
-                        if self.stop_flag:
-                            break
-                        self._process_item(it, True, start)
+                    self._img_pool.setMaxThreadCount(cpu)
+                    if cpu > 1:
+                        self.log.emit(
+                            f"Параллельная обработка изображений: до {cpu} потоков")
+                self._max_threads = cpu
+                for itm in images:
+                    if self.stop_flag:
+                        break
+                    self._processed_ids.add(itm.get('iid'))
+                    self._img_pool.start(_ImgRunnable(self, itm, start))
+                # НЕ ждём waitForDone — короткая пауза, чтобы подхватить доброшенные
+                # файлы и занять ими свободные потоки, не крутя цикл вхолостую.
+                time.sleep(0.08)
+                continue
+
+            # Новых задач нет. Если картинки ещё кодируются — ждём и снова
+            # перечитываем очередь (вдруг доросли новые); иначе очередь пуста.
+            if (self._img_pool is not None
+                    and self._img_pool.activeThreadCount() > 0):
+                time.sleep(0.1)
+                continue
+            break
+
+        if self._img_pool is not None:
+            self._img_pool.waitForDone()
 
         self.active_threads.emit(0, 0)
         self.finished_all.emit()

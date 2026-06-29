@@ -13,3 +13,13 @@ requests
 soundfile
 numpy
 lxml
+
+# Подвкладка «Фото → Удаление объектов/фона» (LaMa, RMBG-2.0). Без них приложение
+# работает, но подвкладка покажет заглушку.
+# ускорение на видеокарте (удаление объектов и фона идёт в РАЗЫ быстрее):
+#   • NVIDIA:                    pip uninstall onnxruntime && pip install onnxruntime-gpu
+#   • ЛЮБАЯ видеокарта (Windows): pip uninstall onnxruntime && pip install onnxruntime-directml
+# Код сам подхватит GPU (CUDA → DirectML → CPU); ставить можно ТОЛЬКО ОДИН пакет
+# onnxruntime* (они конфликтуют). Без GPU-пакета считается на CPU.
+opencv-python
+onnxruntime

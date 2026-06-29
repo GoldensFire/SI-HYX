@@ -30,10 +30,13 @@ def _safe_replace(tmp: str, dst: str) -> None:
     Raises the last error only if even the overwrite copy fails (target truly
     locked for writing); the caller logs it and removes *tmp*.
     """
-    try:
-        os.chmod(dst, _stat.S_IWRITE | _stat.S_IREAD)
-    except OSError:
-        pass
+    def _clear_readonly():
+        try:
+            os.chmod(dst, _stat.S_IWRITE | _stat.S_IREAD)
+        except OSError:
+            pass
+
+    _clear_readonly()
 
     last_err: OSError | None = None
     for _attempt in range(5):
@@ -45,11 +48,32 @@ def _safe_replace(tmp: str, dst: str) -> None:
             _time.sleep(0.2 * (_attempt + 1))
 
     # Atomic replace impossible — fall back to overwriting the file in place.
-    _shutil.copyfile(tmp, dst)
+    # An overwrite only needs write access to the *existing* file, not the right
+    # to delete its directory entry, so it beats a lingering shared read handle
+    # or Controlled-Folder-Access that blocks the rename. The lock is still
+    # often transient (OneDrive/AV/indexer), so retry this fallback too, clearing
+    # the read-only bit before every attempt and backing off between tries.
+    for _attempt in range(5):
+        try:
+            _clear_readonly()
+            _shutil.copyfile(tmp, dst)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return
+        except OSError as _e:
+            last_err = _e
+            _time.sleep(0.3 * (_attempt + 1))
+
+    # Truly locked for writing — leave the original file untouched and let the
+    # caller surface an actionable message. (copyfile only ever raised before
+    # opening dst for write here, so dst is still the intact previous version.)
     try:
         os.remove(tmp)
     except OSError:
         pass
+    raise last_err if last_err is not None else OSError(f"could not replace {dst}")
 
 
 class SiqPackage:

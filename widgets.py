@@ -9,7 +9,7 @@
 # widgets.py — кастомные виджеты, делегаты, превью, info-подсказки
 from config import *
 from utils import *
-from PyQt6.QtWidgets import QSizePolicy
+from PyQt6.QtWidgets import QSizePolicy, QAbstractButton
 
 
 class SmallIconDelegate(QStyledItemDelegate):
@@ -149,6 +149,10 @@ class PreviewNameDelegate(StatusColorDelegate):
         text_h = (fm.height() + 2) if name else 0
 
         icon = index.data(Qt.ItemDataRole.DecorationRole)
+        # Аудио (нет видеоряда → нет превью): не резервируем место под картинку,
+        # имя рисуем по центру компактной строки.
+        audio_only = bool(index.data(ITEM_AUDIO_ROLE))
+        has_icon = isinstance(icon, QIcon) and not icon.isNull()
         icon_h = max(0, rect.height() - 2 * pad - text_h)
         # Низ картинки — чтобы подпись шла сразу под ней (без большого зазора).
         img_bottom = rect.top() + pad
@@ -169,8 +173,12 @@ class PreviewNameDelegate(StatusColorDelegate):
                 img_bottom = y + h
 
         if name:
-            # Подпись — сразу под картинкой (не приклеена ко дну ячейки).
-            ty = min(img_bottom + 2, rect.bottom() - text_h - pad)
+            # Аудио без превью — имя по центру строки; иначе сразу под картинкой.
+            if audio_only and not has_icon:
+                ty = rect.top() + (rect.height() - text_h) // 2
+            else:
+                # Подпись — сразу под картинкой (не приклеена ко дну ячейки).
+                ty = min(img_bottom + 2, rect.bottom() - text_h - pad)
             avail = rect.width() - 2 * pad
             fits = fm.horizontalAdvance(name) <= avail
             painter.setPen(self._NAME_COLOR)
@@ -231,7 +239,12 @@ class PreviewNameDelegate(StatusColorDelegate):
 
     def sizeHint(self, option, index):
         s = super().sizeHint(option, index)
-        extra = option.fontMetrics.height() + 2 + 8  # строка имени + отступы
+        line = option.fontMetrics.height() + 2
+        # Аудио без превью — компактная строка (только имя + отступы), без
+        # резерва 90px под миниатюру: «зелёная полоса» результата не раздувается.
+        if bool(index.data(ITEM_AUDIO_ROLE)):
+            return QSize(s.width(), line + 10)
+        extra = line + 8  # строка имени + отступы
         return QSize(s.width(), max(s.height(), 90) + extra)
 
 
@@ -337,6 +350,11 @@ class _InfoTipPopup(QLabel):
             "border-radius:6px;padding:6px 8px;font-size:12px;}")
 
     def show_for(self, badge, text):
+        # Уже показываем ровно эту подсказку — не дёргаем show()/move() повторно.
+        # При перестроении виджетов под курсором (списки/плитки) ToolTip-события
+        # повторяются с тем же текстом; без этой проверки попап моргал.
+        if self.isVisible() and self.text() == text:
+            return
         self.setText(text)
         self.adjustSize()
         # Ниже-правее значка — курсор на значке не попадёт на попап (иначе цикл).
@@ -381,6 +399,15 @@ class HoverTipManager(QObject):
     def eventFilter(self, obj, ev):
         try:
             et = ev.type()
+            # Курсор-«рука» на ЛЮБОЙ кнопке при наведении (как в вебе): большинство
+            # кнопок в проге не задавали курсор явно и оставались со стрелкой — теперь
+            # везде единообразно. Ставим только если у кнопки ДЕФОЛТНЫЙ курсор-стрелка
+            # (не перетираем кастомные SizeAll/OpenHand у drag-кнопок) и она активна.
+            if et == QEvent.Type.Enter and isinstance(obj, QAbstractButton):
+                if (obj.isEnabled()
+                        and obj.cursor().shape() == Qt.CursorShape.ArrowCursor):
+                    obj.setCursor(Qt.CursorShape.PointingHandCursor)
+                return False
             if et == QEvent.Type.ToolTip:
                 tip = obj.toolTip() if isinstance(obj, QWidget) else ""
                 if tip:
@@ -388,9 +415,16 @@ class HoverTipManager(QObject):
                     return True  # подавляем системный QToolTip (источник мерцания)
                 # Пустая подсказка (напр. значок ⓘ управляет попапом сам) — не трогаем.
                 return False
+            # ВАЖНО: НЕ прячем попап по QEvent.Hide любого виджета. Этот фильтр
+            # стоит на ВСЁМ приложении, и Hide прилетает от каждого скрывающегося
+            # виджета — при активной перестройке UI (напр. вкладка SiQuesterHYX
+            # пересобирает списки/плитки) Hide сыпется пачками, попап моргал:
+            # show(ToolTip)→hide(Hide)→show(ToolTip)→… — это и есть «мерцающее
+            # окошко, которое появляется и исчезает». Скрытие виджета под курсором
+            # и так доставляет Leave, поэтому подсказка корректно убирается и без
+            # реакции на Hide.
             if et in (QEvent.Type.Leave, QEvent.Type.MouseButtonPress,
-                      QEvent.Type.Wheel, QEvent.Type.Hide,
-                      QEvent.Type.WindowDeactivate):
+                      QEvent.Type.Wheel, QEvent.Type.WindowDeactivate):
                 _InfoTipPopup.instance().hide()
         except Exception:
             pass
@@ -693,9 +727,16 @@ class RecentFileThumb(QWidget):
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         self.setToolTip(path)
         self._drag_start = None
+        self._selected = False      # выделена ли карточка (ЛКМ / Shift / Ctrl)
         self._thumb_attempts = 0
         self._last_seen_size = -1   # для дозаписываемых файлов (Filmora и пр.)
         self._has_thumb = False     # получена ли настоящая миниатюра
+        # Состояние файла (размер/mtime), которому соответствует ТЕКУЩАЯ миниатюра.
+        # Если файл по тому же пути перезапишут (напр. «…_обрез.mp4» переэкспортируют
+        # перекодировкой — он станет короче/легче), эти значения разойдутся с
+        # фактическими и карточка перегенерирует превью/размер/длительность.
+        self._content_mtime = -1.0
+        self._content_size = -1
 
         ext = os.path.splitext(path)[1].lower()
         is_img   = ext in RIBBON_IMG
@@ -750,13 +791,56 @@ class RecentFileThumb(QWidget):
         # Прозрачная рамка 1px уже в обычном состоянии: при наведении меняется
         # только ЦВЕТ рамки, а не геометрия. Иначе добавление рамки на :hover
         # сдвигало содержимое на 1px → переразметка → мерцание/лаг (как было у ⓘ).
-        self.setStyleSheet("RecentFileThumb{background:#2a2a2a;border-radius:5px;"
-                           "border:1px solid transparent;}"
-                           "RecentFileThumb:hover{background:#363636;border:1px solid #555;}")
+        self._apply_selection_style()
 
         # Загрузка миниатюры в фоне (через QThreadPool — НЕ блокирует GUI при старте)
         self._thumb_ready.connect(self._apply_thumb)
         QThreadPool.globalInstance().start(_RecentThumbWorker(self.path, self._thumb_ready))
+
+    def _apply_selection_style(self):
+        """Стиль карточки. Подсветку выделения даём ДВУМЯ способами разом:
+        • ФОН через QSS (на голом QWidget на Windows фон рисуется надёжно — рамка
+          QSS нет, поэтому полагаться только на неё нельзя);
+        • рамку поверх — в paintEvent (гарантированно).
+        Раньше выделение рисовалось ТОЛЬКО в paintEvent и на части машин не было
+        видно — теперь выделенная карточка дополнительно получает синеватый фон."""
+        if self._selected:
+            self.setStyleSheet(
+                "RecentFileThumb{background:#2d3c57;border-radius:5px;"
+                "border:1px solid #89b4fa;}"
+                "RecentFileThumb:hover{background:#344665;"
+                "border:1px solid #89b4fa;}")
+        else:
+            self.setStyleSheet(
+                "RecentFileThumb{background:#2a2a2a;border-radius:5px;"
+                "border:1px solid transparent;}"
+                "RecentFileThumb:hover{background:#363636;border:1px solid #555;}")
+
+    def set_selected(self, on):
+        on = bool(on)
+        if on != self._selected:
+            self._selected = on
+            self._apply_selection_style()   # синеватый фон выделения (надёжный QSS)
+            self.update()                   # + рамка в paintEvent
+
+    def paintEvent(self, e):
+        # Базовый фон/hover из stylesheet рисует QStyle через super().
+        super().paintEvent(e)
+        if not self._selected:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QColor(137, 180, 250, 55))      # лёгкая синяя заливка
+        p.setPen(QPen(QColor("#89b4fa"), 2))       # синяя рамка выделения
+        r = QRectF(self.rect()).adjusted(1.0, 1.0, -1.5, -1.5)
+        p.drawRoundedRect(r, 5, 5)
+
+    def _strip(self):
+        """Поднимается по родителям до ленты RecentFilesStrip (управляет выделением)."""
+        p = self.parent()
+        while p is not None and not isinstance(p, RecentFilesStrip):
+            p = p.parent()
+        return p
 
     def _placeholder_html(self):
         """HTML-заглушка превью: крупный значок типа + расширение файла снизу."""
@@ -826,6 +910,13 @@ class RecentFileThumb(QWidget):
             self._thumb_lbl.setText("")
             self._thumb_lbl.setPixmap(pix)
             self._has_thumb = True
+            # Запоминаем, какому состоянию файла соответствует это превью —
+            # чтобы заметить позднюю перезапись файла по тому же пути.
+            try:
+                self._content_size = os.path.getsize(self.path)
+                self._content_mtime = os.path.getmtime(self.path)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -836,6 +927,24 @@ class RecentFileThumb(QWidget):
         пробуем снова. ffmpeg-воркер запускаем только при изменении размера —
         для готовых/безвидеошных файлов лишних запусков нет."""
         if self._has_thumb:
+            # Превью уже есть, но файл по тому же пути могли ПЕРЕЗАПИСАТЬ (та же
+            # «…_обрез.mp4» переэкспортирована перекодировкой — стала короче/легче).
+            # Замечаем это по изменению размера/mtime и перегенерируем карточку
+            # (превью + размер + длительность), иначе лента показывала бы старое.
+            try:
+                cur = os.path.getsize(self.path)
+                cur_mtime = os.path.getmtime(self.path)
+            except Exception:
+                return
+            if cur != self._content_size or cur_mtime != self._content_mtime:
+                self._has_thumb = False
+                self._content_size = cur
+                self._content_mtime = cur_mtime
+                self._last_seen_size = cur
+                self._refresh_size()
+                self._thumb_lbl.setText(self._placeholder_html())
+                self._thumb_attempts = 0
+                self._retry_thumb()
             return
         try:
             cur = os.path.getsize(self.path)
@@ -859,20 +968,51 @@ class RecentFileThumb(QWidget):
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
             self._drag_start = e.pos()
+            self._pending_collapse = False
+            # Логика проводника: нажатие на УЖЕ выделенную карточку без модификаторов
+            # НЕ схлопывает мультивыделение сразу — иначе drag утащит лишь одну.
+            # Схлопываем до неё только на отпускании, если это был клик (без drag).
+            strip = self._strip()
+            if strip is not None:
+                mods = e.modifiers()
+                plain = not (mods & (Qt.KeyboardModifier.ControlModifier
+                                     | Qt.KeyboardModifier.ShiftModifier))
+                if plain and self._selected:
+                    self._pending_collapse = True       # отложили до release
+                else:
+                    strip.handle_thumb_click(self, mods)
         super().mousePressEvent(e)
 
     def mouseReleaseEvent(self, e):
+        # Клик (без перетаскивания) по уже выделенной карточке — теперь схлопываем
+        # выделение до неё одной (как в проводнике).
+        if (e.button() == Qt.MouseButton.LeftButton
+                and getattr(self, "_pending_collapse", False)):
+            strip = self._strip()
+            if strip is not None:
+                strip.handle_thumb_click(self, Qt.KeyboardModifier.NoModifier)
+        self._pending_collapse = False
         self._drag_start = None
         super().mouseReleaseEvent(e)
 
     def mouseMoveEvent(self, e):
         if self._drag_start is not None and (e.pos() - self._drag_start).manhattanLength() > 6:
             self._drag_start = None
+            # Начали тащить — отменяем отложенное схлопывание, тащим всё выделенное.
+            self._pending_collapse = False
             from PyQt6.QtCore import QMimeData, QUrl
             from PyQt6.QtGui import QDrag
+            # Тащим ВСЕ выделенные, если перетягиваемая карточка — одна из выделенных;
+            # иначе только её одну.
+            paths = [self.path]
+            strip = self._strip()
+            if strip is not None and self._selected:
+                sel = strip.selected_paths()
+                if len(sel) > 1:
+                    paths = sel
             drag = QDrag(self)
             md = QMimeData()
-            md.setUrls([QUrl.fromLocalFile(self.path)])
+            md.setUrls([QUrl.fromLocalFile(p) for p in paths])
             drag.setMimeData(md)
             drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction)
         super().mouseMoveEvent(e)
@@ -882,7 +1022,17 @@ class RecentFileThumb(QWidget):
             p = self
             while p and not hasattr(p, 'add_paths'):
                 p = p.parent()
-            if p: p.add_paths([self.path])
+            if not p:
+                return
+            # Двойной клик добавляет ВСЕ выделенные (если их несколько и текущая
+            # среди них), иначе — только эту карточку.
+            paths = [self.path]
+            strip = self._strip()
+            if strip is not None and self._selected:
+                sel = strip.selected_paths()
+                if len(sel) > 1:
+                    paths = sel
+            p.add_paths(paths)
         except Exception: pass
 
     # ── Контекстное меню (ПКМ) с действиями над файлом ──────────────────────
@@ -963,8 +1113,18 @@ class RecentFileThumb(QWidget):
     def _action_delete(self):
         # Без подтверждения: файл уходит в Корзину (откуда его можно вернуть),
         # поэтому диалог «вы уверены?» не нужен.
+        # Владельцем операции отдаём top-level окно: лента/карточка могли стать
+        # нативными дочерними окнами (drag&drop), и NULL-hwnd привёл бы к ошибке
+        # «must be a top level window» и срыву удаления.
         try:
-            if move_to_trash(self.path):
+            hwnd = None
+            try:
+                top = self.window()
+                if top is not None:
+                    hwnd = int(top.winId())
+            except Exception:
+                hwnd = None
+            if move_to_trash(self.path, hwnd=hwnd):
                 # Карточку уберёт автообновление стрипа (poll), а саму скрываем сразу.
                 self.hide()
             else:
@@ -998,6 +1158,7 @@ class RecentFilesStrip(QWidget):
         except Exception:
             self._custom_folder = ""
         self._known_paths: list = []  # текущий список путей (актуальный снимок)
+        self._anchor_thumb = None      # якорь для Shift-выделения диапазона
         self.setFixedHeight(128)
 
         outer = QHBoxLayout(self)
@@ -1042,6 +1203,11 @@ class RecentFilesStrip(QWidget):
         self._timer.start()
 
         self._update_folder_btn()
+        # Клик ЛКМ в любом месте интерфейса ВНЕ ленты снимает выделение карточек.
+        try:
+            QApplication.instance().installEventFilter(self)
+        except Exception:
+            pass
         if self._custom_folder:        # своя папка задана — показываем сразу, до refresh()
             self._folder = self._effective_folder()
             self._apply(self._scan())
@@ -1051,6 +1217,83 @@ class RecentFilesStrip(QWidget):
         bar = self._scroll.horizontalScrollBar()
         bar.setValue(bar.value() - event.angleDelta().y() // 2)
         event.accept()
+
+    # ── Выделение карточек (как в проводнике: ЛКМ / Shift / Ctrl) ────────────
+    def _ordered_thumbs(self) -> list:
+        """Карточки-миниатюры в визуальном порядке слева направо."""
+        out = []
+        for i in range(self._row.count()):
+            it = self._row.itemAt(i)
+            w = it.widget() if it else None
+            if isinstance(w, RecentFileThumb):
+                out.append(w)
+        return out
+
+    def selected_paths(self) -> list:
+        """Пути выделенных карточек в визуальном порядке."""
+        return [t.path for t in self._ordered_thumbs() if t._selected]
+
+    def clear_selection(self):
+        """Снимает выделение со всех карточек (клик мимо — как в проводнике)."""
+        changed = False
+        for t in self._ordered_thumbs():
+            if t._selected:
+                t.set_selected(False)
+                changed = True
+        self._anchor_thumb = None
+        return changed
+
+    def eventFilter(self, obj, ev):
+        # ЛКМ в любом месте интерфейса ВНЕ ленты снимает выделение карточек
+        # (как в проводнике). Фильтр стоит на всём приложении.
+        #
+        # ВАЖНО (не откатывать на проверку obj!): нельзя判断 «внутри ли ленты» по
+        # `obj`/`isAncestorOf(obj)`. Необработанный press карточки ВСПЛЫВАЕТ к
+        # родителям ленты и выше (главное окно) — фильтр получал тот же press с
+        # obj = ПРЕДКОМ ленты (вне неё) и ошибочно звал clear_selection СРАЗУ после
+        # выделения карточки (выделение «не появлялось»). Поэтому проверяем
+        # ГЛОБАЛЬНУЮ позицию клика относительно экранного прямоугольника ленты.
+        try:
+            if (ev.type() == QEvent.Type.MouseButtonPress
+                    and ev.button() == Qt.MouseButton.LeftButton
+                    and any(t._selected for t in self._ordered_thumbs())):
+                gp = ev.globalPosition().toPoint()
+                rect = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
+                if not rect.contains(gp):
+                    self.clear_selection()
+        except Exception:
+            pass
+        return False
+
+    def handle_thumb_click(self, thumb, modifiers):
+        """Обновляет выделение по клику на карточку с учётом Shift/Ctrl:
+        • без модификаторов — выделить только эту (снять остальные);
+        • Ctrl — переключить эту, не трогая остальные;
+        • Shift — выделить диапазон от якоря до этой;
+        • Ctrl+Shift — добавить диапазон к текущему выделению."""
+        thumbs = self._ordered_thumbs()
+        if not thumbs or thumb not in thumbs:
+            return
+        ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        if shift and self._anchor_thumb in thumbs:
+            i0 = thumbs.index(self._anchor_thumb)
+            i1 = thumbs.index(thumb)
+            lo, hi = sorted((i0, i1))
+            rng = set(thumbs[lo:hi + 1])
+            for t in thumbs:
+                if t in rng:
+                    t.set_selected(True)
+                elif not ctrl:           # Ctrl+Shift — копим, иначе заменяем
+                    t.set_selected(False)
+            # якорь при Shift не двигаем
+        elif ctrl:
+            thumb.set_selected(not thumb._selected)
+            self._anchor_thumb = thumb
+        else:
+            for t in thumbs:
+                t.set_selected(t is thumb)
+            self._anchor_thumb = thumb
 
     @classmethod
     def _get_all_ext(cls):
@@ -1115,6 +1358,15 @@ class RecentFilesStrip(QWidget):
         self._default_folder = folder or ""
         self._folder = self._effective_folder()
         self._apply(self._scan())
+
+    def force_refresh(self):
+        """Немедленный опрос папки/карточек, не дожидаясь 5-сек. таймера — напр.
+        после обрезки/экспорта в «Монтаже», когда файл по тому же пути
+        перезаписан перекодировкой (стал короче/легче)."""
+        try:
+            self._poll()
+        except Exception:
+            pass
 
     def _effective_folder(self) -> str:
         """Своя папка пользователя приоритетнее; иначе — папка загрузки."""
@@ -1283,6 +1535,23 @@ class DraggableTreeWidget(QTreeWidget):
         iid = self._badge_iid_at(pos)
         deleg.set_badge_hover(iid)
 
+    def _over_name_region(self, pos, idx):
+        """Колонка «Превью»: True — курсор над строкой имени (внизу ячейки),
+        False — над миниатюрой. Аудио-строки (без превью) — целиком имя."""
+        try:
+            idx0 = idx.sibling(idx.row(), 0)
+            rect = self.visualRect(idx0)
+            if not rect.isValid() or rect.height() <= 0:
+                return False
+            if idx0.data(ITEM_AUDIO_ROLE):
+                return True
+            # Имя рисуется одной строкой у нижнего края ячейки
+            # (см. PreviewNameDelegate.paint).
+            text_h = self.fontMetrics().height() + 2
+            return pos.y() >= rect.bottom() - text_h - 6
+        except Exception:
+            return False
+
     def viewportEvent(self, e):
         # Тултип ячейки (полное имя/путь) показываем тем же стабильным попапом,
         # что и значки ⓘ. Системный QToolTip на ячейках дерева мерцает —
@@ -1292,12 +1561,22 @@ class DraggableTreeWidget(QTreeWidget):
             et = e.type()
             if et == QEvent.Type.ToolTip:
                 item = self.itemAt(e.pos())
+                idx = self.indexAt(e.pos())
+                col = idx.column() if idx.isValid() else -1
                 # Над значком «сравнить» — подсказка о значке (БЕЗ имени файла);
                 # имя файла остаётся только при наведении на саму картинку.
                 if self._badge_iid_at(e.pos()) is not None:
                     tip = "Сравнить исходник и результат"
+                elif item is None:
+                    tip = ""
+                elif col == 0:
+                    # Превью → путь файла; имя под превью → полное имя файла.
+                    tip = item.text(0) if self._over_name_region(e.pos(), idx) \
+                        else item.toolTip(0)
                 else:
-                    tip = item.toolTip(0) if item else ""
+                    # На своей колонке — её подсказка (напр. «Время…»);
+                    # иначе путь файла из колонки превью.
+                    tip = item.toolTip(col) or item.toolTip(0)
                 if tip:
                     _InfoTipPopup.instance().show_at(e.globalPos(), tip)
                 else:

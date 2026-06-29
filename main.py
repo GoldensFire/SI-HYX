@@ -36,6 +36,10 @@ _QT_LOG_NOISE = (
     # в т.ч. когда тот же файл открывает вкладка «SiQuesterHYX».
     "Could not find codec parameters for stream",
     "Consider increasing the value for the 'analyzeduration'",
+    # Лента последних файлов при drag&drop ненадолго получает нативное дочернее
+    # окно — Qt пишет «must be a top level window». Безобидно (удаление в Корзину
+    # уже берёт top-level winId владельцем, см. utils.move_to_trash) — глушим.
+    "must be a top level window",
 )
 
 
@@ -54,7 +58,7 @@ def _qt_message_filter(mode, context, message):
 class UnifiedWindow(QMainWindow):
     url_from_browser = pyqtSignal(str, bool)  # URL + audio_only из браузерного расширения (HTTP-сервер → Qt)
     log_signal = pyqtSignal(str)              # потокобезопасный лог (из фоновых потоков → GUI)
-    update_available_sig = pyqtSignal(str, str, int, str)  # версия, ссылка на zip, размер (байт), sha256 архива ("" = не проверять)
+    update_available_sig = pyqtSignal(str, str, int, str, str)  # версия, ссылка на zip, размер (байт), sha256 архива ("" = не проверять), ченжлог
     update_ready_sig = pyqtSignal(str)        # путь к распакованной новой версии (готово к установке)
 
     # ВНИМАНИЕ РАЗРАБОТЧИКА: В этом приложении категорически запрещено использовать
@@ -101,6 +105,7 @@ class UnifiedWindow(QMainWindow):
         self._pending_update_url = ""
         self._pending_update_version = ""
         self._pending_update_sha = ""
+        self._pending_update_changelog = ""   # текст релиза с GitHub (что нового)
         self._skipped_update_version = self._load_skipped_version()
         self.update_banner = QWidget()
         self.update_banner.setObjectName("updateBanner")
@@ -116,18 +121,26 @@ class UnifiedWindow(QMainWindow):
         btn_up_now.setIconSize(QSize(20, 20))
         btn_up_now.setObjectName("b_run")
         btn_up_now.clicked.connect(self._on_banner_update)
+        # «Что нового» — показывает ченжлог релиза, взятый со страницы GitHub
+        # releases (тело релиза). Виден только если ченжлог пришёл.
+        self.btn_changelog = QPushButton("Что нового")
+        self.btn_changelog.setIcon(get_icon('fa5s.scroll'))
+        self.btn_changelog.setToolTip("Показать список изменений этого релиза")
+        self.btn_changelog.clicked.connect(self._show_changelog)
+        self.btn_changelog.setVisible(False)
         btn_skip = QPushButton("Пропустить версию")
         btn_skip.setToolTip("Больше не предлагать обновиться до этой версии (при выходе следующей — предложу снова)")
         btn_skip.clicked.connect(self._on_banner_skip)
         btn_later = QPushButton("Позже")
         btn_later.clicked.connect(lambda: self.update_banner.setVisible(False))
         bl.addWidget(self.update_banner_lbl); bl.addStretch()
+        bl.addWidget(self.btn_changelog)
         bl.addWidget(btn_up_now); bl.addWidget(btn_skip); bl.addWidget(btn_later)
         l.addWidget(self.update_banner)
 
         self.tabs = QTabWidget()
         self.tab_media = MediaTab(self); self.tab_ytdlp = YtdlpTab(self)
-        self.tab_photo = PhotoMergerTab(self)
+        self.tab_photo = PhotoTab(self)
         self.tab_b64    = Base64Tab(self)
         self.tab_prompt = PromptTab(self)
         # Объект создан, но если вкладка выключена — он НЕ в таббаре. Родитель у
@@ -145,13 +158,13 @@ class UnifiedWindow(QMainWindow):
             'ytdlp':  ("fa5s.cloud-download-alt", "Загрузчик",
                        "Скачивание видео/аудио с YouTube и других платформ"),
             'edit':   ("fa5s.cut", "Монтаж",
-                       "(Бета-тест) Обрезка видео / аудио, в том числе без перекодирования"),
-            'photo':  ("fa5s.image", "Объединить фото",
-                       "Объединение нескольких изображений в одно."),
+                       "(Бета-тест) Упрощённый видеоредактор, пока из основных фич только кадрирование, обрезка без перекодирования, удаление вотермарок"),
+            'photo':  ("fa5s.image", "Редактирование фото",
+                       "Супер-лайт версия Photoshop: Кадрирование, удаление объектов, удаление фона и отдельно объединение фото"),
             'b64':    ("fa5s.font", "Base64",
                        "Кодирование файлов и текста в Base64."),
             'prompt': ("fa5s.clipboard", "Промпт",
-                       "Менеджер промптов: хранение и быстрый выбор заготовок."),
+                       "Вам это не нужно. Менеджер промптов для нейронки."),
             'siquester': ("fa5s.dice", "SiQuesterHYX",
                           "Экспериментальная вкладка SiQuester: просмотр и работа "
                           "с .siq-вопросами."),
@@ -171,6 +184,16 @@ class UnifiedWindow(QMainWindow):
         # Вкладки можно перетаскивать мышью и сортировать в удобном порядке;
         # порядок сохраняется между запусками (см. _save_tab_order / tab_order).
         self.tabs.setMovable(True)
+        # Когда вкладки не помещаются по ширине, QTabBar дорисовывает справа две
+        # стрелки-прокрутки — они выглядят как «две пустые маленькие вкладки».
+        # Отключаем их: вкладки ужимаются под доступную ширину, а длинные
+        # заголовки при нехватке места обрезаются многоточием.
+        self.tabs.setUsesScrollButtons(False)
+        try:
+            self.tabs.tabBar().setUsesScrollButtons(False)
+            self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
+        except Exception:
+            pass
         self._reordering_tabs = False
         try:
             self.tabs.tabBar().tabMoved.connect(self._on_tab_moved)
@@ -186,8 +209,16 @@ class UnifiedWindow(QMainWindow):
             bar = self.tabs.tabBar()
             bar.setMouseTracking(True)
             bar.installEventFilter(self)
+            # Перетаскивание файла НА заголовок вкладки: наведение задерживается
+            # → вкладка открывается сама (можно бросить в её содержимое), а бросок
+            # прямо на заголовок добавляет файл в эту вкладку (см. eventFilter).
+            bar.setAcceptDrops(True)
         except Exception:
             pass
+        self._tab_drag_idx = -1
+        self._tab_drag_timer = QTimer(self)
+        self._tab_drag_timer.setSingleShot(True)
+        self._tab_drag_timer.timeout.connect(self._tab_drag_switch)
 
         # Кнопки в строке вкладок — corner widget подгоняется под высоту таббара
         self.btn_settings = QToolButton()
@@ -332,8 +363,12 @@ class UnifiedWindow(QMainWindow):
         ty = self.tab_ytdlp
         self._server_enabled = bool(s.get("server_enabled", False))
         self._wheel_changes_values = bool(s.get("wheel_changes_values", False))
-        self._video_software_render = bool(s.get("video_software_render", False))
         self._video_hw_decode = bool(s.get("video_hw_decode", True))
+        self._keep_models_in_ram = bool(s.get("keep_models_in_ram", False))
+        try:
+            self.tab_photo.inpaint.set_keep_models(self._keep_models_in_ram)
+        except Exception:
+            pass
         self._siquester_tab_enabled = bool(s.get("siquester_tab_enabled", False))
         self._shikimori_tab_enabled = bool(s.get("shikimori_tab_enabled", False))
         self._shikimori_settings = dict(s.get("shikimori", {}) or {})
@@ -361,7 +396,7 @@ class UnifiedWindow(QMainWindow):
             tm.chk_enable_video.setChecked(v.get("enabled", True))
             tm.s_spd.setValue(v.get("speed", 100))
             tm.s_crf.setValue(v.get("crf", 45))
-            tm.s_pre.setValue(v.get("pre", 1))
+            tm.s_pre.setValue(v.get("pre", 2))
             combo_set_value(tm.c_res, v.get("res", "1280x720"))
             tm.c_fps.setCurrentText(v.get("fps", "Исходный (max 30)"))
             tm._set_preset_mode(v.get("preset_mode", "std"))
@@ -704,13 +739,15 @@ class UnifiedWindow(QMainWindow):
         try: self._save_settings_now()
         except Exception: pass
 
-    def _set_video_software_render(self, checked: bool):
-        self._video_software_render = bool(checked)
+    def _set_video_hw_decode(self, checked: bool):
+        self._video_hw_decode = bool(checked)
         try: self._save_settings_now()
         except Exception: pass
 
-    def _set_video_hw_decode(self, checked: bool):
-        self._video_hw_decode = bool(checked)
+    def _set_keep_models_in_ram(self, checked: bool):
+        self._keep_models_in_ram = bool(checked)
+        try: self.tab_photo.inpaint.set_keep_models(self._keep_models_in_ram)
+        except Exception: pass
         try: self._save_settings_now()
         except Exception: pass
 
@@ -1003,7 +1040,9 @@ class UnifiedWindow(QMainWindow):
                     if best_url:
                         # запоминаем, тихая ли это проверка — слот решает, уважать ли «пропуск»
                         self._check_was_silent = silent
-                        self.update_available_sig.emit(best_tag, best_url, best_size, best_sha)
+                        changelog = str(best_rel.get("body") or "").strip()
+                        self.update_available_sig.emit(
+                            best_tag, best_url, best_size, best_sha, changelog)
                     elif not silent:
                         self.log_signal.emit("Обновление найдено, но подходящий ассет не найден.")
                 elif not silent:
@@ -1112,7 +1151,8 @@ class UnifiedWindow(QMainWindow):
             self.log(f"Версия {ver} пропущена. Предложу обновиться при следующем релизе "
                      f"(или нажмите «Проверить обновления» вручную).")
 
-    def _on_update_available(self, version: str, url: str, size: int, sha: str = ""):
+    def _on_update_available(self, version: str, url: str, size: int,
+                             sha: str = "", changelog: str = ""):
         if getattr(self, "_updating", False):
             return
         # Пропущенную версию не показываем при ТИХОЙ (авто) проверке; ручная
@@ -1128,15 +1168,45 @@ class UnifiedWindow(QMainWindow):
         self._pending_update_url = url
         self._pending_update_version = version
         self._pending_update_sha = sha or ""
+        self._pending_update_changelog = changelog or ""
         self.update_banner_lbl.setText(
             f"Доступна новая версия {version} ({sz}). "
             f"Программа обновится и перезапустится.")
+        self.btn_changelog.setVisible(bool(self._pending_update_changelog))
         self.update_banner.setVisible(True)
 
     def _on_banner_update(self):
         self.update_banner.setVisible(False)
         if self._pending_update_url:
             self._start_update_download(self._pending_update_url)
+
+    def _show_changelog(self):
+        """Окно со списком изменений релиза (тело релиза с GitHub releases,
+        обычно Markdown — рендерим как Markdown)."""
+        text = (self._pending_update_changelog or "").strip()
+        if not text:
+            return
+        ver = self._pending_update_version or ""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Что нового — {ver}" if ver else "Что нового")
+        dlg.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        v = QVBoxLayout(dlg); v.setContentsMargins(12, 12, 12, 12); v.setSpacing(8)
+        view = QTextEdit(dlg); view.setReadOnly(True)
+        try:
+            view.setMarkdown(text)        # GitHub-тело релиза — Markdown
+        except Exception:
+            view.setPlainText(text)       # на всякий случай — как есть
+        v.addWidget(view)
+        row = QHBoxLayout(); row.addStretch(1)
+        btn_close = QPushButton("Закрыть", dlg)
+        btn_close.clicked.connect(dlg.close)
+        row.addWidget(btn_close)
+        v.addLayout(row)
+        g = self.geometry()
+        dlg.resize(max(560, int(g.width() * 0.6)), max(420, int(g.height() * 0.7)))
+        dlg.move(g.x() + (g.width() - dlg.width()) // 2,
+                 g.y() + (g.height() - dlg.height()) // 2)
+        dlg.exec()
 
     def _start_update_download(self, url: str):
         if getattr(self, "_updating", False):
@@ -1442,6 +1512,17 @@ class UnifiedWindow(QMainWindow):
         vui.addWidget(hint("Выкл — колёсико над полями прокручивает панель, а не меняет числа."))
         add_row(sec_main, grp_ui, "колесо мышь интерфейс значения прокрутка битрейт ползунки")
 
+        grp_ai = QGroupBox("Фото — нейросети")
+        vai = QVBoxLayout(grp_ai)
+        chk_keep = QCheckBox("Не выгружать модели нейронок из ОЗУ")
+        chk_keep.setChecked(bool(getattr(self, "_keep_models_in_ram", False)))
+        chk_keep.toggled.connect(self._set_keep_models_in_ram)
+        vai.addWidget(chk_keep)
+        vai.addWidget(hint("Выкл (по умолч.): модели удаления объектов/фона выгружаются из памяти "
+                           "через минуту простоя или при уходе со вкладки «Фото» (освобождается ~1–2 ГБ; "
+                           "следующий запуск ждёт перезагрузку модели). Вкл — держать в ОЗУ всегда (быстрее)."))
+        add_row(sec_main, grp_ai, "нейросеть модель озу память выгрузка lama rmbg удаление объект фон фото")
+
         # ══ Секция «Монтаж» ══════════════════════════════════════════════════
         sec_edit = make_section("Монтаж")
 
@@ -1492,29 +1573,13 @@ class UnifiedWindow(QMainWindow):
                               "настройка сочетаний невозможна."))
         add_row(sec_edit, grp_keys, "монтаж обрезка сочетание клавиши shift c v плейхед старт конец in out горячие")
 
-        grp_scrub = QGroupBox("Покадровая перемотка")
-        vsc = QVBoxLayout(grp_scrub)
-        if te is not None and getattr(te, "_ready", False):
-            chk_scrub_audio = QCheckBox("Звук при покадровой перемотке (скраб, как в Filmora)")
-            chk_scrub_audio.setChecked(bool(getattr(te, "_scrub_audio_enabled", True)))
-            chk_scrub_audio.toggled.connect(lambda v: te.set_scrub_audio(bool(v)))
-            vsc.addWidget(chk_scrub_audio)
-            vsc.addWidget(hint("Вкл (по умолч.): при шаге по кадрам (←/→, WASD) звучит короткий "
-                               "фрагмент новой позиции — слышно, что под курсором."))
-        else:
-            vsc.addWidget(hint("Вкладка «Монтаж» недоступна (нет модуля мультимедиа)."))
-        add_row(sec_edit, grp_scrub, "монтаж покадровая перемотка скраб звук filmora кадр шаг стрелки wasd аудио")
+        # Блок «Покадровая перемотка» убран: скраб-звук теперь всегда включён.
 
         grp_render = QGroupBox("Видео и оверлеи")
         vr = QVBoxLayout(grp_render)
 
-        if te is not None and getattr(te, "_ready", False):
-            chk_subframe = QCheckBox("Субтитры рендерить прямо в кадр (как в VLC)")
-            chk_subframe.setChecked(bool(getattr(te, "_subs_in_frame", True)))
-            chk_subframe.toggled.connect(lambda v: te.set_subs_in_frame(bool(v)))
-            vr.addWidget(chk_subframe)
-            vr.addWidget(hint("Вкл (по умолч.): субтитры рисуются внутри кадра (как в VLC). "
-                              "Выкл: отдельный оверлей поверх видео. Применяется сразу."))
+        # Настройка «Субтитры рендерить прямо в кадр» убрана: зафиксирована
+        # значением по умолчанию (рендер в кадр, как в VLC).
 
         chk_hw = QCheckBox("Аппаратное ускорение видео (H.264 / HEVC)")
         chk_hw.setChecked(bool(getattr(self, "_video_hw_decode", True)))
@@ -1524,14 +1589,9 @@ class UnifiedWindow(QMainWindow):
                           "— тяжёлые файлы в «Монтаже» играют плавно. Выключите, если прямой AV1 "
                           "(SiQuesterHYX) даёт чёрный экран. Нужен перезапуск."))
 
-        chk_sw = QCheckBox("Программный рендер видео (убирает оверлей RivaTuner/FPS)")
-        chk_sw.setChecked(bool(getattr(self, "_video_software_render", False)))
-        chk_sw.toggled.connect(self._set_video_software_render)
-        vr.addWidget(chk_sw)
-        vr.addWidget(hint("Помогает, когда RivaTuner рисует FPS поверх видео: рендер без "
-                          "D3D/GL-свопчейна (HW-ускорение видео при этом тоже выключается). "
-                          "Нужен перезапуск."))
-        add_row(sec_edit, grp_render, "rivatuner оверлей fps d3d11 рендер видео аппаратное программное ускорение субтитры кадр vlc метод hevc h264 dxva декодирование")
+        # Настройка «Программный рендер видео» убрана: программный рендер
+        # отключён всегда (видео идёт по аппаратному D3D/GL-свопчейну).
+        add_row(sec_edit, grp_render, "оверлей fps d3d11 рендер видео аппаратное ускорение hevc h264 dxva декодирование")
 
         # ══ Секция «Экспериментально» (предпоследняя) ════════════════════════
         sec_exp = make_section("Экспериментально")
@@ -1558,16 +1618,15 @@ class UnifiedWindow(QMainWindow):
         chk_siq.toggled.connect(self._set_siquester_tab_enabled)
         vexp.addWidget(chk_siq)
         vexp.addWidget(hint(icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
-                            + " Экспериментально. Просмотрщик пакетов SIGame (.siq) и "
-                            "статистика. Без перезапуска."))
+                            + " Вам это не надо. Просмотрщик пакетов SIGame (.siq) и "
+                            "статистика."))
         chk_shiki = QCheckBox("Включить вкладку «ShikimoriHYX» (поиск аниме по Shikimori API)")
         chk_shiki.setChecked(bool(getattr(self, "_shikimori_tab_enabled", False)))
         chk_shiki.toggled.connect(self._set_shikimori_tab_enabled)
         vexp.addWidget(chk_shiki)
         vexp.addWidget(hint(icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
-                            + " Экспериментально. Поиск аниме через Shikimori API с фильтрами; "
-                            "экспорт в JSON/CSV. OAuth-токен — в переменной SHIKIMORI_TOKEN. "
-                            "Без перезапуска."))
+                            + " Экспериментально. Поиск аниме через Shikimori API с фильтрами, сортировка по индексу популярности, нужен, если вы делаете аниме пак, пишите в лс, если будете пользоваться - объясню; "
+                ))
         add_row(sec_exp, grp_siq,
                 "промпт prompt заготовки шаблоны "
                 "siquester сиквестер siq пакет вопросы статистика эксперимент вкладка просмотр sigame "
@@ -1599,7 +1658,8 @@ class UnifiedWindow(QMainWindow):
         vl = QVBoxLayout(grp_links)
         links = QLabel(
             f'Discord: <a href="{DISCORD_URL}" style="color:#89b4fa;">{DISCORD_URL}</a><br>'
-            f'GitHub: <a href="{GITHUB_URL}" style="color:#89b4fa;">{GITHUB_URL}</a>')
+            f'GitHub: <a href="{GITHUB_URL}" style="color:#89b4fa;">{GITHUB_URL}</a><br>'
+            f'Гайд: <a href="{GUIDE_URL}" style="color:#89b4fa;">{GUIDE_URL}</a>')
         links.setOpenExternalLinks(True)
         links.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         links.setWordWrap(True)
@@ -1699,8 +1759,8 @@ class UnifiedWindow(QMainWindow):
                 },
                 'server_enabled': bool(getattr(self, '_server_enabled', False)),
                 'wheel_changes_values': bool(getattr(self, '_wheel_changes_values', False)),
-                'video_software_render': bool(getattr(self, '_video_software_render', False)),
                 'video_hw_decode': bool(getattr(self, '_video_hw_decode', True)),
+                'keep_models_in_ram': bool(getattr(self, '_keep_models_in_ram', False)),
                 'siquester_tab_enabled': bool(getattr(self, '_siquester_tab_enabled', False)),
                 'shikimori_tab_enabled': bool(getattr(self, '_shikimori_tab_enabled', False)),
                 'shikimori': self._collect_shikimori_settings(),
@@ -1791,8 +1851,12 @@ class UnifiedWindow(QMainWindow):
         if self.pbar.maximum() == 0:          # вернуть из busy в обычный режим
             self.pbar.setRange(0, 100)
         self.pbar.setValue(val); self.pbar.setFormat(text)
-        # Зеркалим прогресс перекодирования на иконку в панели задач
-        if val >= 100:
+        # Зеркалим прогресс перекодирования на иконку в панели задач.
+        # ВАЖНО: val==0 — это «простаивает/завершилось/ошибка/отменено», НЕ занятость.
+        # set_value(…,0,100) трактует completed<=0 как INDETERMINATE (бегущий бар),
+        # из-за чего после ошибки/отмены на иконке вечно «крутился» процесс. Поэтому
+        # на 0 (и на ≥100) индикатор УБИРАЕМ, а не оставляем пульсировать.
+        if val >= 100 or val <= 0:
             self.clear_taskbar_progress()
         else:
             self.set_taskbar_progress(val, 100)
@@ -1824,8 +1888,9 @@ class UnifiedWindow(QMainWindow):
             is_siq = tsq is not None and cur is tsq
             tsh = getattr(self, "tab_shikimori", None)
             is_shiki = tsh is not None and cur is tsh
-            self.console_panel.setVisible(not (is_edit or is_siq or is_shiki))
-            self.pbar.setVisible(not (is_siq or is_shiki))
+            is_photo = cur is getattr(self, "tab_photo", None)
+            self.console_panel.setVisible(not (is_edit or is_siq or is_shiki or is_photo))
+            self.pbar.setVisible(not (is_siq or is_shiki or is_photo))
         except Exception:
             pass
 
@@ -1844,7 +1909,79 @@ class UnifiedWindow(QMainWindow):
             elif et in (QEvent.Type.Leave, QEvent.Type.Hide,
                         QEvent.Type.WindowDeactivate):
                 self._hide_tab_tip()
+            elif et == QEvent.Type.DragEnter:
+                if self._tab_drag_has_files(event):
+                    event.acceptProposedAction(); return True
+            elif et == QEvent.Type.DragMove:
+                if self._tab_drag_has_files(event):
+                    try: self._tab_drag_hover(bar, event.position().toPoint())
+                    except Exception: pass
+                    event.acceptProposedAction(); return True
+            elif et == QEvent.Type.DragLeave:
+                self._tab_drag_idx = -1
+                self._tab_drag_timer.stop()
+            elif et == QEvent.Type.Drop:
+                if self._tab_drag_has_files(event):
+                    try: self._tab_drag_drop(bar, event)
+                    except Exception as e:
+                        try: self.log(f"tab drop error: {e}")
+                        except Exception: pass
+                    event.acceptProposedAction(); return True
         return super().eventFilter(obj, event)
+
+    # ── Перетаскивание файла на заголовок вкладки ────────────────────────────
+    @staticmethod
+    def _tab_drag_has_files(event):
+        try:
+            md = event.mimeData()
+            return bool(md and md.hasUrls()
+                        and any(u.toLocalFile() for u in md.urls()))
+        except Exception:
+            return False
+
+    def _tab_drag_hover(self, bar, pos):
+        """Курсор с файлом завис над заголовком: запускаем таймер автопереключения
+        на эту вкладку (как в браузерах при перетаскивании на заголовок)."""
+        idx = bar.tabAt(pos)
+        if idx < 0:
+            self._tab_drag_idx = -1
+            self._tab_drag_timer.stop()
+            return
+        if idx == self.tabs.currentIndex():
+            self._tab_drag_idx = -1
+            self._tab_drag_timer.stop()
+            return
+        if idx != self._tab_drag_idx:
+            self._tab_drag_idx = idx
+            self._tab_drag_timer.start(600)
+
+    def _tab_drag_switch(self):
+        if self._tab_drag_idx >= 0:
+            try: self.tabs.setCurrentIndex(self._tab_drag_idx)
+            except Exception: pass
+
+    def _tab_drag_drop(self, bar, event):
+        """Бросок файла прямо на заголовок: открываем вкладку и добавляем в неё
+        файл(ы) — тем же путём, что и обычный drop в её содержимое."""
+        self._tab_drag_timer.stop()
+        self._tab_drag_idx = -1
+        idx = bar.tabAt(event.position().toPoint())
+        if idx < 0:
+            return
+        paths = [u.toLocalFile() for u in event.mimeData().urls()
+                 if u.toLocalFile()]
+        if not paths:
+            return
+        self.tabs.setCurrentIndex(idx)
+        page = self.tabs.widget(idx)
+        fn = (getattr(page, "accept_dropped_paths", None)
+              or getattr(page, "add_paths", None))
+        if fn is not None:
+            fn(paths)
+        try:
+            self.raise_(); self.activateWindow()
+        except Exception:
+            pass
 
     def _update_tab_tip(self, pos):
         """Показывает попап-подсказку, если курсор над значком ⓘ вкладки.
@@ -2047,21 +2184,31 @@ def _install_crash_handler():
         except Exception:
             pass
         try:
-            from PyQt6.QtWidgets import QMessageBox
-            box = QMessageBox()
-            box.setIcon(QMessageBox.Icon.Critical)
-            box.setWindowTitle("SI-HYX — критическая ошибка")
-            box.setText("Произошла непредвиденная ошибка, программа будет закрыта.")
-            box.setInformativeText(f"{exc_type.__name__}: {exc_value}")
-            box.setDetailedText(tb_text)
+            from error_report import ErrorReportDialog
+            dlg = ErrorReportDialog(
+                "SI-HYX — критическая ошибка",
+                "Произошла непредвиденная ошибка, программа будет закрыта.",
+                detail=f"{exc_type.__name__}: {exc_value}",
+                where="Критическая ошибка (краш)",
+                report_detail=tb_text)
             try:
                 if APP_ICON:
-                    box.setWindowIcon(QIcon(APP_ICON))
+                    dlg.setWindowIcon(QIcon(APP_ICON))
             except Exception:
                 pass
-            box.exec()
+            dlg.exec()
         except Exception:
-            pass
+            try:
+                from PyQt6.QtWidgets import QMessageBox
+                box = QMessageBox()
+                box.setIcon(QMessageBox.Icon.Critical)
+                box.setWindowTitle("SI-HYX — критическая ошибка")
+                box.setText("Произошла непредвиденная ошибка, программа будет закрыта.")
+                box.setInformativeText(f"{exc_type.__name__}: {exc_value}")
+                box.setDetailedText(tb_text)
+                box.exec()
+            except Exception:
+                pass
         os._exit(1)
 
     sys.excepthook = _handle
@@ -2134,4 +2281,9 @@ def main():
 
 
 if __name__ == "__main__":
+    # ОБЯЗАТЕЛЬНО до любого порождения процессов: иначе в собранном (PyInstaller,
+    # spawn) приложении дочерний процесс заново запустит весь main(). Нужно для
+    # процессного прокси LaMa («Фото → Удаление объектов»).
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()

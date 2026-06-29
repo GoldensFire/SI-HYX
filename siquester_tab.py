@@ -52,6 +52,20 @@ class SiQuesterTab(QWidget):
         self._filter_installed = False
         self._built = False
 
+        # Непрозрачный фон вкладки в тон теме SiQuester (QMainWindow=#181825).
+        self.setObjectName("siquesterTabRoot")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("#siquesterTabRoot { background:#181825; }")
+        # ГЛАВНОЕ против протекания соседней вкладки: внутри SiQuester живёт нативный
+        # QVideoWidget (QtMultimedia). Из-за него ТОЛЬКО видео получает свою native-
+        # поверхность, а остальная вкладка делит общий бэкстор QStackedWidget с
+        # соседями — и в непокрашенные участки (угол сайдбара у «Все») просачивались
+        # пиксели ShikimoriHYX (карточки аниме). Даём этой вкладке СОБСТВЕННУЮ
+        # native-поверхность (WA_NativeWindow) + обещание непрозрачности — тогда
+        # соседний лист рисуется в свой буфер и физически не может сюда попасть.
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
         self._lay = QVBoxLayout(self)
         self._lay.setContentsMargins(0, 0, 0, 0)
         self._lay.setSpacing(0)
@@ -118,6 +132,28 @@ class SiQuesterTab(QWidget):
         lay.addWidget(lbl)
         lay.addStretch()
 
+    def _hide_floating_panels(self):
+        """Прячет плавающие панели SiQuester (поиск по пакам / медиа).
+
+        Это setParent(inner)-оверлеи поверх сайдбара (move(0,46)). Если оставить
+        их открытыми и переключить вкладку SI-HYX, при возврате они «висят»
+        обрывком над сайдбаром («Все») — наложение чужого интерфейса. Закрываем
+        их при уходе с вкладки и при входе, плюс форсируем перерисовку, чтобы не
+        оставалось артефакта недорисовки от встроенного QMainWindow."""
+        if self.inner is None:
+            return
+        for attr in ("_search_panel", "_media_search_panel"):
+            p = getattr(self.inner, attr, None)
+            if p is not None:
+                try:
+                    p.hide()
+                except Exception:
+                    pass
+        try:
+            self.inner.update()
+        except Exception:
+            pass
+
     # ── Хоткеи SiQuester активны только когда вкладка показана ──────────────
     def showEvent(self, ev):
         super().showEvent(ev)
@@ -125,6 +161,8 @@ class SiQuesterTab(QWidget):
         # вкладка уже встроена в QTabWidget, поэтому окно встраивается как дочерний
         # виджет и не мелькает (см. _ensure_built).
         self._ensure_built()
+        # Не показываем «висящую» с прошлого раза панель поиска поверх сайдбара.
+        self._hide_floating_panels()
         if self.inner is not None and not self._filter_installed:
             try:
                 QApplication.instance().installEventFilter(self.inner)
@@ -134,6 +172,9 @@ class SiQuesterTab(QWidget):
 
     def hideEvent(self, ev):
         super().hideEvent(ev)
+        # Уходя с вкладки — закрываем плавающие панели, чтобы при возврате они не
+        # оставались обрывком над сайдбаром.
+        self._hide_floating_panels()
         self._remove_filter()
 
     def _remove_filter(self):

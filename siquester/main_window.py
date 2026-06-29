@@ -816,28 +816,60 @@ class MainWindow(QMainWindow):
         else: self.stack.setCurrentWidget(self.input_panel)
 
     def _load_saved(self):
-        datasets_raw = load_datasets()
-        # Batch-add all datasets without rebuilding sidebar each time.
-        for ds in datasets_raw:
+        """Загружает сохранённые пакеты, НЕ блокируя GUI-поток: по одному пакету
+        за тик цикла событий (см. _load_saved_step).
+
+        Раньше всё делалось разом, синхронно: разбор каждого .siq (открытие zip +
+        чтение длительностей медиа из архива) и построение всех плиток/вьюеров.
+        При первом показе встроенной вкладки «SiQuesterHYX» это намертво занимало
+        GUI-поток на ~30 секунд — приложение «зависало», а окно мерцало (Windows
+        рисует «призрак» неотвечающего окна, который то появляется, то исчезает).
+        Теперь оболочка окна видна сразу, пакеты «подъезжают» по одному, и между
+        ними цикл событий успевает крутиться — никакого зависания и мерцания."""
+        self._pending_saved = load_datasets()
+        self._load_idx = 0
+        if not self._pending_saved:
+            self.stack.setCurrentWidget(self.empty_page)
+            return
+        # Таймер — ДОЧЕРНИЙ объект окна: если окно уничтожат во время загрузки
+        # (вкладку выключили в настройках), таймер уничтожится вместе с ним и
+        # гарантированно не дёрнет метод на уже удалённых виджетах.
+        self._load_timer = QTimer(self)
+        self._load_timer.setSingleShot(True)
+        self._load_timer.timeout.connect(self._load_saved_step)
+        self._load_timer.start(0)
+
+    def _load_saved_step(self):
+        """Догружает один сохранённый пакет и планирует следующий на след. тик."""
+        raw = getattr(self, "_pending_saved", None)
+        if not raw or self._load_idx >= len(raw):
+            self._pending_saved = None
+            if not self.datasets:
+                self.stack.setCurrentWidget(self.empty_page)
+            return
+        ds = raw[self._load_idx]
+        self._load_idx += 1
+        # Сохраняем выбор пользователя: первый пакет показываем сразу, дальше не
+        # «выдёргиваем» его на нулевой, если он успел кликнуть другой.
+        prev = self.sidebar.current_real_idx()
+        try:
             self._add_dataset(ds, save=False, _batch=True)
-        # Single sidebar rebuild after all items are added.
-        if self.datasets:
-            self.sidebar.rebuild(self.datasets)
-            self._update_info()
-        # Re-attach any previously linked SIQ files automatically
-        for ds in self.datasets:
+            real_idx = len(self.datasets) - 1
             siq_path = ds.get("siq_path", "")
             if siq_path and os.path.exists(siq_path):
                 try:
                     siq = SiqPackage(siq_path)
-                    ds["total_duration_sec"] = siq.total_duration
-                    ds["widget"].attach_siq(siq)
+                    self.datasets[real_idx]["total_duration_sec"] = siq.total_duration
+                    self.datasets[real_idx]["widget"].attach_siq(siq)
                 except Exception as e:
                     _logger.warning(f"[siq reload] {e}")
-        if self.datasets:
-            self.sidebar.select_by_real(0); self._show_ds(0)
-        else:
-            self.stack.setCurrentWidget(self.empty_page)
+            self.sidebar.rebuild(self.datasets)
+            self._update_info()
+            self.sidebar.select_by_real(prev if prev >= 0 else 0)
+        except Exception as e:
+            _logger.warning(f"[load_saved step] {e}")
+        # Следующий пакет — на следующем тике цикла событий (GUI остаётся живым).
+        self._load_timer.start(0)
 
     def _add_dataset(self, ds, save=True, _batch=False):
         w = ResultPage(ds, parent=self)

@@ -9,11 +9,15 @@ __pycache__/
 
 # Внешние бинарники (большие, кладутся в релиз-архив, не в репозиторий)
 bin/
+# Модель LaMa (~200 МБ) — тоже в релиз-архив, а не в git
+models/
 
 # Локальные/служебные файлы
 settings.json
 *.log
 *_original_backup.py
+# Случайный лог-маркер сборки build.bat (echo «Version: … -> …» в файл)
+SI-HYX v*
 YouTubecookies.txt
 *cookies*.txt
 

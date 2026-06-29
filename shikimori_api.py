@@ -110,6 +110,80 @@ def views_from_card(card: dict) -> int:
     return total
 
 
+# Веса статусов для «индекса популярности» (по просьбе пользователя): сколько
+# «баллов» индекса даёт один пользователь из каждого списка. Реально смотревшие
+# весомее планирующих. name в rates_statuses_stats приходит ЛОКАЛИЗОВАННЫМ (RU)
+# или английским ключом — матчим оба, регистронезависимо (ср. VIEW_STATUSES).
+_INDEX_STATUS_WEIGHTS = {
+    "completed": 10.0, "просмотрено": 10.0, "прочитано": 10.0,   # просмотрено
+    "watching": 8.0,   "смотрю": 8.0,       "читаю": 8.0,         # смотрю
+    "dropped": 6.0,    "брошено": 6.0,                            # брошено
+    "on_hold": 6.0,    "отложено": 6.0,                           # отложено
+    "planned": 2.0,    "запланировано": 2.0,                      # запланировано
+}
+
+
+def index_base_from_card(card: dict) -> float:
+    """Взвешенная «база индекса» из rates_statuses_stats: каждый пользователь
+    даёт столько баллов, сколько весит его статус (просмотрено=10, смотрю=8,
+    брошено/отложено=6, запланировано=2). При отсутствии данных вернёт 0."""
+    if not isinstance(card, dict):
+        return 0.0
+    total = 0.0
+    for s in card.get("rates_statuses_stats") or []:
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get("name") or "").strip().lower()
+        w = _INDEX_STATUS_WEIGHTS.get(name)
+        if w:
+            try:
+                total += w * int(s.get("value") or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+# Каноничные RU-подписи статусов для разбивки индекса в подсказке (агрегируют и
+# английские ключи, и локализованные имена аниме/манги к одной подписи).
+_INDEX_STATUS_LABELS = {
+    "completed": "Просмотрено", "просмотрено": "Просмотрено", "прочитано": "Прочитано",
+    "watching": "Смотрю", "смотрю": "Смотрю", "читаю": "Читаю",
+    "dropped": "Брошено", "брошено": "Брошено",
+    "on_hold": "Отложено", "отложено": "Отложено",
+    "planned": "В планах", "запланировано": "В планах",
+}
+
+
+def index_components_from_card(card: dict) -> list[tuple[str, float, int]]:
+    """Разбивка «базы индекса» по статусам для подсказки: список кортежей
+    (подпись, взвешенный_вклад, число_людей) по убыванию вклада. Подпись —
+    каноничная RU (см. _INDEX_STATUS_LABELS). Возвращает только статусы с
+    ненулевым числом людей; сумма взвешенных вкладов == index_base_from_card."""
+    if not isinstance(card, dict):
+        return []
+    agg: dict[str, list] = {}  # подпись -> [взвешенный_вклад, число_людей]
+    for s in card.get("rates_statuses_stats") or []:
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get("name") or "").strip().lower()
+        w = _INDEX_STATUS_WEIGHTS.get(name)
+        if not w:
+            continue
+        try:
+            cnt = int(s.get("value") or 0)
+        except (TypeError, ValueError):
+            cnt = 0
+        if cnt <= 0:
+            continue
+        label = _INDEX_STATUS_LABELS.get(name, name.capitalize())
+        cur = agg.setdefault(label, [0.0, 0])
+        cur[0] += w * cnt
+        cur[1] += cnt
+    out = [(label, wv, cnt) for label, (wv, cnt) in agg.items()]
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out
+
+
 def kinds_for(content_type: str):
     return MANGA_KINDS if content_type == CONTENT_MANGA else KINDS
 
@@ -128,6 +202,53 @@ def status_label(content_type: str, status: str) -> str:
     if content_type == CONTENT_MANGA:
         return MANGA_STATUS_LABELS.get(status, status)
     return STATUS_LABELS.get(status, status)
+
+
+# ── Группировка жанров: Жанры / Темы / Демография ────────────────────────────
+# Shikimori /api/genres отдаёт «классический» набор, где у ВСЕХ записей
+# kind == "genre" (тип аниме/манга — в entry_type). Сам сайт Shikimori делит
+# этот набор на «Жанры», «Темы» и «Демография». Поскольку REST не присылает эту
+# принадлежность, классифицируем по стабильному английскому имени (одинаково для
+# аниме и манги). Если же будущий API вернёт kind="theme"/"demographic" — доверяем
+# ему (см. genre_group).
+GROUP_GENRE = "genre"
+GROUP_THEME = "theme"
+GROUP_DEMOGRAPHIC = "demographic"
+
+GENRE_GROUP_LABELS = {
+    GROUP_GENRE: "Жанры",
+    GROUP_THEME: "Темы",
+    GROUP_DEMOGRAPHIC: "Демография",
+}
+# Порядок показа групп в интерфейсе.
+GENRE_GROUP_ORDER = (GROUP_GENRE, GROUP_THEME, GROUP_DEMOGRAPHIC)
+
+# Возрастные категории Shikimori.
+_DEMOGRAPHIC_NAMES = frozenset({
+    "kids", "shoujo", "shounen", "seinen", "josei",
+})
+# «Темы» (по классификации Shikimori/MAL): сеттинг/мотив, а не жанр.
+_THEME_NAMES = frozenset({
+    "cars", "demons", "game", "historical", "magic", "martial arts", "mecha",
+    "music", "parody", "police", "samurai", "school", "space", "super power",
+    "vampire", "harem", "military", "work life", "gender bender",
+})
+
+
+def genre_group(genre: dict) -> str:
+    """К какой группе отнести жанр из /api/genres: "genre"/"theme"/"demographic".
+
+    Сначала смотрим на kind (если API уже различает темы/демографию), иначе
+    классифицируем по английскому имени (стабильно для аниме и манги)."""
+    kind = str((genre or {}).get("kind") or "").strip().lower()
+    if kind in (GROUP_THEME, GROUP_DEMOGRAPHIC):
+        return kind
+    name = str((genre or {}).get("name") or "").strip().lower()
+    if name in _DEMOGRAPHIC_NAMES:
+        return GROUP_DEMOGRAPHIC
+    if name in _THEME_NAMES:
+        return GROUP_THEME
+    return GROUP_GENRE
 
 
 class ShikimoriError(Exception):
@@ -162,6 +283,50 @@ class Anime:
             if src and len(src) >= 4 and src[:4].isdigit():
                 return int(src[:4])
         return None
+
+    @property
+    def air_date(self):
+        """Дата выхода как datetime.date (по aired_on/released_on, YYYY-MM-DD) для
+        ТОЧНОГО расчёта «свежести» индекса по дню/месяцу, а не только году. Если
+        день/месяц неизвестны — подставляем 1-е/январь; если даты нет — None."""
+        import datetime as _dt
+        for src in (self.aired_on, self.released_on):
+            if not src or len(src) < 4 or not src[:4].isdigit():
+                continue
+            parts = str(src).split("-")
+            try:
+                y = int(parts[0])
+                m = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 1
+                d = int(parts[2][:2]) if len(parts) >= 3 and parts[2][:2].isdigit() else 1
+                m = min(12, max(1, m)); d = min(28, max(1, d)) if m == 2 else min(31, max(1, d))
+                return _dt.date(y, m, d)
+            except (ValueError, IndexError):
+                continue
+        return None
+
+    # Русские названия месяцев (родительный падеж) и сезонов — для date_label.
+    _MONTHS_RU = ("января", "февраля", "марта", "апреля", "мая", "июня",
+                  "июля", "августа", "сентября", "октября", "ноября", "декабря")
+    _SEASONS_RU = ("Зима", "Зима", "Весна", "Весна", "Весна", "Лето",
+                   "Лето", "Лето", "Осень", "Осень", "Осень", "Зима")
+
+    @property
+    def date_label(self) -> str:
+        """Дата выхода для показа, как можно точнее:
+        «12 апреля 2019» (есть день+месяц) → «Весна 2019» (есть месяц) →
+        «2019» (только год) → «» (даты нет)."""
+        src = self.aired_on or self.released_on
+        if not src or len(src) < 4 or not src[:4].isdigit():
+            return ""
+        y = src[:4]
+        parts = src.split("-")
+        mm = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+        dd = int(parts[2][:2]) if len(parts) >= 3 and parts[2][:2].isdigit() else 0
+        if 1 <= mm <= 12 and dd >= 1:
+            return f"{dd} {self._MONTHS_RU[mm - 1]} {y}"
+        if 1 <= mm <= 12:
+            return f"{self._SEASONS_RU[mm - 1]} {y}"
+        return y
 
     @classmethod
     def from_json(cls, d: dict, base_url: str = DEFAULT_BASE_URL) -> "Anime":
@@ -238,6 +403,7 @@ class AnimeFilter:
     episodes_min: Optional[int] = None
     episodes_max: Optional[int] = None
     genres: list[int] = field(default_factory=list)
+    exclude_genres: list[int] = field(default_factory=list)
     order: str = "ranked"
     content_type: str = "anime"   # "anime" | "manga"
 
@@ -253,8 +419,15 @@ class AnimeFilter:
             params["status"] = self.status
         if self.order in ORDERS:
             params["order"] = self.order
-        if self.genres:
-            params["genre"] = ",".join(str(g) for g in self.genres)
+        # Жанры/темы: включаемые — id, исключаемые — с префиксом «!» (так Shikimori
+        # помечает исключение), всё в одном параметре. Используем genre_v2 —
+        # современный параметр, который понимает ПОЛНЫЙ набор id жанров/тем/
+        # демографий (включая «Reincarnation» и прочие новые темы из GraphQL).
+        # Старый «genre» знает лишь легаси-набор и для новых id отдаёт пусто.
+        if self.genres or self.exclude_genres:
+            parts = [str(g) for g in self.genres]
+            parts += [f"!{g}" for g in self.exclude_genres]
+            params["genre_v2"] = ",".join(parts)
         # Сервер принимает только МИНИМАЛЬНУЮ оценку и целым числом.
         if self.score_min is not None:
             params["score"] = str(int(self.score_min))
@@ -265,13 +438,21 @@ class AnimeFilter:
         return params
 
     def _season_param(self) -> str:
+        # ВАЖНО: одиночный год ("2017") сервер трактует как РОВНО этот год, а НЕ
+        # «до/от». Поэтому открытую границу разворачиваем в ДИАПАЗОН ("1900_2017" /
+        # "2017_2027"), иначе «Год по 2017» искал только 2017 (и «Год с 2017» —
+        # тоже только 2017). Точную отсечку всё равно делает matches_local.
+        import datetime as _dt
         lo, hi = self.year_from, self.year_to
         if lo and hi:
             return f"{min(lo, hi)}_{max(lo, hi)}"
         if lo:
-            return str(lo)
+            # «От lo» — от lo до следующего года (захватываем и анонсы).
+            hi_open = max(int(lo), _dt.date.today().year + 1)
+            return f"{lo}_{hi_open}"
         if hi:
-            return str(hi)
+            # «До hi» — от ранней эпохи аниме до hi.
+            return f"{min(1900, int(hi))}_{hi}"
         return ""
 
     # ── Локальная часть ────────────────────────────────────────────────────
@@ -375,6 +556,59 @@ class ShikimoriApiClient:
                 time.sleep(self._backoff(attempt))
         raise last_err or ShikimoriError("Неизвестная ошибка запроса.")
 
+    # ── GraphQL POST (для полного списка жанров/тем) ───────────────────────
+    def _graphql(self, query: str, variables: Optional[dict] = None) -> Any:
+        """POST к /api/graphql с ретраями. Сами обрабатываем редирект (301/302/
+        307/308): requests на 301 превращает POST→GET и теряет тело, поэтому
+        перепосылаем тело на адрес из Location (домен Shikimori мигрирует между
+        .one/.io). Возвращает содержимое поля data или бросает ShikimoriError."""
+        from urllib.parse import urljoin
+        url = self.base_url + "/api/graphql"
+        payload = {"query": query, "variables": variables or {}}
+        last_err: Optional[Exception] = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = self._session.post(
+                    url, json=payload, timeout=self.timeout, allow_redirects=False)
+                # Следуем за редиректом ВРУЧНУЮ, сохраняя метод POST и тело.
+                hops = 0
+                while resp.status_code in (301, 302, 307, 308) and hops < 4:
+                    loc = resp.headers.get("Location")
+                    if not loc:
+                        break
+                    nurl = urljoin(resp.url, loc)
+                    resp = self._session.post(
+                        nurl, json=payload, timeout=self.timeout,
+                        allow_redirects=False)
+                    hops += 1
+            except requests.Timeout as e:
+                last_err = ShikimoriError(f"Таймаут запроса к Shikimori: {e}")
+            except requests.RequestException as e:
+                last_err = ShikimoriError(f"Сетевая ошибка: {e}")
+            else:
+                if resp.status_code == 200:
+                    try:
+                        body = resp.json()
+                    except ValueError as e:
+                        raise ShikimoriError(f"Некорректный JSON от сервера: {e}")
+                    if isinstance(body, dict) and body.get("errors"):
+                        msg = body["errors"][0].get("message", "GraphQL error") \
+                            if isinstance(body["errors"], list) and body["errors"] \
+                            else "GraphQL error"
+                        raise ShikimoriError(f"GraphQL: {msg}")
+                    return (body or {}).get("data") if isinstance(body, dict) else None
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    last_err = ShikimoriError(f"Сервер вернул {resp.status_code}.")
+                    if attempt < self.max_retries:
+                        time.sleep(self._retry_delay(resp, attempt))
+                        continue
+                else:
+                    raise ShikimoriError(
+                        f"GraphQL отклонён сервером (HTTP {resp.status_code}).")
+            if attempt < self.max_retries:
+                time.sleep(self._backoff(attempt))
+        raise last_err or ShikimoriError("Неизвестная ошибка GraphQL-запроса.")
+
     @staticmethod
     def _backoff(attempt: int) -> float:
         return min(8.0, 0.5 * (2 ** attempt))
@@ -416,13 +650,58 @@ class ShikimoriApiClient:
         return data
 
     def genres(self, content_type: str = "anime") -> list[dict]:
-        """Список жанров (id/name/russian) для выпадающего фильтра.
-        Жанры аниме и манги частично различаются — фильтруем по kind."""
+        """Полный список жанров/тем/демографий (id/name/russian/kind) для фильтра.
+
+        Берём через GraphQL (`genres(entryType: …)`): только он отдаёт СОВРЕМЕННЫЙ
+        набор с правильным `kind` ("genre"/"theme"/"demographic") и id, понятными
+        параметру genre_v2 поиска. Это даёт ВСЕ темы (включая «Reincarnation»,
+        «Isekai» и т.п.), которых нет в легаси /api/genres.
+
+        Если GraphQL недоступен — откатываемся на REST /api/genres (легаси-набор,
+        классифицируется по имени в genre_group)."""
+        ct = (content_type or "anime").lower()
+        entry = "Manga" if ct == "manga" else "Anime"
+        try:
+            data = self._graphql(
+                "query($e: GenreEntryTypeEnum!){ genres(entryType: $e){ "
+                "id name russian kind } }", {"e": entry})
+            glist = (data or {}).get("genres") if isinstance(data, dict) else None
+            if isinstance(glist, list) and glist:
+                out = []
+                for g in glist:
+                    if not isinstance(g, dict):
+                        continue
+                    # id из GraphQL приходит строкой — нормализуем к int.
+                    try:
+                        gid = int(g.get("id"))
+                    except (TypeError, ValueError):
+                        continue
+                    out.append({
+                        "id": gid,
+                        "name": g.get("name") or "",
+                        "russian": g.get("russian") or "",
+                        "kind": (g.get("kind") or "genre"),
+                    })
+                if out:
+                    return out
+        except ShikimoriError:
+            pass  # тихий откат на REST ниже
+
+        # Откат: легаси REST (без новых тем; kind всегда "genre").
         data = self._get("/api/genres")
         if not isinstance(data, list):
             return []
-        return [g for g in data if isinstance(g, dict)
-                and (g.get("kind") in (None, content_type))]
+        out = []
+        for g in data:
+            if not isinstance(g, dict):
+                continue
+            et = str(g.get("entry_type") or "").lower()
+            if et:
+                if et == ct:
+                    out.append(g)
+            elif g.get("kind") in (None, content_type):  # совместимость со старым API
+                out.append(g)
+        return out
 
     def close(self) -> None:
         try:
@@ -509,6 +788,7 @@ def quick_find(query: str = "", *, max_score: Optional[float] = None,
                episodes_min: Optional[int] = None,
                episodes_max: Optional[int] = None,
                genres: Optional[Iterable[int]] = None,
+               exclude_genres: Optional[Iterable[int]] = None,
                client: Optional[ShikimoriApiClient] = None,
                **find_kwargs: Any) -> list[Anime]:
     """Однострочный поиск без ручного создания клиента/фильтра.
@@ -522,6 +802,7 @@ def quick_find(query: str = "", *, max_score: Optional[float] = None,
             score_min=min_score, score_max=max_score,
             episodes_min=episodes_min, episodes_max=episodes_max,
             genres=list(genres) if genres else [],
+            exclude_genres=list(exclude_genres) if exclude_genres else [],
         )
         return find_anime(client, flt, **find_kwargs)
     finally:

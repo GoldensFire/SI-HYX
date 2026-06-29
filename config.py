@@ -97,7 +97,8 @@ try:
     )
     from PyQt6.QtGui import (
         QAction, QColor, QFont, QIcon, QPixmap, QBrush, QImage as QtGuiImage,
-        QKeySequence, QShortcut, QPainter, QPen, QCursor, QTextCursor
+        QKeySequence, QShortcut, QPainter, QPen, QCursor, QTextCursor,
+        QFontMetrics
     )
     from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 except Exception as e:
@@ -426,6 +427,9 @@ ITEM_STATUS_ROLE = Qt.ItemDataRole.UserRole + 10
 # Кастомная роль: на странице обработки помечает обработанную картинку, у которой
 # можно сравнить исходник и результат (значок-«сравнение» на превью).
 ITEM_COMPARE_ROLE = Qt.ItemDataRole.UserRole + 11
+# Кастомная роль: помечает строку как аудио (без видеоряда) — для неё в колонке
+# «Превью» не резервируется место под миниатюру, строка компактнее, имя по центру.
+ITEM_AUDIO_ROLE = Qt.ItemDataRole.UserRole + 12
 
 
 ALLOWED_IMG = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp', '.gif', '.avif'}
@@ -438,6 +442,11 @@ RIBBON_IMG = ALLOWED_IMG | {'.svg'}
 
 
 ALLOWED_MEDIA = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.mp3', '.wav', '.aac', '.m4a', '.flac', '.ogg', '.opus', '.wma'}
+
+
+# Аудио-форматы (подмножество ALLOWED_MEDIA без видеоряда) — у них в очереди
+# обработки нет превью-кадра, строку рисуем компактнее (см. PreviewNameDelegate).
+ALLOWED_AUDIO = {'.mp3', '.wav', '.aac', '.m4a', '.flac', '.ogg', '.opus', '.wma'}
 
 
 FORMAT_OPTIONS = {
@@ -462,13 +471,18 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # Репозиторий для автообновления (GitHub Releases)
 GITHUB_OWNER = "GoldensFire"
 GITHUB_REPO = "SI-HYX"
 DISCORD_URL = "https://discord.gg/EPCE3rMfFa"
 GITHUB_URL = "https://github.com/GoldensFire/SI-HYX"
+GUIDE_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id=3744506167"
+# Приём отчётов об ошибках (кнопка «Сообщить об ошибке» в диалогах ошибки).
+# Cloudflare Worker, который принимает JSON POST и пересылает его (напр. в Discord).
+# Пусто → кнопка отчёта в диалоге будет неактивна.
+ERROR_REPORT_URL = "https://bold-shadow-2a11.longld342.workers.dev/"
 HTTP_PORT = 7432  # порт локального сервера для браузерного расширения
 
 # Метка для пунктов выпадающих списков, которые являются значением по умолчанию.

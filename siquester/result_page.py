@@ -23,6 +23,12 @@ class ResultPage(QWidget):
         self._gen = 0
         self._pending: list[QWidget] = []
         self._content_widget = None
+        # Сетку плиток строим ЛЕНИВО — только когда страница пакета реально
+        # показана (см. _rebuild_content/showEvent). При старте так со всеми
+        # пакетами сразу: иначе построение 18 пакетов по ~5 сек подряд намертво
+        # вешало GUI-поток. Видимая страница строится сразу.
+        self._content_dirty = False
+        self._siq_view_dirty = False   # вьюер вопросов тоже строим лениво (см. attach_siq)
         # ── Undo / Redo stacks ──────────────────────────────
         self._undo_stack: _collections.deque = _collections.deque(maxlen=self._MAX_UNDO)
         self._redo_stack: list = []
@@ -70,6 +76,19 @@ class ResultPage(QWidget):
         self._splitter.setSizes([10000, 0])
 
         self._rebuild_content(animated=False)
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        if self._mw is None:
+            self._mw = self.window()
+        # Достраиваем отложенное при первом реальном показе страницы: сначала
+        # вьюер+сетку (если был привязан siq), иначе — только сетку плиток.
+        if getattr(self, "_siq_view_dirty", False):
+            self._ensure_siq_view()
+        elif getattr(self, "_content_dirty", False):
+            # Первый показ страницы пакета — сетку плиток заполняем порциями,
+            # чтобы доска появилась мгновенно, а не висла на ~1.4 с.
+            self._rebuild_content(animated=False, chunked=True)
 
     # ── Banner ────────────────────────────────────────────
     def _invalidate_fill_cache(self):
@@ -199,11 +218,17 @@ class ResultPage(QWidget):
         nc.addWidget(pkg_edit)
 
         r2 = QHBoxLayout(); r2.setSpacing(8)
+        # ВАЖНО: НЕ звать setVisible(True) на ещё БЕСРОДНОМ QLabel — Qt на миг
+        # показывает его как отдельное top-level окно (мелькающие окошки
+        # «📦 …»/«⏱ …», которые видел пользователь). Свежесозданный QLabel и так
+        # появится вместе с родителем; пустые просто прячем (.hide() не мелькает).
         size_lbl = _lbl(f"📦 {pkg_size}" if pkg_size else "", "color:#6c7086;font-size:10px;")
-        size_lbl.setVisible(bool(pkg_size)); r2.addWidget(size_lbl)
+        r2.addWidget(size_lbl)
+        if not pkg_size: size_lbl.hide()
         dur_lbl  = _lbl(f"⏱ {fmt_dur(total_dur)}" if total_dur > 0 else "",
                         "color:#cba6f7;font-size:10px;")
-        dur_lbl.setVisible(total_dur > 0); r2.addWidget(dur_lbl)
+        r2.addWidget(dur_lbl)
+        if total_dur <= 0: dur_lbl.hide()
         r2.addStretch(); nc.addLayout(r2); bl.addLayout(nc)
 
         count_lbl = _lbl(
@@ -354,17 +379,31 @@ class ResultPage(QWidget):
             _logger.warning(f"[attach_siq sync] {e}")
         # Invalidate completeness cache — SIQ object is new
         self._banner_fill_cache = None
-        # Build viewer
+        # Построение правой панели-вьюера + сетки плиток — дорогое (QuestionViewer
+        # и плитки для пакета на 150+ вопросов). Откладываем до первого показа
+        # страницы: при старте attach_siq зовётся для всех 18 пакетов, а виден
+        # лишь один. Невидимый пакет достроится в showEvent при первом открытии.
+        self._siq_view_dirty = True
+        if self.isVisible():
+            self._ensure_siq_view()
+
+    def _ensure_siq_view(self):
+        """Строит вьюер вопросов + сетку плиток для уже привязанного siq.
+        Вызывается при первом показе страницы (или сразу, если она видима)."""
+        if not self._siq_view_dirty or self._siq is None:
+            return
+        self._siq_view_dirty = False
         while self._viewer_lay.count():
             it = self._viewer_lay.takeAt(0)
             if it.widget(): it.widget().deleteLater()
-        self._viewer = QuestionViewer(siq)
+        self._viewer = QuestionViewer(self._siq)
         self._viewer.edit_requested.connect(self._on_edit_question_requested)
         self._viewer_lay.addWidget(self._viewer)
         self._viewer_wrap.setVisible(True)
         self._splitter.setSizes([6000, 4000])
         self._refresh_banner_widget()
-        self._rebuild_content(animated=False)
+        # Первый показ доски редактирования — плитки порциями (мгновенный каркас).
+        self._rebuild_content(animated=False, chunked=True)
 
     # ── WASD keyboard navigation ──────────────────────────────
     def _wasd_navigate(self, dx: int, dy: int):
@@ -449,7 +488,14 @@ class ResultPage(QWidget):
         f.setStyleSheet(_SS_DARK_BASE)
         return f
 
-    def _rebuild_content(self, animated=True):
+    def _rebuild_content(self, animated=True, chunked=False):
+        # Если страница пакета сейчас НЕ видна — откладываем дорогое построение
+        # сетки плиток до её первого показа (showEvent). Это ключ к мгновенному
+        # открытию вкладки: при старте строится только видимый пакет, а не все 18.
+        if not self.isVisible():
+            self._content_dirty = True
+            return
+        self._content_dirty = False
         self._gen += 1; my_gen = self._gen
         self._drop_areas.clear()
         self._drop_area_index.clear()   # rebuilt by _build_tile_view below
@@ -460,7 +506,15 @@ class ResultPage(QWidget):
         content = QWidget(); content.setStyleSheet("background:#181825;")
         cl = QVBoxLayout(content); cl.setContentsMargins(16,14,16,24); cl.setSpacing(0)
 
+        # _build_tile_view собирает плитки в self._pending_tile_fills, а не лепит
+        # их сразу: при chunked=True (первый показ страницы) сама сетка плиток
+        # достраивается порциями по таймеру — каркас доски виден мгновенно, а 150+
+        # плиток «доезжают» за пару кадров вместо ~1.4 с фриза. При обычной
+        # перерисовке (правка) заполняем синхронно — код после rebuild сразу
+        # рассчитывает на готовые плитки (выделение и т.п.).
         self._build_tile_view(cl)
+        if not chunked:
+            self._flush_tile_fills_sync()
 
         cl.addStretch()
         if my_gen != self._gen: content.deleteLater(); return
@@ -468,6 +522,9 @@ class ResultPage(QWidget):
         old = self._content_widget
         self._content_widget = content
         self._scroll.setWidget(content)
+
+        if chunked:
+            self._start_tile_fill(my_gen)
 
         # Restore scroll position after layout settles
         QTimer.singleShot(0, lambda v=_saved_scroll: self._scroll.verticalScrollBar().setValue(v))
@@ -491,6 +548,9 @@ class ResultPage(QWidget):
     # ── Tile view ─────────────────────────────────────────
     def _build_tile_view(self, cl: QVBoxLayout):
         has_siq = self._siq is not None
+        # Плитки не добавляем сразу — собираем сюда (area, q_fulls, has_siq) и
+        # заполняем синхронно или порциями (см. _rebuild_content/_start_tile_fill).
+        self._pending_tile_fills = []
         # Cache scale factor once — constant for the entire build pass.
         _scale         = _screen_scale()
         _th_label_w_px = max(200, int(420 * _scale))
@@ -852,6 +912,7 @@ class ResultPage(QWidget):
                 tiles_w.dragMoveEvent  = _tiles_drag_move
                 tiles_w.dropEvent      = _tiles_drop
 
+                q_fulls = []
                 for qi, q in enumerate(theme["questions"]):
                     q_full = q
                     if has_siq:
@@ -862,9 +923,9 @@ class ResultPage(QWidget):
                                               "right": q.get("right", 0)}
                         except Exception:
                             q_full = q
-                    tiles_w.add_tile(q_full, has_siq)
-                if has_siq:
-                    tiles_w.add_plus_tile()
+                    q_fulls.append(q_full)
+                # Откладываем фактическое создание плиток (см. _build_tile_view).
+                self._pending_tile_fills.append((tiles_w, q_fulls, has_siq))
 
                 row_hl.addWidget(tiles_w, stretch=1)
                 cl.addWidget(theme_row)
@@ -889,6 +950,68 @@ class ResultPage(QWidget):
             add_rnd2.setObjectName(_ON_BTN_COMPARE); add_rnd2.setFixedHeight(30)
             add_rnd2.clicked.connect(self._add_round)
             cl.addWidget(add_rnd2)
+
+    # ── Tile fill (synchronous / chunked) ─────────────────────
+    def _flush_tile_fills_sync(self):
+        """Создаёт все отложенные плитки немедленно (обычная перерисовка)."""
+        fills = getattr(self, "_pending_tile_fills", None)
+        if not fills:
+            self._pending_tile_fills = []
+            return
+        self._pending_tile_fills = []
+        self._tile_fill_queue = None   # отменяем возможную незавершённую порцию
+        for area, q_fulls, has_siq in fills:
+            for q in q_fulls:
+                area.add_tile(q, has_siq)
+            if has_siq:
+                area.add_plus_tile()
+
+    def _start_tile_fill(self, gen: int):
+        """Заполняет сетку плитками порциями по таймеру: каркас доски виден сразу,
+        а плитки «доезжают» за несколько кадров — без длинного фриза на первом
+        показе пакета."""
+        fills = getattr(self, "_pending_tile_fills", None)
+        self._pending_tile_fills = []
+        if not fills:
+            self._tile_fill_queue = None
+            return
+        queue = _collections.deque()
+        for area, q_fulls, has_siq in fills:
+            for q in q_fulls:
+                queue.append(("tile", area, q, has_siq))
+            if has_siq:
+                queue.append(("plus", area, None, has_siq))
+        self._tile_fill_queue = queue
+        self._tile_fill_gen = gen
+        QTimer.singleShot(0, self._fill_tiles_chunk)
+
+    def _fill_tiles_chunk(self):
+        # Перерисовка/смена пакета увеличивает _gen — устаревшее заполнение бросаем.
+        if getattr(self, "_tile_fill_gen", -1) != self._gen:
+            self._tile_fill_queue = None
+            return
+        q = getattr(self, "_tile_fill_queue", None)
+        if not q:
+            return
+        # Бюджет по времени (~12 мс): сколько плиток успеем — столько и создаём за
+        # тик, затем уступаем циклу событий, чтобы держать ~60 к/с независимо от
+        # стоимости плитки на конкретной машине.
+        start = _time.perf_counter()
+        while q:
+            kind, area, data, has_siq = q.popleft()
+            try:
+                if kind == "tile":
+                    area.add_tile(data, has_siq)
+                else:
+                    area.add_plus_tile()
+            except RuntimeError:
+                pass   # область удалена при перестроении — пропускаем
+            if (_time.perf_counter() - start) > 0.012:
+                break
+        if q:
+            QTimer.singleShot(0, self._fill_tiles_chunk)
+        else:
+            self._tile_fill_queue = None
 
     def _move_round(self, src_idx: int, dst_idx: int):
         """Reorder rounds (ds + siq XML)."""
@@ -1191,8 +1314,19 @@ class ResultPage(QWidget):
         self._push_undo()
         ok = self._siq.save_round_prices(rnd_idx, mn, mx, st)
         if not ok:
-            QMessageBox.warning(self, "Ошибка",
-                                "Не удалось сохранить новые цены в .siq файл.")
+            # Roll back the undo snapshot we pushed — nothing actually changed.
+            try:
+                if self._undo_stack:
+                    self._undo_stack.pop()
+            except Exception:
+                pass
+            QMessageBox.warning(
+                self, "Не удалось сохранить",
+                "Не удалось записать новые цены в .siq файл — он, скорее всего, "
+                "занят другой программой.\n\n"
+                "Закройте файл, если он открыт в другом приложении "
+                "(другой плеер/редактор вопросов, архиватор), дождитесь "
+                "завершения синхронизации OneDrive, и попробуйте снова.")
             return
         # Sync ds["rounds"] prices from siq
         try:

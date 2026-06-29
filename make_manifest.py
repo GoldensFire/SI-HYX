@@ -4,11 +4,13 @@
 Две команды (вызываются из build.bat):
 
   1) python make_manifest.py binver "dist\\SI-HYX vX.Y.Z"
-     • считает SHA256 по всему содержимому <app>/bin (детерминированно: файлы
-       в отсортированном порядке, в хеш идут относительный путь + содержимое);
+     • считает SHA256 по всем внешним ассетам <app>/bin + <app>/models
+       (детерминированно: файлы в отсортированном порядке, в хеш идут
+       '<папка>/<относит.путь>' + содержимое);
      • пишет этот хеш в <app>/bin/.binver — программа читает его, чтобы понять,
-       какой набор bin у неё сейчас стоит.
-     Делается ДО упаковки full-архива, чтобы .binver попал внутрь него.
+       какой набор внешних ассетов у неё сейчас стоит.
+     Делается ДО упаковки full-архива (и ПОСЛЕ копирования bin+models), чтобы
+     .binver попал внутрь него.
 
   2) python make_manifest.py manifest "dist\\SI-HYX vX.Y.Z" "dist" ^
             "dist\\...-update.zip" "dist\\...-full.zip"
@@ -19,7 +21,7 @@
        битый или подменённый zip не распаковывается.
      Делается ПОСЛЕ упаковки обоих архивов.
 
-Файл .binver в хеш bin НЕ включается (иначе хеш зависел бы сам от себя).
+Файл .binver в хеш НЕ включается (иначе хеш зависел бы сам от себя).
 """
 import hashlib
 import json
@@ -37,19 +39,39 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
-def compute_bin_sha(bin_dir: str) -> str:
+# Внешние ассеты приложения, по которым считается хеш «версии бинарников»:
+#   • bin\    — ffmpeg/yt-dlp и пр.;
+#   • models\ — lama_fp32.onnx / model_uint8.onnx (подвкладки «Фото»). Тоже внешний
+#               ассет рядом с .exe (НЕ внутри сборки) — чтобы не попадать в дельта-
+#               апдейт. Включаем в хеш: если модель сменилась, апдейтер выберет
+#               полный архив (а не код-онли) — пользователь получит новую модель.
+# Папки нет → она пропускается (хеш считается по тому, что есть).
+ASSET_DIRS = ("bin", "models")
+
+
+def compute_bin_sha(app_dir: str) -> str:
+    """SHA256 по всем внешним ассетам (ASSET_DIRS) приложения. Детерминированно:
+    в хеш идут '<папка>/<относит.путь>' + содержимое в отсортированном порядке.
+    .binver исключается (иначе хеш зависел бы сам от себя)."""
     h = hashlib.sha256()
-    for root, _dirs, files in os.walk(bin_dir):
-        for name in sorted(files):
-            if name == BINVER_NAME:
-                continue
-            path = os.path.join(root, name)
-            rel = os.path.relpath(path, bin_dir).replace("\\", "/")
-            h.update(rel.encode("utf-8"))
-            h.update(b"\0")
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                    h.update(chunk)
+    entries = []
+    for sub in ASSET_DIRS:
+        root_dir = os.path.join(app_dir, sub)
+        if not os.path.isdir(root_dir):
+            continue
+        for root, _dirs, files in os.walk(root_dir):
+            for name in files:
+                if name == BINVER_NAME:
+                    continue
+                path = os.path.join(root, name)
+                rel = (sub + "/" + os.path.relpath(path, root_dir)).replace("\\", "/")
+                entries.append((rel, path))
+    for rel, path in sorted(entries):
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
     return h.hexdigest()
 
 
@@ -58,7 +80,8 @@ def cmd_binver(app_dir: str):
     if not os.path.isdir(bin_dir):
         print(f"[ERROR] bin not found: {bin_dir}")
         sys.exit(1)
-    sha = compute_bin_sha(bin_dir)
+    # Хеш по bin + models; пишем его в bin/.binver (его читает сама программа).
+    sha = compute_bin_sha(app_dir)
     with open(os.path.join(bin_dir, BINVER_NAME), "w", encoding="ascii") as f:
         f.write(sha)
     print(f"bin_sha = {sha}")
@@ -81,7 +104,7 @@ def cmd_manifest(app_dir: str, dist_dir: str, update_zip: str, full_zip: str):
 
     manifest = {
         "version": config.APP_VERSION,
-        "bin_sha": compute_bin_sha(bin_dir),
+        "bin_sha": compute_bin_sha(app_dir),
         "update_sha": _sha256_file(update_zip),
         "full_sha": _sha256_file(full_zip),
     }

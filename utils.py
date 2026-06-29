@@ -1185,11 +1185,18 @@ def pil_to_qicon(img):
         return QIcon()
 
 
-def move_to_trash(path):
+def move_to_trash(path, hwnd=None):
     """Отправляет файл в Корзину (Windows) БЕЗ системного диалога подтверждения.
     Возвращает True при успехе. Реализовано через WinAPI SHFileOperationW с
     флагом FOF_ALLOWUNDO — это кладёт файл в Корзину (откуда его можно вернуть),
-    а не удаляет безвозвратно; стороннюю зависимость (send2trash) не тянем."""
+    а не удаляет безвозвратно; стороннюю зависимость (send2trash) не тянем.
+
+    hwnd — HWND ОКНА-ВЛАДЕЛЬЦА операции (целое). Передавать обязательно
+    top-level окно: если оставить NULL, SHFileOperation берёт активное окно
+    потока, а им может оказаться дочернее нативное окно Qt (когда виджет был
+    промоутнут в нативный, например ради drag&drop). Тогда Windows пытается
+    сделать НЕ-top-level окно владельцем — Qt пишет «must be a top level window»,
+    а сама операция срывается. Явный top-level HWND это устраняет."""
     try:
         path = os.path.abspath(path)
     except Exception:
@@ -1220,7 +1227,11 @@ def move_to_trash(path):
             FOF_NOERRORUI = 0x0400        # без окон об ошибках
 
             op = _SHFILEOPSTRUCTW()
-            op.hwnd = None
+            # Владелец операции — только валидный top-level HWND (см. docstring).
+            try:
+                op.hwnd = int(hwnd) if hwnd else None
+            except Exception:
+                op.hwnd = None
             op.wFunc = FO_DELETE
             # pFrom — список путей, оканчивающийся ДВОЙНЫМ NUL.
             op.pFrom = path + '\x00\x00'
