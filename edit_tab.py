@@ -14,6 +14,7 @@ import sys
 import json
 import math
 import wave
+import uuid
 import tempfile
 import subprocess
 import threading
@@ -26,6 +27,8 @@ from collections import deque
 # импортируется в main.py до создания QApplication, поэтому setdefault здесь
 # срабатывает вовремя и не перетирает значения, заданные пользователем извне.
 from config import SETTINGS_FILE as _SETTINGS_FILE
+from msgbox import msgbox_critical, msgbox_warning, msgbox_information, msgbox_question
+from widgets import info_badge
 
 
 def _read_bool_setting(key, default=False):
@@ -123,8 +126,7 @@ def run_ffprobe(path):
                            encoding="utf-8", errors="replace",
                            creationflags=CREATE_NO_WINDOW)
         return json.loads(p.stdout)
-    except Exception as e:
-        print("ffprobe failed:", e)
+    except Exception:
         return None
 
 
@@ -1002,8 +1004,6 @@ class VideoInpaintWorker(QThread):
             if self._cancel or msg == "Отменено":
                 self.failed.emit("Отменено")
             else:
-                import traceback
-                traceback.print_exc()
                 self.failed.emit(msg)
         finally:
             # Уборка временных файлов — безусловная.
@@ -1072,7 +1072,7 @@ class _VideoMaskDialog(QDialog):
     def _accept(self):
         m = self.canvas.get_mask()
         if m is None or int(m.max()) == 0:
-            QMessageBox.information(
+            msgbox_information(
                 self, "Маска пуста",
                 "Сначала закрасьте кистью объект, который нужно удалить.")
             return
@@ -1219,13 +1219,30 @@ class ProxyWorker(QThread):
                 if self._stopped:
                     self.finished.emit(False, "Отменено", "")
                     return
-                if rc == 0:
+                # rc==0 не гарантия успеха: mov/mp4 с moov в конце файла (не
+                # +faststart) через НЕ-seekable pipe:0 ffmpeg демуксит с ошибкой
+                # «partial file»/«Invalid data…», но всё равно завершается кодом 0,
+                # написав пустой (~200 байт, только ftyp) выходной файл — баг
+                # воспроизводился на реальном AV1+Opus исходнике без faststart
+                # (итог: «в Монтаже ни картинки, ни звука»). Поэтому после pipe-
+                # попытки проверяем реальный размер результата, а не только rc —
+                # иначе следующая (рабочая) команда с прямым файловым входом даже
+                # не пробуется.
+                if rc == 0 and self._looks_like_real_output(err):
                     self.finished.emit(True, "OK", self.output_path)
                     return
                 last_error = (err or "")[-600:] or f"код {rc}"
             except Exception as e:
                 last_error = str(e)
         self.finished.emit(False, last_error, "")
+
+    def _looks_like_real_output(self, err_text=""):
+        if "Output file is empty" in (err_text or ""):
+            return False
+        try:
+            return os.path.getsize(self.output_path) > 4096
+        except OSError:
+            return False
 
     def stop(self):
         self._stopped = True
@@ -1306,23 +1323,25 @@ class AudioWaveformLoader(QThread):
         ok = False
         # Сначала через FILE_SHARE_DELETE-пайп (исходник остаётся удаляемым во
         # время построения волны). Не для всех контейнеров pipe:0 годится
-        # (moov в конце mp4 без faststart), поэтому при неудаче — прямой вход.
+        # (moov в конце mp4 без faststart) — ffmpeg тогда может отрапортовать
+        # rc=0, при этом записав ПУСТОЙ wav (см. тот же баг в ProxyWorker), так
+        # что дополнительно проверяем реальное число сэмплов, а не только rc.
         if os.name == 'nt':
             try:
-                ok = self._run_ffmpeg(cmd_pipe, feed_path=self.filepath)
+                ok = self._run_ffmpeg(cmd_pipe, feed_path=self.filepath) and self._wav_has_frames(self.tmp_wav)
             except Exception:
                 ok = False
         if not ok and not self._stopped:
             try:
-                ok = self._run_ffmpeg(cmd_file)
-            except Exception as e:
-                print("Audio extract failed:", e)
+                ok = self._run_ffmpeg(cmd_file) and self._wav_has_frames(self.tmp_wav)
+            except Exception:
+                ok = False
 
         if not ok and not self._stopped:
             try:
                 ok = self._run_ffmpeg(
                     [FFMPEG, "-y", "-i", self.filepath, "-vn",
-                     "-ac", "2", "-ar", "6000", "-f", "wav", self.tmp_wav])
+                     "-ac", "2", "-ar", "6000", "-f", "wav", self.tmp_wav]) and self._wav_has_frames(self.tmp_wav)
             except Exception:
                 ok = False
 
@@ -1339,6 +1358,17 @@ class AudioWaveformLoader(QThread):
             samples, duration, left, right = [], 0.0, [], []
         self._cleanup_tmp()
         self.finished.emit(samples, duration, left, right)
+
+    @staticmethod
+    def _wav_has_frames(path):
+        try:
+            wf = wave.open(path, 'rb')
+            try:
+                return wf.getnframes() > 0
+            finally:
+                wf.close()
+        except Exception:
+            return False
 
     def _cleanup_tmp(self):
         try:
@@ -1588,6 +1618,23 @@ class WaveformWidget(QWidget):
         self._cache_key = None
         self.update()
 
+    def prime_duration(self, duration):
+        """Сообщает волне длительность файла РАНЬШЕ, чем достроятся семплы.
+        Длительность уже известна из ffprobe/контейнера сразу при загрузке файла,
+        но до этого метода self.duration оставалась 0.0 (см. reset_markers) —
+        из-за этого клик по полосе волны во время «Загрузка волны…»/«Создание
+        превью…» ВСЕГДА сикал в начало (mousePressEvent считал волну неготовой),
+        хотя сам плеер уже мог играть с любой позиции. Семплы/loading_text не
+        трогаем — визуально полоса остаётся в состоянии загрузки."""
+        d = max(0.0, float(duration or 0.0))
+        if d <= 0:
+            return
+        self.duration = d
+        if not (0.0 <= self.in_s < self.out_s <= self.duration):
+            self.in_s = 0.0
+            self.out_s = self.duration
+        self.update()
+
     def set_in_out(self, in_s, out_s, keep_view=False):
         self.in_s = max(0.0, min(in_s, self.duration))
         self.out_s = max(0.0, min(out_s, self.duration))
@@ -1797,7 +1844,7 @@ class WaveformWidget(QWidget):
             x = ev.position().x()
         except Exception:
             x = ev.x()
-        if self.duration <= 0 or self.loading_text:
+        if self.duration <= 0:
             self.seekRequested.emit(0.0); return
         w = max(1, self.width()); x = max(0, min(w, x))
 
@@ -2485,6 +2532,17 @@ class VideoCanvas(QWidget):
         self._crop_drag = None          # активная ручка: tl/tr/bl/br/t/b/l/r/move
         self._crop_anchor = None        # позиция мыши (norm) на момент захвата
         self._crop_start_rect = None    # рамка (QRectF) на момент захвата
+        # Во время активной перемотки (протяжка слайдера/волны) кадры сыпятся
+        # часто и ненадолго — плавное (билинейное) масштабирование каждого из них
+        # даёт заметную лишнюю нагрузку без пользы (кадр всё равно тут же сменится).
+        # На это время рисуем ближайшим соседом (быстрее), а как только перемотка
+        # утихла — возвращаем сглаживание для финального кадра. См. set_scrub_active.
+        self._scrub_active = False
+        # То же и во время ВОСПРОИЗВЕДЕНИЯ: кадр сменится через ~16 мс, сглаживание
+        # на нём не разглядеть, зато билинейный ресайз каждого кадра зря грузит ЦП
+        # (главный поток и так занят frame.toImage()). На паузе/стопе — сглаживаем
+        # (чёткий стоп-кадр). См. set_playing.
+        self._playing = False
         self.setMouseTracking(True)
         # Плавающие кнопки «Применить/Отмена» прямо на холсте (как в Photoshop).
         self._crop_apply_btn = make_icon_btn("Применить", icon='fa5s.check', accent=True)
@@ -2519,6 +2577,23 @@ class VideoCanvas(QWidget):
         self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
         self._update_crop_buttons()
         self.update()
+
+    def set_scrub_active(self, on: bool):
+        """Включает/выключает быстрый (без сглаживания) режим отрисовки на время
+        активной перемотки — см. комментарий у self._scrub_active."""
+        on = bool(on)
+        if on != self._scrub_active:
+            self._scrub_active = on
+
+    def set_playing(self, on: bool):
+        """Быстрый (без сглаживания) ресайз кадра во время воспроизведения — см.
+        комментарий у self._playing. На паузе/стопе возвращаем сглаживание и
+        перерисовываем текущий кадр уже сглаженно (чёткий стоп-кадр)."""
+        on = bool(on)
+        if on != self._playing:
+            self._playing = on
+            if not on and self._frame_img is not None:
+                self.update()
 
     def has_crop(self) -> bool:
         return self._crop_norm is not None
@@ -2722,6 +2797,12 @@ class VideoCanvas(QWidget):
         """Текст по центру холста, когда видеоряда нет (редактируется аудио).
         Пустая строка — обычный режим (показ кадров)."""
         text = text or ""
+        # Включаем режим «нет видео» — стираем последний кадр ПРЕДЫДУЩЕГО файла.
+        # paintEvent рисует _frame_img в приоритете над сообщением, поэтому без
+        # сброса старое видео «зависало» на холсте при загрузке аудиофайла
+        # (менялась только волна, а картинка оставалась прежней).
+        if text:
+            self._frame_img = None
         if text == self._audio_only_msg:
             return
         self._audio_only_msg = text
@@ -2884,6 +2965,11 @@ class VideoCanvas(QWidget):
                           if (out_seconds and out_seconds > 0) else None)
 
     def _on_frame(self, frame):
+        # Аудиофайл (видеоряда нет): игнорируем любые «поздние» кадры от плеера
+        # (например, финальный кадр прошлого источника при смене файла), иначе
+        # старое видео вновь заполнит _frame_img и перекроет сообщение «нет видео».
+        if self._audio_only_msg:
+            return
         # Граница OUT по PTS кадра — ПРОВЕРЯЕМ ДО конвертации в QImage и показа.
         # Кадр за границей не рисуем и просим плеер на паузу (анти-overshoot).
         if frame is not None and self._bound_us is not None:
@@ -2998,7 +3084,11 @@ class VideoCanvas(QWidget):
         img = self._frame_img
         if img is not None and not img.isNull():
             vr = self.video_rect()
-            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            # Во время протяжки/воспроизведения — без сглаживания (быстрее, кадр всё
+            # равно сейчас сменится); на устоявшемся стоп-кадре — со сглаживанием
+            # (качество).
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,
+                            not (self._scrub_active or self._playing))
             p.drawImage(vr, img)
             # Субтитры рисуем в ВИДИМОЙ части кадра (пересечение зумированного vr
             # с областью виджета), а не во всём vr. Иначе при приближении кадра
@@ -3052,12 +3142,49 @@ class SeekSlider(QSlider):
     page-step'ами). Пока пользователь держит ползунок, плеер не перебивает его
     значение (см. is_user_seeking)."""
 
+    # Максимальная частота РЕАЛЬНЫХ seek'ов (sliderMoved → player.setPosition) во
+    # время протяжки мышью — на тяжёлом H.264/HEVC (редкие кейфреймы) плеер не
+    # успевает отрабатывать seek на каждый пиксель движения курсора (mouseMoveEvent
+    # может сыпаться намного чаще) и «копит» очередь — перемотка ощущается с
+    # запозданием, хотя каждый отдельный seek сам по себе быстрый. Ручку слайдера
+    # (setValue) НЕ троттлим — она остаётся под курсором мгновенно, как обычно;
+    # троттлится только фактическая перемотка видео. Покадрового шага стрелками
+    # (step_frame/step_frame_scrub) это не касается — тот путь вызывает
+    # player.setPosition() напрямую, минуя sliderMoved.
+    _SEEK_THROTTLE_S = 0.05
+
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self._seeking = False
+        self._last_seek_emit = 0.0
+        self._seek_pending_v = None
+        self._seek_flush_timer = QTimer(self)
+        self._seek_flush_timer.setSingleShot(True)
+        self._seek_flush_timer.timeout.connect(self._flush_pending_seek)
 
     def is_user_seeking(self):
         return self._seeking
+
+    def _emit_seek(self, v):
+        """Троттлит sliderMoved во время протяжки (см. _SEEK_THROTTLE_S); клик и
+        отпускание кнопки — всегда мгновенно, без троттлинга."""
+        now = time.monotonic()
+        if now - self._last_seek_emit >= self._SEEK_THROTTLE_S:
+            self._last_seek_emit = now
+            self._seek_pending_v = None
+            self._seek_flush_timer.stop()
+            self.sliderMoved.emit(v)
+        else:
+            self._seek_pending_v = v
+            if not self._seek_flush_timer.isActive():
+                remaining = max(1, int((self._SEEK_THROTTLE_S - (now - self._last_seek_emit)) * 1000))
+                self._seek_flush_timer.start(remaining)
+
+    def _flush_pending_seek(self):
+        if self._seek_pending_v is not None and self._seeking:
+            self._last_seek_emit = time.monotonic()
+            v, self._seek_pending_v = self._seek_pending_v, None
+            self.sliderMoved.emit(v)
 
     def _value_at(self, x):
         opt = QStyleOptionSlider()
@@ -3079,6 +3206,7 @@ class SeekSlider(QSlider):
         if (ev.button() == Qt.MouseButton.LeftButton
                 and self.orientation() == Qt.Orientation.Horizontal):
             self._seeking = True
+            self._last_seek_emit = time.monotonic()  # свежее окно троттлинга для нового драга
             v = self._value_at(int(ev.position().x()))
             self.setValue(v)
             self.sliderMoved.emit(v)
@@ -3095,8 +3223,8 @@ class SeekSlider(QSlider):
         if (self._seeking
                 and self.orientation() == Qt.Orientation.Horizontal):
             v = self._value_at(int(ev.position().x()))
-            self.setValue(v)
-            self.sliderMoved.emit(v)
+            self.setValue(v)        # ручка следует за курсором мгновенно, без троттлинга
+            self._emit_seek(v)      # а сам seek видео — троттлится (см. _SEEK_THROTTLE_S)
             ev.accept()
             return
         super().mouseMoveEvent(ev)
@@ -3104,6 +3232,13 @@ class SeekSlider(QSlider):
     def mouseReleaseEvent(self, ev):
         if self._seeking and ev.button() == Qt.MouseButton.LeftButton:
             self._seeking = False
+            # Финальную позицию отпускания отдаём немедленно, не дожидаясь
+            # отложенного флаша троттлера — иначе итоговый кадр «доедет» с задержкой.
+            self._seek_flush_timer.stop()
+            if self._seek_pending_v is not None:
+                v, self._seek_pending_v = self._seek_pending_v, None
+                self._last_seek_emit = time.monotonic()
+                self.sliderMoved.emit(v)
             ev.accept()
             return
         super().mouseReleaseEvent(ev)
@@ -3564,6 +3699,20 @@ class FullscreenVideo(QWidget):
         self.bar.setGeometry(tl.x(), tl.y(), self.width(), bar_h)
         if self.bar.isVisible():
             self.bar.raise_()   # поверх оверлея субтитров
+        # self.bar — WA_TranslucentBackground + WindowType.Tool получает нативный
+        # хэндл сразу при создании (до первого setGeometry), поэтому его QScreen
+        # застревает на том экране, где он появился на свет (обычно первичный
+        # монитор) — даже когда полноэкранное окно реально открыто на ДРУГОМ
+        # мониторе. Из-за этого стандартный hover-tooltip кнопок панели считает
+        # границы экрана по чужому монитору и получается «за пределами экрана».
+        # Перепривязываем окно панели к экрану, где она физически оказалась.
+        try:
+            scr = QApplication.screenAt(tl)
+            wh = self.bar.windowHandle()
+            if scr is not None and wh is not None and wh.screen() is not scr:
+                wh.setScreen(scr)
+        except Exception:
+            pass
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
@@ -3938,6 +4087,10 @@ class EditTab(QWidget):
         # она дёргается). См. step_frame_scrub / on_playback_changed.
         self._scrubbing = False
         self._scrub_target = None     # последняя цель покадрового шага (мс)
+        self._frame_seek_busy = False    # в полёте не больше одного player.setPosition()
+        self._frame_seek_pending = None  # см. step_frame/_dispatch_frame_seek
+        self._frame_seek_target_ms = None
+        self._frame_seek_gen = 0
         # Флаг «прогрев аудио»: после СТОП беззвучно поднимаем аудио-декодер в
         # точке IN, чтобы следующее воспроизведение стартовало без задержки звука
         # (см. _preroll_at / stop_playback). Кнопку/иконку при этом не трогаем.
@@ -3985,9 +4138,20 @@ class EditTab(QWidget):
         self.sync_timer.setInterval(80)
         self.sync_timer.timeout.connect(self.sync_ui)
 
+        # Идле-таймер «активной перемотки» для VideoCanvas.set_scrub_active — см.
+        # seek_to(). Пока идут seek'и (протяжка слайдера/волны), таймер постоянно
+        # перезапускается; как только он ОТРАБОТАЛ (перемотка утихла) — возвращаем
+        # сглаживание кадра.
+        self._scrub_idle_timer = QTimer(self)
+        self._scrub_idle_timer.setSingleShot(True)
+        self._scrub_idle_timer.setInterval(150)
+        self._scrub_idle_timer.timeout.connect(self._on_scrub_idle)
+
         self.ffmpeg_thread = None
         self.proxy_thread = None
         self.audio_worker = None
+        self._waveform_cache = {}   # (path, mtime, size, audio_index) -> (samples, duration, left, right)
+        self._subtitle_fonts_cache = {}   # (path, mtime, size) -> fonts_dir
 
         self.init_ui()
         self.apply_theme()
@@ -4262,8 +4426,10 @@ class EditTab(QWidget):
         ])
         self.cmb_pb_quality.setToolTip(
             "Качество предпросмотра (не влияет на экспорт).\n"
-            "Полное — играет оригинал.\n"
-            "1/2 и 1/4 — плеер показывает уменьшенную копию (прокси): "
+            "Полное — играет оригинал без прокси. Исключение — AV1: его "
+            "QtMultimedia не тянет напрямую, поэтому для него прокси строится "
+            "всегда (это единственный случай «не поддерживается»).\n"
+            "1/2 и 1/4 — плеер всегда показывает уменьшенную копию (прокси): "
             "воспроизведение и перемотка работают быстрее на тяжёлых файлах.")
         self.cmb_pb_quality.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -5078,7 +5244,7 @@ class EditTab(QWidget):
         except Exception:
             pass
         try:
-            QMessageBox.information(self, "Файл был занят", msg)
+            msgbox_information(self, "Файл был занят", msg)
         except Exception:
             pass
 
@@ -5270,8 +5436,22 @@ class EditTab(QWidget):
 
     def showEvent(self, ev):
         super().showEvent(ev)
+        # Пересчитать размер холста ДО отрисовки — иначе виджет мигает старым
+        # размером и лишь на resizeEvent долетает до нужного (визуальный сдвиг).
+        if self._ready:
+            self._adjust_video_height()
         # Вкладку показали (вернулись на «Монтаж») — вернуть оверлей субтитров.
         QTimer.singleShot(0, self._position_overlay)
+        # QTabWidget помнит, какой дочерний виджет был в фокусе на этой странице
+        # в прошлый раз (например, кнопка «Открыть» или комбобокс «Режим
+        # обрезки») и возвращает фокус ЕМУ при переключении на вкладку. Из-за
+        # этого мгновенный Space сразу после переключения на «Монтаж» не играл
+        # видео (шорткат Space зарегистрирован на self), а активировал
+        # сфокусированный виджет — жал кнопку/раскрывал комбобокс. Перехватываем
+        # фокус на себя при каждом показе вкладки, чтобы Space гарантированно
+        # доставался toggle_play, а не случайному виджету боковой панели.
+        if self._ready:
+            QTimer.singleShot(0, self.setFocus)
 
     def hideEvent(self, ev):
         super().hideEvent(ev)
@@ -5402,13 +5582,16 @@ class EditTab(QWidget):
             return "—"
 
     @staticmethod
-    def _track_label(s, i, kind):
+    def _track_label(s, i, kind, total=1):
         tags = s.get('tags', {}) or {}
         lang = tags.get('language') or tags.get('LANGUAGE') or ''
         title = tags.get('title') or tags.get('TITLE') or ''
         codec = (s.get('codec_name') or '').upper()
         parts = [f"{i + 1}."]
-        if lang: parts.append(lang)
+        # Тег языка показываем ТОЛЬКО когда дорожек несколько — иначе выбирать
+        # нечего, а тег часто врёт (YouTube помечает единственную/оригинальную
+        # дорожку как "eng" независимо от реального языка озвучки).
+        if lang and total > 1: parts.append(lang)
         if title: parts.append(title[:18])
         if codec and not title: parts.append(codec)
         return " ".join(parts) or f"Дорожка {i + 1}"
@@ -5427,7 +5610,7 @@ class EditTab(QWidget):
             self.cmb_audio.clear()
             self._audio_entries = []
             for i, s in enumerate(self._audio_streams):
-                self.cmb_audio.addItem(self._track_label(s, i, "Аудио"))
+                self.cmb_audio.addItem(self._track_label(s, i, "Аудио", total=len(self._audio_streams)))
                 self._audio_entries.append(('emb', i))
             for p in self._audio_ext:
                 self.cmb_audio.addItem(get_icon('fa5s.file'), os.path.basename(p))
@@ -5441,7 +5624,7 @@ class EditTab(QWidget):
             self.cmb_subs.addItem("Выкл")
             self._sub_entries = []
             for i, s in enumerate(self._sub_streams):
-                self.cmb_subs.addItem(self._track_label(s, i, "Субтитры"))
+                self.cmb_subs.addItem(self._track_label(s, i, "Субтитры", total=len(self._sub_streams)))
                 self._sub_entries.append(('emb', i))
             for p in self._sub_ext:
                 self.cmb_subs.addItem(get_icon('fa5s.file'), os.path.basename(p))
@@ -5711,12 +5894,12 @@ class EditTab(QWidget):
 
     def edit_subtitles(self):
         if self.cmb_subs.currentIndex() <= 0:
-            QMessageBox.information(self, "Субтитры",
+            msgbox_information(self, "Субтитры",
                                     "Сначала выберите дорожку субтитров.")
             return
         srt = self._current_subs_as_srt()
         if not srt or not srt.strip():
-            QMessageBox.information(
+            msgbox_information(
                 self, "Субтитры",
                 "Не удалось получить текст субтитров для редактирования "
                 "(возможно, это субтитры-картинки).")
@@ -5726,7 +5909,7 @@ class EditTab(QWidget):
             return
         new_text = dlg.text()
         if not _parse_srt(new_text):
-            QMessageBox.warning(self, "Субтитры",
+            msgbox_warning(self, "Субтитры",
                                 "После правки не осталось ни одной реплики.")
             return
         try:
@@ -5739,7 +5922,7 @@ class EditTab(QWidget):
             with open(path, 'w', encoding='utf-8') as f:
                 f.write(new_text if new_text.endswith("\n") else new_text + "\n")
         except Exception as e:
-            QMessageBox.warning(self, "Субтитры", f"Не удалось сохранить: {e}")
+            msgbox_warning(self, "Субтитры", f"Не удалось сохранить: {e}")
             return
         path = os.path.normpath(path)
         # Делаем отредактированный файл активной дорожкой (превью + вшивание).
@@ -6085,9 +6268,15 @@ class EditTab(QWidget):
                 return
             try:
                 self._ass.set_frame_size(w, h)
-                arr, ax, ay, _changed = self._ass.render(pos_s * 1000.0)
+                arr, ax, ay, changed = self._ass.render(pos_s * 1000.0)
             except Exception:
                 arr = None
+                changed = True
+            # libass говорит, изменилась ли картинка с прошлого рендера — если нет,
+            # то, что уже на экране, всё ещё актуально: не гоняем QImage-копию и
+            # перерисовку виджета впустую на каждый тик sync_ui (12.5 раз/сек).
+            if not changed:
+                return
             if arr is None:
                 tgt.clear_subtitle()
             else:
@@ -6361,7 +6550,7 @@ class EditTab(QWidget):
 
         metadata = run_ffprobe(self.actual_source_file)
         if not metadata:
-            QMessageBox.critical(self, "Ошибка", "Не удалось получить метаданные (ffprobe недоступен).")
+            msgbox_critical(self, "Ошибка", "Не удалось получить метаданные (ffprobe недоступен).")
             self.waveform.set_data([], 0.0)
             return
 
@@ -6371,6 +6560,9 @@ class EditTab(QWidget):
         except Exception:
             self.duration = 0.0; self.lbl_duration.setText("—")
         self._update_total_time()
+        # Даём волне длительность СРАЗУ (не дожидаясь построения семплов) — иначе
+        # клик по полосе во время «Создание превью…»/«Загрузка волны…» сикал в 0.
+        self.waveform.prime_duration(self.duration)
 
         vinfo = None; ainfo = None
         for s in metadata.get('streams', []):
@@ -6389,11 +6581,16 @@ class EditTab(QWidget):
             self.video_stream_index = vinfo.get('index')
             is_av1 = vinfo.get('codec_name', '').lower() == 'av1'
             self._source_is_av1 = is_av1
-            scale = self._pb_quality_scale()
-            # Прокси нужен если: исходник AV1 (QtMultimedia его не тянет плавно)
-            # ИЛИ выбрано пониженное качество воспроизведения.
+            # Размер/FPS источника нужны для «оптимизации» превью-прокси (см.
+            # _proxy_scale_for) — сохраняем, чтобы ими же пользовалась смена качества.
+            try: self._src_video_h = int(vinfo.get('height') or 0)
+            except Exception: self._src_video_h = 0
+            self._src_video_fps = self._parse_fps(vinfo)
+            scale = self._proxy_scale_for(is_av1)
+            # Прокси нужен если: исходник AV1 (QtMultimedia его не тянет плавно), ИЛИ
+            # выбрано пониженное качество, ИЛИ тяжёлый источник ужат под painted-режим.
             if is_av1 or scale < 0.999:
-                self.create_proxy_for_preview(vinfo, scale=scale, is_av1=is_av1); return
+                self.create_proxy_for_preview(vinfo, ainfo, scale=scale, is_av1=is_av1); return
             self.finish_loading_file(vinfo, ainfo)
         else:
             self.finish_loading_file(None, ainfo)
@@ -6412,7 +6609,7 @@ class EditTab(QWidget):
 
         img = QImage(str(path))
         if img.isNull():
-            QMessageBox.critical(self, "Ошибка", "Не удалось открыть картинку.")
+            msgbox_critical(self, "Ошибка", "Не удалось открыть картинку.")
             return
         self.is_still_image = True
         self.still_image_path = Path(path)
@@ -6469,6 +6666,47 @@ class EditTab(QWidget):
         except Exception:
             return 1.0
 
+    @staticmethod
+    def _parse_fps(vinfo):
+        """FPS видеодорожки из ffprobe-словаря ('avg_frame_rate'/'r_frame_rate'
+        вида 'num/den'). 0.0 — если неизвестно."""
+        for key in ('avg_frame_rate', 'r_frame_rate'):
+            val = (vinfo or {}).get(key) or ''
+            try:
+                if '/' in str(val):
+                    num, den = str(val).split('/', 1)
+                    den = float(den)
+                    if den:
+                        f = float(num) / den
+                        if f > 0:
+                            return f
+                elif val:
+                    return float(val)
+            except Exception:
+                pass
+        return 0.0
+
+    def _proxy_scale_for(self, is_av1):
+        """Масштаб превью-прокси. По умолчанию прокси НЕ строится вообще — плеер
+        играет оригинал напрямую. Исключение — исходники, которые QtMultimedia не
+        тянет напрямую (сейчас это AV1): для них прокси обязателен (конвертация в
+        H.264), и заодно даунскейлим его под painted-режим (VideoCanvas.toImage()
+        дешевле на уменьшенном кадре — иначе на 1080p60 воспроизведение проседает
+        до слайд-шоу). Обычные «тяжёлые, но поддерживаемые» источники (1080p60,
+        2K/4K H.264/VP9 и т.п.) больше НЕ ужимаются автоматически — это осознанный
+        выбор пользователя (жалоба на потерю качества по умолчанию), доступен через
+        ручной выбор «1/2»/«1/4» в «Качество воспроизведения»."""
+        user = self._pb_quality_scale()          # 1.0 / 0.5 / 0.25
+        src_h = int(getattr(self, '_src_video_h', 0) or 0)
+        fps = float(getattr(self, '_src_video_fps', 0.0) or 0.0)
+        # 60 fps = вдвое больше кадров/с (вдвое больше toImage) → целимся в 540p,
+        # иначе 720p (чуть чётче, кадров меньше).
+        target = 540 if fps >= 49 else 720
+        cap = 1.0
+        if is_av1 and src_h > target:
+            cap = target / float(src_h)
+        return min(user, cap)
+
     def _proxy_limit_sec(self):
         """Сколько секунд исходника класть в прокси (0 = весь файл).
         Берётся из спина «Минут для прокси» в правой панели."""
@@ -6477,7 +6715,7 @@ class EditTab(QWidget):
         except Exception:
             return 0.0
 
-    def create_proxy_for_preview(self, vinfo, scale=1.0, is_av1=False):
+    def create_proxy_for_preview(self, vinfo, ainfo=None, scale=1.0, is_av1=False):
         if scale < 0.999 and is_av1:
             self.log_label.setText("Подготовка превью (AV1, пониженное качество)...")
         elif scale < 0.999:
@@ -6496,22 +6734,16 @@ class EditTab(QWidget):
         # Проценты создания прокси — в волну, рядом с «Ожидание метаданных…»
         # (так же, как «Извлечение аудио… N%» для H.264).
         self.proxy_thread.progress.connect(self.waveform.set_loading)
-        self.proxy_thread.finished.connect(lambda s, m, o: self.on_proxy_ready(s, m, o, vinfo))
+        self.proxy_thread.finished.connect(lambda s, m, o: self.on_proxy_ready(s, m, o, vinfo, ainfo))
         self.proxy_thread.start()
 
-    def on_proxy_ready(self, success, msg, output_path, vinfo):
+    def on_proxy_ready(self, success, msg, output_path, vinfo, ainfo):
         self.btn_play.setEnabled(True); self.btn_cut.setEnabled(True)
         self._report_progress(100); self.log_label.setText("Готово")
         # Файл очистили, пока строился прокси — не оживляем UI удалённым файлом.
         if self.actual_source_file is None:
             self.lbl_proxy.setText(""); self.lbl_proxy.setVisible(False)
             return
-
-        def _first_audio(meta):
-            for s in (meta or {}).get('streams', []):
-                if s.get('codec_type') == 'audio':
-                    return s
-            return None
 
         if success:
             self.is_proxy_active = True
@@ -6530,11 +6762,13 @@ class EditTab(QWidget):
                 badge += f" · первые {int(round(lim / 60))} мин"
             self.lbl_proxy.setText(icon_html('fa5s.bolt', 13, C['yellow']) + badge)
             self.lbl_proxy.setVisible(True)
-            ainfo = _first_audio(run_ffprobe(self.filepath))
-        else:
-            if msg != "Отменено":
-                QMessageBox.warning(self, "Ошибка прокси", f"Не удалось создать превью: {msg}")
-            ainfo = _first_audio(run_ffprobe(self.actual_source_file))
+        elif msg != "Отменено":
+            msgbox_warning(self, "Ошибка прокси", f"Не удалось создать превью: {msg}")
+        # «Аудио»/«Битрейт аудио» должны показывать РЕАЛЬНЫЙ кодек исходника (напр.
+        # Opus), а не превью-прокси — прокси ВСЕГДА транскодирует звук в AAC (см.
+        # ProxyWorker.run, -c:a aac) ради совместимости с QtMultimedia, поэтому
+        # ainfo здесь — тот же объект, что пришёл из ffprobe исходника в load_file
+        # (передан через create_proxy_for_preview), а не повторный probe self.filepath.
         self.finish_loading_file(vinfo, ainfo)
 
     def _on_pb_quality_changed(self, _idx=None):
@@ -6558,8 +6792,8 @@ class EditTab(QWidget):
             was_playing = False
         self._pb_restore = (pos, was_playing)
 
-        scale = self._pb_quality_scale()
         is_av1 = bool(getattr(self, '_source_is_av1', False))
+        scale = self._proxy_scale_for(is_av1)
         need_proxy = is_av1 or scale < 0.999
 
         # Освобождаем плеер от старого прокси-файла (иначе Windows его не отдаст),
@@ -6637,7 +6871,7 @@ class EditTab(QWidget):
             self._swap_player_source(output_path)
         else:
             if msg != "Отменено":
-                QMessageBox.warning(self, "Ошибка прокси",
+                msgbox_warning(self, "Ошибка прокси",
                                     f"Не удалось создать превью: {msg}")
             self.lbl_proxy.setText(""); self.lbl_proxy.setVisible(False)
             self._swap_player_source(self.actual_source_file)
@@ -6771,11 +7005,28 @@ class EditTab(QWidget):
         a_idx = self.audio_stream_index if not self.is_proxy_active else None
         self._start_waveform(self.filepath, a_idx)
 
+    @staticmethod
+    def _file_cache_stamp(path):
+        """(mtime, size) файла — ключ инвалидации кэша по факту его изменения
+        на диске (не просто по пути, который может указывать на подменённый файл)."""
+        try:
+            st = os.stat(path)
+            return (st.st_mtime, st.st_size)
+        except OSError:
+            return None
+
     def _start_waveform(self, filepath, audio_index):
         """Запускает (или перезапускает) построение аудиоволны для конкретного
         файла и индекса дорожки. Используется и при загрузке файла, и при смене
         озвучки — тогда волна перестраивается под новую дорожку."""
         if not filepath:
+            return
+        stamp = self._file_cache_stamp(filepath)
+        cache_key = (str(filepath), audio_index, stamp) if stamp else None
+        cached = self._waveform_cache.get(cache_key) if cache_key else None
+        if cached is not None:
+            self._waveform_cache_key = None
+            self.on_waveform_ready(*cached)
             return
         # Снимаем предыдущий воркер, чтобы две волны не гонялись наперегонки
         # (иначе в виджет прилетела бы волна старой дорожки последней).
@@ -6785,6 +7036,7 @@ class EditTab(QWidget):
             except Exception:
                 pass
         self.waveform.set_loading("Загрузка волны...")
+        self._waveform_cache_key = cache_key
         self.audio_worker = AudioWaveformLoader(str(filepath), audio_index,
                                                 self.duration)
         self.audio_worker.finished.connect(self.on_waveform_ready)
@@ -6792,6 +7044,12 @@ class EditTab(QWidget):
         self.audio_worker.start()
 
     def on_waveform_ready(self, samples, duration, left=None, right=None):
+        cache_key = getattr(self, "_waveform_cache_key", None)
+        if cache_key is not None:
+            self._waveform_cache_key = None
+            self._waveform_cache[cache_key] = (samples, duration, left, right)
+            if len(self._waveform_cache) > 8:
+                self._waveform_cache.pop(next(iter(self._waveform_cache)))
         use_duration = self.duration if (self.duration and self.duration > 0) else duration
         if duration > 0 and use_duration < (duration - 0.05):
             use_duration = duration
@@ -7018,6 +7276,7 @@ class EditTab(QWidget):
             pass
 
     def on_position_changed(self, pos_ms):
+        self._confirm_frame_seek(pos_ms)   # см. step_frame/_dispatch_frame_seek
         pos_s = pos_ms / 1000.0
         self.lbl_current_time.setText(s_to_time(pos_s))
         if self.duration and self.duration > 0 and not self.slider.is_user_seeking():
@@ -7134,11 +7393,20 @@ class EditTab(QWidget):
     def seek_to(self, t_s):
         try:
             ms = int(max(0.0, min(t_s, max(0.0, self.duration))) * 1000)
+            if isinstance(self.video_widget, VideoCanvas):
+                self.video_widget.set_scrub_active(True)
+                self._scrub_idle_timer.start()   # перезапуск — «перемотка ещё идёт»
             self.player.setPosition(ms)
             self.waveform.set_playhead(t_s)
             self._ext_audio_seek(ms)
         except Exception as e:
-            print("seek_to error:", e)
+            self.main.log(f"seek_to error: {e}")
+
+    def _on_scrub_idle(self):
+        """Перемотка утихла (seek_to не вызывался _scrub_idle_timer.interval() мс) —
+        возвращаем сглаженную отрисовку кадра в VideoCanvas."""
+        if isinstance(self.video_widget, VideoCanvas):
+            self.video_widget.set_scrub_active(False)
 
     def toggle_play(self):
         self._scrubbing = False   # явное play/pause не должно гаситься скрабом
@@ -7226,6 +7494,10 @@ class EditTab(QWidget):
         if self._scrubbing or getattr(self, "_prerolling", False):
             return
         playing = (state == QMediaPlayer.PlaybackState.PlayingState)
+        # Painted-режим: во время игры ресайзим кадр быстрым методом (экономим ЦП).
+        vw = getattr(self, "video_widget", None)
+        if isinstance(vw, VideoCanvas):
+            vw.set_playing(playing)
         if playing:
             self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
             self.sync_timer.start()
@@ -7704,7 +7976,7 @@ class EditTab(QWidget):
         if not src or not os.path.exists(str(src)) or self.duration <= 0:
             return
         if getattr(self, "video_stream_index", None) is None:
-            QMessageBox.information(
+            msgbox_information(
                 self, "Только для видео",
                 "Удаление объекта доступно для видео. Для одиночного изображения "
                 "используйте вкладку «Фото».")
@@ -7714,7 +7986,7 @@ class EditTab(QWidget):
         # Доступность движка LaMa (numpy/opencv/модель).
         inp = self._ensure_inpainter()
         if inp is None or not inp.is_available():
-            QMessageBox.warning(
+            msgbox_warning(
                 self, "Удаление объекта недоступно",
                 "Не найдены необходимые компоненты (numpy/opencv или файл модели "
                 "LaMa). Удаление объекта с видео недоступно в этой сборке.")
@@ -7723,7 +7995,7 @@ class EditTab(QWidget):
         # Кадр для рисования маски — из оригинала на текущей позиции, полный размер.
         frame = self._grab_source_frame_bgr(src)
         if frame is None:
-            QMessageBox.warning(
+            msgbox_warning(
                 self, "Ошибка",
                 "Не удалось получить кадр видео для рисования маски.")
             return
@@ -7830,7 +8102,7 @@ class EditTab(QWidget):
             return
         src = str(src)
         name = os.path.basename(src)
-        reply = QMessageBox.question(
+        reply = msgbox_question(
             self, "Удалить исходный файл?",
             "Файл будет удалён с диска без возможности восстановления:\n\n"
             f"{name}\n\nПродолжить?",
@@ -7860,7 +8132,7 @@ class EditTab(QWidget):
         try:
             os.remove(src)
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось удалить файл:\n{e}")
+            msgbox_critical(self, "Ошибка", f"Не удалось удалить файл:\n{e}")
             return
         # Сбрасываем состояние редактора (файл больше не загружен).
         self.actual_source_file = None
@@ -7893,6 +8165,22 @@ class EditTab(QWidget):
             return
         try:
             fs = FullscreenVideo(self)
+            # fs — самостоятельное окно без родителя (иначе showFullScreen на
+            # дочернем виджете ведёт себя иначе), поэтому Qt может открыть его
+            # fullscreen'ом на ПЕРВИЧНОМ мониторе, даже если само приложение
+            # (и мышь пользователя) сейчас на другом. Явно ставим тот же экран,
+            # где сейчас окно приложения — заодно фиксирует QScreen ДО первого
+            # show(), от чего зависит и корректный клэмп tooltip'ов панели
+            # управления (см. FullscreenVideo._relayout).
+            try:
+                src_screen = self.window().windowHandle().screen()
+            except Exception:
+                src_screen = None
+            if src_screen is not None:
+                fs.winId()   # форсирует создание нативного хэндла ДО setScreen
+                wh = fs.windowHandle()
+                if wh is not None:
+                    wh.setScreen(src_screen)
             # Снимаем фиксированные размеры с видео и переносим его в окно.
             self.video_widget.setMinimumSize(0, 0)
             self.video_widget.setMaximumSize(16777215, 16777215)
@@ -7901,6 +8189,12 @@ class EditTab(QWidget):
             self.btn_fullscreen.setIcon(_fullscreen_icon(expand=False))
             self.btn_fullscreen.setToolTip("Свернуть (Esc / двойной клик по видео)")
             fs.showFullScreen()
+            # Без этого клавиши (F/Esc/Space/стрелки) не доходили до окна: после
+            # showFullScreen() фокус клавиатуры мог оставаться на виджете, у
+            # которого он был ДО входа в полноэкранный режим (например, на
+            # волне/поле ссылки в основном окне) — F там ничего не делал.
+            fs.activateWindow()
+            fs.setFocus(Qt.FocusReason.OtherFocusReason)
             fs.sync_from_player()
             fs.sync_volume()
             fs.update_play_icon(
@@ -7911,7 +8205,7 @@ class EditTab(QWidget):
             except Exception:
                 pass
         except Exception as e:
-            print("enter_fullscreen error:", e)
+            self.main.log(f"enter_fullscreen error: {e}")
             self._fs_window = None
 
     def exit_fullscreen(self):
@@ -7968,8 +8262,62 @@ class EditTab(QWidget):
         ms_per_frame = (1000.0 / self.fps) if (self.fps and self.fps > 0) else 40
         new_ms = max(0, min(int(self.duration * 1000), ms + int(step * ms_per_frame)))
         self._scrub_target = new_ms
+        # Цель шага (_scrub_target) обновляем ВСЕГДА и мгновенно — арифметика шага
+        # держащейся клавиши остаётся точной. А вот реальный player.setPosition()
+        # диспетчеризуем через _dispatch_frame_seek: держать ←/→ = автоповтор ОС
+        # шлёт events быстрее, чем плеер успевает довести seek до кадра, и они
+        # раньше просто копились в очереди — отсюда «догоняющий» скачок на
+        # несколько секунд ПОСЛЕ отпускания клавиши. Теперь в полёте не больше
+        # одного seek'а: если предыдущий ещё не подтверждён — новая цель просто
+        # ЗАМЕНЯЕТ предыдущую отложенную (как уже сделано для превью-миниатюр
+        # наведения), и в итоге всегда доезжаем ровно до последней зажатой цели.
+        self._dispatch_frame_seek(new_ms)
+
+    def _dispatch_frame_seek(self, new_ms):
+        if getattr(self, "_frame_seek_busy", False):
+            self._frame_seek_pending = new_ms   # копим только САМУЮ СВЕЖУЮ цель
+            return
+        self._frame_seek_busy = True
+        self._frame_seek_target_ms = new_ms
+        self._frame_seek_gen = getattr(self, "_frame_seek_gen", 0) + 1
+        gen = self._frame_seek_gen
         self.player.setPosition(new_ms)
         self._ext_audio_seek(new_ms)
+        # Запасной выход — ТОЛЬКО если on_position_changed сам не подтвердит
+        # доезд до цели (см. _confirm_frame_seek). Окно щедрое (не 100-200мс):
+        # на тяжёлом HEVC без ближайшего кейфрейма один seek может декодировать
+        # секунду и дольше, а слишком короткий запасной таймер сам стал бы
+        # источником бага — «отпускал» бы busy раньше, чем предыдущий seek
+        # реально доехал, и держащаяся стрелка перебивала бы декодирование
+        # снова и снова, так и не давая ни одному кадру долистать до конца
+        # (ровно то поведение — «зажал на 10с, показали 1 кадр» — которое
+        # чиним). gen — чтобы устаревший запасной таймер не «отпустил» уже
+        # ДРУГОЙ, более поздний seek.
+        QTimer.singleShot(2500, lambda: self._release_frame_seek(gen))
+
+    def _confirm_frame_seek(self, pos_ms):
+        """Вызывается из on_position_changed на каждое реальное изменение позиции:
+        как только плеер довёл её до запрошенной цели — освобождаем «в полёте»
+        сразу, не дожидаясь запасного таймера (и шлём накопившуюся свежую цель,
+        если пользователь всё ещё держит стрелку)."""
+        if not getattr(self, "_frame_seek_busy", False):
+            return
+        target = getattr(self, "_frame_seek_target_ms", None)
+        if target is None:
+            return
+        tol_ms = max(20, int(1000.0 / self.fps)) if (self.fps and self.fps > 0) else 40
+        if abs(pos_ms - target) <= tol_ms:
+            self._release_frame_seek(self._frame_seek_gen)
+
+    def _release_frame_seek(self, gen=None):
+        if gen is not None and gen != getattr(self, "_frame_seek_gen", None):
+            return   # устаревший вызов — «в полёте» уже другая, более поздняя цель
+        self._frame_seek_busy = False
+        self._frame_seek_target_ms = None
+        pending = getattr(self, "_frame_seek_pending", None)
+        if pending is not None:
+            self._frame_seek_pending = None
+            self._dispatch_frame_seek(pending)
 
     def step_frame_scrub(self, step):
         playing = (self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
@@ -8233,7 +8581,7 @@ class EditTab(QWidget):
 
     def start_cut(self):
         if not self.actual_source_file or not self.actual_source_file.exists():
-            QMessageBox.warning(self, "Внимание", "Файл не загружен.")
+            msgbox_warning(self, "Внимание", "Файл не загружен.")
             return
         # Не запускаем вторую обрезку поверх уже идущей: иначе ссылка на прежний
         # рабочий поток терялась бы (его перетирал новый), и поток мог «висеть» —
@@ -8260,8 +8608,30 @@ class EditTab(QWidget):
         except Exception:
             pass
 
+        # Точку старта привязываем ВНИЗ к сетке кадров. Плеер (QtMultimedia) на
+        # позиции IN показывает кадр, который «на экране» в этот момент — т.е.
+        # кадр с pts ≤ IN (округление ВНИЗ). А ffmpeg-рез (-ss IN) оставляет
+        # первый кадр с pts ≥ IN (округление ВВЕРХ). Если IN стоит между кадрами
+        # (обычный случай — плейхед по звуку/мышью почти никогда не попадает ровно
+        # на кадр), экспорт начинался бы на ОДИН кадр позже того, что видно в
+        # превью — отсюда баг «первое слово/кадр срезается, а в монтаже он есть».
+        # Пол к кадру делает export-seek WYSIWYG с превью: ffmpeg берёт ровно тот
+        # кадр, что показан. Только для видео с известным fps; аудио режем как есть
+        # (кадров нет — точное время верно). eps=1e-3 кадра гасит float-дрожь у
+        # самой границы, не перескакивая на кадр раньше.
+        if self.video_stream_index is not None and self.fps and self.fps > 0:
+            frame_idx = math.floor(in_s * self.fps + 1e-3)
+            # Целимся на четверть кадра НИЖЕ границы кадра: ffmpeg-seek оставляет
+            # первый кадр с pts ≥ ss, а при дробном fps (23.976/29.97) pts кадра
+            # не ложится ровно в миллисекунды и округление строки времени (.3f)
+            # могло бы перескочить на кадр ВПЕРЁД. Смещение −0.25 кадра держит ss
+            # заведомо ниже pts нужного кадра (но выше предыдущего), поэтому ffmpeg
+            # берёт ровно тот кадр, что показан в превью, на ЛЮБОМ fps.
+            snapped = (frame_idx - 0.25) / self.fps
+            in_s = max(0.0, min(snapped, self.duration))
+
         if out_s <= in_s:
-            QMessageBox.warning(self, "Внимание", "Конечная точка должна быть позже начальной.")
+            msgbox_warning(self, "Внимание", "Конечная точка должна быть позже начальной.")
             return
 
         mode = self.cmb_mode.currentIndex()
@@ -8309,10 +8679,10 @@ class EditTab(QWidget):
         Требует включённой пикселизации — в этом весь смысл режима картинки."""
         src = self.still_image_path or self.actual_source_file
         if not src or not os.path.exists(str(src)):
-            QMessageBox.warning(self, "Внимание", "Картинка не загружена.")
+            msgbox_warning(self, "Внимание", "Картинка не загружена.")
             return
         if not getattr(self, "_pixelize_active", False):
-            QMessageBox.information(
+            msgbox_information(
                 self, "Пикселизация",
                 "Включите «Пикселизацию» (кнопка с сеткой) — для картинки именно она "
                 "и создаёт видео-проявление.")
@@ -8387,7 +8757,7 @@ class EditTab(QWidget):
         того же исходника, занявшую это базовое имя."""
         src = Path(src) if src else self.actual_source_file
         if not src or not src.exists():
-            QMessageBox.warning(self, "Внимание", "Файл не загружен.")
+            msgbox_warning(self, "Внимание", "Файл не загружен.")
             return
 
         stem = src.stem; suffix = src.suffix
@@ -8663,20 +9033,16 @@ class EditTab(QWidget):
 
         def _on_finished(success, message, _temp=temp_out, _final=final_out,
                          _exact=exact_copy, _reqdur=dur_cut, _burn=burn_subs,
-                         _fonts=fonts_dir, _in=in_s, _out=out_s, _src=src):
+                         _in=in_s, _out=out_s, _src=src):
             try:
                 if getattr(self, "_cut_ticker", None) is not None:
                     self._cut_ticker.stop()
             except Exception:
                 pass
             self.btn_cut.setEnabled(True)
-            # Чистим временную папку извлечённых шрифтов (если была).
-            if _fonts:
-                try:
-                    import shutil
-                    shutil.rmtree(_fonts, ignore_errors=True)
-                except Exception:
-                    pass
+            # Папка извлечённых шрифтов больше не удаляется сразу — она в
+            # _subtitle_fonts_cache и живёт до закрытия вкладки (см. shutdown()),
+            # чтобы повторный экспорт того же источника не гонял ffmpeg заново.
             if success and _temp:
                 try:
                     is_loaded = (os.path.normpath(str(self.actual_source_file)) ==
@@ -8723,6 +9089,14 @@ class EditTab(QWidget):
                         QTimer.singleShot(0, lambda: self._execute_smartcut(
                             _in, _out, out_path=_final))
                         return
+                    if action == 'process':
+                        # Точный рез + «Обработка» текущими настройками одним
+                        # проходом (см. _execute_cut_and_process) — неточный
+                        # результат быстрой обрезки больше не нужен.
+                        self._discard_temp_cut(_final, is_loaded)
+                        QTimer.singleShot(0, lambda: self._execute_cut_and_process(
+                            _in, _out, out_path=_final, src=_src))
+                        return
                     if action == 'delete':
                         # Удаляем созданный неточный файл по просьбе пользователя.
                         # Если он сейчас открыт в плеере — сперва освобождаем источник.
@@ -8740,7 +9114,7 @@ class EditTab(QWidget):
                             self.log_label.setStyleSheet(f"color: {C['text2']}; font-size: 12px;")
                             self._report_progress(0, "Файл удалён")
                         except Exception as e:
-                            QMessageBox.warning(self, "Не удалось удалить",
+                            msgbox_warning(self, "Не удалось удалить",
                                                 f"Не удалось удалить файл:\n{e}")
                         return
                     if is_loaded:
@@ -8782,7 +9156,7 @@ class EditTab(QWidget):
         см. _execute_cut)."""
         src = self.actual_source_file
         if not src or not src.exists():
-            QMessageBox.warning(self, "Внимание", "Файл не загружен.")
+            msgbox_warning(self, "Внимание", "Файл не загружен.")
             return
         stem = src.stem; suffix = src.suffix
         out_dir = (Path(self.export_dir)
@@ -8868,6 +9242,132 @@ class EditTab(QWidget):
         self.ffmpeg_thread.finished.connect(_on_finished)
         self.ffmpeg_thread.start()
 
+    def _execute_cut_and_process(self, in_s, out_s, out_path=None, src=None):
+        """Кнопка «Обрезать и обработать»: режет диапазон [in_s,out_s) И сразу
+        применяет вкладку «Обработка» ЕЁ ТЕКУЩИМИ настройками (CRF/preset/
+        скорость/loudnorm/fps/…) — одним ffmpeg-проходом внутри
+        ProcessWorker.process_media (item['trim']), без отдельного x264-реэнкода
+        в Монтаже, который иначе перекодировался бы ЕЩЁ РАЗ при последующем
+        прогоне через «Обработку» (двойное поколение потерь).
+
+        Настройки НЕ копируем — вызываем тот же MediaTab._run_items(), что и
+        кнопка «НАЧАТЬ» на вкладке «Обработка», поэтому любые настройки,
+        добавленные туда в будущем, подхватятся автоматически.
+
+        Имя итогового файла собираем ПОСЛЕ обработки (см. _on_finished_all), а
+        не заранее фиксированным «{stem}_обрез{исходное_расширение}» — иначе
+        (а) из имени пропадали суффиксы реально применённых настроек (crf/
+        speed/norm/fade/noaudio — ровно то, что показывает суффикс в обычной
+        «Обработке»), и (б) для источников не-.mp4 (mkv/…) итог process_media
+        (всегда .mp4 для AV1) переименовывался под ЧУЖОЕ расширение источника —
+        файл с mp4-содержимым получал имя «*.mkv», что вводило в заблуждение."""
+        src = Path(src) if src else self.actual_source_file
+        if not src or not src.exists():
+            msgbox_warning(self, "Внимание", "Файл не загружен.")
+            return
+        tm = getattr(self.main, 'tab_media', None)
+        if tm is None:
+            msgbox_warning(self, "Внимание", "Вкладка «Обработка» недоступна.")
+            return
+        try:
+            busy = bool(getattr(tm, 'worker', None) is not None and tm.worker.isRunning())
+        except Exception:
+            busy = False
+        if busy:
+            msgbox_information(
+                self, "«Обработка» занята",
+                "Во вкладке «Обработка» уже идёт очередь — дождитесь её "
+                "завершения и повторите обрезку.")
+            return
+
+        stem = src.stem
+        out_dir = (Path(self.export_dir)
+                   if (self.export_dir and os.path.isdir(self.export_dir)) else src.parent)
+        replace_original = self.chk_overwrite.isChecked()
+
+        self._report_progress(0, "Обработка…")
+        self.log_label.setText("Отправлено в «Обработку»…")
+        self._set_cut_status("Обработка… подготовка", icon='fa5s.hourglass-half')
+        self.btn_cut.setEnabled(False)
+        self._cut_t0 = time.time(); self._cut_lastp = 0.0
+        if getattr(self, "_cut_ticker", None) is None:
+            self._cut_ticker = QTimer(self); self._cut_ticker.setInterval(500)
+            self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
+        self._cut_ticker.start()
+
+        iid = uuid.uuid4().hex
+        item = {'iid': iid, 'path': str(src), 'type': 'MEDIA',
+                'dur': max(0.0, out_s - in_s), 'is_done': False,
+                'trim': (in_s, out_s)}
+        # _run_items сама собирает настройки со всех виджетов «Обработки» и
+        # запускает ProcessWorker (тот же путь, что кнопка «НАЧАТЬ»); в очереди —
+        # только наш синтетический элемент, чужие файлы не затрагиваются.
+        tm._run_items([item])
+        proc_worker = getattr(tm, 'worker', None)
+        if proc_worker is None:
+            self.on_ffmpeg_finished(False, "Не удалось запустить «Обработку»")
+            return
+
+        def _on_progress(p_iid, pct, _iid=iid):
+            if p_iid == _iid:
+                self._on_cut_progress(pct)
+
+        def _on_status(s_iid, txt, code, _iid=iid):
+            if s_iid == _iid:
+                self._smartcut_status(txt)
+
+        def _on_finished_all(_item=item):
+            for sig, slot in ((proc_worker.progress, _on_progress),
+                              (proc_worker.status, _on_status),
+                              (proc_worker.finished_all, _on_finished_all)):
+                try: sig.disconnect(slot)
+                except Exception: pass
+            try:
+                if getattr(self, "_cut_ticker", None) is not None:
+                    self._cut_ticker.stop()
+            except Exception:
+                pass
+            self.btn_cut.setEnabled(True)
+            temp_out = _item.get('out_path')
+            if not _item.get('is_done') or not temp_out or not os.path.exists(temp_out):
+                self.on_ffmpeg_finished(
+                    False, "«Обработка» не создала результат (см. лог вкладки «Обработка»)")
+                return
+            try:
+                # process_media сам собрал имя с суффиксами применённых настроек
+                # (crf/speed/norm/fade/noaudio — см. process_media в workers.py) —
+                # переносим ТОЛЬКО хвост после исходного stem, добавляя «_обрез»
+                # перед ним, и берём РЕАЛЬНОЕ расширение результата (для AV1 —
+                # всегда .mp4, даже если источник .mkv).
+                temp_stem, temp_ext = os.path.splitext(os.path.basename(temp_out))
+                tail = temp_stem[len(stem):] if temp_stem.startswith(stem) else ("_" + temp_stem)
+                final_out = str(out_dir / f"{stem}_обрез{tail}{temp_ext}")
+                if os.path.exists(final_out) and not replace_original:
+                    final_out = _unique_output(final_out)
+
+                is_loaded = (os.path.normpath(str(self.actual_source_file)) ==
+                             os.path.normpath(final_out))
+                if replace_original and os.path.exists(final_out):
+                    try:
+                        os.remove(final_out)
+                    except OSError:
+                        pass  # занят другим процессом — уйдём на свободное имя
+                saved_final = self._replace_tolerant(temp_out, final_out)
+                if os.path.normpath(saved_final) != os.path.normpath(final_out):
+                    self._notify_busy_rename(final_out, saved_final)
+                    final_out = saved_final
+                    is_loaded = (os.path.normpath(str(self.actual_source_file)) ==
+                                 os.path.normpath(final_out))
+                if is_loaded:
+                    self.load_file(final_out)
+                self.on_ffmpeg_finished(True, "Готово (Обработка)")
+            except Exception as e:
+                self.on_ffmpeg_finished(False, f"Ошибка при сохранении: {e}")
+
+        proc_worker.progress.connect(_on_progress)
+        proc_worker.status.connect(_on_status)
+        proc_worker.finished_all.connect(_on_finished_all)
+
     def on_ffmpeg_finished(self, success, message):
         if success:
             self.log_label.setText(icon_html('fa5s.check', 12, C['green2']) + " Готово")
@@ -8899,7 +9399,7 @@ class EditTab(QWidget):
                     "Ошибка", "Обрезка завершилась с ошибкой.",
                     detail=str(message), where="Монтаж: обрезка", parent=self).exec()
             except Exception:
-                QMessageBox.critical(self, "Ошибка", f"Обрезка завершилась с ошибкой:\n{message}")
+                msgbox_critical(self, "Ошибка", f"Обрезка завершилась с ошибкой:\n{message}")
             self._report_progress(0, "Ошибка")
             self._clear_cut_status()
 
@@ -8913,7 +9413,17 @@ class EditTab(QWidget):
     def _extract_subtitle_fonts(self, src):
         """Извлекает вложенные шрифты (font attachments) контейнера во временную
         папку, чтобы при вшивании субтитров libass рендерил их РОДНЫМИ шрифтами
-        (полная поддержка ASS-стилей). Возвращает путь к папке или None."""
+        (полная поддержка ASS-стилей). Возвращает путь к папке или None.
+
+        Результат кешируется по (путь, mtime, размер) — повторный экспорт того же
+        источника не гоняет ffmpeg заново. Папка живёт до закрытия вкладки
+        (см. shutdown()), а не удаляется сразу после экспорта, как раньше."""
+        stamp = self._file_cache_stamp(src)
+        cache_key = (str(src), stamp) if stamp else None
+        if cache_key is not None:
+            cached = self._subtitle_fonts_cache.get(cache_key)
+            if cached is not None and os.path.isdir(cached):
+                return cached
         try:
             d = tempfile.mkdtemp(prefix="sihyx_fonts_")
             # -dump_attachment:t "" выгружает все attachments в текущую папку.
@@ -8922,6 +9432,16 @@ class EditTab(QWidget):
             subprocess.run([FFMPEG, "-y", "-dump_attachment:t", "", "-i", str(src)],
                            cwd=d, capture_output=True, creationflags=CREATE_NO_WINDOW)
             if os.listdir(d):
+                if cache_key is not None:
+                    self._subtitle_fonts_cache[cache_key] = d
+                    if len(self._subtitle_fonts_cache) > 8:
+                        old_key = next(iter(self._subtitle_fonts_cache))
+                        old_dir = self._subtitle_fonts_cache.pop(old_key)
+                        try:
+                            import shutil
+                            shutil.rmtree(old_dir, ignore_errors=True)
+                        except Exception:
+                            pass
                 return d
             os.rmdir(d)
         except Exception:
@@ -8944,6 +9464,52 @@ class EditTab(QWidget):
         except Exception:
             pass
 
+    def _show_cut_choice_dialog(self, title, text, buttons):
+        """Диалог выбора при неточной обрезке без перекодирования — кнопки
+        СВЕРХУ ВНИЗ (а не в ряд, как у стандартного QMessageBox), у каждой
+        значок ⓘ с объяснением, что она делает (вариантов до 5 — в ряд не
+        помещались и было неясно, чем они отличаются).
+
+        buttons — список (key, label, tip, destructive); первая кнопка — она
+        же дефолтная (Enter). Возвращает key нажатой кнопки или None (Esc/крестик)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setMinimumWidth(440)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(14)
+
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(lbl)
+
+        btn_col = QVBoxLayout()
+        btn_col.setSpacing(6)
+        result = {'key': None}
+
+        def _pick(key):
+            result['key'] = key
+            dlg.accept()
+
+        for i, (key, label, tip, destructive) in enumerate(buttons):
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            b = QPushButton(label)
+            b.setMinimumHeight(34)
+            if destructive:
+                b.setStyleSheet(f"QPushButton {{ color: {C['red']}; }}")
+            if i == 0:
+                b.setDefault(True)
+                b.setAutoDefault(True)
+            b.clicked.connect(lambda _=False, k=key: _pick(k))
+            row.addWidget(b, 1)
+            row.addWidget(info_badge(tip))
+            btn_col.addLayout(row)
+        lay.addLayout(btn_col)
+
+        dlg.exec()
+        return result['key']
+
     def _notify_cut_accuracy(self, final_path, requested_dur, exact_copy, burn_subs,
                              in_s=None, out_s=None, src=None):
         """Сообщает, удалось ли обрезать БЕЗ перекодировки точно по кадрам.
@@ -8959,7 +9525,7 @@ class EditTab(QWidget):
           None       — оставить файл как есть."""
         try:
             if burn_subs:
-                QMessageBox.information(
+                msgbox_information(
                     self, "Готово",
                     "Субтитры вшиты в видео (с перекодировкой).")
                 return None
@@ -8980,73 +9546,80 @@ class EditTab(QWidget):
                                        and not audio_only) else 0.05
             diff = abs(actual - requested_dur) if actual > 0 else 0.0
             if actual <= 0 or diff <= tol:
-                QMessageBox.information(
+                msgbox_information(
                     self, "Готово — точная обрезка",
                     "Обрезано без перекодировки, точно по заданным меткам времени."
                     if audio_only else
                     "Обрезано без перекодировки, точно по заданным кадрам.")
                 return None
+            keep_btn = ("keep", "Оставить как есть",
+                        "Оставить уже готовый файл с небольшим расхождением от "
+                        "заданных меток времени — обрезка быстрая и без потери "
+                        "качества.", False)
+            del_btn = ("delete", "Удалить файл",
+                       "Удалить с диска уже созданный неточный файл — если "
+                       "результат не нужен.", True)
             if audio_only:
                 # Для аудио Smart Cut неприменим (он про ключевые кадры видео).
                 # Предлагаем только перекодировку, удаление или «оставить как есть».
-                box = QMessageBox(self)
-                box.setIcon(QMessageBox.Icon.Question)
-                box.setWindowTitle("Не получилось точно без потерь")
-                box.setText(
+                text = (
                     "Быстрая обрезка (копирование) НЕ попала точно по времени: "
                     "начало сдвинулось к ближайшей границе аудиокадра.\n\n"
                     f"Запрошено: {s_to_time(requested_dur)}\n"
                     f"Получилось: {s_to_time(actual)}\n"
                     f"Расхождение: {s_to_time(diff)}\n\n"
                     "Что сделать с фрагментом?")
-                a_enc = a_del = None
+                buttons = [keep_btn]
                 if in_s is not None and out_s is not None:
-                    a_enc = box.addButton("Перекодировать (точно)",
-                                          QMessageBox.ButtonRole.AcceptRole)
-                a_del = box.addButton("Удалить файл",
-                                      QMessageBox.ButtonRole.DestructiveRole)
-                a_keep = box.addButton("Оставить как есть",
-                                       QMessageBox.ButtonRole.RejectRole)
-                box.setDefaultButton(a_keep)
-                box.exec()
-                clicked = box.clickedButton()
-                if clicked is a_enc:
-                    return 'encode'
-                if clicked is a_del:
-                    return 'delete'
-                return None
+                    buttons.append(("encode", "Перекодировать (точно)",
+                                    "Вырезать фрагмент заново с перекодировкой — точно "
+                                    "по заданному времени, но с потерей качества "
+                                    "(повторное сжатие аудио).", False))
+                buttons.append(del_btn)
+                key = self._show_cut_choice_dialog(
+                    "Не получилось точно без потерь", text, buttons)
+                return key if key != "keep" else None
             # Не кадрово-точно → предлагаем варианты: Smart Cut (точно + почти без
             # потерь), полную перекодировку (точно, с потерями), удалить файл или
             # оставить как есть.
             can_retry = (in_s is not None and out_s is not None)
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Icon.Question)
-            box.setWindowTitle("Не получилось точно без потерь")
-            box.setText(
+            text = (
                 "Обрезка без перекодировки (быстро) НЕ кадрово-точная: начало "
                 "сдвинулось к ближайшему ключевому кадру.\n\n"
                 f"Запрошено: {s_to_time(requested_dur)}\n"
                 f"Получилось: {s_to_time(actual)}\n"
                 f"Расхождение: {s_to_time(diff)}\n\n"
                 "Что сделать с фрагментом?")
-            btn_smart = btn_enc = btn_del = None
+            buttons = []
             if can_retry:
-                btn_smart = box.addButton("Smart Cut (точно, почти без потерь)",
-                                          QMessageBox.ButtonRole.AcceptRole)
-                btn_enc = box.addButton("Перекодировать (точно, с потерями)",
-                                        QMessageBox.ButtonRole.AcceptRole)
-            btn_del = box.addButton("Удалить файл", QMessageBox.ButtonRole.DestructiveRole)
-            btn_keep = box.addButton("Оставить как есть", QMessageBox.ButtonRole.RejectRole)
-            box.setDefaultButton(btn_smart if btn_smart is not None else btn_keep)
-            box.exec()
-            clicked = box.clickedButton()
-            if clicked is btn_smart:
-                return 'smartcut'
-            if clicked is btn_enc:
-                return 'encode'
-            if clicked is btn_del:
-                return 'delete'
-            return None
+                buttons.append(("smartcut", "Smart Cut (точно, почти без потерь)",
+                                "Точно нарезать по заданным меткам: копирует потоки "
+                                "везде, где можно, и перекодирует только короткий "
+                                "кусочек у точек реза. Почти без потери качества, "
+                                "быстрее полной перекодировки.", False))
+                buttons.append(("encode", "Перекодировать (точно, с потерями)",
+                                "Перекодировать весь вырезанный фрагмент заново — точно "
+                                "по заданным меткам времени, но с повторным сжатием "
+                                "(заметнее теряется качество).", False))
+                # Режет диапазон И сразу применяет «Обработку» (её текущие настройки
+                # CRF/скорость/loudnorm/…) ОДНИМ проходом — без промежуточного x264-
+                # реэнкода, который иначе перекодировался бы ещё раз при последующем
+                # прогоне через «Обработку» (двойное поколение потерь). См.
+                # EditTab._execute_cut_and_process.
+                if hasattr(self.main, 'tab_media'):
+                    buttons.append(("process", "Обрезать и обработать",
+                                    "Точно вырезать диапазон и сразу применить текущие "
+                                    "настройки вкладки «Обработка» (CRF/скорость/"
+                                    "громкость) одним проходом — без двойной "
+                                    "перекодировки.", False))
+            if not can_retry:
+                buttons.append(keep_btn)   # без смещения меток — дефолт безопасный, не «Удалить»
+            buttons.append(del_btn)
+            if can_retry:
+                buttons.append(keep_btn)
+            key = self._show_cut_choice_dialog(
+                "Не получилось точно без потерь", text, buttons)
+            return key if key != "keep" else None
         except Exception:
             pass
         return None
@@ -9105,8 +9678,23 @@ class EditTab(QWidget):
             act_redo.setShortcutContext(ctx)
             act_redo.triggered.connect(self.redo)
             self.addAction(act_redo)
+            # Доп. подстраховка ПРЯМО на волне: после перетаскивания маркеров
+            # IN/OUT фокус остаётся на self.waveform (см. её mousePressEvent), но
+            # пользователи жаловались, что Ctrl+Z/Ctrl+Y там «не работает нихуя» —
+            # вешаем те же сочетания WidgetShortcut'ом прямо на виджет волны, чтобы
+            # они точно срабатывали независимо от того, как разрешится
+            # WidgetWithChildrenShortcut выше по дереву.
+            self._sc_wave_undo = QShortcut(QKeySequence("Ctrl+Z"), self.waveform)
+            self._sc_wave_undo.setContext(Qt.ShortcutContext.WidgetShortcut)
+            self._sc_wave_undo.activated.connect(self.undo)
+            self._sc_wave_redo = QShortcut(QKeySequence("Ctrl+Y"), self.waveform)
+            self._sc_wave_redo.setContext(Qt.ShortcutContext.WidgetShortcut)
+            self._sc_wave_redo.activated.connect(self.redo)
+            self._sc_wave_redo2 = QShortcut(QKeySequence("Ctrl+Shift+Z"), self.waveform)
+            self._sc_wave_redo2.setContext(Qt.ShortcutContext.WidgetShortcut)
+            self._sc_wave_redo2.activated.connect(self.redo)
         except Exception as e:
-            print("shortcuts error:", e)
+            self.main.log(f"shortcuts error: {e}")
 
     def compute_step(self, fast=False):
         step = 1.0 / self.fps if (self.fps and self.fps > 0) else 0.04
@@ -9409,6 +9997,15 @@ class EditTab(QWidget):
                 self.sub_overlay.close()
                 self.sub_overlay.deleteLater()
                 self.sub_overlay = None
+        except Exception:
+            pass
+        # Чистим временные папки извлечённых шрифтов, накопленные кэшем (см.
+        # _extract_subtitle_fonts) — они больше не удаляются сразу после экспорта.
+        try:
+            import shutil
+            for d in self._subtitle_fonts_cache.values():
+                shutil.rmtree(d, ignore_errors=True)
+            self._subtitle_fonts_cache.clear()
         except Exception:
             pass
 

@@ -479,7 +479,7 @@ class PackageInfoDialog(QDialog):
         if ok:
             self.saved.emit(); self.accept()
         else:
-            QMessageBox.warning(self, "Ошибка", "Не удалось сохранить информацию о пакете.")
+            msgbox_warning(self, "Ошибка", "Не удалось сохранить информацию о пакете.")
 
 __all__ = [
     'PackageInfoDialog',

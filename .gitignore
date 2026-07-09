@@ -2,6 +2,9 @@
 build/
 dist/
 *.spec
+# SI-HYX.spec — не автогенерат, а вручную поддерживаемый единый источник
+# правды для build.bat (datas/hiddenimports/excludes) — держим в git.
+!SI-HYX.spec
 
 # Python
 __pycache__/
@@ -23,3 +26,16 @@ YouTubecookies.txt
 
 graphify-out/
 GRAPH_REPORT.md
+
+# sigstats: локальный кэш/данные (см. sigstats/config.py, BASE_DIR)
+/media/
+/packages/
+/sigstats.db
+/author_blacklist.json
+/package_blacklist.json
+/played_packages.json
+/search_page_cache.json
+/ui_settings.json
+
+# Временные файлы сторонних утилит (ab-av1 и т.п.)
+.ab-av1-*/

@@ -118,8 +118,29 @@ def _style_cb(cb):
         "QComboBox{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:4px;padding:4px 8px;font-size:12px;}"
         "QComboBox QAbstractItemView{background:#1e1e2e;color:#cdd6f4;selection-background-color:#313244;}")
 
+
+def _find_mw(widget):
+    """Walk up the parent chain to find siquester's own MainWindow.
+
+    QWidget.window() finds the nearest top-level ancestor — but when SiQuester
+    is embedded as a SI-HYX tab (siquester_tab.py), its MainWindow is
+    reparented as a plain child widget (Qt.WindowType.Widget) so it's no
+    longer a "window", and .window() bubbles past it to the SI-HYX host
+    window instead (which has no .datasets/_save_notif/etc). Duck-type our
+    way up the parent chain instead so this works both standalone and
+    embedded.
+    """
+    p = widget
+    while p is not None:
+        if hasattr(p, "datasets") and hasattr(p, "_save_notif"):
+            return p
+        p = p.parentWidget()
+    return widget.window()
+
+
 __all__ = [
     '_SCREEN_SCALE_CACHE',
+    '_find_mw',
     '_lbl',
     '_make_tag_fn',
     '_parse_hms',

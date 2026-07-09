@@ -15,6 +15,7 @@ from workers import *
 from PyQt6.QtWidgets import (QSizePolicy, QButtonGroup, QTabWidget,
                              QColorDialog, QStyleOptionSlider, QScrollBar,
                              QFontComboBox)
+from PyQt6.QtGui import QPainterPath
 
 # ── Опциональные зависимости подвкладки «Удаление объектов» (LaMa/ONNX) ──────
 # Нужны numpy + opencv; саму onnxruntime подтягивает lama_inpaint лениво (при
@@ -170,6 +171,7 @@ class YtdlpTab(QWidget):
         self.fetch_timer.setInterval(800)
         self.fetch_timer.timeout.connect(self._start_fetch)
         self.info_worker = None
+        self._url_start_s = None    # тайминг из ?t=/&t= ссылки (None — не задан)
         self.setup_ui()
         self.kodik_info_sig.connect(self._populate_kodik)
 
@@ -203,7 +205,7 @@ class YtdlpTab(QWidget):
         
         # Отдельной кнопки «Проверить ссылку» нет — длительность/инфо и списки
         # Kodik подтягиваются автоматически при вставке/изменении ссылки.
-        self.url_edit.textChanged.connect(lambda: self.fetch_timer.start())
+        self.url_edit.textChanged.connect(self._on_url_edited)
 
         h = QHBoxLayout()
         btn_v = _icon_btn("Скачать", 'fa5s.download'); btn_v.clicked.connect(lambda: self.add_dl(False))
@@ -322,8 +324,10 @@ class YtdlpTab(QWidget):
         btn_clear_time.clicked.connect(self._clear_timings)
 
         sliders_box = QVBoxLayout()
-        self.slider_start = QSlider(Qt.Orientation.Horizontal)
-        self.slider_end = QSlider(Qt.Orientation.Horizontal)
+        # _JumpSlider — клик по дорожке сразу ставит ползунок в точку клика
+        # (а не «ползёт» на pageStep). Двигать можно и кликом, и протаскиванием.
+        self.slider_start = _JumpSlider(Qt.Orientation.Horizontal)
+        self.slider_end = _JumpSlider(Qt.Orientation.Horizontal)
         self.slider_start.setRange(0, 36000); self.slider_end.setRange(0, 36000)
         self.slider_start.valueChanged.connect(self._slider_to_spins)
         self.slider_end.valueChanged.connect(self._slider_to_spins)
@@ -334,6 +338,18 @@ class YtdlpTab(QWidget):
         _time_lbl.addStretch()
         sliders_box.addLayout(_time_lbl)
         sliders_box.addWidget(self.slider_start); sliders_box.addWidget(self.slider_end)
+
+        # Быстрые кнопки длины отрезка: ставят ползунок «По» на +N от ползунка «С».
+        # Удобно, когда нужен ровный кусок фиксированной длины от выбранной точки.
+        dur_box = QHBoxLayout(); dur_box.setSpacing(4)
+        dur_box.addWidget(QLabel("Длина:"))
+        for _lbl, _sec in (("+30с", 30), ("+1 мин", 60), ("+3 мин", 180), ("+5 мин", 300)):
+            _b = QPushButton(_lbl)
+            _b.setToolTip(f"Поставить «По» на +{_lbl.lstrip('+')} от ползунка «С»")
+            _b.clicked.connect(lambda _=False, s=_sec: self._add_duration(s))
+            dur_box.addWidget(_b)
+        dur_box.addStretch()
+        sliders_box.addLayout(dur_box)
 
         # Спинбоксы С:/По: + Сбросить — одной строкой; ползунки — ниже (чтобы
         # всё влезало в фиксированную ширину правой панели, как в 1-й вкладке).
@@ -379,6 +395,15 @@ class YtdlpTab(QWidget):
             self.slider_start.blockSignals(False); self.slider_end.blockSignals(False)
         except Exception: pass
 
+    def _add_duration(self, seconds):
+        """Ставит ползунок «По» на +seconds от текущего ползунка «С»
+        (кнопки быстрой длины отрезка). Спинбоксы обновятся через сигнал."""
+        try:
+            start_s = self.slider_start.value()
+            end_s = min(start_s + seconds, self.slider_end.maximum())
+            self.slider_end.setValue(end_s)
+        except Exception: pass
+
     def _fill_time_boxes(self, sec, boxes):
         """Заполняет три спинбокса (ч, м, с) из значения в секундах."""
         h = sec // 3600; m = (sec % 3600) // 60; s = sec % 60
@@ -396,6 +421,23 @@ class YtdlpTab(QWidget):
             self._fill_time_boxes(start_s, self.ts)
             self._fill_time_boxes(end_s, self.te)
         except Exception: pass
+
+    def _on_url_edited(self):
+        self.fetch_timer.start()
+        # Ссылка вида youtu.be/xxx?t=9182 — сразу выставляем «С:» на этот тайминг
+        # (не дожидаясь ответа InfoWorker с длительностью).
+        url = self.url_edit.text().strip()
+        ts = parse_youtube_start_seconds(url) if url else None
+        self._url_start_s = ts
+        if ts is not None:
+            if ts > self.slider_start.maximum():
+                self.slider_start.setRange(0, ts)
+                if self.slider_end.maximum() < ts:
+                    self.slider_end.setRange(0, ts)
+            self.slider_start.setValue(ts)
+            if self.slider_end.value() < ts:
+                self.slider_end.setValue(self.slider_end.maximum())
+            self.main.log(f"Ссылка содержит тайминг: качаю с {ts} сек.")
 
     def _start_fetch(self):
         url = self.url_edit.text().strip()
@@ -470,7 +512,8 @@ class YtdlpTab(QWidget):
         try:
             if duration > 0:
                 self.slider_start.setRange(0, duration); self.slider_end.setRange(0, duration)
-                self.slider_start.setValue(0); self.slider_end.setValue(duration)
+                start_val = min(self._url_start_s, duration) if self._url_start_s else 0
+                self.slider_start.setValue(start_val); self.slider_end.setValue(duration)
                 self._slider_to_spins()
         except Exception: pass
         try:
@@ -504,6 +547,7 @@ class YtdlpTab(QWidget):
         self.main.log(f"[Ошибка метаданных] {err_msg}")
 
     def _clear_timings(self):
+        self._url_start_s = None
         for box in self.ts + self.te:
             box.blockSignals(True); box.setValue(0); box.blockSignals(False)
         self.slider_start.blockSignals(True); self.slider_start.setValue(0); self.slider_start.blockSignals(False)
@@ -805,6 +849,10 @@ class MediaTab(QWidget):
         self.items = []
         self._item_map: dict = {}
         self._item_data_map: dict = {}
+        # iid'ы, удалённые из очереди пользователем — та же живая ссылка
+        # передаётся ProcessWorker'у, чтобы он мог прервать УЖЕ идущую обработку
+        # конкретного файла, а не только не начинать ещё не стартовавшие.
+        self._removed_ids: set = set()
         self.pool = QThreadPool()
         self.export_dir = ""  # пусто = экспортировать рядом с исходником
         self.setAcceptDrops(True)
@@ -813,9 +861,18 @@ class MediaTab(QWidget):
         # iid'ы, которые сейчас кодируются (таймер тикает их время вверх).
         self._proc_started: dict = {}
         self._proc_running: set = set()
+        self._item_pass: dict = {}   # iid → «N/total» текущего прохода подбора картинки
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.setInterval(500)
         self._elapsed_timer.timeout.connect(self._tick_elapsed)
+        # Пока воркер работает, каждые 500мс подсовываем ему АКТУАЛЬНЫЕ настройки
+        # с виджетов (см. _settings_sync_tick) — иначе файл, добавленный в очередь
+        # уже во время обработки, кодировался бы с настройками, замороженными в
+        # момент нажатия «НАЧАТЬ» (та же проблема, что и с CRF/скоростью/etc.,
+        # изменёнными на лету).
+        self._settings_sync_timer = QTimer(self)
+        self._settings_sync_timer.setInterval(500)
+        self._settings_sync_timer.timeout.connect(self._settings_sync_tick)
         self.setup_ui()
         self.thumb_sig.connect(self.set_thumb)
         self.media_info_sig.connect(self._apply_media_info)
@@ -863,7 +920,7 @@ class MediaTab(QWidget):
             "Добавляйте файлы сюда\n\n"
             "Перетащите видео, аудио или изображения в это окно\n"
             "или нажмите «Добавить файлы»")
-        self.tree.setHeaderLabels(["Превью", "", "Размер", "Битрейт", "LUFS", "Длительность", "Статус", "Время"])
+        self.tree.setHeaderLabels(["Превью", "", "Размер", "Битрейт", "LUFS", "Длительность", "Статус", "Время", "Оценка XPSNR"])
         self.tree.setRootIsDecorated(False)
         self.tree.setItemDelegate(StatusColorDelegate(self.tree))  # цветовая подсветка строк
         # 0-я колонка: миниатюра + имя файла под ней (одной строкой, с многоточием).
@@ -883,14 +940,27 @@ class MediaTab(QWidget):
         self.tree.verticalScrollBar().setSingleStep(24)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.tree.header().resizeSection(0, 180)
-        for i in range(1, 8): self.tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
+        for i in range(1, 9): self.tree.header().setSectionResizeMode(i, QHeaderView.ResizeMode.ResizeToContents)
         # Колонка 1 — только метки «Было/Стало» (имя файла переехало под превью),
         # поэтому ширину отдаём по содержимому (ResizeToContents выше).
+        # «Длительность» (5) и «Время» (7) — при ResizeToContents ширину диктует
+        # длинное слово в заголовке, а не сам текст ячейки («22.75 с», «01:38»),
+        # из-за чего колонки заметно шире содержимого. Фиксируем уже (но оставляем
+        # Interactive — можно растянуть руками при необходимости).
+        self.tree.header().setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        self.tree.header().resizeSection(5, 90)
+        self.tree.header().setSectionResizeMode(7, QHeaderView.ResizeMode.Interactive)
+        self.tree.header().resizeSection(7, 78)
 
         h = QHBoxLayout()
         b1 = _icon_btn("Добавить файлы", 'fa5s.plus'); b1.clicked.connect(self.add)
         b2 = _icon_btn("Удалить", 'fa5s.times'); b2.clicked.connect(self.rem)
         b3 = _icon_btn("Очистить", 'fa5s.trash'); b3.clicked.connect(self.clear)
+        for b in (b1, b2, b3): b.setMaximumWidth(120)
+        b4 = _icon_btn("", 'fa5s.columns')
+        b4.setFixedWidth(36)
+        b4.setToolTip("Сравнить любые два файла с диска (картинки или видео)")
+        b4.clicked.connect(self._compare_any_files)
         self.btn_export_dir = _icon_btn("", 'fa5s.folder-open')  # выбор папки экспорта
         self.btn_export_dir.setFixedWidth(36)
         self.btn_export_dir.setToolTip("Выбрать папку экспорта. По умолчанию — рядом с исходным файлом.")
@@ -902,7 +972,7 @@ class MediaTab(QWidget):
         self.btn_export_reset.setEnabled(False)
         self.lbl_export_dir = QLabel("По умолчанию экспорт в папку исходника")
         self.lbl_export_dir.setStyleSheet("color:#a6adc8; font-size:11px;")
-        h.addWidget(b1); h.addWidget(b2); h.addWidget(b3); h.addWidget(self.btn_export_dir); h.addWidget(self.btn_export_reset); h.addWidget(self.lbl_export_dir)
+        h.addWidget(b1); h.addWidget(b2); h.addWidget(b3); h.addWidget(b4); h.addWidget(self.btn_export_dir); h.addWidget(self.btn_export_reset); h.addWidget(self.lbl_export_dir)
         h.addStretch()
 
         # Левая часть может ужиматься (растяжимая, маленький минимум),
@@ -992,6 +1062,9 @@ class MediaTab(QWidget):
         hdv.addWidget(self._badge_degvol); hdv.addStretch()
         fa.addRow(self._lbl_degvol, hdv)
 
+        self.ck_no_audio = QCheckBox("Удалить аудио"); self.ck_no_audio.setChecked(False)
+        fa.addRow(row_with_info(self.ck_no_audio, "Полностью вырезает звуковую дорожку из видео (-an). Остальные настройки звука выше становятся неактуальны."))
+
         self._deg_group = [self._lbl_samplebit, self.s_hz, self.ck_u8,
                            self._lbl_lowpass, self.s_lp,
                            self._lbl_highpass, self.s_hp,
@@ -1007,6 +1080,22 @@ class MediaTab(QWidget):
                     if wi: wi.setVisible(checked)
         self.ck_deg.toggled.connect(_update_deg_vis)
         _update_deg_vis(self.ck_deg.isChecked())
+
+        # «Удалить аудио» гасит остальные настройки звука (они бы всё равно
+        # игнорировались в process_media, но серым фоном честнее показать это в UI).
+        self._audio_effect_widgets = [self.ck_norm, self.s_tgt, self.s_lra, self.s_tp,
+                                      self.ck_fade_in, self.s_fade_in, self.ck_fade, self.s_fade,
+                                      self.c_abitrate, self.ck_deg] + self._deg_group
+
+        def _update_no_audio_vis(checked):
+            for wdg in self._audio_effect_widgets:
+                wdg.setEnabled(not checked)
+            if checked:
+                _update_deg_vis(False)   # скрыть под-настройки degrade, если были открыты
+            else:
+                _update_deg_vis(self.ck_deg.isChecked())
+        self.ck_no_audio.toggled.connect(_update_no_audio_vis)
+        _update_no_audio_vis(self.ck_no_audio.isChecked())
 
         ga.setLayout(fa); rv_inner.addWidget(ga)
 
@@ -1028,10 +1117,36 @@ class MediaTab(QWidget):
         self.btn_mode_std  = QPushButton("Стандарт");       self.btn_mode_std.setCheckable(True);  self.btn_mode_std.setChecked(True)
         self.btn_mode_dark = _icon_btn("Тёмные сцены", 'fa5s.moon'); self.btn_mode_dark.setCheckable(True); self.btn_mode_dark.setChecked(False)
         self.btn_mode_std.setToolTip("yuv420p, 1-pass")
-        self.btn_mode_dark.setToolTip("10-бит (yuv420p10le), tune=ssim, 2-pass AV1\nCRF, preset и разрешение — без изменений")
+        self.btn_mode_dark.setToolTip("10-бит (yuv420p10le), tune=0, 2-pass AV1\nCRF, preset и разрешение — без изменений")
         self.btn_mode_std.clicked.connect(lambda: self._set_preset_mode("std"))
         self.btn_mode_dark.clicked.connect(lambda: self._set_preset_mode("dark"))
         mode_h = QHBoxLayout(); mode_h.addWidget(self.btn_mode_std); mode_h.addWidget(self.btn_mode_dark)
+        mode_h.addStretch(1)
+        # Ширину тоглов профиля резервируем под ЖИРНЫЙ текст: глобальный QSS
+        # (QPushButton:checked → font-weight:bold) делает активную кнопку жирной,
+        # из-за чего «Тёмные сцены» обрезалось до «…сцень». sizeHint() у Qt НЕ
+        # учитывает font-weight, заданный CSS-псевдо-состоянием (:checked) —
+        # только реальный .font() виджета — так что заранее посчитать нужную
+        # ширину числом (как раньше) не выйдет, ЛЮБАЯ константа была подогнана
+        # под неверный шрифт (при setMinimumWidth в __init__ кнопка ещё не
+        # «располирована» глобальным QSS — .font() отдаёт временный дефолтный
+        # шрифт, а не итоговый Segoe UI/13px). Меряем НАСТОЯЩИЙ размер: временно
+        # выставляем жирный шрифт САМОМУ виджету (после ensurePolished — это уже
+        # правильный шрифт), берём sizeHint() и возвращаем шрифт обратно —
+        # bold остаётся исключительно на совести CSS :checked, как и было.
+        QTimer.singleShot(0, self._size_profile_toggle_buttons)
+
+        # ── Метрика качества (AV1, всегда SVT-AV1) ────────────────────────────
+        # Выкл — ручной CRF как есть, кодировщик просто тюнится под tune=0
+        # (как и раньше). XPSNR — CRF на каждый файл подбирается
+        # самостоятельно (_metric_crf_search в workers.py, без внешних
+        # инструментов: короткий пробный сэмпл + бинарный поиск + встроенный
+        # ffmpeg-фильтр xpsnr) так, чтобы результат достигал заданного
+        # значения в дБ (см. s_target_metric ниже); сам кодировщик всё равно
+        # тюнится под tune=0 — метрика здесь означает цель ПОДБОРА CRF, а не
+        # тюнинг энкодера.
+        self.ck_metric_xpsnr = QCheckBox("XPSNR")
+        self.ck_metric_xpsnr.setChecked(False)
 
         self.s_crf = QSpinBox(); self.s_crf.setRange(0, 63); self.s_crf.setValue(45)
         self.s_pre = QSpinBox(); self.s_pre.setRange(0, 13); self.s_pre.setValue(2)
@@ -1053,6 +1168,64 @@ class MediaTab(QWidget):
         henc.addWidget(self._badge_crf)
         henc.addStretch()
         fv.addRow(label_with_info("CRF / Preset:", "CRF — качество (меньше = качественнее, но больше файл. Рекомендуется 40-45. Может принимать значения от 0 до 63)"), henc)
+
+        # ── Тюнинг SVT-AV1 (--tune) — под какую метрику оптимизирует энкодер ──
+        # Реально поддерживаемые SVT-AV1 режимы тюнинга (проверено на бандленном
+        # ffmpeg/SVT-AV1): 0=VQ, 1=PSNR, 2=SSIM, 4=MS-SSIM, 5=VMAF. tune=3 (IQ)
+        # сознательно пропущен — он поддерживает только all-intra/low-delay
+        # предсказание и падает с ошибкой на нашей random-access GOP-структуре
+        # (keyint=-1:scd=1, см. _av1_encoder_args в workers.py).
+        self.c_tune = InvertedWheelComboBox()
+        self.c_tune.addItem("VQ (0)" + DEFAULT_TAG, 0)
+        self.c_tune.addItem("PSNR (1)", 1)
+        self.c_tune.addItem("SSIM (2)", 2)
+        self.c_tune.addItem("MS-SSIM (4)", 4)
+        self.c_tune.addItem("VMAF (5)", 5)
+        self.c_tune.setMinimumWidth(150); self.c_tune.setMaximumWidth(180)
+        fv.addRow(label_with_info(
+            "Тюнинг:",
+            "Под какую метрику качества оптимизирует SVT-AV1 при кодировании.\n"
+            "VQ — субъективное визуальное качество (по умолчанию).\n"
+            "PSNR / SSIM / MS-SSIM / VMAF — оптимизация под соответствующую объективную метрику."),
+            self.c_tune)
+
+        # ── Метрика: Выкл (ручной CRF) / XPSNR (авто-подбор CRF) ───────────
+        self.s_target_metric = QSlider(Qt.Orientation.Horizontal)
+        self.s_target_metric.setRange(15, 60); self.s_target_metric.setValue(40)
+        self.s_target_metric.setSingleStep(1); self.s_target_metric.setPageStep(1)
+        self.s_target_metric.setEnabled(False)
+        self.s_target_metric.setMaximumWidth(140)
+
+        self.lbl_target_metric = QLabel("40 дБ")
+        self.lbl_target_metric.setMinimumWidth(55)
+        self.lbl_target_metric.setEnabled(False)
+
+        def _on_metric_toggled(checked):
+            self.s_target_metric.setEnabled(checked)
+            self.lbl_target_metric.setEnabled(checked)
+            try: self.main._save_settings_now()
+            except Exception: pass
+        def _on_target_changed(v):
+            self.lbl_target_metric.setText(f"{v} дБ")
+            try: self.main._save_settings_now()
+            except Exception: pass
+        self.ck_metric_xpsnr.toggled.connect(_on_metric_toggled)
+        self.s_target_metric.valueChanged.connect(_on_target_changed)
+
+        metric_h = QHBoxLayout()
+        metric_h.addWidget(self.ck_metric_xpsnr)
+        metric_h.addWidget(self.s_target_metric)
+        metric_h.addWidget(self.lbl_target_metric)
+        self._badge_metric = info_badge(
+            "Выкл — CRF задаётся вручную выше, кодировщик просто кодирует с ним как есть.\n"
+            "XPSNR — перед кодированием на коротком сэмпле подбирается CRF под каждый файл так, "
+            "чтобы результат достигал указанного значения в дБ (выше — качественнее и крупнее файл). "
+            "Ручной CRF выше остаётся резервным значением, если подбор не удался. "
+            "Дольше по времени — на каждый файл делается до 6 пробных кодирований.")
+        metric_h.addWidget(self._badge_metric)
+        metric_h.addStretch()
+        fv.addRow(label_with_info("Метрика:", "Выкл — ручной CRF (по умолчанию). XPSNR — CRF подбирается автоматически под целевое значение в дБ."), metric_h)
+
         fv.addRow(label_with_info("Разрешение:", "Масштаб выходного видео. «Исходное» — без изменений. Уменьшение сохраняет пропорции (без растяжения)."), self.c_res)
         fv.addRow(label_with_info("FPS:", "Частота кадров на выходе. «Исходный (max 30)» — снижает только если выше 30."), self.c_fps)
 
@@ -1071,11 +1244,14 @@ class MediaTab(QWidget):
         self._crop_black_row = row_with_info(self.ck_crop_black, "Автоматически определяет и вырезает чёрные поля (letterbox/pillarbox) при перекодировании. Рамка определяется по началу видео через cropdetect.")
         fv.addRow(self._crop_black_row)
 
+        self._fv_form = fv
         gv.setLayout(fv); rv_inner.addWidget(gv)
         # Скрываем строки видео если перекодирование выключено
         self._video_enc_rows = [self.btn_mode_std, self.btn_mode_dark,
-                                 self.s_crf, self.s_pre, self.c_res, self.c_fps,
+                                 self.ck_metric_xpsnr,
+                                 self.s_crf, self.s_pre, self.c_tune, self.c_res, self.c_fps,
                                  self._badge_crf,
+                                 self.s_target_metric, self.lbl_target_metric, self._badge_metric,
                                  self.s_vfade_in, self.s_vfade_out, self._crop_black_row]
         def _update_video_enc(checked):
             for w in self._video_enc_rows:
@@ -1109,6 +1285,17 @@ class MediaTab(QWidget):
         self.c_img_fmt.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         favi.addRow(label_with_info("Формат:", "Выходной формат изображений. avif — лучшее сжатие, на остальные форматы можно забить"), self.c_img_fmt)
 
+        # Цветовая субдискретизация AVIF (только для avif; при альфе всегда 4:2:0)
+        self.c_chroma = InvertedWheelComboBox()
+        self.c_chroma.addItems(["4:2:0" + DEFAULT_TAG, "4:2:2", "4:4:4"])
+        self.c_chroma.setCurrentText("4:2:0" + DEFAULT_TAG)
+        self.c_chroma.setMinimumWidth(140); self.c_chroma.setMaximumWidth(180)
+        favi.addRow(label_with_info(
+            "Субдискретизация:",
+            "Цветовая субдискретизация AVIF. 4:2:0 — минимальный размер файла (хватает для фото). "
+            "4:4:4 — максимум цветовой чёткости (текст, графика, скриншоты), но файл крупнее. "
+            "Для изображений с прозрачностью всегда 4:2:0."), self.c_chroma)
+
         # ── Лимит размера файла ──────────────────────────────────────────────
         hlim = QHBoxLayout()
         self.ck_lim = QCheckBox("Сжать до")
@@ -1134,6 +1321,26 @@ class MediaTab(QWidget):
         self.s_passes.setEnabled(self.ck_lim.isChecked())
         favi.addRow(hpass)
 
+        # ── CQ-level: фиксированное качество AVIF (используется, когда лимит
+        # размера выше выключен — при включённом лимите качество подбирается
+        # автоматически бинарным поиском независимо от этого значения, поэтому
+        # при включённом «Сжать до» поле визуально отключается) ─────────────
+        self.s_cq = QSpinBox()
+        self.s_cq.setRange(0, 63); self.s_cq.setValue(30)
+        self.s_cq.setMaximumWidth(80)
+        self._lbl_cq = label_with_info(
+            "--cq-level:",
+            "Уровень качества AVIF (libaom-av1, CQ-level: 0 — максимальное качество, 63 — максимальное сжатие). "
+            "Применяется только когда выключен лимит «Сжать до» — при включённом лимите качество подбирается "
+            "автоматически под нужный размер файла.")
+        favi.addRow(self._lbl_cq, self.s_cq)
+        # При включённом лимите размера CQ-level не участвует в кодировании —
+        # отключаем визуально (темнее), чтобы не создавать видимость выбора.
+        self.ck_lim.toggled.connect(lambda on: self.s_cq.setEnabled(not on))
+        self.ck_lim.toggled.connect(lambda on: self._lbl_cq.setEnabled(not on))
+        self.s_cq.setEnabled(not self.ck_lim.isChecked())
+        self._lbl_cq.setEnabled(not self.ck_lim.isChecked())
+
         # ── Лимит разрешения ─────────────────────────────────────────────────
         hdim = QHBoxLayout()
         self.ck_dim = QCheckBox("Снизить до")
@@ -1148,7 +1355,32 @@ class MediaTab(QWidget):
         self.ck_dim.toggled.connect(self.s_dim.setEnabled)
         favi.addRow(hdim)
 
-        self.sl_aspd = QSlider(Qt.Orientation.Horizontal); self.sl_aspd.setRange(0, 8); self.sl_aspd.setValue(2)
+        # ── Отдельные лимиты ширины / высоты (независимо от макс. стороны) ────
+        # Применяются вместе с «макс. стороной»: итог — самый строгий предел,
+        # пропорции сохраняются, увеличение никогда не делается.
+        hwid = QHBoxLayout()
+        self.ck_width = QCheckBox("Ширина до"); self.ck_width.setChecked(False)
+        self.s_width = QSpinBox(); self.s_width.setRange(16, 8000); self.s_width.setSuffix(" px")
+        self.s_width.setValue(1280); self.s_width.setEnabled(False)
+        hwid.addWidget(self.ck_width); hwid.addWidget(self.s_width)
+        hwid.addWidget(QLabel("(ширина)"))
+        hwid.addWidget(info_badge("Ограничивает ШИРИНУ изображения (px), высота подстраивается пропорционально. Работает независимо и вместе с «макс. стороной»."))
+        hwid.addStretch()
+        self.ck_width.toggled.connect(self.s_width.setEnabled)
+        favi.addRow(hwid)
+
+        hhei = QHBoxLayout()
+        self.ck_height = QCheckBox("Высота до"); self.ck_height.setChecked(False)
+        self.s_height = QSpinBox(); self.s_height.setRange(16, 8000); self.s_height.setSuffix(" px")
+        self.s_height.setValue(720); self.s_height.setEnabled(False)
+        hhei.addWidget(self.ck_height); hhei.addWidget(self.s_height)
+        hhei.addWidget(QLabel("(высота)"))
+        hhei.addWidget(info_badge("Ограничивает ВЫСОТУ изображения (px), ширина подстраивается пропорционально. Работает независимо и вместе с «макс. стороной»."))
+        hhei.addStretch()
+        self.ck_height.toggled.connect(self.s_height.setEnabled)
+        favi.addRow(hhei)
+
+        self.sl_aspd = _JumpSlider(Qt.Orientation.Horizontal); self.sl_aspd.setRange(0, 8); self.sl_aspd.setValue(2)
         # Перезаписывать ИСХОДНИК: результат сохраняется под именем оригинала
         # (без суффикса «_Сжатый»), а сам исходный файл удаляется. По умолчанию
         # ВЫКЛ — операция необратима (оригинал не восстановить).
@@ -1156,7 +1388,19 @@ class MediaTab(QWidget):
         self.ck_overwrite_src.setChecked(False)
         favi.addRow(label_with_info("Скорость:", "левее — медленнее и компактнее файл, правее — быстрее, но больше"), self.sl_aspd)
         favi.addRow(row_with_info(self.ck_overwrite_src, "ОПАСНО: удаляет исходное изображение и оставляет только сжатую версию (с именем оригинала, без «_Сжатый»). Оригинал не восстановить. По умолчанию выключено."))
+        self._favi_form = favi
         gavi.setLayout(favi); rv_inner.addWidget(gavi)
+
+        # ── Продвинутые настройки кодирования (Тюнинг / Метрика-XPSNR / CQ-level) ─
+        # Редко нужны и путают в базовом сценарии — скрыты по умолчанию, включаются
+        # ОДНИМ переключателем в Настройках (см. set_advanced_encode_visible).
+        self._adv_encode_widgets_fv = [self.c_tune, self.ck_metric_xpsnr,
+                                        self.s_target_metric, self.lbl_target_metric,
+                                        self._badge_metric]
+        self._adv_encode_widgets_favi = [self.s_cq, self._lbl_cq]
+        self._show_advanced_encode = False
+        self.chk_enable_video.toggled.connect(lambda _c: self._apply_advanced_encode_visibility())
+        self._apply_advanced_encode_visibility()
 
         rv_inner.addStretch(); w.setLayout(rv_inner); rw.setWidget(w); right_layout.addWidget(rw)
 
@@ -1166,7 +1410,7 @@ class MediaTab(QWidget):
         self.c_priority = InvertedWheelComboBox()
         self.c_priority.addItems(["Низкий", "Обычный", "Высокий"])
         self.c_priority.setCurrentText("Обычный")
-        self.c_priority.setMaximumWidth(120)
+        self.c_priority.setMaximumWidth(150)
         # Приоритет сохраняем СВОИМ изолированным write (read-modify-write только
         # ключа 'priority'), а не только общим _save_settings_now: тот собирает
         # ВЕСЬ словарь настроек и при любой ошибке сборки молча НИЧЕГО не пишет
@@ -1178,7 +1422,7 @@ class MediaTab(QWidget):
         # Всего логических потоков ЦП на этой машине — показываем сразу (0/N),
         # а не 0/0, чтобы было видно потенциал ещё до запуска обработки.
         self._cpu_threads = max(1, cpu_thread_count())
-        self.lbl_threads = QLabel(f"Потоки ЦП в работе: 0/{self._cpu_threads}")
+        self.lbl_threads = QLabel(f"Параллельных задач: 0/{self._cpu_threads}")
         self.lbl_threads.setToolTip(
             "Занятые логические потоки ЦП. Видео/аудио кодируются по одному файлу, "
             "но SVT-AV1 нагружает все ядра — поэтому показывается полное число потоков. "
@@ -1221,6 +1465,20 @@ class MediaTab(QWidget):
         except Exception:
             pass
 
+    def _size_profile_toggle_buttons(self):
+        """Резервирует под кнопки «Стандарт»/«Тёмные сцены» ширину, достаточную
+        для их ЖИРНОГО (:checked, см. глобальный QSS) начертания — см. пояснение
+        в __init__. Меряет реальный полированный шрифт виджета, а не константу."""
+        for _b in (self.btn_mode_std, self.btn_mode_dark):
+            _b.ensurePolished()
+            _orig_font = _b.font()
+            _bold_font = QFont(_orig_font); _bold_font.setBold(True)
+            _b.setFont(_bold_font)
+            _bold_w = _b.sizeHint().width()
+            _b.setFont(_orig_font)
+            if _b.minimumWidth() < _bold_w:
+                _b.setMinimumWidth(_bold_w)
+
     def _set_preset_mode(self, mode):
         """Переключает профиль кодирования без изменения preset и битрейта аудио."""
         is_dark = (mode == "dark")
@@ -1229,6 +1487,65 @@ class MediaTab(QWidget):
         self.btn_mode_std.blockSignals(False); self.btn_mode_dark.blockSignals(False)
         try: self.main._save_settings_now()
         except Exception: pass
+
+    def _video_metric_value(self):
+        """'none' | 'xpsnr' — цель авто-подбора CRF (_metric_crf_search
+        в workers.py). 'none' — ручной CRF без подбора."""
+        return 'xpsnr' if self.ck_metric_xpsnr.isChecked() else 'none'
+
+    @staticmethod
+    def _set_form_row_visible(form, widgets, visible):
+        """Показывает/скрывает виджеты формы И их лейбл (QFormLayout не двигает
+        лейбл сам по себе — ищем строку, где поле — один из widgets или их
+        layout-обёртка, см. _update_video_enc)."""
+        for w in widgets:
+            w.setVisible(visible)
+        for row_idx in range(form.rowCount()):
+            lbl = form.itemAt(row_idx, QFormLayout.ItemRole.LabelRole)
+            fld = form.itemAt(row_idx, QFormLayout.ItemRole.FieldRole)
+            if not fld:
+                continue
+            wgt = fld.widget()
+            if wgt is None and fld.layout():
+                wgt = fld.layout().itemAt(0).widget() if fld.layout().count() else None
+            matches = wgt in widgets or (
+                fld.layout() and any(
+                    fld.layout().itemAt(i).widget() in widgets
+                    for i in range(fld.layout().count())
+                    if fld.layout().itemAt(i).widget()
+                )
+            )
+            if matches and lbl and lbl.widget():
+                lbl.widget().setVisible(visible)
+
+    def set_advanced_encode_visible(self, on: bool):
+        """Настройки → единый переключатель «Тюнинг / Метрика (XPSNR) / CQ-level».
+        Втроём скрыты по умолчанию (редко нужны, путают в базовом сценарии) —
+        включаются/выключаются ОДНИМ чекбоксом в Настройках."""
+        self._show_advanced_encode = bool(on)
+        self._apply_advanced_encode_visibility()
+
+    def _apply_advanced_encode_visibility(self):
+        show = bool(getattr(self, '_show_advanced_encode', False))
+        # Тюнинг/Метрика имеют смысл только пока включено само перекодирование видео.
+        self._set_form_row_visible(self._fv_form, self._adv_encode_widgets_fv,
+                                    show and self.chk_enable_video.isChecked())
+        self._set_form_row_visible(self._favi_form, self._adv_encode_widgets_favi, show)
+        # Колонка "Оценка XPSNR" в таблице файлов заполняется только когда метрика
+        # включена — без неё это всегда пустой прочерк, прячем саму колонку.
+        self.tree.setColumnHidden(8, not show)
+
+    def _video_tune_value(self):
+        """Числовое значение SVT-AV1 --tune (0/1/2/4/5, см. c_tune в __init__)
+        для финального кодирования (_av1_encoder_args в workers.py)."""
+        data = self.c_tune.currentData()
+        return int(data) if data is not None else 0
+
+    def _set_tune_value(self, value):
+        """Выставляет c_tune по числовому значению tune (обратная операция
+        к _video_tune_value) — используется при загрузке сохранённых настроек."""
+        idx = self.c_tune.findData(int(value))
+        self.c_tune.setCurrentIndex(idx if idx >= 0 else 0)
 
     def on_url_ctx(self, pos):
         m = QMenu()
@@ -1435,17 +1752,20 @@ class MediaTab(QWidget):
                 # Тултип превью — только путь; полное имя показывается при
                 # наведении на строку имени под превью (см. DraggableTreeWidget).
                 it.setToolTip(0, p)
-                # Колонка 1: только метки Было/Стало для строк ниже (1-я строка
-                # пустая для выравнивания). Остальные ячейки — 3 строки
-                # [пусто, было, стало].
-                it.setText(1, "\nБыло\nСтало")
-                it.setText(2, f"\n{human_size(size)}\n—")   # Размер: было(исх) / стало
-                it.setText(3, "\n—\n—")                     # Битрейт: исх / итог
-                it.setText(4, "\n—\n—")                     # LUFS: до / после
-                it.setText(5, "\n—\n—")                     # Длительность: исх / итог
+                # Колонка 1: метки Было/Стало. 2 строки [было, стало] —
+                # центрируются по высоте строки как имя файла и статус (пустая
+                # 1-я строка раньше сдвигала пару вниз от центра).
+                it.setText(1, "Было\nСтало")
+                it.setText(2, f"{human_size(size)}\n—")     # Размер: было(исх) / стало
+                it.setText(3, "—\n—")                       # Битрейт: исх / итог
+                it.setText(4, "—\n—")                       # LUFS: до / после
+                it.setText(5, "—\n—")                       # Длительность: исх / итог
                 it.setText(6, "Ожидание")                   # Статус (одна строка)
                 it.setText(7, "—")                          # Время перекодирования (мм:сс)
                 it.setToolTip(7, "Время, потраченное на перекодирование")
+                it.setText(8, "—")                          # Оценка XPSNR (заполняется после видео-кодирования)
+                it.setToolTip(8, "Оценка качества результата (XPSNR, дБ) — выше значит ближе к оригиналу.\n"
+                                 "Только для перекодированного видео (AV1); при копировании/аудио — «—».")
                 it.setData(0, Qt.ItemDataRole.UserRole, iid)
                 # Аудио (без видеоряда) → компактная строка без места под превью.
                 if ext in ALLOWED_AUDIO:
@@ -1463,8 +1783,10 @@ class MediaTab(QWidget):
                         # появлялись при добавлении файла.
                         try:
                             dur_r, br_r, size_r, a_br_r, a_codec_r = get_media_info(path_local)
+                            v_r = get_video_codec_label(path_local)
+                            size_label_r = f"{v_r} {human_size(size_r)}" if v_r else human_size(size_r)
                             self.media_info_sig.emit(
-                                iid_local, human_size(size_r),
+                                iid_local, size_label_r,
                                 fmt_bitrate_with_codec(a_codec_r, a_br_r or br_r),
                                 float(dur_r or 0.0))
                         except Exception: pass
@@ -1504,16 +1826,18 @@ class MediaTab(QWidget):
 
     @staticmethod
     def _set_pair(item, col, top=None, bottom=None):
-        """Ячейка из 3 строк: [метка/пусто, было, стало]. Меняет только было/стало
-        (top/bottom), сохраняя 1-ю строку (метку имени или пустую заглушку
-        выравнивания)."""
+        """Ячейка из 2 строк: [было, стало]. Меняет только было/стало
+        (top/bottom), сохраняя другую строку. Пара центрируется по высоте
+        строки (как имя файла и статус)."""
         cur = (item.text(col) or "").split("\n")
-        head = cur[0] if len(cur) >= 1 else ""
-        t = cur[1] if len(cur) > 1 and cur[1] else "—"
-        b = cur[2] if len(cur) > 2 and cur[2] else "—"
+        # Легаси-формат из 3 строк ([пусто, было, стало]) — отбрасываем пустую.
+        if len(cur) >= 3:
+            cur = cur[1:]
+        t = cur[0] if len(cur) > 0 and cur[0] else "—"
+        b = cur[1] if len(cur) > 1 and cur[1] else "—"
         if top is not None: t = top
         if bottom is not None: b = bottom
-        item.setText(col, f"{head}\n{t}\n{b}")
+        item.setText(col, f"{t}\n{b}")
 
     @staticmethod
     def _fmt_dur(sec):
@@ -1532,9 +1856,11 @@ class MediaTab(QWidget):
                 self._set_pair(item, 2, bottom=size_new)          # Размер: стало
                 self._set_pair(item, 3, bottom=bitrate_result)    # Битрейт: итог
                 item.setData(0, ITEM_STATUS_ROLE, 'done')
-                # Для обработанной картинки включаем значок «сравнить» на превью.
+                # Для обработанной картинки/видео включаем значок «сравнить» на превью
+                # (аудио без видеоряда сравнивать нечем — там значок не нужен).
                 entry = self._item_data_map.get(iid)
-                if entry and entry.get('type') == 'IMG':
+                is_video = entry and entry.get('type') == 'MEDIA' and Path(entry.get('path', '')).suffix.lower() not in ALLOWED_AUDIO
+                if entry and (entry.get('type') == 'IMG' or is_video):
                     item.setData(0, ITEM_COMPARE_ROLE, True)
                     item.setToolTip(0, (item.toolTip(0) or "")
                                     + "\n\nЗначок в углу превью — сравнить исходник и результат.")
@@ -1542,9 +1868,10 @@ class MediaTab(QWidget):
         except Exception: pass
 
     def _on_compare_clicked(self, index):
-        """Клик по значку «сравнить» на превью обработанной картинки: открывает
-        полноэкранное сравнение исходника и результата (ориентация — по форме
-        картинок). Если оригинал/результат недоступны — показывает то, что есть."""
+        """Клик по значку «сравнить» на превью обработанного файла: открывает
+        полноэкранное сравнение исходника и результата (картинка — по форме,
+        видео — плеер слева/справа с синхронной перемоткой). Если оригинал/
+        результат недоступны — показывает то, что есть."""
         try:
             iid = index.data(Qt.ItemDataRole.UserRole)
             entry = self._item_data_map.get(iid)
@@ -1554,12 +1881,49 @@ class MediaTab(QWidget):
             out = entry.get('out_path', '')
             src_ok = bool(src) and os.path.exists(src)
             out_ok = bool(out) and os.path.exists(out)
+            is_video = entry.get('type') == 'MEDIA' and Path(src or out).suffix.lower() not in ALLOWED_AUDIO
             if src_ok and out_ok and os.path.abspath(src) != os.path.abspath(out):
-                show_image_compare(src, out, self)
+                if is_video:
+                    show_video_compare(src, out, self)
+                else:
+                    show_image_compare(src, out, self)
             elif out_ok:
-                show_image_fullscreen(out, self)
+                if is_video:
+                    show_video_compare(out, out, self)
+                else:
+                    show_image_fullscreen(out, self)
             elif src_ok:
-                show_image_fullscreen(src, self)
+                if is_video:
+                    show_video_compare(src, src, self)
+                else:
+                    show_image_fullscreen(src, self)
+        except Exception as e:
+            self.main.log(f"Сравнение: {e}")
+
+    def _compare_any_files(self):
+        """Кнопка «Сравнить» в тулбаре списка — сравнение ЛЮБЫХ двух файлов с
+        диска, а не только пары исходник/результат из очереди обработки. Тип
+        (картинка или видео) определяется по расширению первого файла. Можно
+        выбрать всего один файл — окно сравнения откроется сразу с ним (слева),
+        а второй добавляется прямо в окне значком папки (тот же интерфейс,
+        что и при обычном сравнении)."""
+        try:
+            video_exts = ALLOWED_MEDIA - ALLOWED_AUDIO
+            exts = " ".join(f"*{e}" for e in sorted(ALLOWED_IMG | video_exts))
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, "Выберите файл(ы) для сравнения (можно один — второй добавите в окне)", "",
+                f"Изображения и видео ({exts});;Все файлы (*)")
+            if not paths:
+                return
+            a = paths[0]
+            b = paths[1] if len(paths) > 1 else None
+            ext_a = Path(a).suffix.lower()
+            if ext_a in ALLOWED_IMG:
+                show_image_compare(a, b, self, use_filenames=True)
+            elif ext_a in video_exts:
+                show_video_compare(a, b, self, use_filenames=True)
+            else:
+                self.main.log(f"Сравнение: неподдерживаемый тип файла «{ext_a}»")
         except Exception as e:
             self.main.log(f"Сравнение: {e}")
 
@@ -1569,6 +1933,16 @@ class MediaTab(QWidget):
             item = self._find_item(iid)
             if item:
                 self._set_pair(item, 5, bottom=self._fmt_dur(dur_str))
+        except Exception: pass
+
+    def update_item_xpsnr(self, iid, score):
+        """Оценка качества результата (XPSNR, дБ) — заполняется после видео-
+        кодирования (см. xpsnr_sig в workers.py). score=None — не измерялась
+        (не видео, копия без перекодирования, или замер не удался)."""
+        try:
+            item = self._find_item(iid)
+            if item:
+                item.setText(8, "—" if score is None else f"{score:.1f} дБ")
         except Exception: pass
 
     def update_lufs_columns(self, iid, before, after):
@@ -1583,9 +1957,15 @@ class MediaTab(QWidget):
         try:
             for i in self.tree.selectedItems():
                 iid = i.data(0, Qt.ItemDataRole.UserRole)
-                self.items = [x for x in self.items if x['iid'] != iid]
+                # Мутируем СПИСОК НА МЕСТЕ (не self.items = [...]) — ProcessWorker
+                # держит ссылку на этот же объект-список как «живую» очередь
+                # (см. queue_ref в _run_items); переприсваивание отвязывало бы
+                # воркер от изменений, и удалённый файл всё равно обрабатывался
+                # бы до конца, а не только до нажатия «СТОП».
+                self.items[:] = [x for x in self.items if x['iid'] != iid]
                 self._item_map.pop(iid, None)
                 self._item_data_map.pop(iid, None)
+                self._removed_ids.add(iid)
                 self.tree.invisibleRootItem().removeChild(i)
         except Exception: pass
 
@@ -1601,21 +1981,19 @@ class MediaTab(QWidget):
         """Кнопка «НАЧАТЬ» — обрабатывает всю очередь."""
         self._run_items(self.items)
 
-    def _run_items(self, target):
-        if not target: return
-        # Не запускаем второй воркер поверх активного (двойной клик во время работы)
-        if getattr(self, 'worker', None) is not None:
-            try:
-                if self.worker.isRunning():
-                    self.main.log("Дождитесь завершения текущей обработки.")
-                    return
-            except Exception: pass
+    def _collect_settings(self):
+        """Собирает АКТУАЛЬНОЕ состояние всех настроек «Обработки» с виджетов —
+        единственное место сборки, чтобы кнопка «НАЧАТЬ» и фоновая пере-синхронизация
+        настроек уже идущего воркера (_settings_sync_tick) всегда читали одно и то же
+        и любая новая настройка, добавленная сюда в будущем, подхватывалась обоими
+        путями сама собой."""
         try: ab = self.c_abitrate.currentText() or "128"
         except Exception: ab = "128"
         try: spd = self.s_spd.value()
         except Exception: spd = 100
-        s = {
+        return {
             'audio': {
+                'remove': bool(self.ck_no_audio.isChecked()),
                 'norm': bool(self.ck_norm.isChecked()),
                 'tgt': float(self.s_tgt.value()), 'lra': float(self.s_lra.value()), 'tp': float(self.s_tp.value()),
                 'fade': bool(self.ck_fade.isChecked()), 'fade_d': float(self.s_fade.value()),
@@ -1628,6 +2006,8 @@ class MediaTab(QWidget):
                 'enabled': bool(self.chk_enable_video.isChecked()), 'speed': int(spd), 'crf': int(self.s_crf.value()),
                 'pre': int(self.s_pre.value()), 'res': strip_default_tag(self.c_res.currentText()), 'fps': self.c_fps.currentText().strip().replace(',', '.'),
                 'preset_mode': 'dark' if self.btn_mode_dark.isChecked() else 'std',
+                'tune': self._video_tune_value(),
+                'metric': self._video_metric_value(), 'target_metric': float(self.s_target_metric.value()),
                 'vfade_in': bool(self.ck_vfade_in.isChecked()), 'vfade_in_d': float(self.s_vfade_in.value()),
                 'vfade_out': bool(self.ck_vfade_out.isChecked()), 'vfade_out_d': float(self.s_vfade_out.value()),
                 'crop_black': bool(self.ck_crop_black.isChecked())
@@ -1635,21 +2015,52 @@ class MediaTab(QWidget):
             'avif': {
                 'limit': int(self.s_lim.value()) if self.ck_lim.isChecked() else 0,
                 'adim': int(self.s_dim.value()) if self.ck_dim.isChecked() else 0,
+                'awidth': int(self.s_width.value()) if self.ck_width.isChecked() else 0,
+                'aheight': int(self.s_height.value()) if self.ck_height.isChecked() else 0,
                 'aspd': int(self.sl_aspd.value()),
-                'overwrite_src': bool(self.ck_overwrite_src.isChecked()) if hasattr(self, 'ck_overwrite_src') else False,
-                'fit_passes': int(self.s_passes.value()) if hasattr(self, 's_passes') else 4,
-                'img_fmt': strip_default_tag(self.c_img_fmt.currentText()) if hasattr(self, 'c_img_fmt') else 'avif'
+                'cq': int(self.s_cq.value()),
+                'overwrite_src': bool(self.ck_overwrite_src.isChecked()),
+                'fit_passes': int(self.s_passes.value()),
+                'img_fmt': strip_default_tag(self.c_img_fmt.currentText()),
+                'chroma': strip_default_tag(self.c_chroma.currentText()).replace(':', '')
             },
             'export_dir': self.export_dir or '',
             'priority': {'Низкий': 'low', 'Обычный': 'normal', 'Высокий': 'high'}.get(
-                self.c_priority.currentText(), 'normal') if hasattr(self, 'c_priority') else 'normal'
+                self.c_priority.currentText(), 'normal')
         }
-        self.worker = ProcessWorker(target, s)
+
+    def _settings_sync_tick(self):
+        """Пока воркер работает — подсовывает ему свежий словарь настроек (см.
+        _collect_settings). ProcessWorker читает self.settings заново для КАЖДОГО
+        файла (self.settings.get(...) внутри process_media), поэтому уже начатый
+        файл фоновым перезапросом не затрагивается — досрочно подхватывают
+        изменение только ещё не стартовавшие (в т.ч. добавленные во время работы)."""
+        w = getattr(self, 'worker', None)
+        if w is None or not w.isRunning():
+            self._settings_sync_timer.stop()
+            return
+        try:
+            w.settings = self._collect_settings()
+        except Exception:
+            pass
+
+    def _run_items(self, target):
+        if not target: return
+        # Не запускаем второй воркер поверх активного (двойной клик во время работы)
+        if getattr(self, 'worker', None) is not None:
+            try:
+                if self.worker.isRunning():
+                    self.main.log("Дождитесь завершения текущей обработки.")
+                    return
+            except Exception: pass
+        s = self._collect_settings()
+        self.worker = ProcessWorker(target, s, removed_ids=self._removed_ids)
         self.worker.status.connect(self.on_stat); self.worker.progress.connect(self.on_prog)
         self.worker.log.connect(self.main.log); self.worker.finished_all.connect(self.done)
         self.worker.global_progress.connect(self.main.update_global_progress)
         self.worker.update_item_sig.connect(self.update_item_info); self.worker.update_lufs_sig.connect(self.update_lufs_columns)
         self.worker.update_dur_sig.connect(self.update_item_dur)
+        self.worker.xpsnr_sig.connect(self.update_item_xpsnr)
         self.worker.active_threads.connect(self._on_active_threads)
 
         try:
@@ -1669,11 +2080,14 @@ class MediaTab(QWidget):
 
         self.b_run.setEnabled(False); self.b_stop.setEnabled(True)
         self.worker.start()
+        self._settings_sync_timer.start()
 
     def stop(self):
         if self.worker:
             try: self.worker.stop()
             except Exception: pass
+
+    _RE_IMG_PASS = re.compile(r"картинки (\d+)/(\d+)")
 
     def on_stat(self, iid, txt, code):
         try:
@@ -1686,12 +2100,21 @@ class MediaTab(QWidget):
                 if code != 'proc':
                     i.setText(6, txt)
                 self.tree.viewport().update()
+            # Подбор AVIF/WebP под лимит размера идёт несколькими проходами —
+            # текст вида «Конвертация картинки N/total» несёт номер прохода,
+            # который показываем рядом с временем (колонка «Время»).
+            if code == 'proc':
+                m = self._RE_IMG_PASS.search(txt or "")
+                if m:
+                    self._item_pass[iid] = f"{m.group(1)}/{m.group(2)}"
+                    self._update_elapsed_text(iid)
             # Учёт времени перекодирования (колонка «Время»):
             #   proc      → засекаем старт (единожды) и запускаем тик-таймер;
             #   done/err  → фиксируем итог и больше не тикаем этот файл.
             if code == 'proc':
                 self._start_elapsed(iid)
             elif code in ('done', 'err'):
+                self._item_pass.pop(iid, None)
                 self._freeze_elapsed(iid)
         except Exception: pass
 
@@ -1712,6 +2135,22 @@ class MediaTab(QWidget):
         m, s = divmod(sec, 60)
         return f"{m:02d}:{s:02d}"
 
+    def _elapsed_text_for(self, iid, elapsed_sec) -> str:
+        """мм:сс + «(x/y)» прохода подбора картинки, если он сейчас идёт."""
+        txt = self._fmt_elapsed(elapsed_sec)
+        p = self._item_pass.get(iid)
+        return f"{txt} ({p})" if p else txt
+
+    def _update_elapsed_text(self, iid):
+        """Перерисовывает колонку «Время» текущего файла (напр. когда сменился
+        номер прохода, а не только тик таймера)."""
+        start = self._proc_started.get(iid)
+        if start is None:
+            return
+        i = self._find_item(iid)
+        if i:
+            i.setText(7, self._elapsed_text_for(iid, time.monotonic() - start))
+
     def _start_elapsed(self, iid):
         """Засекает старт перекодирования файла (если ещё не засечён) и
         включает таймер, который тикает время вверх до завершения."""
@@ -1720,7 +2159,7 @@ class MediaTab(QWidget):
         self._proc_running.add(iid)
         i = self._find_item(iid)
         if i:
-            i.setText(7, self._fmt_elapsed(time.monotonic() - self._proc_started[iid]))
+            i.setText(7, self._elapsed_text_for(iid, time.monotonic() - self._proc_started[iid]))
         if not self._elapsed_timer.isActive():
             self._elapsed_timer.start()
 
@@ -1734,7 +2173,7 @@ class MediaTab(QWidget):
                 continue
             start = self._proc_started.get(iid)
             if start is not None:
-                i.setText(7, self._fmt_elapsed(now - start))
+                i.setText(7, self._elapsed_text_for(iid, now - start))
         if not self._proc_running:
             self._elapsed_timer.stop()
 
@@ -1742,6 +2181,7 @@ class MediaTab(QWidget):
         """Фиксирует итоговое время файла и снимает его с тиканья (идемпотентно —
         повторные сигналы done/100% не пересчитывают и не сдвигают итог)."""
         self._proc_running.discard(iid)
+        self._item_pass.pop(iid, None)
         start = self._proc_started.pop(iid, None)
         if start is not None:
             i = self._find_item(iid)
@@ -1754,17 +2194,18 @@ class MediaTab(QWidget):
         try:
             # В простое показываем 0 из всех потоков ЦП машины (а не 0/0).
             total = m if m > 0 else self._cpu_threads
-            self.lbl_threads.setText(f"Потоки ЦП в работе: {n}/{total}")
+            self.lbl_threads.setText(f"Параллельных задач: {n}/{total}")
         except Exception: pass
 
     def done(self):
         self.b_run.setEnabled(True); self.b_stop.setEnabled(False)
+        self._removed_ids.clear()
         # Страховка: фиксируем итоговое время по всем ещё «тикающим» файлам и
         # останавливаем таймер (на случай, если кто-то не прислал done/err).
         for iid in list(self._proc_running):
             self._freeze_elapsed(iid)
         self._elapsed_timer.stop()
-        try: self.lbl_threads.setText(f"Потоки ЦП в работе: 0/{self._cpu_threads}")
+        try: self.lbl_threads.setText(f"Параллельных задач: 0/{self._cpu_threads}")
         except Exception: pass
         self.main.log("Готово")
         try: play_done_sound()
@@ -2733,6 +3174,7 @@ class InpaintCanvas(QWidget):
     strokeFinished = pyqtSignal()        # завершён штрих кистью (для авто-удаления)
     clearRequested = pyqtSignal()        # нажата кнопка «Очистить» в углу холста
     imageChanged = pyqtSignal()          # появилось/исчезло изображение (undo/redo) — пере-включить инструменты
+    textSelected = pyqtSignal()          # плавающий текст создан/выделен — открыть панель его свойств
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2749,6 +3191,7 @@ class InpaintCanvas(QWidget):
         # показываем шахматкой в _rebuild_base, а при сохранении склеиваем в BGRA.
         self._alpha = None
         self._base_pix = None           # QPixmap кэш изображения для отрисовки
+        self._overlay_btns_state = None  # memo-ключ _sync_overlay_buttons (см. там)
         self._scale = 1.0
         self._off = QPointF(0, 0)
         self._user_zoomed = False
@@ -2772,6 +3215,9 @@ class InpaintCanvas(QWidget):
         # Шрифт инструмента «Текст» (по умолчанию — системный, 48 px высотой).
         self._text_font = QFont()
         self._text_font.setPixelSize(48)
+        self._text_color = QColor(255, 255, 255)     # цвет НОВОГО текста (не влияет на уже созданный)
+        self._text_stroke_width = 0.0
+        self._text_stroke_color = QColor(0, 0, 0)
         self._crop_a = None             # верх-лев угол рамки кадрирования (коорд. изобр.)
         self._crop_b = None             # ниж-прав угол рамки кадрирования
         self._crop_drag = None          # активная «ручка»: tl/tr/bl/br/t/b/l/r/move
@@ -2781,6 +3227,14 @@ class InpaintCanvas(QWidget):
         self._history = []              # [(img_bgr, overlay QImage)] для отмены
         self._redo = []                 # стек возврата (Ctrl+Y)
         self._HISTORY_MAX = 8
+        # Кэш PNG-кодирования img_bgr для _snapshot(): само фото не меняется во
+        # время штриха кистью/ластиком (мазки идут в _paint_layer), а перекодировать
+        # его целиком на КАЖДОЕ нажатие ЛКМ (_push_history) — это заметный фриз
+        # на крупных фото (счёт на сотни мс). img_bgr всегда переприсваивается
+        # новым массивом при реальном изменении (поворот/кроп/bake) — сравнение
+        # по identity безопасно.
+        self._bgr_snap_src = None
+        self._bgr_snap_enc = None
         # Незакреплённый («плавающий») объект — фигура или текст, который только
         # что положили: его можно ПЕРЕТАСКИВАТЬ (как в Photoshop), пока не вжали в
         # картинку. Вжигается при клике вне него / смене инструмента / Enter / сейве.
@@ -2928,8 +3382,18 @@ class InpaintCanvas(QWidget):
 
     def _sync_overlay_buttons(self):
         """Показ/позиция/доступность значков отмены-возврата (слева сверху) и
-        кнопки «Очистить» (справа сверху) на холсте."""
+        кнопки «Очистить» (справа сверху) на холсте.
+        Вызывается из paintEvent на КАЖДЫЙ репейнт (в т.ч. на каждый мазок кисти
+        при рисовании) — но фактическая раскладка зависит только от небольшого
+        набора значений; если ни один не изменился с прошлого вызова, репозиция
+        виджетов (десяток .move()/.setEnabled() на кадр) не нужна."""
         has = self.img_bgr is not None
+        state = (has, self.width(),
+                 bool(self._history), bool(self._redo),
+                 self._vbar.isVisible() if has else False)
+        if state == self._overlay_btns_state:
+            return
+        self._overlay_btns_state = state
         all_btns = [self._undo_btn, self._redo_btn, self._clear_btn] + self._orient_btns
         for b in all_btns:
             b.setVisible(has)
@@ -2982,7 +3446,14 @@ class InpaintCanvas(QWidget):
         self.update()
 
     def load_path(self, path):
-        self.set_image_bgr(load_bgr(path))
+        # _load_image_alpha (не load_bgr) — иначе прозрачность PNG/WEBP/AVIF
+        # терялась бы уже при открытии (cv2.IMREAD_COLOR альфу отбрасывает).
+        arr = _load_image_alpha(path)
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            self.set_image_bgr(arr[:, :, :3])
+            self.apply_cutout(arr[:, :, 3])
+        else:
+            self.set_image_bgr(arr)
 
     def add_overlay_image(self, arr):
         """Кладёт изображение arr (BGR H×W×3 или BGRA H×W×4) как плавающий слой
@@ -3081,13 +3552,53 @@ class InpaintCanvas(QWidget):
         return _np.ascontiguousarray(_np.dstack([bgr, alpha]))
 
     # ── История / отмена / возврат ──────────────────────────────────────────
+    @staticmethod
+    def _encode_layer(obj):
+        """Сжимает слой истории в PNG (lossless) вместо хранения сырого буфера —
+        маски/слой кисти по большей части прозрачны/однородны и жмутся в разы
+        (при _HISTORY_MAX=8 и 4 слоях на шаг сырые копии на 4K-фото легко уходят
+        в сотни МБ)."""
+        if obj is None:
+            return None
+        if isinstance(obj, _np.ndarray):
+            ok, buf = _cv2.imencode('.png', obj)
+            return ('np', buf.tobytes()) if ok else ('raw', obj)
+        from PyQt6.QtCore import QBuffer
+        ba = QByteArray()
+        qbuf = QBuffer(ba)
+        qbuf.open(QBuffer.OpenModeFlag.WriteOnly)
+        obj.save(qbuf, 'PNG')
+        qbuf.close()
+        return ('qimg', bytes(ba))
+
+    @staticmethod
+    def _decode_layer(enc):
+        if enc is None:
+            return None
+        kind, raw = enc
+        if kind == 'raw':
+            return raw
+        if kind == 'np':
+            return _cv2.imdecode(_np.frombuffer(raw, _np.uint8), _cv2.IMREAD_UNCHANGED)
+        img = QtGuiImage.fromData(raw, 'PNG')
+        if img.format() != QtGuiImage.Format.Format_ARGB32_Premultiplied:
+            img = img.convertToFormat(QtGuiImage.Format.Format_ARGB32_Premultiplied)
+        return img
+
     def _snapshot(self):
         """Текущее состояние для истории: картинка + маска удаления + слой краски.
-        Копии делаем безопасно (любой слой может быть None — напр. после очистки)."""
-        ov = self._overlay.copy() if self._overlay is not None else None
-        pl = self._paint_layer.copy() if self._paint_layer is not None else None
-        al = self._alpha.copy() if self._alpha is not None else None
-        return (self.img_bgr, ov, pl, al)
+        Хранится в сжатом (PNG) виде — см. _encode_layer; любой слой может быть
+        None (напр. после очистки)."""
+        ov = self._encode_layer(self._overlay)
+        pl = self._encode_layer(self._paint_layer)
+        al = self._encode_layer(self._alpha)
+        if self.img_bgr is self._bgr_snap_src:
+            bgr = self._bgr_snap_enc
+        else:
+            bgr = self._encode_layer(self.img_bgr)
+            self._bgr_snap_src = self.img_bgr
+            self._bgr_snap_enc = bgr
+        return (bgr, ov, pl, al)
 
     def _push_history(self):
         if self.img_bgr is None:
@@ -3099,7 +3610,11 @@ class InpaintCanvas(QWidget):
         self._redo.clear()
 
     def _restore_state(self, snap, msg):
-        img, ov, pl, al = snap
+        img_enc, ov_enc, pl_enc, al_enc = snap
+        img = self._decode_layer(img_enc)
+        ov = self._decode_layer(ov_enc)
+        pl = self._decode_layer(pl_enc)
+        al = self._decode_layer(al_enc)
         # Восстановление в «очищенный» холст (img is None) — напр. отмена «Очистить».
         if img is None:
             self.img_bgr = None
@@ -3294,6 +3809,15 @@ class InpaintCanvas(QWidget):
                 ps = self._text_font.pointSizeF()
                 self._text_font.setPixelSize(max(6, int(round(ps * 1.6))))
 
+    def set_text_color(self, color):
+        if color is not None and color.isValid():
+            self._text_color = QColor(color.red(), color.green(), color.blue())
+
+    def set_text_stroke(self, width, color=None):
+        self._text_stroke_width = max(0.0, float(width))
+        if color is not None and color.isValid():
+            self._text_stroke_color = QColor(color.red(), color.green(), color.blue())
+
     # ── Фигуры и текст (рисуются прямо в изображение) ────────────────────────
     def _shape_pen(self):
         c = self._brush_color
@@ -3368,13 +3892,30 @@ class InpaintCanvas(QWidget):
             self, "Текст", "Введите текст (системный шрифт выбирается в панели):", "")
         if not ok or not text.strip():
             return
-        c = self._brush_color
+        c = self._text_color
         self._pending = {'kind': 'text', 'pos': QPointF(ipt), 'text': text,
                          'font': QFont(self._text_font),
-                         'color': QColor(c.red(), c.green(), c.blue())}
+                         'color': QColor(c.red(), c.green(), c.blue()),
+                         'stroke_width': float(self._text_stroke_width),
+                         'stroke_color': QColor(self._text_stroke_color)}
         self._pending_move = False
         self.update()
-        self.statusChanged.emit("Текст добавлен — перетащите, чтобы сдвинуть.")
+        self.textSelected.emit()
+        self.statusChanged.emit("Текст добавлен — перетащите, чтобы сдвинуть, "
+                                "или настройте цвет/шрифт/обводку в панели слева.")
+
+    def edit_pending_text(self, ipt):
+        """Двойной клик по плавающему тексту — меняем саму строку (остальные
+        параметры: шрифт/цвет/обводка — остаются, редактируются в панели)."""
+        if self._pending is None or self._pending.get('kind') != 'text':
+            return
+        if not self._object_bbox(self._pending).contains(ipt):
+            return
+        text, ok = QInputDialog.getMultiLineText(
+            self, "Текст", "Измените текст:", self._pending['text'])
+        if ok and text.strip():
+            self._pending['text'] = text
+            self.update()
 
     # ── Плавающие объекты (фигура/текст): перетаскивание и вжигание ──────────
     def _draw_object(self, painter, obj):
@@ -3391,14 +3932,29 @@ class InpaintCanvas(QWidget):
             return
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         if obj['kind'] == 'text':
-            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
-            painter.setFont(obj['font'])
-            painter.setPen(obj['color'])
             fm = QFontMetrics(obj['font'])
             x = obj['pos'].x()
             y = obj['pos'].y() + fm.ascent()
-            for i, line in enumerate(obj['text'].split("\n")):
-                painter.drawText(QPointF(x, y + i * fm.lineSpacing()), line)
+            stroke_w = float(obj.get('stroke_width', 0) or 0)
+            if stroke_w > 0:
+                # Обводка (как в Photoshop): путь текста, обвод + заливка —
+                # даёт чёткий контур в любой толщине (в отличие от много-теневого трюка).
+                path = QPainterPath()
+                for i, line in enumerate(obj['text'].split("\n")):
+                    path.addText(QPointF(x, y + i * fm.lineSpacing()), obj['font'], line)
+                pen = QPen(obj.get('stroke_color', QColor(0, 0, 0)))
+                pen.setWidthF(stroke_w)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(pen)
+                painter.setBrush(obj['color'])
+                painter.drawPath(path)
+            else:
+                painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+                painter.setFont(obj['font'])
+                painter.setPen(obj['color'])
+                for i, line in enumerate(obj['text'].split("\n")):
+                    painter.drawText(QPointF(x, y + i * fm.lineSpacing()), line)
             return
         c = obj['color']
         pen = QPen(c)
@@ -3436,7 +3992,9 @@ class InpaintCanvas(QWidget):
             lines = obj['text'].split("\n")
             w = max((fm.horizontalAdvance(l) for l in lines), default=1)
             h = fm.lineSpacing() * max(1, len(lines))
-            return QRectF(obj['pos'].x(), obj['pos'].y(), max(1, w), max(1, h))
+            r = QRectF(obj['pos'].x(), obj['pos'].y(), max(1, w), max(1, h))
+            sw = float(obj.get('stroke_width', 0) or 0) / 2.0
+            return r.adjusted(-sw, -sw, sw, sw) if sw else r
         r = QRectF(obj['a'], obj['b']).normalized()
         t = float(obj.get('thickness', 1)) / 2.0 + 4.0   # запас под толщину/наконечник
         return r.adjusted(-t, -t, t, t)
@@ -4154,6 +4712,8 @@ class InpaintCanvas(QWidget):
                 self._pending_move = True
                 self._pending_anchor = ipt
                 self.setCursor(Qt.CursorShape.SizeAllCursor)
+                if self._pending.get('kind') == 'text':
+                    self.textSelected.emit()
                 return
             # Клик ВНЕ рамки — закрепляем слой (снимает выделение, как клик мимо
             # рамки free-transform в Photoshop). Дальше клик НЕ продолжаем в кисть
@@ -4276,6 +4836,13 @@ class InpaintCanvas(QWidget):
                     self._crop_handle_at(ev.position())))
         self.update()
 
+    def mouseDoubleClickEvent(self, ev):
+        if (ev.button() == Qt.MouseButton.LeftButton and self._pending is not None
+                and self._pending.get('kind') == 'text'):
+            self.edit_pending_text(self._w2i(ev.position()))
+            return
+        super().mouseDoubleClickEvent(ev)
+
     def mouseReleaseEvent(self, ev):
         _default_cursor = (Qt.CursorShape.OpenHandCursor if self._tool == self.TOOL_MOVE
                            else Qt.CursorShape.CrossCursor)
@@ -4313,6 +4880,10 @@ class InpaintCanvas(QWidget):
             # Ластик стирает мазки кисти (слой краски) — пересчитываем флаг краски.
             if self._tool == self.TOOL_ERASE:
                 self._recompute_paint_flag()
+            # Кисть/ластик могли изменить _has_paint — сигналим вкладке пере-включить
+            # кнопки (кнопка «Ластик» неактивна, пока нечего стирать, см. _refresh_enabled).
+            if self._tool in (self.TOOL_BRUSH, self.TOOL_ERASE):
+                self.imageChanged.emit()
             # Завершено выделение для удаления — сигналим вкладке: убрать закрашенное
             # (как Photoshop Spot Healing Brush: пометил — сразу убралось).
             if was_mask and self._has_strokes:
@@ -4623,96 +5194,6 @@ class _JumpSlider(QSlider):
         super().mouseMoveEvent(ev)
 
 
-class _ScreenColorPicker(QWidget):
-    """Пипетка «взять цвет с экрана»: накрывает весь рабочий стол снимком, и
-    следующий левый клик где угодно (в т.ч. поверх других окон/рабочего стола)
-    берёт цвет того пикселя. Esc или правый клик — отмена."""
-    picked = pyqtSignal(QColor)
-
-    def __init__(self, parent=None):
-        super().__init__(None)   # самостоятельное верхнеуровневое окно
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint
-                            | Qt.WindowType.WindowStaysOnTopHint)
-        self.setCursor(eyedropper_cursor())
-        self.setMouseTracking(True)
-        self._shots = []         # [(geo_logical QRect, QImage, dpr)]
-        self._vgeo = QRect()
-        self._cur = None         # текущая позиция курсора (глобальная)
-
-    def start(self):
-        screens = QApplication.screens()
-        vgeo = QRect()
-        for s in screens:
-            vgeo = vgeo.united(s.geometry())
-        self._vgeo = vgeo
-        for s in screens:
-            pm = s.grabWindow(0)
-            self._shots.append((s.geometry(), pm.toImage(),
-                                pm.devicePixelRatio() or 1.0))
-        self.setGeometry(vgeo)
-        self.show()
-        self.raise_()
-        self.activateWindow()
-        self.setFocus()
-        self.grabKeyboard()
-
-    def _color_at(self, gp) -> QColor:
-        for geo, img, dpr in self._shots:
-            if geo.contains(gp):
-                px = min(max(int((gp.x() - geo.x()) * dpr), 0), img.width() - 1)
-                py = min(max(int((gp.y() - geo.y()) * dpr), 0), img.height() - 1)
-                return QColor(img.pixelColor(px, py))
-        return QColor()
-
-    def paintEvent(self, ev):
-        p = QPainter(self)
-        for geo, img, dpr in self._shots:
-            p.drawImage(QRect(geo.x() - self._vgeo.x(), geo.y() - self._vgeo.y(),
-                              geo.width(), geo.height()), img)
-        if self._cur is not None:
-            col = self._color_at(self._cur)
-            lx = self._cur.x() - self._vgeo.x()
-            ly = self._cur.y() - self._vgeo.y()
-            box = QRect(lx + 18, ly + 18, 128, 40)
-            if box.right() > self.width():
-                box.moveLeft(lx - 18 - box.width())
-            if box.bottom() > self.height():
-                box.moveTop(ly - 18 - box.height())
-            p.fillRect(box, QColor(20, 20, 30, 235))
-            p.setPen(QColor('#45475a')); p.drawRect(box)
-            sw = QRect(box.left() + 6, box.top() + 6, 28, 28)
-            p.fillRect(sw, col); p.setPen(QColor('#cdd6f4')); p.drawRect(sw)
-            p.setPen(QColor('#cdd6f4'))
-            p.drawText(QRect(sw.right() + 8, box.top(), box.width() - 44, box.height()),
-                       int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
-                       col.name().upper())
-        p.end()
-
-    def mouseMoveEvent(self, ev):
-        self._cur = ev.globalPosition().toPoint()
-        self.update()
-
-    def mousePressEvent(self, ev):
-        if ev.button() == Qt.MouseButton.LeftButton:
-            self._finish(self._color_at(ev.globalPosition().toPoint()))
-        else:
-            self._finish(QColor())
-
-    def keyPressEvent(self, ev):
-        if ev.key() == Qt.Key.Key_Escape:
-            self._finish(QColor())
-        else:
-            super().keyPressEvent(ev)
-
-    def _finish(self, col):
-        try:
-            self.releaseKeyboard()
-        except Exception:
-            pass
-        self.close()
-        self.picked.emit(col)
-        self.deleteLater()
-
 
 class InpaintTab(QWidget):
     """Подвкладка «Удаление объектов»: закрашиваете кистью водяной знак/надпись —
@@ -4729,6 +5210,7 @@ class InpaintTab(QWidget):
         self._remover = RMBGProcessRemover() if _HAS_RMBG else None
         self._worker = None
         self._bg_worker = None
+        self._cancelling = False
         self._warmup = None
         # Длительность инференса нейросети заранее НЕ известна (один проход модели
         # не даёт сигнала прогресса), поэтому НЕ выдумываем «осталось N секунд» и не
@@ -4987,6 +5469,9 @@ class InpaintTab(QWidget):
         # Undo/redo может вернуть/убрать картинку (напр. отмена «Очистить») —
         # пере-включаем инструменты и холст, иначе картинка видна, но «мёртвая».
         self.canvas.imageChanged.connect(self._refresh_enabled)
+        # Текст создан/выделен кликом — открываем панель его свойств (цвет/шрифт/
+        # размер/обводка), как выделение текстового слоя в Photoshop.
+        self.canvas.textSelected.connect(self._on_text_selected)
         root.addWidget(self.canvas, 1)
         # Передаём холсту стартовый шрифт текста (из комбобокса + размера).
         self._update_text_font()
@@ -5025,9 +5510,14 @@ class InpaintTab(QWidget):
 
     # ── Всплывающие панели «Фигуры»/«Текст» (flyout, как в Photoshop) ─────────
     def _make_flyout(self):
-        """Создаёт пустую всплывающую панель (Qt.Popup — сама закрывается при
-        клике вне неё), пристыкованную к вкладке."""
-        f = QFrame(self, Qt.WindowType.Popup)
+        """Создаёт пустую всплывающую панель, пристыкованную к вкладке. НЕ Qt.Popup —
+        тот грэбит мышь и съедает самый первый клик (клик вне панели, например по
+        холсту, тратился на её закрытие, а не доходил до холста), из-за чего нельзя
+        было сразу же перетащить текст под панелью. Плавающее Tool-окно без грэба
+        не мешает кликам по холсту; закрывается явно при смене инструмента
+        (см. _set_tool)."""
+        f = QFrame(self, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        f.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         f.setObjectName("toolFlyout")
         f.setStyleSheet(
             "QFrame#toolFlyout{background:#181825;border:1px solid #45475a;"
@@ -5072,16 +5562,129 @@ class InpaintTab(QWidget):
         self.spin_font.setSuffix(" px")
         self.spin_font.setToolTip("Высота текста в пикселях изображения.")
         srow.addWidget(self.spin_font, 1); v.addLayout(srow)
+        crow = QHBoxLayout(); crow.addWidget(QLabel("Цвет:"))
+        self.btn_text_color = QPushButton()
+        self.btn_text_color.setFixedSize(28, 22)
+        self.btn_text_color.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_text_color.setToolTip("Цвет текста. Клик по уже написанному тексту "
+                                       "выделяет его — можно поменять цвет/шрифт/обводку.")
+        self.btn_text_color.clicked.connect(self._pick_text_color)
+        crow.addWidget(self.btn_text_color); crow.addStretch(1)
+        v.addLayout(crow)
+        self._text_color = QColor(255, 255, 255)
+        self._update_text_color_swatch(self._text_color)
+
+        _sep = QFrame(); _sep.setFrameShape(QFrame.Shape.HLine)
+        _sep.setStyleSheet("color:#45475a;")
+        v.addWidget(_sep)
+        self.chk_text_stroke = QCheckBox("Обводка")
+        self.chk_text_stroke.setToolTip("Контур текста (как в Photoshop).")
+        v.addWidget(self.chk_text_stroke)
+        strow = QHBoxLayout(); strow.addWidget(QLabel("Толщина:"))
+        self.spin_stroke_w = QSpinBox()
+        self.spin_stroke_w.setRange(1, 60); self.spin_stroke_w.setValue(4)
+        self.spin_stroke_w.setSuffix(" px")
+        strow.addWidget(self.spin_stroke_w, 1); v.addLayout(strow)
+        scrow = QHBoxLayout(); scrow.addWidget(QLabel("Цвет обводки:"))
+        self.btn_stroke_color = QPushButton()
+        self.btn_stroke_color.setFixedSize(28, 22)
+        self.btn_stroke_color.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_stroke_color.clicked.connect(self._pick_stroke_color)
+        scrow.addWidget(self.btn_stroke_color); scrow.addStretch(1)
+        v.addLayout(scrow)
+        self._stroke_color = QColor(0, 0, 0)
+        self._update_stroke_color_swatch(self._stroke_color)
+
         self.cmb_font.currentFontChanged.connect(lambda *_: self._update_text_font())
         self.spin_font.valueChanged.connect(lambda *_: self._update_text_font())
+        self.chk_text_stroke.toggled.connect(lambda *_: self._update_text_stroke())
+        self.spin_stroke_w.valueChanged.connect(lambda *_: self._update_text_stroke())
+
+    def _update_text_color_swatch(self, color):
+        self.btn_text_color.setStyleSheet(
+            f"background-color: {color.name()}; border:1px solid #585b70; border-radius:3px;")
+
+    def _update_stroke_color_swatch(self, color):
+        self.btn_stroke_color.setStyleSheet(
+            f"background-color: {color.name()}; border:1px solid #585b70; border-radius:3px;")
+
+    def _active_text_obj(self):
+        """Плавающий (ещё не вжатый) текстовый объект, если он сейчас выделен."""
+        p = getattr(self.canvas, "_pending", None)
+        return p if (p is not None and p.get('kind') == 'text') else None
+
+    def _on_text_selected(self):
+        """Текст создан/выбран кликом — подтягиваем его текущие параметры в
+        панель (иначе она показывала бы значения по умолчанию для СЛЕДУЮЩЕГО
+        текста, а не выделенного) и открываем панель."""
+        obj = self._active_text_obj()
+        if obj is not None:
+            f = obj['font']
+            self.cmb_font.blockSignals(True); self.spin_font.blockSignals(True)
+            self.cmb_font.setCurrentFont(f)
+            self.spin_font.setValue(max(6, f.pixelSize() if f.pixelSize() > 0 else 48))
+            self.cmb_font.blockSignals(False); self.spin_font.blockSignals(False)
+            self._text_color = QColor(obj['color'])
+            self._update_text_color_swatch(self._text_color)
+            sw = float(obj.get('stroke_width', 0) or 0)
+            self._stroke_color = QColor(obj.get('stroke_color', QColor(0, 0, 0)))
+            self.chk_text_stroke.blockSignals(True); self.spin_stroke_w.blockSignals(True)
+            self.chk_text_stroke.setChecked(sw > 0)
+            if sw > 0:
+                self.spin_stroke_w.setValue(int(round(sw)))
+            self.chk_text_stroke.blockSignals(False); self.spin_stroke_w.blockSignals(False)
+            self._update_stroke_color_swatch(self._stroke_color)
+        self.btn_text.setChecked(True)
+        # Popup сам делает mouse-grab при show() — если он уже открыт, повторный
+        # show() посреди перетаскивания текста срывает драг (грэб перехватывает
+        # move/release у холста). Не переоткрываем, если панель и так на экране.
+        if not self._text_flyout.isVisible():
+            self._show_flyout(self._text_flyout, self.btn_text)
+
+    def _pick_text_color(self):
+        col = QColorDialog.getColor(self._text_color, self, "Цвет текста")
+        if not col.isValid():
+            return
+        self._text_color = col
+        self._update_text_color_swatch(col)
+        self.canvas.set_text_color(col)
+        obj = self._active_text_obj()
+        if obj is not None:
+            obj['color'] = QColor(col)
+            self.canvas.update()
+
+    def _pick_stroke_color(self):
+        col = QColorDialog.getColor(self._stroke_color, self, "Цвет обводки")
+        if not col.isValid():
+            return
+        self._stroke_color = col
+        self._update_stroke_color_swatch(col)
+        self.canvas.set_text_stroke(self.canvas._text_stroke_width, col)
+        obj = self._active_text_obj()
+        if obj is not None and obj.get('stroke_width', 0):
+            obj['stroke_color'] = QColor(col)
+            self.canvas.update()
+
+    def _update_text_stroke(self):
+        width = float(self.spin_stroke_w.value()) if self.chk_text_stroke.isChecked() else 0.0
+        self.canvas.set_text_stroke(width, self._stroke_color)
+        obj = self._active_text_obj()
+        if obj is not None:
+            obj['stroke_width'] = width
+            obj['stroke_color'] = QColor(self._stroke_color)
+            self.canvas.update()
 
     def _on_shapes_btn(self):
         """Клик по «Фигуры»: активируем текущую фигуру и открываем выбор."""
+        if hasattr(self, "_text_flyout"):
+            self._text_flyout.hide()
         self._set_tool(self._cur_shape_tool)
         self.btn_shapes.setChecked(True)
         self._show_flyout(self._shape_flyout, self.btn_shapes)
 
     def _on_text_btn(self):
+        if hasattr(self, "_shape_flyout"):
+            self._shape_flyout.hide()
         self._set_tool(InpaintCanvas.TOOL_TEXT)
         self.btn_text.setChecked(True)
         self._show_flyout(self._text_flyout, self.btn_text)
@@ -5134,12 +5737,17 @@ class InpaintTab(QWidget):
 
     def _update_text_font(self):
         """Собирает QFont из выбранного системного шрифта + размера (px) и отдаёт
-        холсту для инструмента «Текст»."""
+        холсту для инструмента «Текст» (по умолчанию для НОВОГО текста; если сейчас
+        выделен плавающий текст — меняет и его, живьём, как в Photoshop)."""
         if not hasattr(self, "canvas"):
             return
         f = QFont(self.cmb_font.currentFont())
         f.setPixelSize(int(self.spin_font.value()))
         self.canvas.set_text_font(f)
+        obj = self._active_text_obj()
+        if obj is not None:
+            obj['font'] = QFont(self.canvas._text_font)
+            self.canvas.update()
 
     def _on_color_picked(self, col):
         # Цвет, взятый Alt-пипеткой из холста: только обновляем образец (сам
@@ -5156,7 +5764,7 @@ class InpaintTab(QWidget):
         if not _HAS_ORT:
             # Без onnxruntime удаление не сработает — предупреждаем сразу при выборе
             # инструмента (раньше предупреждал клик по кнопке).
-            QMessageBox.warning(self, "Нет onnxruntime",
+            msgbox_warning(self, "Нет onnxruntime",
                                 "Для удаления объектов установите onnxruntime:\n\n"
                                 "pip install onnxruntime")
             self.btn_run.setChecked(False)
@@ -5174,6 +5782,16 @@ class InpaintTab(QWidget):
 
     # ── Реакции UI ───────────────────────────────────────────────────────────
     def _set_tool(self, tool):
+        # Панели «Фигуры»/«Текст» больше не Qt.Popup (не закрываются сами при клике
+        # мимо) — закрываем их явно при смене инструмента, кроме случая, когда сам
+        # инструмент — фигура/текст (тогда панель переоткрывает вызвавший метод).
+        _flyout_tools = (InpaintCanvas.TOOL_RECT, InpaintCanvas.TOOL_ELLIPSE,
+                         InpaintCanvas.TOOL_LINE, InpaintCanvas.TOOL_ARROW,
+                         InpaintCanvas.TOOL_TEXT)
+        if tool not in _flyout_tools:
+            for fly in (getattr(self, "_shape_flyout", None), getattr(self, "_text_flyout", None)):
+                if fly is not None:
+                    fly.hide()
         self.canvas.set_tool(tool)
         # Возвращаем фокус холсту, чтобы WASD/стрелки (панорамирование) работали
         # сразу после клика по кнопке инструмента, а не уходили в кнопку.
@@ -5215,6 +5833,9 @@ class InpaintTab(QWidget):
             b.setEnabled(has and not busy)
         self.btn_open.setEnabled(not busy)
         self.btn_outdir.setEnabled(not busy)
+        # «Ластик» стирает ТОЛЬКО ещё не вжатые мазки «Кисти» (см. _paint_image_to) —
+        # пока их нет, стирать нечего, кнопка неактивна.
+        self.btn_erase.setEnabled(has and not busy and bool(getattr(self.canvas, "_has_paint", False)))
         # Во время обработки холст не трогаем (мазки кистью всё равно сбросятся
         # результатом) — блокируем ввод, оставляя картинку видимой.
         self.canvas.setEnabled(has and not busy)
@@ -5255,14 +5876,23 @@ class InpaintTab(QWidget):
                     f"Поверх — {os.path.basename(path)}. "
                     "Перетащите на нужное место; Enter или клик вне — вжать.")
             else:
-                self.canvas.set_image_bgr(load_bgr(path))
+                # Сохраняем альфа-канал при первом открытии — иначе прозрачность
+                # PNG/WEBP/AVIF терялась бы уже на этом шаге (cv2.IMREAD_COLOR
+                # альфу отбрасывает), а «Удалить фон» потом рисовал бы поверх
+                # чужого фона, оставшегося от исходника.
+                arr = _load_image_alpha(path)
+                if arr.ndim == 3 and arr.shape[2] == 4:
+                    self.canvas.set_image_bgr(arr[:, :, :3])
+                    self.canvas.apply_cutout(arr[:, :, 3])
+                else:
+                    self.canvas.set_image_bgr(arr)
                 self._src_path = path
                 self._set_status(f"Загружено: {os.path.basename(path)}. "
                                  "Закрасьте объект кистью и нажмите «Удалить объект».")
                 self._kick_warmup()
             self._refresh_enabled()
         except Exception as exc:
-            QMessageBox.warning(self, "Ошибка", f"Не удалось открыть изображение:\n{exc}")
+            msgbox_warning(self, "Ошибка", f"Не удалось открыть изображение:\n{exc}")
 
     def add_paths(self, paths):
         imgs = [p for p in paths if os.path.splitext(p)[1].lower() in
@@ -5305,7 +5935,16 @@ class InpaintTab(QWidget):
         else:
             ext = src_ext if src_ext in ("png", "bmp", "tif", "tiff") else "png"
         out_dir = self._out_dir or src_dir or os.getcwd()
-        return os.path.join(out_dir, f"{base}_photo.{ext}")
+        stem = f"{base}_photo"
+        path = os.path.join(out_dir, f"{stem}.{ext}")
+        if not os.path.exists(path):
+            return path
+        n = 1
+        while True:
+            path = os.path.join(out_dir, f"{stem}_{n}.{ext}")
+            if not os.path.exists(path):
+                return path
+            n += 1
 
     def _save(self):
         if not self.canvas.has_image():
@@ -5330,7 +5969,7 @@ class InpaintTab(QWidget):
             if os.path.exists(out):
                 self._show_saved_toast(os.path.basename(out))
         except Exception as exc:
-            QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить:\n{exc}")
+            msgbox_warning(self, "Ошибка", f"Не удалось сохранить:\n{exc}")
 
     def _show_saved_toast(self, name: str):
         """Зелёный плавающий баннер «Файл сохранён» по центру сверху вкладки,
@@ -5450,7 +6089,7 @@ class InpaintTab(QWidget):
         if self.canvas.has_crop():
             self.canvas.apply_crop()
         if not _HAS_ORT:
-            QMessageBox.warning(self, "Нет onnxruntime",
+            msgbox_warning(self, "Нет onnxruntime",
                                 "Для удаления объектов установите onnxruntime:\n\n"
                                 "pip install onnxruntime")
             return
@@ -5461,6 +6100,7 @@ class InpaintTab(QWidget):
             return
         if self._worker is not None and self._worker.isRunning():
             return
+        self._cancelling = False        # новый запуск — снимаем возможный флаг отмены
         # Снимок «до» (с отдельным слоем краски и маской) — для Ctrl+Z, затем
         # вживляем мазки кисти, чтобы нейросеть видела финальную картинку.
         self.canvas._push_history()
@@ -5492,17 +6132,29 @@ class InpaintTab(QWidget):
                 "QProgressBar{background:#11111b;border:1px solid #45475a;"
                 "border-radius:5px;max-height:8px;min-height:8px;}"
                 "QProgressBar::chunk{background:#89b4fa;border-radius:5px;}")
-            chip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             lay = QHBoxLayout(chip)
-            lay.setContentsMargins(10, 7, 10, 7); lay.setSpacing(8)
+            lay.setContentsMargins(10, 7, 8, 7); lay.setSpacing(8)
             self._proc_ic = QLabel()
+            self._proc_ic.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             lay.addWidget(self._proc_ic)
             self._proc_lbl = QLabel(label)
+            self._proc_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             lay.addWidget(self._proc_lbl)
             self._proc_bar = QProgressBar()
+            self._proc_bar.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             self._proc_bar.setTextVisible(False)
             self._proc_bar.setFixedWidth(80)
             lay.addWidget(self._proc_bar)
+            self._proc_cancel_btn = QPushButton("Отменить")
+            self._proc_cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._proc_cancel_btn.setToolTip("Отменить обработку")
+            self._proc_cancel_btn.setStyleSheet(
+                "QPushButton{background:#313244;border:1px solid #45475a;"
+                "border-radius:5px;color:#f38ba8;font-size:11px;font-weight:600;"
+                "padding:3px 8px;}"
+                "QPushButton:hover{background:#45475a;border-color:#f38ba8;}")
+            self._proc_cancel_btn.clicked.connect(self._cancel_proc)
+            lay.addWidget(self._proc_cancel_btn)
             self._proc_chip = chip
         # Честный индикатор: бесконечный «бегунок» занятости. Длительность одного
         # прохода нейросети заранее неизвестна, поэтому НЕ выдумываем проценты и
@@ -5581,7 +6233,36 @@ class InpaintTab(QWidget):
         if chip is not None:
             chip.hide()
 
+    def _cancel_proc(self):
+        """Отмена текущей обработки (LaMa/RMBG). В процессном режиме kill дочернего
+        процесса прерывает инференс за миллисекунды (воркер ловит обрыв пайпа и
+        завершается сам). НО интерфейс приводим в «Отменено» СРАЗУ, не дожидаясь
+        сигнала воркера: в редком in-process фолбэке одиночный sess.run() прервать
+        нельзя, и иначе чип «Удаляю…» и курсор-«ожидание» висели бы до конца прохода
+        («не останавливает / с задержкой»). Поздний результат осиротевшего воркера
+        отбрасывается по флагу _cancelling (см. _on_done/_on_bg_done)."""
+        running = ((self._worker is not None and self._worker.isRunning())
+                   or (self._bg_worker is not None and self._bg_worker.isRunning()))
+        if not running:
+            return
+        self._cancelling = True
+        if self._worker is not None and self._worker.isRunning() and self._inpainter is not None:
+            try: self._inpainter.cancel()
+            except Exception: pass
+        if self._bg_worker is not None and self._bg_worker.isRunning() and self._remover is not None:
+            try: self._remover.cancel()
+            except Exception: pass
+        # Мгновенная реакция UI — не ждём, пока воркер domотает/разблокируется.
+        self._finish_proc()
+        self._hide_proc_chip()
+        self.unsetCursor()
+        self._set_status(status_html('fa5s.ban', "Отменено пользователем.", '#f9e2af'))
+        self._refresh_enabled()
+
     def _on_progress(self, done, total):
+        # Отменено — чип уже скрыт в _cancel_proc, поздний прогресс игнорируем.
+        if getattr(self, "_cancelling", False):
+            return
         # LaMa с НЕСКОЛЬКИМИ областями: показываем РЕАЛЬНЫЙ прогресс по областям —
         # переключаем чип в детерминированный «режим областей».
         chip = getattr(self, "_proc_chip", None)
@@ -5598,6 +6279,16 @@ class InpaintTab(QWidget):
                              '#89b4fa'))
 
     def _on_done(self, result):
+        # Пользователь отменил, пока шёл инференс, — результат уже не нужен (UI
+        # приведён в «Отменено» в _cancel_proc). Прибираемся и выходим, НЕ применяя
+        # результат (иначе объект «удалялся» вопреки отмене — «не останавливает»).
+        if getattr(self, "_cancelling", False):
+            self._cancelling = False
+            self._worker = None
+            self._hide_proc_chip()
+            self.unsetCursor()
+            self._refresh_enabled()
+            return
         # apply_result сам пушит историю; мы уже сохранили состояние до запуска,
         # поэтому применяем без повторного пуша.
         self.canvas.img_bgr = _np.ascontiguousarray(result)
@@ -5622,8 +6313,12 @@ class InpaintTab(QWidget):
         self.unsetCursor()
         self._worker = None
         self._refresh_enabled()
+        if getattr(self, "_cancelling", False):
+            self._cancelling = False
+            self._set_status(status_html('fa5s.ban', "Отменено пользователем.", '#f9e2af'))
+            return
         self._set_status(status_html('fa5s.times-circle', f"Ошибка: {err}", '#f38ba8'))
-        QMessageBox.warning(self, "Ошибка обработки", str(err))
+        msgbox_warning(self, "Ошибка обработки", str(err))
 
     # ── Удаление фона (RMBG-2.0) ─────────────────────────────────────────────
     def _remove_bg(self):
@@ -5631,7 +6326,7 @@ class InpaintTab(QWidget):
         if not self.canvas.has_image():
             return
         if not _HAS_RMBG or self._remover is None:
-            QMessageBox.warning(
+            msgbox_warning(
                 self, "Удаление фона недоступно",
                 "Нужна модель models/model_uint8.onnx и пакет onnxruntime.\n\n"
                 "Установка onnxruntime:  pip install onnxruntime")
@@ -5639,6 +6334,7 @@ class InpaintTab(QWidget):
         if (self._worker is not None and self._worker.isRunning()) or \
            (self._bg_worker is not None and self._bg_worker.isRunning()):
             return
+        self._cancelling = False        # новый запуск — снимаем возможный флаг отмены
         # Вжигаем плавающий слой и мазки кисти, снимок «до» — для Ctrl+Z.
         self.canvas.commit_pending()
         # Незавершённое кадрирование применяем перед удалением фона (иначе рамка
@@ -5661,6 +6357,14 @@ class InpaintTab(QWidget):
         self._refresh_enabled()
 
     def _on_bg_done(self, alpha):
+        # Отменено во время инференса — фон уже не убираем (UI в «Отменено»).
+        if getattr(self, "_cancelling", False):
+            self._cancelling = False
+            self._bg_worker = None
+            self._hide_proc_chip()
+            self.unsetCursor()
+            self._refresh_enabled()
+            return
         # Историю уже сохранили перед запуском — применяем без повторного пуша.
         self.canvas.apply_cutout(alpha)
         self._finish_proc()
@@ -5683,8 +6387,12 @@ class InpaintTab(QWidget):
         self.unsetCursor()
         self._bg_worker = None
         self._refresh_enabled()
+        if getattr(self, "_cancelling", False):
+            self._cancelling = False
+            self._set_status(status_html('fa5s.ban', "Отменено пользователем.", '#f9e2af'))
+            return
         self._set_status(status_html('fa5s.times-circle', f"Ошибка: {err}", '#f38ba8'))
-        QMessageBox.warning(self, "Ошибка удаления фона", str(err))
+        msgbox_warning(self, "Ошибка удаления фона", str(err))
 
 
 class _PhotoModeSwitch(QWidget):

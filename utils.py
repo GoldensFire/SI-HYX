@@ -298,6 +298,32 @@ def host_matches(url: str, *domains: str) -> bool:
     return False
 
 
+def parse_youtube_start_seconds(url: str):
+    """Достаёт тайминг из параметра t=/start= ссылки на YouTube (в секундах).
+    Понимает как чистые секунды (t=9182, t=9182s), так и составной формат
+    (t=1h30m5s, t=2m10s). Возвращает None, если ссылка не с YouTube или
+    параметра нет/он битый."""
+    if not host_matches(url, 'youtube.com', 'youtu.be'):
+        return None
+    try:
+        from urllib.parse import urlparse, parse_qs
+        import re
+        q = parse_qs(urlparse(url).query)
+        raw = (q.get('t') or q.get('start') or [None])[0]
+        if not raw:
+            return None
+        raw = raw.strip()
+        if raw.isdigit():
+            return int(raw)
+        m = re.fullmatch(r'(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?', raw)
+        if not m or not any(m.groups()):
+            return None
+        h, mi, s = (int(g) if g else 0 for g in m.groups())
+        return h * 3600 + mi * 60 + s
+    except Exception:
+        return None
+
+
 def get_cookies_path(url: str) -> str:
     if host_matches(url, 'tiktok.com'):   return COOKIE_PATHS['tiktok']
     if host_matches(url, 'instagram.com', 'fbcdn.net', 'cdninstagram.com'):
@@ -1001,14 +1027,45 @@ def get_video_codec(path):
         return None
 
 
-def measure_loudness(path, should_stop=None):
+_CODEC_LABELS = {
+    'h264': 'H.264', 'avc': 'H.264', 'avc1': 'H.264',
+    'hevc': 'H.265', 'h265': 'H.265',
+    'av1': 'AV1', 'av01': 'AV1',
+    'vp9': 'VP9', 'vp8': 'VP8',
+    'mpeg4': 'MPEG-4', 'mpeg2video': 'MPEG-2',
+}
+
+
+def codec_label(codec_name):
+    """Читаемое имя кодека (h264 → «H.264», av1 → «AV1» и т.п.) для UI —
+    неизвестные кодеки показываются как есть, в верхнем регистре."""
+    if not codec_name:
+        return None
+    key = codec_name.strip().lower()
+    return _CODEC_LABELS.get(key, key.upper())
+
+
+def get_video_codec_label(path):
+    """Кодек видеодорожки файла в человекочитаемом виде («H.264»/«H.265»/«AV1»…)
+    или None, если видеодорожки нет (аудио-файл) либо ffprobe не смог определить."""
+    return codec_label(get_video_codec(path))
+
+
+def measure_loudness(path, should_stop=None, start=None, dur=None):
     """Сканирует громкость файла. should_stop — необязательный callable: если он
     начинает возвращать True во время сканирования (пользователь нажал «Стоп»),
     процесс ffmpeg убивается и функция возвращает None. Без него — как раньше,
     блокирующий проход. Для длинных файлов (часы) без этого «Стоп» не срабатывал,
-    пока полный проход loudnorm не закончится (см. process_media)."""
+    пока полный проход loudnorm не закончится (см. process_media).
+
+    start/dur (необязательные, секунды) — сканировать только этот диапазон
+    (обрезка + «Обработка» одним проходом: «до»-LUFS должен быть за сам
+    вырезаемый отрезок, а не за весь исходник). Точность кадра тут не нужна —
+    обычный входной seek."""
     try:
-        cmd = [FFMPEG, "-hide_banner", "-nostats", "-i", path, "-af", "loudnorm=I=-16:LRA=20:TP=-1.5:print_format=json", "-f", "null", "-"]
+        ss = ["-ss", f"{start:.3f}"] if start else []
+        t = ["-t", f"{dur:.3f}"] if dur else []
+        cmd = [FFMPEG, "-hide_banner", "-nostats"] + ss + ["-i", path] + t + ["-af", "loudnorm=I=-16:LRA=20:TP=-1.5:print_format=json", "-f", "null", "-"]
         p = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
         if should_stop is None:
             stderr = p.communicate()[1] or ""
@@ -1269,3 +1326,5 @@ def detect_ffmpeg_encoders():
 
 def require_svt():
     return 'libsvtav1' in detect_ffmpeg_encoders()
+
+

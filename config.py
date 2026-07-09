@@ -278,6 +278,33 @@ def _hw_decode_device_types():
 
 os.environ.setdefault("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", _hw_decode_device_types())
 
+# Раз аппаратный AV1-декодер отсутствует на многих GPU (см. коммент выше),
+# FFmpeg-бэкенд QtMultimedia на КАЖДЫЙ кадр AV1 пишет в консоль "Failed setup
+# for format d3d11: hwaccel initialisation returned error" (сам кадр при этом
+# успешно докодируется программно — это просто спам, не ошибка воспроизведения).
+# ВАЖНО: это НЕ идёт через QLoggingCategory (QT_LOGGING_RULES тут бессилен) —
+# это сырой av_log() из libavutil/libavcodec, который FFmpeg печатает в stderr
+# напрямую. Единственный способ заглушить именно эти строки — вызвать
+# av_log_set_level(AV_LOG_QUIET) в той же avutil-*.dll, что уже загружена в
+# процесс вместе с Qt6Multimedia (ctypes.CDLL находит УЖЕ загруженный модуль
+# по пути и просто увеличивает refcount — глобальный уровень логирования общий
+# для всего процесса, включая FFmpeg-бэкенд Qt). Не трогает отдельные
+# субпроцессы ffmpeg.exe (у них свой -loglevel).
+def _quiet_bundled_ffmpeg_logging():
+    try:
+        import ctypes, glob
+        import PyQt6
+        bin_dir = os.path.join(os.path.dirname(PyQt6.__file__), "Qt6", "bin")
+        dlls = glob.glob(os.path.join(bin_dir, "avutil-*.dll"))
+        if not dlls:
+            return
+        avutil = ctypes.CDLL(dlls[0])
+        avutil.av_log_set_level(-8)   # AV_LOG_QUIET
+    except Exception:
+        pass
+
+_quiet_bundled_ffmpeg_logging()
+
 
 COOKIE_PATHS = {
     'youtube':   os.path.join(CONFIG_DIR, "cookies_youtube.txt"),
@@ -314,6 +341,28 @@ FFMPEG = _resolve_tool("ffmpeg")
 
 
 FFPROBE = _resolve_tool("ffprobe")
+
+
+def _resolve_ffmpeg7_dir():
+    """Каталог с отдельным ffmpeg 7.x — ИСКЛЮЧИТЕЛЬНО для yt-dlp `--download-sections`.
+    Основной ffmpeg в bin — 8.x, а он ломает нарезку по таймингам (внешний баг
+    ffmpeg 8.1, yt-dlp issue #16546: битый/audio-only отрезок). ffmpeg 7.x режет
+    секцию корректно. Кладём его в подпапку bin/ffmpeg7. Если её нет — возвращаем
+    None, и нарезка откатывается на обычный ffmpeg (лучше кривой отрезок, чем краш)."""
+    roots = []
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        roots.append(base)
+    roots.append(os.path.dirname(os.path.abspath(sys.argv[0] or ".")))
+    roots.append(os.path.dirname(os.path.abspath(__file__)))
+    for r in roots:
+        for cand in (os.path.join(r, "ffmpeg7"), os.path.join(r, "bin", "ffmpeg7")):
+            if os.path.isfile(os.path.join(cand, "ffmpeg" + (".exe" if IS_WIN else ""))):
+                return cand
+    return None
+
+
+FFMPEG7_DIR = _resolve_ffmpeg7_dir()
 
 
 def _resolve_asset(name):
@@ -471,7 +520,7 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.5.1"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # Репозиторий для автообновления (GitHub Releases)
 GITHUB_OWNER = "GoldensFire"
@@ -483,6 +532,10 @@ GUIDE_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id=3744506167"
 # Cloudflare Worker, который принимает JSON POST и пересылает его (напр. в Discord).
 # Пусто → кнопка отчёта в диалоге будет неактивна.
 ERROR_REPORT_URL = "https://bold-shadow-2a11.longld342.workers.dev/"
+# База синхронизации вкладки Collab: Cloudflare Worker + KV,
+# который принимает/отдаёт текстовый обзор пака по коду комнаты. Пусто →
+# в самой вкладке можно вписать адрес вручную (поле «Сервер»). См. coop_worker.js.
+COOP_SYNC_URL = ""
 HTTP_PORT = 7432  # порт локального сервера для браузерного расширения
 
 # Метка для пунктов выпадающих списков, которые являются значением по умолчанию.

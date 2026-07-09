@@ -293,6 +293,11 @@ class RMBGProcessRemover:
             self._fallback = None
             self._device = "—"
 
+    def cancel(self):
+        """Прерывает ТЕКУЩИЙ remove(), заблокированный на recv() внутри
+        self._lock — в отличие от unload(), лок НЕ берём (иначе дедлок)."""
+        self._kill_proc()
+
     def _kill_proc(self):
         try:
             if self._conn is not None:

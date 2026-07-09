@@ -1,0 +1,268 @@
+"""Аналитика поверх БД: датафреймы пакетов и тем с поправкой на длину пакета."""
+from __future__ import annotations
+import json
+import sqlite3
+
+import pandas as pd
+
+from . import config
+from .normalize import pick_display_variant, normalize_theme
+
+
+def load_packages(conn: sqlite3.Connection) -> pd.DataFrame:
+    df = pd.read_sql_query("SELECT * FROM packages", conn)
+    if df.empty:
+        return df
+    df["completion_pct"] = df["completion_rate"] * 100
+    # перцентиль завершённости ВНУТРИ группы по длине — снимает смещение
+    # «короткие пакеты всегда заканчивают чаще».
+    df["completion_rank_in_group"] = (
+        df.groupby("length_group")["completion_rate"]
+        .rank(pct=True) * 100
+    )
+    df["authors"] = df["authors_json"].apply(
+        lambda s: json.loads(s) if s else [])
+    df["tags"] = df["tags_json"].apply(lambda s: json.loads(s) if s else [])
+    # категории: список [{name,pct}] и быстрый словарь name->pct
+    df["categories"] = df["categories_json"].apply(
+        lambda s: json.loads(s) if s else [])
+    df["cat_map"] = df["categories"].apply(
+        lambda lst: {c["name"]: (c.get("pct") or 0) for c in lst})
+    # проценты попыток ответа и правильных ответов
+    df["answer_pct"] = df["answer_rate"] * 100
+    df["correct_pct"] = df["correct_rate"] * 100
+    # сложность пака по доле попыток ответа: чем реже пытаются отвечать, тем
+    # вопросы воспринимаются сложнее (готовы поставить сложность правильных
+    # ответов на второй план — «сложно» тут значит «не рискуют отвечать»).
+    df["difficulty"] = df["answer_pct"].apply(_difficulty_label)
+    # длительность пакета (если посчитана из .siq): в минутах и в виде мм:сс
+    if "duration_sec" not in df.columns:
+        df["duration_sec"] = pd.NA
+    df["duration_min"] = pd.to_numeric(df["duration_sec"], errors="coerce") / 60
+    df["duration_str"] = df["duration_sec"].apply(_fmt_duration)
+    if "modern_codec_share" not in df.columns:
+        df["modern_codec_share"] = pd.NA
+    df["balance_index"] = _balance_index(
+        df["completion_rate"], df["answer_rate"], df["correct_rate"],
+        df["duration_min"], df["modern_codec_share"])
+    return df
+
+
+def _difficulty_label(answer_pct) -> str | None:
+    if answer_pct is None or pd.isna(answer_pct):
+        return None
+    if answer_pct > 65:
+        return "лёгкий"
+    if answer_pct >= 45:
+        return "средне"
+    if answer_pct >= 30:
+        return "сложно"
+    return "оч. сложно"
+
+
+def _fmt_duration(sec) -> str:
+    if sec is None or (isinstance(sec, float) and pd.isna(sec)) or pd.isna(sec):
+        return "—"
+    sec = int(round(float(sec)))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _balance_index(completion_rate: pd.Series, answer_rate: pd.Series,
+                   correct_rate: pd.Series,
+                   duration_min: pd.Series | None = None,
+                   modern_codec_share: pd.Series | None = None) -> pd.Series:
+    """Индекс баланса 0–100.
+
+    Это % завершения, скорректированный на сложность. Пак тем «ценнее», чем он
+    сложнее при той же завершаемости: низкий % попыток ответа и низкий %
+    правильных дают бонус, высокие — штраф. За высокий % попыток ответа штраф
+    чуть строже, чем за высокий % правильных (вес 0.8 против 0.5): если по
+    вопросам много жмут — они «дешёвые», это сильнее обесценивает пак, чем то,
+    что нажавшие угадали. Привязка к завершаемости не даёт паку с низким
+    завершением стать «лучшим». Множитель ограничен диапазоном 0.4…1.6.
+
+    Длинные паки поощряются (если длительность известна из .siq): бонус до +20 %
+    линейно от 20 до 50 минут. Короче 20 мин или без данных — без бонуса.
+
+    Современные кодеки видео (hevc/av1/vvc) дают супер-небольшой бонус — до +5 %,
+    пропорционально доле вопросов с таким видео.
+    """
+    a_term = (0.8 * (0.5 - answer_rate)).fillna(0.0)
+    c_term = (0.5 * (0.5 - correct_rate)).fillna(0.0)
+    mult = (1 + a_term + c_term).clip(lower=0.4, upper=1.6)
+    base = completion_rate * 100 * mult
+    if duration_min is not None:
+        dur_bonus = (1 + (((duration_min - 20) / 30) * 0.20)
+                     .clip(lower=0.0, upper=0.20)).fillna(1.0)
+        base = base * dur_bonus
+    if modern_codec_share is not None:
+        share = pd.to_numeric(modern_codec_share, errors="coerce").clip(lower=0.0, upper=1.0)
+        base = base * (1 + 0.05 * share).fillna(1.0)
+    return base.clip(lower=0, upper=100).round(0)
+
+
+def category_names(df: pd.DataFrame) -> list[str]:
+    """Все встречающиеся названия категорий (для фильтра)."""
+    names: set[str] = set()
+    for lst in df.get("categories", []):
+        for c in lst:
+            if c.get("name"):
+                names.add(c["name"])
+    return sorted(names)
+
+
+def packages_with_theme(conn: sqlite3.Connection, name_norm: str) -> pd.DataFrame:
+    """Пакеты, содержащие тему (по пересчитанному на лету ключу нормализации).
+
+    Ключ пересчитывается из t.name, чтобы отражать актуальную логику группировки
+    (в БД name_norm может быть устаревшим).
+    """
+    df = pd.read_sql_query(
+        """
+        SELECT p.id AS pid, p.name AS "Название", p.authors_display AS "Авторы",
+               p.question_count AS "Вопр.", p.length_group AS "Группа",
+               p.completion_rate*100 AS "% завершения",
+               t.name AS "Тема в паке"
+        FROM themes t JOIN packages p ON p.id = t.package_id
+        """,
+        conn,
+    )
+    if df.empty:
+        return df.drop(columns=["pid"], errors="ignore")
+    df["_norm"] = df["Тема в паке"].map(normalize_theme)
+    df = df[df["_norm"] == name_norm]
+    df = (df.sort_values("% завершения", ascending=False, na_position="last")
+            .drop_duplicates("pid")
+            .drop(columns=["pid", "_norm"]))
+    return df.reset_index(drop=True)
+
+
+def theme_table(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Сводка по темам (по нормализованному ключу).
+
+    Колонки: тема (для показа), в скольких пакетах, доля, средняя завершённость,
+    средний перцентиль завершённости в группе (с поправкой на длину), редкость.
+    """
+    total_packages = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
+    if not total_packages:
+        return pd.DataFrame()
+
+    # одна строка на (пакет, тема) — без дублей тем внутри пакета.
+    rows = pd.read_sql_query(
+        """
+        SELECT t.name        AS variant,
+               t.package_id,
+               p.completion_rate,
+               p.has_stats,
+               p.length_group,
+               p.completion_rate IS NOT NULL AS has_rate
+        FROM themes t
+        JOIN packages p ON p.id = t.package_id
+        """,
+        conn,
+    )
+    if rows.empty:
+        return pd.DataFrame()
+    # ключ группировки пересчитываем из имени — отражает актуальную нормализацию
+    rows["name_norm"] = rows["variant"].map(normalize_theme)
+
+    # перцентиль завершённости пакета внутри группы (тот же, что в load_packages)
+    pkg = rows.drop_duplicates("package_id")[
+        ["package_id", "completion_rate", "length_group"]].copy()
+    pkg["pct_in_group"] = (
+        pkg.groupby("length_group")["completion_rate"].rank(pct=True) * 100)
+    rows = rows.merge(pkg[["package_id", "pct_in_group"]], on="package_id", how="left")
+
+    # уникальные пары (тема, пакет)
+    uniq = rows.drop_duplicates(["name_norm", "package_id"])
+
+    agg = uniq.groupby("name_norm").agg(
+        n_packages=("package_id", "nunique"),
+        n_with_stats=("has_stats", "sum"),
+        avg_completion=("completion_rate", "mean"),
+        avg_pct_in_group=("pct_in_group", "mean"),
+    ).reset_index()
+
+    # отображаемое написание темы: вариант с эмодзи / самый длинный
+    variants = (uniq.groupby("name_norm")["variant"]
+                .apply(lambda s: pick_display_variant(list(s))))
+    agg = agg.merge(variants.rename("theme").reset_index(), on="name_norm")
+
+    agg["share"] = agg["n_packages"] / total_packages
+    agg["share_pct"] = agg["share"] * 100          # доля в процентах (для показа)
+    agg["avg_completion_pct"] = agg["avg_completion"] * 100
+
+    def rarity(share: float) -> str:
+        if share < config.RARE_THEME_MAX:
+            return "редкая"
+        if share > config.FREQUENT_THEME_MIN:
+            return "частая"
+        return "средняя"
+
+    agg["rarity"] = agg["share"].apply(rarity)
+    agg = agg.sort_values(["n_packages", "avg_completion_pct"],
+                          ascending=[False, False]).reset_index(drop=True)
+    return agg
+
+
+def author_table(conn: sqlite3.Connection) -> pd.DataFrame:
+    """Топ авторов по качеству их паков.
+
+    Качество = средний перцентиль завершённости их паков (с поправкой на длину) +
+    средняя сырая завершённость. Учитываются только паки со статистикой.
+    """
+    df = pd.read_sql_query(
+        "SELECT id, authors_json, completion_rate, has_stats, length_group, "
+        "started_games FROM packages", conn)
+    if df.empty:
+        return pd.DataFrame()
+    df["pct_in_group"] = (
+        df.groupby("length_group")["completion_rate"].rank(pct=True) * 100)
+
+    rows = []
+    for _, r in df.iterrows():
+        for a in (json.loads(r["authors_json"]) if r["authors_json"] else []):
+            rows.append({
+                "author": a,
+                "completion_rate": r["completion_rate"],
+                "has_stats": r["has_stats"],
+                "pct_in_group": r["pct_in_group"],
+                "started": r["started_games"] or 0,
+            })
+    a = pd.DataFrame(rows)
+    if a.empty:
+        return a
+
+    g = a.groupby("author").agg(
+        packages=("author", "size"),
+        with_stats=("has_stats", "sum"),
+        avg_completion=("completion_rate", "mean"),
+        avg_pct_in_group=("pct_in_group", "mean"),
+        total_started=("started", "sum"),
+    ).reset_index()
+    g["avg_completion_pct"] = g["avg_completion"] * 100
+    g = g.sort_values(["avg_pct_in_group", "packages"],
+                      ascending=[False, False], na_position="last").reset_index(drop=True)
+    return g
+
+
+def package_questions(conn: sqlite3.Connection, package_id: int) -> pd.DataFrame:
+    return pd.read_sql_query(
+        """SELECT round_index, theme_index, question_index, price, text, answer,
+                  media_json, answer_media_json, shown_count, answered_count,
+                  correct_count, wrong_count, duration_sec
+           FROM questions WHERE package_id=?
+           ORDER BY round_index, theme_index, question_index""",
+        conn, params=(package_id,),
+    )
+
+
+def package_themes(conn: sqlite3.Connection, package_id: int) -> pd.DataFrame:
+    return pd.read_sql_query(
+        """SELECT round_index, round_name, theme_index, name
+           FROM themes WHERE package_id=?
+           ORDER BY round_index, theme_index""",
+        conn, params=(package_id,),
+    )

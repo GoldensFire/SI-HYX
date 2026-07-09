@@ -12,8 +12,6 @@ from .widgets_question import *
 from .widgets_tiles import *
 
 class ResultPage(QWidget):
-    update_requested = pyqtSignal(object)   # emits self
-
     def __init__(self, ds, parent=None):
         super().__init__(parent)
         self.setStyleSheet("background:#181825;")
@@ -80,7 +78,7 @@ class ResultPage(QWidget):
     def showEvent(self, ev):
         super().showEvent(ev)
         if self._mw is None:
-            self._mw = self.window()
+            self._mw = _find_mw(self)
         # Достраиваем отложенное при первом реальном показе страницы: сначала
         # вьюер+сетку (если был привязан siq), иначе — только сетку плиток.
         if getattr(self, "_siq_view_dirty", False):
@@ -99,8 +97,18 @@ class ResultPage(QWidget):
         rounds    = self.ds["rounds"]
         pkg_name  = self.ds["pkg_name"]
         stats     = self.ds.get("stats", "")
-        pkg_size  = self.ds.get("pkg_size", "")
         total_dur = self.ds.get("total_duration_sec", 0)
+
+        # Package size on disk changes as questions are edited (auto-saved to
+        # the .siq file) — re-stat it here instead of trusting the value
+        # cached at import time, otherwise the banner shows a stale size.
+        siq_path = self.ds.get("siq_path", "")
+        if siq_path and os.path.exists(siq_path):
+            try:
+                self.ds["pkg_size"] = f"{os.path.getsize(siq_path)/1024/1024:.1f} МБ"
+            except OSError:
+                pass
+        pkg_size  = self.ds.get("pkg_size", "")
 
         # Single pass: compute n_all, g_t, g_r without building intermediate lists.
         # Cache result by _banner_stats_key — invalidated in update_stats().
@@ -209,7 +217,7 @@ class ResultPage(QWidget):
             if new_name and new_name != rp.ds["pkg_name"]:
                 rp.ds["pkg_name"] = new_name
                 if hasattr(rp, '_siq') and rp._siq: rp._siq.name = new_name
-                mw = rp.window()
+                mw = _find_mw(rp)
                 if hasattr(mw, "_rename_pkg"):
                     idx = next((i for i, d in enumerate(mw.datasets)
                                 if d["widget"] is rp), None)
@@ -255,10 +263,6 @@ class ResultPage(QWidget):
                       "background:rgba(166,227,161,0.15);border-radius:5px;padding:3px 10px;")
         bl2.addWidget(gt_lbl); bl2.addWidget(gr_lbl)
 
-        upd = AnimatedButton("📊 Статистика")
-        upd.setObjectName(_ON_BTN_UPDATE)
-        upd.setToolTip("Вставить HTML статистики SIGame для обновления")
-        upd.clicked.connect(lambda: self.update_requested.emit(self)); bl2.addWidget(upd)
         self._view_btns = []
         if _has_siqpath:
             save_btn = AnimatedButton("💾")
@@ -272,7 +276,7 @@ class ResultPage(QWidget):
             copy_ans_btn.setObjectName(_ON_BTN_COMPARE)
             copy_ans_btn.setToolTip("Выбрать пакеты и скопировать ответы в буфер обмена")
             def _open_copy_dialog(_, rp=self):
-                rp._copy_all_answers_dialog(getattr(rp.window(), 'datasets', []))
+                rp._copy_all_answers_dialog(getattr(_find_mw(rp), 'datasets', []))
             copy_ans_btn.clicked.connect(_open_copy_dialog); bl2.addWidget(copy_ans_btn)
 
             pkg_info_btn = AnimatedButton("📦 Инфо пака")
@@ -284,7 +288,7 @@ class ResultPage(QWidget):
                 dlg = PackageInfoDialog(rp._siq, rp)
                 def _on_saved():
                     rp._refresh_banner_widget()
-                    mw = rp.window()
+                    mw = _find_mw(rp)
                     if hasattr(mw, '_rename_pkg'):
                         idx = next((i for i, d in enumerate(mw.datasets)
                                     if d['widget'] is rp), None)
@@ -322,7 +326,7 @@ class ResultPage(QWidget):
     @property
     def _mw_ref(self):
         """Cached reference to the MainWindow."""
-        return self._mw or self.window()
+        return self._mw or _find_mw(self)
 
     def attach_siq(self, siq: SiqPackage):
         self._siq = siq
@@ -358,12 +362,24 @@ class ResultPage(QWidget):
                 new_themes = []
                 for siq_th in siq_rd["themes"]:
                     tn = siq_th["name"]
-                    qs_stats = stats_map.get((rn, tn), {})
+                    qs_stats = dict(stats_map.get((rn, tn), {}))
                     new_qs = []
                     for q in siq_th["questions"]:
-                        saved = qs_stats.get(q["price"], {})
+                        saved = qs_stats.pop(q["price"], {})
                         new_qs.append({
                             "price": q["price"],
+                            "tries": saved.get("tries", 0),
+                            "right": saved.get("right", 0),
+                        })
+                    # Сохраняем «осиротевшие» статы: цены, вставленные из
+                    # свежего HTML сайта, которых ещё нет в локальном .siq
+                    # (пак на сайте обновили — добавили вопрос — а .siq
+                    # ещё старый). Раньше они тут молча терялись при каждом
+                    # attach_siq, и статистика «откатывалась» на меньшее
+                    # число вопросов в теме. Не отбрасываем — дописываем.
+                    for price, saved in sorted(qs_stats.items()):
+                        new_qs.append({
+                            "price": price,
                             "tries": saved.get("tries", 0),
                             "right": saved.get("right", 0),
                         })
@@ -1038,7 +1054,7 @@ class ResultPage(QWidget):
         name = ""   # empty — user fills via inline double-click rename
         ok_siq = self._siq.add_theme(rnd_idx, name)
         if not ok_siq:
-            QMessageBox.warning(self, "Ошибка", "Не удалось добавить тему в .siq файл."); return
+            msgbox_warning(self, "Ошибка", "Не удалось добавить тему в .siq файл."); return
         self.ds["rounds"][rnd_idx]["themes"].append({"name": name, "questions": []})
         self._rebuild_content(animated=False)
         mw = self._mw_ref
@@ -1307,7 +1323,7 @@ class ResultPage(QWidget):
 
         mn, mx, st = sp_min.value(), sp_max.value(), sp_step.value()
         if mx < mn:
-            QMessageBox.warning(self, "Ошибка",
+            msgbox_warning(self, "Ошибка",
                                 "Максимальная цена должна быть не меньше минимальной.")
             return
 
@@ -1320,7 +1336,7 @@ class ResultPage(QWidget):
                     self._undo_stack.pop()
             except Exception:
                 pass
-            QMessageBox.warning(
+            msgbox_warning(
                 self, "Не удалось сохранить",
                 "Не удалось записать новые цены в .siq файл — он, скорее всего, "
                 "занят другой программой.\n\n"
@@ -1439,7 +1455,7 @@ class ResultPage(QWidget):
         name = ""   # empty — user fills via inline edit
         ok_siq = self._siq.add_round(name)
         if not ok_siq:
-            QMessageBox.warning(self, "Ошибка", "Не удалось добавить раунд в .siq файл."); return
+            msgbox_warning(self, "Ошибка", "Не удалось добавить раунд в .siq файл."); return
         self.ds["rounds"].append({"round_name": name, "themes": []})
         self._rebuild_content(animated=False)
         mw = self._mw_ref
@@ -1509,7 +1525,7 @@ class ResultPage(QWidget):
                     qs = self.ds["rounds"][rnd_idx]["themes"][theme_idx]["questions"]
                     qs[:] = [q for q in qs if q["price"] != suggested]
                 except: pass
-                QMessageBox.warning(self, "Ошибка", "Не удалось добавить вопрос в .siq файл.")
+                msgbox_warning(self, "Ошибка", "Не удалось добавить вопрос в .siq файл.")
                 return
             # Ensure ds and siq are in sync
             try:
@@ -1643,11 +1659,12 @@ class ResultPage(QWidget):
         """SIQ is already auto-saved on every edit; show notification and refresh date."""
         src = self.ds.get("siq_path", "")
         if not src or not os.path.exists(src):
-            QMessageBox.warning(self, "Нет файла", "SIQ-файл не найден или не прикреплён.")
+            msgbox_warning(self, "Нет файла", "SIQ-файл не найден или не прикреплён.")
             return
         mw = self._mw_ref
         if hasattr(mw, '_show_save_notification'):
             mw._show_save_notification()
+        self._refresh_banner_widget()   # pick up the current on-disk package size
         # Refresh the "saved: dd.mm.yyyy HH:MM" label in the toolbar
         if hasattr(mw, '_set_filename_text'):
             try:

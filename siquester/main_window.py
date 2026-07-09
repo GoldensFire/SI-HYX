@@ -1,4 +1,4 @@
-"""Top-level pages (EmptyPage, InputPanel) and the MainWindow."""
+"""Top-level pages (EmptyPage) and the MainWindow."""
 
 from .qt import *
 from .constants import *
@@ -11,35 +11,7 @@ from .widgets_common import *
 from .widgets_editors import *
 from .result_page import *
 from .sidebar import *
-
-class InputPanel(QWidget):
-    analyze_requested = pyqtSignal(str)
-    def __init__(self,parent=None):
-        super().__init__(parent); self.setStyleSheet("background:#181825;")
-        root=QVBoxLayout(self); root.setContentsMargins(28,28,28,24); root.setSpacing(14)
-        root.addWidget(_lbl("Добавить пакет","color:#cdd6f4;font-size:18px;font-weight:700;"))
-        root.addWidget(_lbl("Вставьте HTML, перетащите .html/.txt; для .siq — перетащить на окно.","color:#6c7086;font-size:12px;"))
-        df=QFrame(); df.setStyleSheet("QFrame{background:#1e1e2e;border:2px dashed #45475a;border-radius:10px;}")
-        dfl=QVBoxLayout(df); dfl.setContentsMargins(4,4,4,4)
-        self.edit=DropEdit(); self.edit.setPlaceholderText("📂  Перетащите .txt / .html\n\n— или —\n\n📋  Вставьте HTML страницы SIGame (Ctrl+V)")
-        dfl.addWidget(self.edit); root.addWidget(df,stretch=1)
-        bot=QHBoxLayout(); bot.setSpacing(8)
-        self.counter=QLabel("0 символов"); self.counter.setStyleSheet("color:#585b70;font-size:12px;")
-        bot.addWidget(self.counter); bot.addStretch()
-        for obj,label,slot in [("btn_paste","📋  Вставить и анализировать",self._paste_go),
-                                ("btn_analyze","🔍  Анализировать",self._go)]:
-            btn=AnimatedButton(label); btn.setObjectName(obj); btn.clicked.connect(slot); bot.addWidget(btn)
-        root.addLayout(bot)
-        self.edit.textChanged.connect(lambda: self.counter.setText("{:,} символов".format(len(self.edit.toPlainText())).replace(",","\u202f")))
-    def _go(self):
-        t=self.edit.toPlainText().strip()
-        if t: self.analyze_requested.emit(t); self.edit.clear()
-    def _paste_go(self):
-        t=QApplication.clipboard().text().strip()
-        if t: self.analyze_requested.emit(t)
-        else: QMessageBox.information(self,"Буфер пуст","В буфере обмена нет текста.")
-    def clear(self): self.edit.clear()
-
+from . import auto_stats
 
 class EmptyPage(QWidget):
     """Welcome screen — drag a .siq file here as the primary action."""
@@ -85,7 +57,7 @@ class EmptyPage(QWidget):
 
         lay.addWidget(self._frame)
         lay.addWidget(_lbl(
-            "Статистику из SIGame можно добавить позже через кнопку «📊 Статистика» на вкладке пакета",
+            "Статистика подтягивается автоматически с SIStatistics при открытии пакета",
             "color:#585b70;font-size:11px;"))
 
     def _open_dialog(self):
@@ -140,7 +112,7 @@ class MainWindow(QMainWindow):
         """Cache the MainWindow reference on first show — avoids repeated .window() traversal."""
         super().showEvent(ev)
         if not hasattr(self, '_mw') or self._mw is None:
-            self._mw = self.window()  # type: ignore
+            self._mw = _find_mw(self)  # type: ignore
         # Window is shown by main() via showMaximized()
 
     def _build(self):
@@ -210,7 +182,6 @@ class MainWindow(QMainWindow):
         self.sidebar.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.sidebar.setAutoFillBackground(True)  # prevent content bleeding through during animation
         self.sidebar.item_selected.connect(self._show_ds)
-        self.sidebar.add_requested.connect(self._paste_and_analyze)
         self.sidebar.delete_requested.connect(self._delete_ds)
         self.sidebar.reorder_requested.connect(self._on_reorder)
         self.sidebar.move_to_tab.connect(self._move_to_tab)
@@ -248,10 +219,9 @@ class MainWindow(QMainWindow):
         self._collapse_btn.raise_()
         # Position the button once body is shown; also re-position on resize
         body.installEventFilter(self)
-        self.empty_page=EmptyPage(); self.input_panel=InputPanel()
+        self.empty_page=EmptyPage()
         self.empty_page.siq_dropped.connect(self._open_siq_file)
-        self.input_panel.analyze_requested.connect(self._analyze)
-        self.stack.addWidget(self.empty_page); self.stack.addWidget(self.input_panel)
+        self.stack.addWidget(self.empty_page)
         self.stack.setCurrentIndex(0); self.setAcceptDrops(True)
 
         # ── Floating search panel (Ctrl+F) ────────────────────────
@@ -810,11 +780,6 @@ class MainWindow(QMainWindow):
 
     def _restart(self): QApplication.quit(); os.execl(sys.executable,sys.executable,*sys.argv)
 
-    def _paste_and_analyze(self):
-        t=QApplication.clipboard().text().strip()
-        if t: self._analyze(t)
-        else: self.stack.setCurrentWidget(self.input_panel)
-
     def _load_saved(self):
         """Загружает сохранённые пакеты, НЕ блокируя GUI-поток: по одному пакету
         за тик цикла событий (см. _load_saved_step).
@@ -861,6 +826,9 @@ class MainWindow(QMainWindow):
                     siq = SiqPackage(siq_path)
                     self.datasets[real_idx]["total_duration_sec"] = siq.total_duration
                     self.datasets[real_idx]["widget"].attach_siq(siq)
+                    # Пакеты, уже сохранённые ранее, тоже обновляют статистику при
+                    # каждом запуске — не только свежеоткрытые (см. _open_siq_file).
+                    self._auto_fetch_stats(real_idx, siq.name, list(siq.pkg_authors), siq.rounds)
                 except Exception as e:
                     _logger.warning(f"[siq reload] {e}")
             self.sidebar.rebuild(self.datasets)
@@ -873,7 +841,6 @@ class MainWindow(QMainWindow):
 
     def _add_dataset(self, ds, save=True, _batch=False):
         w = ResultPage(ds, parent=self)
-        w.update_requested.connect(self._on_update_requested)
         self.stack.addWidget(w)
         self.datasets.append({**ds, "widget": w})
         if not _batch:
@@ -904,112 +871,9 @@ class MainWindow(QMainWindow):
             if hasattr(self, '_media_search_panel') and self._media_search_panel.isVisible():
                 QTimer.singleShot(50, self._run_media_search)
 
-    def _analyze(self, text):
-        ds_new = parse_html(text)
-        if not ds_new:
-            QMessageBox.warning(self, "Данные не найдены",
-                                "Не удалось найти статистику.\n"
-                                "Убедитесь что вставлен HTML со страницы SIGame.")
-            return
-        for i, ds in enumerate(self.datasets):
-            if ds["pkg_name"].strip().lower() == ds_new["pkg_name"].strip().lower():
-                self._update_ds_stats(i, ds_new); return
-        ds_new["tab_id"] = self.sidebar.current_tab_id()
-        self._add_dataset(ds_new)
-        idx = len(self.datasets) - 1
-        self.sidebar.select_by_real(idx); self._show_ds(idx)
-
-    def _update_ds_stats(self, real_idx, new_parsed):
-        ds = self.datasets[real_idx]
-        if new_parsed.get("stats"): ds["stats"] = new_parsed["stats"]
-        if new_parsed.get("pkg_size"): ds["pkg_size"] = new_parsed["pkg_size"]
-        # Invalidate the banner stats cache for this page
-        w = ds.get("widget")
-        if w is not None:
-            w._banner_stats_key += 1
-
-        def _strip(name):
-            """Strip 「」 brackets and whitespace for loose name matching."""
-            return name.strip("「」").strip()
-
-        new_rounds = new_parsed.get("rounds", [])
-
-        if not ds.get("rounds"):
-            # No existing data — use as-is
-            ds["rounds"] = new_rounds
-        else:
-            # Smart merge: update rounds that match by name, append truly new ones
-            existing = ds["rounds"]
-            existing_stripped = [_strip(r.get("round_name","")) for r in existing]
-
-            for nr in new_rounds:
-                nr_name = _strip(nr.get("round_name",""))
-                # Try exact match first, then stripped match
-                match_i = None
-                for i, er in enumerate(existing):
-                    if _strip(er.get("round_name","")) == nr_name:
-                        match_i = i; break
-
-                if match_i is not None:
-                    # Merge themes/questions into existing round
-                    er = existing[match_i]
-                    for nt in nr.get("themes", []):
-                        nt_name = nt["name"].strip()
-                        et = next((t for t in er.get("themes",[]) if t["name"].strip() == nt_name), None)
-                        if et is None:
-                            er.setdefault("themes", []).append(nt)
-                        else:
-                            # Merge questions by price (or by index for price=0 final round)
-                            new_qs = nt.get("questions", [])
-                            all_zero = all(q["price"] == 0 for q in new_qs)
-                            if all_zero:
-                                # Final round: match by index
-                                for qi, nq in enumerate(new_qs):
-                                    if qi < len(et["questions"]):
-                                        et["questions"][qi]["tries"] = nq["tries"]
-                                        et["questions"][qi]["right"] = nq["right"]
-                                    else:
-                                        et["questions"].append(nq)
-                            else:
-                                # Regular round: match by price
-                                eq_map = {q["price"]: q for q in et.get("questions", [])}
-                                for nq in new_qs:
-                                    if nq["price"] in eq_map:
-                                        eq_map[nq["price"]]["tries"] = nq["tries"]
-                                        eq_map[nq["price"]]["right"] = nq["right"]
-                                    else:
-                                        et["questions"].append(nq)
-                else:
-                    # Round doesn't exist yet — append it
-                    existing.append(nr)
-
-        old_w = ds["widget"]
-        new_w = ResultPage(ds, parent=self); new_w.update_requested.connect(self._on_update_requested)
-        if hasattr(old_w,"_siq") and old_w._siq: new_w.attach_siq(old_w._siq)
-        self.stack.addWidget(new_w); ds["widget"] = new_w
-        self.stack.removeWidget(old_w); old_w.deleteLater()
-        self.sidebar.rebuild(self.datasets); save_datasets(self.datasets)
-        self.sidebar.select_by_real(real_idx); self._show_ds(real_idx); self._update_info()
-
-    def _on_update_requested(self, result_page):
-        real_idx = next((i for i,d in enumerate(self.datasets) if d["widget"] is result_page), None)
-        if real_idx is None: return
-        text = QApplication.clipboard().text().strip()
-        if not text:
-            QMessageBox.warning(self, "Буфер пуст",
-                                "Скопируйте HTML страницы статистики SIGame\nи нажмите «Статистика» снова.")
-            return
-        new_ds = parse_html(text)
-        if not new_ds:
-            QMessageBox.warning(self, "Данные не найдены",
-                                "Не удалось найти статистику.\n"
-                                "Убедитесь что скопирован HTML со страницы SIGame.")
-            return
-        self._update_ds_stats(real_idx, new_ds)
-
     def _open_siq_file(self, path):
         try: siq = SiqPackage(path)
-        except Exception as e: QMessageBox.warning(self,"Ошибка .siq",str(e)); return
+        except Exception as e: msgbox_warning(self,"Ошибка .siq",str(e)); return
         file_mb = os.path.getsize(path)/1024/1024
         siq_rounds = [{"round_name":rd["name"],"themes":[{"name":th["name"],"questions":[{"price":q["price"],"tries":0,"right":0} for q in th["questions"]]} for th in rd["themes"]]} for rd in siq.rounds]
 
@@ -1041,6 +905,7 @@ class MainWindow(QMainWindow):
             ds["widget"].attach_siq(siq)
             self.sidebar.rebuild(self.datasets)
             self.sidebar.select_by_real(match_idx); self._show_ds(match_idx)
+            real_idx = match_idx
         else:
             new_ds = {"pkg_name":siq.name,"stats":"","pkg_size":f"{file_mb:.1f} МБ",
                       "rounds":siq_rounds,"tab_id":self.sidebar.current_tab_id(),
@@ -1049,6 +914,87 @@ class MainWindow(QMainWindow):
             idx = len(self.datasets)-1
             self.sidebar.select_by_real(idx); self._show_ds(idx)
             self.datasets[idx]["widget"].attach_siq(siq)
+            real_idx = idx
+
+        self._auto_fetch_stats(real_idx, siq.name, list(siq.pkg_authors), siq.rounds)
+
+    def _auto_fetch_stats(self, real_idx, name, authors, siq_rounds):
+        """Тянет статистику пакета с SIStatistics в фоне — та же логика имя+авторы,
+        что и в «Поиск пакетов» (см. sigstats/stats_api.py, siquester/auto_stats.py).
+        Без авторов запрос почти гарантированно 404 — не тратим время впустую."""
+        if not authors:
+            return
+        # Карта (round_idx,theme_idx,question_idx) -> (round_name,theme_name,price):
+        # у API индексы порядковые, а в ds["rounds"] (после attach_siq) вопросы
+        # ищутся по имени раунда/темы + цене — строим карту, пока индексы под рукой.
+        keymap = {}
+        for r_idx, rd in enumerate(siq_rounds):
+            for t_idx, th in enumerate(rd["themes"]):
+                for q_idx, q in enumerate(th["questions"]):
+                    keymap[(r_idx, t_idx, q_idx)] = (rd["name"], th["name"], q["price"])
+
+        def _do_fetch():
+            try:
+                result = auto_stats.fetch(name, authors)
+            except Exception as e:
+                _logger.warning(f"[auto stats] {e}")
+                return
+            if result is None:
+                return
+            summary, per_question = result
+            named = {keymap[k]: v for k, v in per_question.items() if k in keymap}
+            _get_ui_bridge().deliver_call(
+                lambda: self._apply_auto_stats(real_idx, summary, named))
+        _threading.Thread(target=_do_fetch, daemon=True, name="auto-stats").start()
+
+    def _apply_auto_stats(self, real_idx, summary, named_stats):
+        """Накладывает результат _auto_fetch_stats на уже открытый датасет.
+
+        И сводная строка ("Завершённых игр"), и поштучная статистика вопросов
+        (tries/right) обновляются КАЖДЫЙ раз, когда пришли свежие данные — обе
+        растут со временем по мере того, как в игру играют ещё. Раньше tries/
+        right заполнялись только в пустые (0/0) значения (защита от перетирания
+        ручной вставки HTML с сайта) — но ручная вставка убрана, автофетч теперь
+        единственный источник, поэтому «замораживать» значения на первом фетче
+        больше не нужно: пак иначе никогда не подхватывал бы новую статистику."""
+        if real_idx >= len(self.datasets):
+            return
+        ds = self.datasets[real_idx]
+        changed = False
+        if summary.get("rate") is not None:
+            pct = round(summary["rate"] * 100)
+            new_stats = f"Завершенных игр: {summary['completed']} из {summary['started']} ({pct}%)"
+            if new_stats != ds.get("stats"):
+                ds["stats"] = new_stats
+                changed = True
+        for rd in ds.get("rounds", []):
+            rn = rd.get("round_name", "")
+            for th in rd.get("themes", []):
+                tn = th.get("name", "")
+                for q in th.get("questions", []):
+                    key = (rn, tn, q.get("price"))
+                    st = named_stats.get(key)
+                    if st and (q.get("tries") != st["tries"] or q.get("right") != st["right"]):
+                        q["tries"] = st["tries"]; q["right"] = st["right"]
+                        changed = True
+        if not changed:
+            return
+
+        # Пересобираем страницу пакета целиком — точечно перекрашивать уже
+        # построенные плитки менее надёжно, чем просто пересоздать страницу.
+        old_w = ds["widget"]
+        new_w = ResultPage(ds, parent=self)
+        if hasattr(old_w, "_siq") and old_w._siq:
+            new_w.attach_siq(old_w._siq)
+        self.stack.addWidget(new_w)
+        ds["widget"] = new_w
+        was_current = self.stack.currentWidget() is old_w
+        self.stack.removeWidget(old_w)
+        old_w.deleteLater()
+        if was_current:
+            self.stack.setCurrentWidget(new_w)
+        self.sidebar.rebuild(self.datasets)
+        save_datasets(self.datasets)
 
     def _show_save_notification(self):
         """Show 'Файл сохранён' banner at top-center of the window for 3 seconds."""
@@ -1150,6 +1096,5 @@ class MainWindow(QMainWindow):
 
 __all__ = [
     'EmptyPage',
-    'InputPanel',
     'MainWindow',
 ]

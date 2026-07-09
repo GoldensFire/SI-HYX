@@ -96,7 +96,7 @@ class UnifiedWindow(QMainWindow):
         self._wheel_changes_values = False
         self._wheel_filter = WheelBlocker(self, lambda: self._wheel_changes_values)
         QApplication.instance().installEventFilter(self._wheel_filter)
-        if not check_ffmpeg(): QMessageBox.critical(self, "Error", "FFmpeg not found!")
+        if not check_ffmpeg(): msgbox_critical(self, "Error", "FFmpeg not found!")
 
         c = QWidget(); self.setCentralWidget(c); l = QVBoxLayout(c)
         l.setContentsMargins(8, 8, 8, 8); l.setSpacing(6)
@@ -170,6 +170,16 @@ class UnifiedWindow(QMainWindow):
                           "с .siq-вопросами."),
             'shikimori': ("fa5s.tv", "ShikimoriHYX",
                           "Экспериментальная вкладка: поиск аниме/манги через Shikimori"),
+            'leaderboard': ("fa5s.trophy", "ЛидербордHYX",
+                            "Просмотр выгрузки рекордов из Firebase: никнеймы и их "
+                            "результаты, удаление ников из списка."),
+            'coop': ("fa5s.users", "Collab",
+                     "Совместная работа над .siq: темы, вопросы и ответы напарника "
+                     "в реальном времени — видно, кто что сделал, и где дубли."),
+            'sigstats': ("fa5s.chart-bar", "Поиск пакетов",
+                         "Сбор и анализ статистики паков «Своя игра» с sibrowser.ru: "
+                         "поиск новых паков по скачиваниям/дате/теме/автору, таблица "
+                         "с фильтрами, карта тем, топ авторов."),
         }
         self.tabs.setIconSize(QSize(16, 16))
         self._add_tab(self.tab_media,  'media')
@@ -184,14 +194,15 @@ class UnifiedWindow(QMainWindow):
         # Вкладки можно перетаскивать мышью и сортировать в удобном порядке;
         # порядок сохраняется между запусками (см. _save_tab_order / tab_order).
         self.tabs.setMovable(True)
-        # Когда вкладки не помещаются по ширине, QTabBar дорисовывает справа две
-        # стрелки-прокрутки — они выглядят как «две пустые маленькие вкладки».
-        # Отключаем их: вкладки ужимаются под доступную ширину, а длинные
-        # заголовки при нехватке места обрезаются многоточием.
-        self.tabs.setUsesScrollButtons(False)
+        # Как в браузере: вкладки НЕ ужимаются, а при нехватке ширины уезжают
+        # за край — QTabBar сам рисует стрелки-прокрутки справа, ими можно
+        # долистать до вкладок, которые не поместились. Дополнительно крутим
+        # эти же вкладки колёсиком мыши (см. eventFilter/_tab_wheel_scroll).
+        self.tabs.setUsesScrollButtons(True)
         try:
-            self.tabs.tabBar().setUsesScrollButtons(False)
-            self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
+            self.tabs.tabBar().setUsesScrollButtons(True)
+            self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
+            self._style_tab_scroll_buttons()
         except Exception:
             pass
         self._reordering_tabs = False
@@ -281,6 +292,10 @@ class UnifiedWindow(QMainWindow):
         self._reposition_console_btn()
         self._console_dialog = None
         self.tabs.currentChanged.connect(self._sync_console_visibility)
+        # tabBarClicked стреляет ДО фактического переключения страницы (в
+        # отличие от currentChanged) — синхронизируем консоль заранее, чтобы
+        # холст «Монтажа» получал финальную высоту сразу, без видимого прыжка.
+        self.tabs.tabBar().tabBarClicked.connect(self._on_tab_bar_clicked)
         self._sync_console_visibility()
 
         # Состояние локального сервера для расширения (по умолчанию ВЫКЛ)
@@ -296,6 +311,19 @@ class UnifiedWindow(QMainWindow):
         self._shikimori_tab_enabled = False
         self.tab_shikimori = None
         self._shikimori_settings = {}   # сохранённые фильтры вкладки ShikimoriHYX
+
+        # Экспериментальная вкладка ЛидербордHYX (по умолчанию ВЫКЛ).
+        self._leaderboard_tab_enabled = False
+        self.tab_leaderboard = None
+
+        # Экспериментальная вкладка Collab (по умолчанию ВЫКЛ).
+        self._coop_tab_enabled = False
+        self.tab_coop = None
+        self._coop_settings = {}   # сохранённые поля вкладки Collab
+
+        # Экспериментальная вкладка Поиск пакетов (по умолчанию ВЫКЛ).
+        self._sigstats_tab_enabled = False
+        self.tab_sigstats = None
 
         # Вкладка «Промпт» (по умолчанию ВЫКЛ).
         self._prompt_tab_enabled = False
@@ -316,6 +344,18 @@ class UnifiedWindow(QMainWindow):
         # …и вкладку ShikimoriHYX, если включена.
         if getattr(self, "_shikimori_tab_enabled", False):
             self._add_shikimori_tab()
+
+        # …и вкладку ЛидербордHYX, если включена.
+        if getattr(self, "_leaderboard_tab_enabled", False):
+            self._add_leaderboard_tab()
+
+        # …и вкладку Collab, если включена.
+        if getattr(self, "_coop_tab_enabled", False):
+            self._add_coop_tab()
+
+        # …и вкладку Поиск пакетов, если включена.
+        if getattr(self, "_sigstats_tab_enabled", False):
+            self._add_sigstats_tab()
 
         # Восстанавливаем сохранённый порядок вкладок (перетаскивание мышью).
         try:
@@ -369,13 +409,23 @@ class UnifiedWindow(QMainWindow):
             self.tab_photo.inpaint.set_keep_models(self._keep_models_in_ram)
         except Exception:
             pass
+        self._show_advanced_encode = bool(s.get("advanced_encode_visible", False))
+        try:
+            tm.set_advanced_encode_visible(self._show_advanced_encode)
+        except Exception:
+            pass
         self._siquester_tab_enabled = bool(s.get("siquester_tab_enabled", False))
         self._shikimori_tab_enabled = bool(s.get("shikimori_tab_enabled", False))
         self._shikimori_settings = dict(s.get("shikimori", {}) or {})
+        self._leaderboard_tab_enabled = bool(s.get("leaderboard_tab_enabled", False))
+        self._coop_tab_enabled = bool(s.get("coop_tab_enabled", False))
+        self._coop_settings = dict(s.get("coop", {}) or {})
+        self._sigstats_tab_enabled = bool(s.get("sigstats_tab_enabled", False))
         self._prompt_tab_enabled = bool(s.get("prompt_tab_enabled", False))
         self._tab_order = list(s.get("tab_order", []) or [])
         try:
             m = s.get("media", {}); a = m.get("audio", {})
+            tm.ck_no_audio.setChecked(a.get("remove", False))
             tm.ck_norm.setChecked(a.get("norm", True))
             tm.s_tgt.setValue(a.get("tgt", -20.0))
             tm.s_lra.setValue(a.get("lra", 11.0))
@@ -400,6 +450,15 @@ class UnifiedWindow(QMainWindow):
             combo_set_value(tm.c_res, v.get("res", "1280x720"))
             tm.c_fps.setCurrentText(v.get("fps", "Исходный (max 30)"))
             tm._set_preset_mode(v.get("preset_mode", "std"))
+            tm._set_tune_value(v.get("tune", 0))
+            try:
+                metric_saved = v.get("metric", "none")
+                tm.ck_metric_xpsnr.setChecked(metric_saved == "xpsnr")
+                if "target_metric" in v:
+                    tm.s_target_metric.setValue(int(float(v.get("target_metric", 40.0))))
+                tm.s_target_metric.setEnabled(tm._video_metric_value() == 'xpsnr')
+                tm.lbl_target_metric.setEnabled(tm._video_metric_value() == 'xpsnr')
+            except Exception: pass
             tm.ck_vfade_in.setChecked(v.get("vfade_in", False))
             tm.s_vfade_in.setValue(v.get("vfade_in_d", 1.0))
             tm.ck_vfade_out.setChecked(v.get("vfade_out", False))
@@ -433,13 +492,24 @@ class UnifiedWindow(QMainWindow):
             tm.s_dim.setValue(av.get("adim", tm.s_dim.value()))
             tm.ck_dim.setChecked(av.get("adim_on", False))
             tm.s_dim.setEnabled(tm.ck_dim.isChecked())
+            tm.s_width.setValue(av.get("awidth", tm.s_width.value()) or tm.s_width.value())
+            tm.ck_width.setChecked(av.get("awidth_on", False))
+            tm.s_width.setEnabled(tm.ck_width.isChecked())
+            tm.s_height.setValue(av.get("aheight", tm.s_height.value()) or tm.s_height.value())
+            tm.ck_height.setChecked(av.get("aheight_on", False))
+            tm.s_height.setEnabled(tm.ck_height.isChecked())
             tm.sl_aspd.setValue(av.get("aspd", tm.sl_aspd.value()))
+            tm.s_cq.setValue(av.get("cq", tm.s_cq.value()))
             tm.s_passes.setValue(av.get("fit_passes", 4))
             try: tm.c_priority.setCurrentText(s.get("priority", "Обычный"))
             except Exception: pass
             if hasattr(tm, "ck_overwrite_src"):
                 tm.ck_overwrite_src.setChecked(av.get("overwrite_src", False))
             combo_set_value(tm.c_img_fmt, av.get("img_fmt", "avif"))
+            try:
+                _chroma = str(av.get("chroma", "420"))
+                combo_set_value(tm.c_chroma, {"420": "4:2:0", "422": "4:2:2", "444": "4:4:4"}.get(_chroma, "4:2:0"))
+            except Exception: pass
 
             # Обновляем стрип последних файлов по восстановленной папке
             try:
@@ -477,8 +547,6 @@ class UnifiedWindow(QMainWindow):
                 fpath = url[len("__screenshot_saved__"):]
                 self.log(f"📷 Скриншот сохранён: {fpath}")
                 return
-            self.raise_()
-            self.activateWindow()
             self.tabs.setCurrentWidget(self.tab_ytdlp)
             self.tab_ytdlp.add_dl_direct(url, audio_only=audio)
             self.log(f"URL из браузера ({'аудио' if audio else 'видео'}): {url}")
@@ -744,6 +812,13 @@ class UnifiedWindow(QMainWindow):
         try: self._save_settings_now()
         except Exception: pass
 
+    def _set_advanced_encode_visible(self, checked: bool):
+        self._show_advanced_encode = bool(checked)
+        try: self.tab_media.set_advanced_encode_visible(self._show_advanced_encode)
+        except Exception: pass
+        try: self._save_settings_now()
+        except Exception: pass
+
     def _set_keep_models_in_ram(self, checked: bool):
         self._keep_models_in_ram = bool(checked)
         try: self.tab_photo.inpaint.set_keep_models(self._keep_models_in_ram)
@@ -955,6 +1030,139 @@ class UnifiedWindow(QMainWindow):
             except Exception:
                 pass
         return dict(getattr(self, "_shikimori_settings", {}) or {})
+
+    # ------------------------------------------------------------------
+    # Экспериментальная вкладка ЛидербордHYX (просмотр выгрузки рекордов)
+    # ------------------------------------------------------------------
+    def _add_leaderboard_tab(self):
+        """Создаёт и добавляет вкладку ЛидербордHYX (если ещё не добавлена).
+        Импорт ленивый — модуль тянется только когда вкладка включена."""
+        if getattr(self, "tab_leaderboard", None) is not None:
+            return
+        try:
+            from leaderboard_tab import LeaderboardTab
+            self.tab_leaderboard = LeaderboardTab(self)
+            self._add_tab(self.tab_leaderboard, 'leaderboard')
+            self._apply_tab_order(getattr(self, "_tab_order", []))
+        except Exception as e:
+            self.tab_leaderboard = None
+            self.log(f"Не удалось добавить вкладку ЛидербордHYX: {e}")
+
+    def _remove_leaderboard_tab(self):
+        t = getattr(self, "tab_leaderboard", None)
+        if t is None:
+            return
+        try:
+            idx = self.tabs.indexOf(t)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            try: t.cleanup()
+            except Exception: pass
+            t.deleteLater()
+        except Exception: pass
+        self.tab_leaderboard = None
+
+    def _set_leaderboard_tab_enabled(self, checked: bool):
+        self._leaderboard_tab_enabled = bool(checked)
+        if checked:
+            self._add_leaderboard_tab()
+        else:
+            self._remove_leaderboard_tab()
+        try: self._save_settings_now()
+        except Exception: pass
+
+    # ------------------------------------------------------------------
+    # Экспериментальная вкладка Collab (совместная работа над .siq)
+    # ------------------------------------------------------------------
+    def _add_coop_tab(self):
+        """Создаёт и добавляет вкладку Collab (если ещё не добавлена).
+        Импорт ленивый — модуль тянется только когда вкладка включена."""
+        if getattr(self, "tab_coop", None) is not None:
+            return
+        try:
+            from coop_tab import CoopTab
+            self.tab_coop = CoopTab(self, dict(getattr(self, "_coop_settings", {}) or {}))
+            self._add_tab(self.tab_coop, 'coop')
+            self._apply_tab_order(getattr(self, "_tab_order", []))
+        except Exception as e:
+            self.tab_coop = None
+            self.log(f"Не удалось добавить вкладку Collab: {e}")
+
+    def _remove_coop_tab(self):
+        t = getattr(self, "tab_coop", None)
+        if t is None:
+            return
+        try:
+            idx = self.tabs.indexOf(t)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            try: t.cleanup()
+            except Exception: pass
+            t.deleteLater()
+        except Exception: pass
+        self.tab_coop = None
+
+    def _set_coop_tab_enabled(self, checked: bool):
+        self._coop_tab_enabled = bool(checked)
+        if checked:
+            self._add_coop_tab()
+        else:
+            # Перед закрытием запоминаем текущие поля вкладки.
+            self._coop_settings = self._collect_coop_settings()
+            self._remove_coop_tab()
+        try: self._save_settings_now()
+        except Exception: pass
+
+    def _collect_coop_settings(self):
+        """Актуальные поля вкладки Collab (или последние сохранённые,
+        если вкладка сейчас не открыта)."""
+        t = getattr(self, "tab_coop", None)
+        if t is not None and hasattr(t, "get_settings"):
+            try:
+                return t.get_settings()
+            except Exception:
+                pass
+        return dict(getattr(self, "_coop_settings", {}) or {})
+
+    # ------------------------------------------------------------------
+    # Экспериментальная вкладка Поиск пакетов (сбор/анализ паков «Своя игра»)
+    # ------------------------------------------------------------------
+    def _add_sigstats_tab(self):
+        """Создаёт и добавляет вкладку Поиск пакетов (если ещё не добавлена).
+        Импорт ленивый — модуль тянет pandas/bs4 и грузится только когда включена."""
+        if getattr(self, "tab_sigstats", None) is not None:
+            return
+        try:
+            from sigstats_tab import SigstatsTab
+            self.tab_sigstats = SigstatsTab(self)
+            self._add_tab(self.tab_sigstats, 'sigstats')
+            self._apply_tab_order(getattr(self, "_tab_order", []))
+        except Exception as e:
+            self.tab_sigstats = None
+            self.log(f"Не удалось добавить вкладку Поиск пакетов: {e}")
+
+    def _remove_sigstats_tab(self):
+        t = getattr(self, "tab_sigstats", None)
+        if t is None:
+            return
+        try:
+            idx = self.tabs.indexOf(t)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            try: t.cleanup()
+            except Exception: pass
+            t.deleteLater()
+        except Exception: pass
+        self.tab_sigstats = None
+
+    def _set_sigstats_tab_enabled(self, checked: bool):
+        self._sigstats_tab_enabled = bool(checked)
+        if checked:
+            self._add_sigstats_tab()
+        else:
+            self._remove_sigstats_tab()
+        try: self._save_settings_now()
+        except Exception: pass
 
     def _open_url(self, url: str):
         try:
@@ -1523,6 +1731,18 @@ class UnifiedWindow(QMainWindow):
                            "следующий запуск ждёт перезагрузку модели). Вкл — держать в ОЗУ всегда (быстрее)."))
         add_row(sec_main, grp_ai, "нейросеть модель озу память выгрузка lama rmbg удаление объект фон фото")
 
+        grp_enc = QGroupBox("Обработка — продвинутые настройки")
+        venc = QVBoxLayout(grp_enc)
+        chk_adv_enc = QCheckBox("Показывать Тюнинг / Метрику (XPSNR) / CQ-level")
+        chk_adv_enc.setChecked(bool(getattr(self, "_show_advanced_encode", False)))
+        chk_adv_enc.toggled.connect(self._set_advanced_encode_visible)
+        venc.addWidget(chk_adv_enc)
+        venc.addWidget(hint("Выкл по умолчанию — три поля скрыты во вкладке «Обработка», "
+                            "чтобы не путать в базовом сценарии (используются ручной CRF и CQ по умолчанию). "
+                            "Включите, если нужно тонко настроить тюнинг SVT-AV1, авто-подбор CRF по XPSNR "
+                            "или ручной уровень качества AVIF."))
+        add_row(sec_main, grp_enc, "обработка тюнинг метрика xpsnr cq level cq-level crf продвинутые расширенные")
+
         # ══ Секция «Монтаж» ══════════════════════════════════════════════════
         sec_edit = make_section("Монтаж")
 
@@ -1627,10 +1847,36 @@ class UnifiedWindow(QMainWindow):
         vexp.addWidget(hint(icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
                             + " Экспериментально. Поиск аниме через Shikimori API с фильтрами, сортировка по индексу популярности, нужен, если вы делаете аниме пак, пишите в лс, если будете пользоваться - объясню; "
                 ))
+        chk_lb = QCheckBox("Включить вкладку «ЛидербордHYX» (просмотр выгрузки рекордов)")
+        chk_lb.setChecked(bool(getattr(self, "_leaderboard_tab_enabled", False)))
+        chk_lb.toggled.connect(self._set_leaderboard_tab_enabled)
+        vexp.addWidget(chk_lb)
+        vexp.addWidget(hint(icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
+                            + " Загрузите JSON-выгрузку лидерборда из Firebase — увидите "
+                            "никнеймы с их рекордами и сможете убрать ник из списка."))
+        chk_coop = QCheckBox("Включить вкладку «Collab» (совместная работа над .siq)")
+        chk_coop.setChecked(bool(getattr(self, "_coop_tab_enabled", False)))
+        chk_coop.toggled.connect(self._set_coop_tab_enabled)
+        vexp.addWidget(chk_coop)
+        vexp.addWidget(hint(icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
+                            + " Для совместных паков: вы и соавторы видите темы, "
+                            "вопросы и ответы друг друга в реальном времени и не дублируете "
+                            "работу. Нужен адрес сервера синхронизации (см. coop_worker.js)."))
+        chk_sigstats = QCheckBox("Включить вкладку «Поиск пакетов» (сбор и анализ статистики паков)")
+        chk_sigstats.setChecked(bool(getattr(self, "_sigstats_tab_enabled", False)))
+        chk_sigstats.toggled.connect(self._set_sigstats_tab_enabled)
+        vexp.addWidget(chk_sigstats)
+        vexp.addWidget(hint(icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
+                            + " Экспериментально. Ищет новые паки на sibrowser.ru по "
+                            "скачиваниям/дате/теме (с % совпадения)/автору, показывает "
+                            "% завершения игр, карту тем и топ авторов."))
         add_row(sec_exp, grp_siq,
                 "промпт prompt заготовки шаблоны "
                 "siquester сиквестер siq пакет вопросы статистика эксперимент вкладка просмотр sigame "
-                "shikimori шикимори аниме поиск оценка жанр год api джойнт")
+                "shikimori шикимори аниме поиск оценка жанр год api "
+                "лидерборд leaderboard рекорды никнеймы firebase счёт ник "
+                "collab coop совместная работа пак напарник соавтор реалтайм темы вопросы ответы дубли синхронизация "
+                "sigstats статистика паки sibrowser сбор скачивания тема категория процент автор экспорт")
 
         # ══ Секция «О программе» ═════════════════════════════════════════════
         sec_about = make_section("О программе")
@@ -1727,6 +1973,7 @@ class UnifiedWindow(QMainWindow):
             s = {
                 'media': {
                     'audio': {
+                        'remove': bool(tm.ck_no_audio.isChecked()),
                         'norm': bool(tm.ck_norm.isChecked()), 'tgt': float(tm.s_tgt.value()), 'lra': float(tm.s_lra.value()),
                         'tp': float(tm.s_tp.value()), 'fade': bool(tm.ck_fade.isChecked()), 'fade_d': float(tm.s_fade.value()),
                         'fade_in': bool(tm.ck_fade_in.isChecked()), 'fade_in_d': float(tm.s_fade_in.value()),
@@ -1738,6 +1985,7 @@ class UnifiedWindow(QMainWindow):
                         'enabled': bool(tm.chk_enable_video.isChecked()), 'speed': int(tm.s_spd.value()), 'crf': int(tm.s_crf.value()),
                         'pre': int(tm.s_pre.value()), 'res': strip_default_tag(tm.c_res.currentText()), 'fps': tm.c_fps.currentText(),
                         'preset_mode': 'dark' if tm.btn_mode_dark.isChecked() else 'std',
+                        'metric': tm._video_metric_value(), 'target_metric': float(tm.s_target_metric.value()),
                         'vfade_in': bool(tm.ck_vfade_in.isChecked()), 'vfade_in_d': float(tm.s_vfade_in.value()),
                         'vfade_out': bool(tm.ck_vfade_out.isChecked()), 'vfade_out_d': float(tm.s_vfade_out.value())
                     },
@@ -1752,18 +2000,27 @@ class UnifiedWindow(QMainWindow):
                 'avif': {
                     'limit': int(tm.s_lim.value()), 'limit_on': bool(tm.ck_lim.isChecked()),
                     'adim': int(tm.s_dim.value()), 'adim_on': bool(tm.ck_dim.isChecked()),
+                    'awidth': int(tm.s_width.value()), 'awidth_on': bool(tm.ck_width.isChecked()),
+                    'aheight': int(tm.s_height.value()), 'aheight_on': bool(tm.ck_height.isChecked()),
                     'aspd': int(tm.sl_aspd.value()),
+                    'cq': int(tm.s_cq.value()),
                     'overwrite_src': bool(tm.ck_overwrite_src.isChecked()) if hasattr(tm, 'ck_overwrite_src') else False,
                     'fit_passes': int(tm.s_passes.value()),
-                    'img_fmt': strip_default_tag(tm.c_img_fmt.currentText())
+                    'img_fmt': strip_default_tag(tm.c_img_fmt.currentText()),
+                    'chroma': strip_default_tag(tm.c_chroma.currentText()).replace(':', '')
                 },
                 'server_enabled': bool(getattr(self, '_server_enabled', False)),
                 'wheel_changes_values': bool(getattr(self, '_wheel_changes_values', False)),
                 'video_hw_decode': bool(getattr(self, '_video_hw_decode', True)),
                 'keep_models_in_ram': bool(getattr(self, '_keep_models_in_ram', False)),
+                'advanced_encode_visible': bool(getattr(self, '_show_advanced_encode', False)),
                 'siquester_tab_enabled': bool(getattr(self, '_siquester_tab_enabled', False)),
                 'shikimori_tab_enabled': bool(getattr(self, '_shikimori_tab_enabled', False)),
                 'shikimori': self._collect_shikimori_settings(),
+                'leaderboard_tab_enabled': bool(getattr(self, '_leaderboard_tab_enabled', False)),
+                'coop_tab_enabled': bool(getattr(self, '_coop_tab_enabled', False)),
+                'coop': self._collect_coop_settings(),
+                'sigstats_tab_enabled': bool(getattr(self, '_sigstats_tab_enabled', False)),
                 'prompt_tab_enabled': bool(getattr(self, '_prompt_tab_enabled', False)),
                 'priority': tm.c_priority.currentText() if hasattr(tm, 'c_priority') else 'Обычный',
                 'prompt_file': getattr(getattr(self, 'tab_prompt', None), '_prompt_path', '') or '',
@@ -1792,6 +2049,7 @@ class UnifiedWindow(QMainWindow):
             ty = self.tab_ytdlp
             # Виджеты с сигналом toggled (QCheckBox, QPushButton checkable)
             toggle_widgets = [
+                tm.ck_no_audio,
                 tm.ck_norm, tm.ck_fade, tm.ck_fade_in, tm.ck_deg, tm.ck_u8,
                 tm.chk_enable_video, tm.btn_mode_dark,
                 tm.ck_overwrite_src,
@@ -1804,12 +2062,12 @@ class UnifiedWindow(QMainWindow):
                 tm.s_tgt, tm.s_lra, tm.s_tp, tm.s_fade, tm.s_fade_in,
                 tm.s_hz, tm.s_lp, tm.s_hp, tm.s_deg_gain,
                 tm.s_spd, tm.s_crf, tm.s_pre,
-                tm.s_lim, tm.s_dim, tm.sl_aspd, tm.s_passes,
+                tm.s_lim, tm.s_dim, tm.sl_aspd, tm.s_cq, tm.s_passes,
                 tm.s_vfade_in, tm.s_vfade_out,
             ]
             # Виджеты с сигналом currentTextChanged (QComboBox)
             combo_widgets = [
-                tm.c_abitrate, tm.c_res, tm.c_fps, tm.c_img_fmt, tm.c_priority,
+                tm.c_abitrate, tm.c_res, tm.c_fps, tm.c_tune, tm.c_img_fmt, tm.c_priority,
                 ty.c_q, ty.c_c, ty.c_s, ty.c_a,
             ]
             # Виджет с сигналом textChanged (QLineEdit)
@@ -1877,22 +2135,46 @@ class UnifiedWindow(QMainWindow):
         try: self._taskbar.clear(self._tb_hwnd())
         except Exception: pass
 
-    def _sync_console_visibility(self, *args):
+    def _sync_console_visibility(self, index=None):
         """Нижняя консоль и прогрессбар. Консоль скрыта на «Монтаж» и
         «SiQuesterHYX» (там она лишь занимает место). Прогрессбар скрыт на
-        «SiQuesterHYX» (на «Монтаж» он нужен для прогресса экспорта)."""
+        «SiQuesterHYX» (на «Монтаж» он нужен для прогресса экспорта).
+
+        Принимает индекс явно (а не только через currentChanged), чтобы можно
+        было спрятать консоль ДО фактического показа страницы — иначе видео на
+        «Монтаж» сперва рисуется в старой (с консолью) высоте и тут же
+        дёргается на новую, бóльшую — см. _on_tab_bar_clicked."""
         try:
-            cur = self.tabs.currentWidget()
+            cur = self.tabs.widget(index) if isinstance(index, int) else self.tabs.currentWidget()
             is_edit = cur is self.tab_edit
             tsq = getattr(self, "tab_siquester", None)
             is_siq = tsq is not None and cur is tsq
             tsh = getattr(self, "tab_shikimori", None)
             is_shiki = tsh is not None and cur is tsh
+            tlb = getattr(self, "tab_leaderboard", None)
+            is_lb = tlb is not None and cur is tlb
+            tcp = getattr(self, "tab_coop", None)
+            is_coop = tcp is not None and cur is tcp
             is_photo = cur is getattr(self, "tab_photo", None)
-            self.console_panel.setVisible(not (is_edit or is_siq or is_shiki or is_photo))
-            self.pbar.setVisible(not (is_siq or is_shiki or is_photo))
+            tst = getattr(self, "tab_sigstats", None)
+            is_sigstats = tst is not None and cur is tst
+            self.console_panel.setVisible(not (is_edit or is_siq or is_shiki or is_lb or is_coop or is_photo or is_sigstats))
+            self.pbar.setVisible(not (is_siq or is_shiki or is_lb or is_coop or is_photo or is_sigstats))
         except Exception:
             pass
+
+    def _on_tab_bar_clicked(self, index):
+        """Вызывается ДО того, как QTabBar реально переключит страницу.
+        Прячем/показываем консоль здесь же, но с отключённой перерисовкой окна —
+        иначе старая вкладка (например «Обработка», где консоль видна) успевает
+        на мгновение перерисоваться в увеличенной высоте ДО самого переключения
+        на «Монтаж» (это отдельный кадр, который тот же currentChanged/showEvent
+        уже не поймать), и глаз ловит этот промежуточный прыжок холста."""
+        self.setUpdatesEnabled(False)
+        try:
+            self._sync_console_visibility(index)
+        finally:
+            QTimer.singleShot(0, lambda: self.setUpdatesEnabled(True))
 
     def eventFilter(self, obj, event):
         # Держим кнопку-значок «развернуть консоль» прижатой к правому верхнему
@@ -1927,7 +2209,52 @@ class UnifiedWindow(QMainWindow):
                         try: self.log(f"tab drop error: {e}")
                         except Exception: pass
                     event.acceptProposedAction(); return True
+            elif et == QEvent.Type.Wheel:
+                self._tab_wheel_scroll(event)
+                return True
         return super().eventFilter(obj, event)
+
+    def _style_tab_scroll_buttons(self):
+        """QTabBar рисует прокрутку через обычные QToolButton — а те у нас
+        стилизованы глобально (config.STYLESHEET) под целую кнопку с фоном и
+        рамкой, из-за чего родная стрелка не рисуется и получаются «два
+        пустых квадратика». Ставим свою стрелку-иконку и снимаем фон/рамку
+        только у этих двух кнопок — как в браузере."""
+        bar = self.tabs.tabBar()
+        buttons = bar.findChildren(QToolButton)
+        if len(buttons) < 2:
+            return
+        # Непрозрачный фон обязателен: эти кнопки рисуются ПОВЕРХ последней
+        # вкладки, а не рядом с ней — с прозрачным/полупрозрачным фоном сквозь
+        # них было видно вкладку под низом (эффект «просвечивания»).
+        flat = ("QToolButton{background:#1e1e2e;border:none;border-radius:0px;"
+                "padding:0px;margin:0px;min-width:18px;min-height:0px;}"
+                "QToolButton:hover{background:#313244;}"
+                "QToolButton:disabled{background:#1e1e2e;}")
+        left, right = buttons[0], buttons[-1]
+        left.setIcon(get_icon('fa5s.chevron-left'))
+        right.setIcon(get_icon('fa5s.chevron-right'))
+        left.setText(""); right.setText("")
+        left.setIconSize(QSize(11, 11)); right.setIconSize(QSize(11, 11))
+        left.setStyleSheet(flat); right.setStyleSheet(flat)
+
+    def _tab_wheel_scroll(self, event):
+        """Крутим вкладки колёсиком мыши, как в браузере — через нативные
+        стрелки-прокрутки QTabBar (клика по ним программно)."""
+        try:
+            delta = event.angleDelta().y() or event.angleDelta().x()
+            if not delta:
+                return
+            bar = self.tabs.tabBar()
+            buttons = [b for b in bar.findChildren(QToolButton) if b.isVisible()]
+            if not buttons:
+                return
+            left, right = buttons[0], buttons[-1]
+            btn = left if delta > 0 else right
+            if btn.isEnabled():
+                btn.click()
+        except Exception:
+            pass
 
     # ── Перетаскивание файла на заголовок вкладки ────────────────────────────
     @staticmethod
@@ -1957,8 +2284,13 @@ class UnifiedWindow(QMainWindow):
 
     def _tab_drag_switch(self):
         if self._tab_drag_idx >= 0:
-            try: self.tabs.setCurrentIndex(self._tab_drag_idx)
+            self.setUpdatesEnabled(False)
+            try:
+                self._sync_console_visibility(self._tab_drag_idx)
+                self.tabs.setCurrentIndex(self._tab_drag_idx)
             except Exception: pass
+            finally:
+                QTimer.singleShot(0, lambda: self.setUpdatesEnabled(True))
 
     def _tab_drag_drop(self, bar, event):
         """Бросок файла прямо на заголовок: открываем вкладку и добавляем в неё
@@ -1972,7 +2304,10 @@ class UnifiedWindow(QMainWindow):
                  if u.toLocalFile()]
         if not paths:
             return
+        self.setUpdatesEnabled(False)
+        self._sync_console_visibility(idx)
         self.tabs.setCurrentIndex(idx)
+        QTimer.singleShot(0, lambda: self.setUpdatesEnabled(True))
         page = self.tabs.widget(idx)
         fn = (getattr(page, "accept_dropped_paths", None)
               or getattr(page, "add_paths", None))
@@ -2128,6 +2463,18 @@ class UnifiedWindow(QMainWindow):
                 tsh = getattr(self, "tab_shikimori", None)
                 if tsh is not None:
                     tsh.cleanup()
+            except Exception:
+                pass
+            try:
+                tlb = getattr(self, "tab_leaderboard", None)
+                if tlb is not None:
+                    tlb.cleanup()
+            except Exception:
+                pass
+            try:
+                tcp = getattr(self, "tab_coop", None)
+                if tcp is not None:
+                    tcp.cleanup()
             except Exception:
                 pass
             try:

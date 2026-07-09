@@ -11,6 +11,7 @@ from config import *
 from utils import *
 from utils import _cookie_matches_domain, _RE_DIGITS
 import re as _re_eta
+import math
 
 
 # Регэксп кадра из stderr ffmpeg ("frame=  123 fps= 45 ...").
@@ -351,6 +352,31 @@ class YtdlpWorker(QThread):
 
     # ─── ДОБАВИТЬ В YtdlpWorker ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _iter_stream_lines(stream):
+        """Итерирует поток, разбивая строки И по '\\n', И по '\\r'.
+
+        Обычный `for line in stream` режет только по '\\n'. Но ffmpeg (которым
+        yt-dlp качает отрезок через --download-sections) печатает прогресс
+        «frame=… time=… speed=…» через ВОЗВРАТ КАРЕТКИ '\\r' без перевода строки.
+        При построчной итерации такие обновления копятся в одном буфере и не
+        доставляются до конца процесса — из-за чего % нарезки не показывался, а
+        строка висела на watchdog-тикере «Скачивание… mm:ss». Читаем посимвольно
+        (объём вывода загрузки небольшой) и отдаём кусок на каждом '\\r'/'\\n'."""
+        buf = []
+        while True:
+            ch = stream.read(1)
+            if not ch:
+                if buf:
+                    yield "".join(buf)
+                return
+            if ch in ("\r", "\n"):
+                if buf:
+                    yield "".join(buf)
+                    buf = []
+            else:
+                buf.append(ch)
+
     def _exec_ytdlp(self, cmd: list, iid: str, is_audio_only: bool):
         """
         Запускает yt-dlp, читает stdout построчно.
@@ -373,7 +399,7 @@ class YtdlpWorker(QThread):
             creationflags=CREATE_NO_WINDOW, bufsize=1, env=subprocess_env())
         threading.Thread(target=self._watchdog, args=(self._proc,), daemon=True).start()
 
-        for raw in self._proc.stdout:
+        for raw in self._iter_stream_lines(self._proc.stdout):
             if not self.is_running:
                 break
             line = clean_ansi(raw.rstrip("\r\n"))
@@ -399,6 +425,25 @@ class YtdlpWorker(QThread):
                 continue
             if "@@PATH@@" in line:
                 out_fullpath = line.split("@@PATH@@", 1)[1].strip()
+                continue
+            # Прогресс НАРЕЗКИ: при --download-sections качает ffmpeg (не нативный
+            # загрузчик yt-dlp), поэтому строк @@@ нет — реальный процент берём из
+            # ffmpeg-строк «frame=… time=HH:MM:SS… speed=Nx» относительно длины
+            # отрезка. Отрицательный time (стартовый префрейм) regex не ловит —
+            # пропускаем. Эти строки НЕ льём в лог, чтобы не спамить консоль.
+            if (getattr(self, "_section_dur", None) and "time=" in line
+                    and ("frame=" in line or "size=" in line)):
+                m = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
+                if m:
+                    t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                    pct = max(0.0, min(99.9, t / self._section_dur * 100.0))
+                    sp = re.search(r"speed=\s*([\d.]+x)", line)
+                    self._enter_download_phase()
+                    self._last_real_progress = time.time()
+                    self._last_pct = pct
+                    self.progress_sig.emit(
+                        self._iid, pct,
+                        f"Нарезка {sp.group(1)}" if sp else "Нарезка…")
                 continue
             tail.append(line)
             self.log_sig.emit(line)
@@ -471,7 +516,6 @@ class YtdlpWorker(QThread):
 
             out_dir = self.c.get('outdir', '.') or '.'
             is_audio_only = self.c.get('audio_only', False)
-            force_kf = False if (is_audio_only or not self.c.get('force_kf', True)) else True
             merge = self.c.get('merge') or 'mp4'
             proxy = (self.c.get('proxy') or '').strip()
 
@@ -503,6 +547,7 @@ class YtdlpWorker(QThread):
 
             # download-sections — уникальное имя на каждый отрезок
             section_arg = None
+            self._section_dur = None   # длительность отрезка → % прогресса ffmpeg
             start_s = self.c.get('start_s')
             end_s = self.c.get('end_s')
             if start_s is not None or end_s is not None:
@@ -510,6 +555,8 @@ class YtdlpWorker(QThread):
                 e_val = int(end_s) if (end_s and end_s > s_val) else None
                 if (s_val and s_val > 0) or e_val:
                     section_arg = f"*{s_val}-{e_val if e_val else 'inf'}"
+                    if e_val:
+                        self._section_dur = float(e_val - s_val)
                     s_tag = f"{s_val}s"
                     e_tag = f"{e_val}s" if e_val else "end"
                     outtmpl = os.path.join(out_dir, f'%(title)s [{s_tag}-{e_tag}].%(ext)s')
@@ -537,8 +584,22 @@ class YtdlpWorker(QThread):
 
             # Указываем yt-dlp на наш ffmpeg (bundled в bin/) — иначе отдельный
             # процесс yt-dlp не найдёт ffmpeg для склейки/извлечения аудио.
-            if os.path.isabs(FFMPEG) and os.path.isfile(FFMPEG):
-                cmd += ["--ffmpeg-location", os.path.dirname(FFMPEG)]
+            # ВАЖНО: для нарезки отрезка (--download-sections) подсовываем ОТДЕЛЬНЫЙ
+            # ffmpeg 7.x (bin/ffmpeg7) — основной 8.x ломает нарезку (см. FFMPEG7_DIR
+            # в config.py и yt-dlp #16546: битый/audio-only отрезок). Для обычных
+            # загрузок остаётся основной ffmpeg.
+            ffloc = None
+            if section_arg and FFMPEG7_DIR:
+                ffloc = FFMPEG7_DIR
+            elif os.path.isabs(FFMPEG) and os.path.isfile(FFMPEG):
+                ffloc = os.path.dirname(FFMPEG)
+            if ffloc:
+                cmd += ["--ffmpeg-location", ffloc]
+                if section_arg and FFMPEG7_DIR:
+                    self.log_sig.emit("Отрезок: использую ffmpeg 7.x для нарезки (bin/ffmpeg7).")
+                elif section_arg:
+                    self.log_sig.emit("ВНИМАНИЕ: ffmpeg 7.x (bin/ffmpeg7) не найден — "
+                                      "нарезка отрезка на ffmpeg 8.x может дать битый файл.")
 
             # Прокси (если задан в настройках вкладки загрузок)
             if proxy:
@@ -628,7 +689,9 @@ class YtdlpWorker(QThread):
 
             if section_arg:
                 cmd += ["--download-sections", section_arg]
-                if force_kf:
+                # Force KF → точный рез с перекодированием в точках; иначе быстрый
+                # рез копированием (по ближайшим ключевым кадрам).
+                if not is_audio_only and self.c.get('force_kf'):
                     cmd += ["--force-keyframes-at-cuts"]
 
             cmd += [url]
@@ -711,6 +774,28 @@ class YtdlpWorker(QThread):
                     raise Exception("\n".join(tail) or f"yt-dlp завершился с кодом {rc}")
                 raise Exception("yt-dlp завершил работу, но файл не найден (ошибка скачивания)")
             out_fullpath = final_path
+
+            # На некоторых роликах yt-dlp завершается с rc=0, но молча скатывается
+            # на audio-only формат (обычно сбой nsig-расшифровки видеоформатов) —
+            # раньше такой результат репортился как «Готово» с битым файлом без
+            # картинки. Проверяем видеодорожку, если запрос был не аудио-only.
+            if not is_audio_only:
+                try:
+                    vp = subprocess.run(
+                        [FFPROBE, "-v", "error", "-select_streams", "v:0",
+                         "-show_entries", "stream=codec_type",
+                         "-of", "csv=p=0", out_fullpath],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        text=True, creationflags=CREATE_NO_WINDOW,
+                    )
+                    has_video = bool(vp.stdout.strip())
+                except Exception:
+                    has_video = True  # ffprobe недоступен — проверку не блокируем
+                if not has_video:
+                    raise Exception(
+                        "yt-dlp скачал файл без видеодорожки (только аудио) — "
+                        "вероятно, сбой получения видеоформатов (nsig/Deno). "
+                        "Попробуйте скачать заново.")
 
             try: self._cleanup_partials(out_dir, out_fullpath)
             except Exception: pass
@@ -896,12 +981,24 @@ class ProcessWorker(QThread):
     update_lufs_sig = pyqtSignal(str, object, object)
     update_dur_sig = pyqtSignal(str, str)   # iid, длительность итогового файла (сек, строкой)
     active_threads = pyqtSignal(int, int)  # (активных воркеров, максимум) — счётчик в UI
+    xpsnr_sig = pyqtSignal(str, object)     # iid, оценка XPSNR в дБ (float) | None
 
-    def __init__(self, queue_ref, settings):
+    # Нижняя граница preset для пробных кодирований в _metric_crf_search —
+    # не даём поиску унаследовать очень медленный (0-4) preset финального
+    # кодирования, иначе один пробный энкод 1080p может идти минутами.
+    _SEARCH_PRESET_FLOOR = 6
+
+    def __init__(self, queue_ref, settings, removed_ids=None):
         super().__init__()
         self.queue = queue_ref
         self.settings = settings
         self.stop_flag = False
+        # Живой набор iid'ов, удалённых пользователем из очереди во время
+        # обработки (тот же объект-множество, что и у MediaTab._removed_ids) —
+        # позволяет прервать УЖЕ идущий ffmpeg для конкретного файла, а не
+        # только не начинать ещё не стартовавшие (см. cancel_check в
+        # run_ffmpeg_capture).
+        self.removed_ids = removed_ids if removed_ids is not None else set()
         self.svt_available = require_svt()
         self._img_pool = None  # QThreadPool для параллельной обработки изображений
         self._active_count = 0
@@ -920,7 +1017,8 @@ class ProcessWorker(QThread):
         return name
 
     def stop(self): self.stop_flag = True
-    def measure_loudness(self, path): return measure_loudness(path, should_stop=lambda: self.stop_flag)
+    def measure_loudness(self, path, start=None, dur=None):
+        return measure_loudness(path, should_stop=lambda: self.stop_flag, start=start, dur=dur)
 
     @staticmethod
     def _priority_creationflag(priority):
@@ -995,16 +1093,52 @@ class ProcessWorker(QThread):
             return False
 
     @staticmethod
-    def _detect_crop(path: str, dur: float = 0.0):
+    def _bt709_color_args(path: str) -> list:
+        """-color_primaries/-color_trc/-colorspace bt709 — тегирует поток BT.709,
+        чтобы плееры не гадали и не показывали SDR-видео «вымытым»/пересвеченным
+        из-за неизвестного цветового пространства. Не меняет пиксели — только
+        метаданные контейнера.
+
+        БЕЗОПАСНО только для обычных SDR-источников: у настоящего HDR (PQ/HLG,
+        BT.2020) эти теги были бы НЕВЕРНЫМИ и испортили бы цвет при просмотре —
+        поэтому сперва читаем теги исходника через ffprobe и тегируем BT.709
+        лишь когда он сам уже BT.709 или вообще без тегов (частый случай для
+        обычных SDR-рипов) — то есть только ДОБАВЛЯЕМ то, что и так верно, а не
+        переопределяем реально другое цветовое пространство."""
+        try:
+            p = subprocess.run(
+                [FFPROBE, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=color_primaries,color_transfer,color_space",
+                 "-of", "default=noprint_wrappers=1:nokey=1", path],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, creationflags=CREATE_NO_WINDOW, timeout=15,
+            )
+            vals = [v.strip().lower() for v in (p.stdout or "").splitlines()]
+        except Exception:
+            return []
+        _SAFE = {"", "unknown", "unspecified", "n/a", "bt709", "bt470bg", "smpte170m"}
+        _HDR_MARKERS = ("bt2020", "smpte2084", "arib-std-b67")
+        if any(any(m in v for m in _HDR_MARKERS) for v in vals):
+            return []  # настоящий HDR/BT.2020 — не трогаем
+        if any(v not in _SAFE for v in vals):
+            return []  # что-то нестандартное — на всякий случай не тегируем
+        return ["-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
+
+    @staticmethod
+    def _detect_crop(path: str, dur: float = 0.0, start: float = 0.0):
         """Определяет рамку видео без чёрных полос через ffmpeg cropdetect.
         Возвращает строку 'w:h:x:y' для фильтра crop или None, если полос нет
         (детектированная рамка совпадает с исходным кадром).
 
         Пропускаем первые ~10% (интро/логотипы часто на чёрном фоне дают ложный
         full-frame), анализируем ограниченный отрезок — детект быстрый и не читает
-        весь файл. round=2 — чётные размеры (требование SVT-AV1)."""
+        весь файл. round=2 — чётные размеры (требование SVT-AV1).
+
+        start — смещение начала анализируемого отрезка (обрезка: сэмплить нужно
+        внутри [in_s,out_s), а не с начала всего файла)."""
         try:
-            ss = ["-ss", f"{dur * 0.1:.2f}"] if dur and dur > 12 else []
+            ss = ["-ss", f"{start + dur * 0.1:.2f}"] if dur and dur > 12 else (
+                ["-ss", f"{start:.2f}"] if start else [])
             cmd = [FFMPEG, "-hide_banner"] + ss + [
                 "-i", path, "-t", "12",
                 "-vf", "cropdetect=limit=24:round=2:reset=0",
@@ -1043,13 +1177,265 @@ class ProcessWorker(QThread):
             return None
 
     @staticmethod
-    def _choose_pix_fmt(has_alpha: bool, ten_bit: bool = False) -> str:
-        """Возвращает pix_fmt с учётом альфа-канала."""
-        if has_alpha:
-            return "yuva420p10le" if ten_bit else "yuva420p"
-        return "yuv420p10le" if ten_bit else "yuv420p"
+    def _choose_pix_fmt(has_alpha: bool) -> str:
+        """Возвращает pix_fmt с учётом альфа-канала. Всегда 10-бит
+        (yuv420p10le/yuva420p10le) — выбора 8-бит в настройках больше нет."""
+        return "yuva420p10le" if has_alpha else "yuv420p10le"
 
-    def run_ffmpeg_capture(self, cmd, total_est_sec, percent_callback, label=None, eta_calc=None):
+    @staticmethod
+    def _target_dims(ow, oh, adim=0, wlim=0, hlim=0):
+        """Целевой размер картинки с учётом всех активных пределов сразу:
+        макс. сторона (adim), макс. ширина (wlim), макс. высота (hlim). Пропорции
+        сохраняются, применяется самый строгий предел, увеличение не делается.
+        Возвращает (w, h) чётные, либо None если ужимать не нужно / размер неизвестен."""
+        try:
+            ow, oh = int(ow), int(oh)
+        except Exception:
+            return None
+        if ow <= 0 or oh <= 0:
+            return None
+        factor = 1.0
+        if adim and adim > 0: factor = min(factor, adim / max(ow, oh))
+        if wlim and wlim > 0: factor = min(factor, wlim / ow)
+        if hlim and hlim > 0: factor = min(factor, hlim / oh)
+        if factor >= 1.0:
+            return None  # уже вписывается во все пределы — не трогаем
+        tw = max(2, int(round(ow * factor)))
+        th = max(2, int(round(oh * factor)))
+        tw -= tw % 2; th -= th % 2  # чётные стороны — безопасно для 4:2:0/4:2:2
+        return (max(2, tw), max(2, th))
+
+    @staticmethod
+    def _avif_pix_fmt(has_alpha, chroma='420'):
+        """pix_fmt для AVIF по выбранной цветовой субдискретизации. Всегда
+        10-бит — выбора 8-бит в настройках больше нет.
+        420 — минимальный размер, 444 — максимум цветовой чёткости (крупнее файл).
+        При альфе цвет всегда идёт как yuva420p10le (альфа выносится
+        alphaextract'ом отдельным потоком), поэтому субдискретизация тут
+        неприменима."""
+        if has_alpha:
+            return "yuva420p10le"
+        return {'420': 'yuv420p10le', '422': 'yuv422p10le', '444': 'yuv444p10le'}.get(str(chroma), 'yuv420p10le')
+
+    @staticmethod
+    def _av1_encoder_args(crf, preset, pix_fmt, tune=0):
+        """Аргументы кодировщика SVT-AV1 (единственный используемый кодек).
+        tune — режим тюнинга SVT-AV1, выбирается в настройках (c_tune в
+        tabs.py): 0=VQ (по умолчанию), 1=PSNR, 2=SSIM, 4=MS-SSIM, 5=VMAF.
+        tune=3 (IQ) намеренно не предлагается — работает только в
+        all-intra/low-delay предсказании и падает с ошибкой на нашей
+        random-access GOP-структуре (keyint=-1:scd=1 ниже). Выбор целевой
+        метрики подбора CRF в настройках (Выкл/XPSNR) с этим тюнингом не
+        связан — тот влияет только на то, ОТКУДА берётся crf, см.
+        _metric_crf_search (самостоятельный подбор CRF под целевую метрику,
+        без внешних инструментов).
+        GOP: keyint=-1 (без принудительного периода) + scd=1 (детектор смены
+        сцены) — ключевые кадры ставятся ТОЛЬКО на реальных сменах сцены.
+        Принудительные периодические keyframe — самая дорогая по битам часть
+        потока, поэтому это даёт максимальную оптимизацию под размер файла."""
+        return ["-c:v", "libsvtav1", "-crf", str(crf),
+                "-preset", str(max(0, min(13, int(preset)))),
+                "-svtav1-params", f"tune={int(tune)}:keyint=-1:scd=1",
+                "-pix_fmt", pix_fmt]
+
+    def _measure_metric(self, orig_path, enc_path, metric):
+        """Сравнивает enc_path с orig_path через встроенный ffmpeg-фильтр
+        xpsnr, возвращает единое число (XPSNR в дБ) или None при ошибке.
+        scale2ref подстраивает оригинал под размер закодированного кадра —
+        иначе фильтр падает при несовпадении разрешений (когда в vf_list
+        есть scale/crop)."""
+        cmd = [FFMPEG, "-i", enc_path, "-i", orig_path,
+               "-filter_complex",
+               f"[1:v][0:v]scale2ref=flags=bicubic[ref][enc];[enc][ref]{metric}",
+               "-f", "null", "-"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", creationflags=CREATE_NO_WINDOW, timeout=300)
+        except Exception:
+            return None
+        out = (r.stderr or "") + (r.stdout or "")
+        if metric == 'xpsnr':
+            m = re.search(r'XPSNR\s+y:\s*([\d.]+)\s+u:\s*([\d.]+)\s+v:\s*([\d.]+)', out)
+            if not m:
+                return None
+            y, u, v = float(m.group(1)), float(m.group(2)), float(m.group(3))
+            # Взвешенное усреднение в линейной (MSE) области с весами 4:1:1
+            # (яркость:цветность при 4:2:0) — стандартная формула сведения
+            # XPSNR к одному числу, а не наивное среднее в дБ.
+            lin = (4 * (10 ** (-y / 10)) + (10 ** (-u / 10)) + (10 ** (-v / 10))) / 6
+            return -10 * math.log10(lin) if lin > 0 else 99.0
+        return None
+
+    def _measure_at_crf(self, sample_path, crf, preset, pix_fmt, tune, vf_list,
+                        metric='xpsnr', cancel_check=None):
+        """Кодирует sample_path (короткий сэмпл, см. metric_sample_input в
+        _process_one) заданным CRF и меряет метрику против него же — разовый
+        замер (без бинарного поиска _metric_crf_search) для колонки «Оценка
+        XPSNR», когда CRF ручной (вместо цели по метрике) или подбор не удался.
+        Возвращает float | None."""
+        tmp_out = os.path.join(TEMP_DIR, f"xpsnrscore_{uuid.uuid4().hex}.mkv")
+        try:
+            if self.stop_flag or (cancel_check is not None and cancel_check()):
+                return None
+            cmd = ([FFMPEG, "-y", "-i", sample_path] +
+                   self._av1_encoder_args(crf, preset, pix_fmt, tune) + ["-an"])
+            if vf_list: cmd += ["-vf", ",".join(vf_list)]
+            cmd += ["-threads", "0", tmp_out]
+            ok = self._run_killable(cmd, cancel_check=cancel_check)
+            if not ok or not os.path.exists(tmp_out):
+                return None
+            return self._measure_metric(sample_path, tmp_out, metric)
+        except Exception:
+            return None
+        finally:
+            try:
+                if os.path.exists(tmp_out): os.remove(tmp_out)
+            except Exception: pass
+
+    def _run_killable(self, cmd, cancel_check=None, on_tick=None, t_start=None, poll=0.4):
+        """Popen + периодический опрос вместо блокирующего subprocess.run —
+        stop_flag/cancel_check подхватываются в пределах poll секунд, а не
+        только когда сам процесс (может идти минутами на медленном preset)
+        завершится сам. Возвращает True при успешном (returncode 0) завершении,
+        False при ошибке/отмене."""
+        si = subprocess.STARTUPINFO() if IS_WIN else None
+        if IS_WIN and si is not None: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 creationflags=CREATE_NO_WINDOW | getattr(self, '_priority_flag', 0),
+                                 startupinfo=si)
+        except Exception:
+            return False
+        last_tick = time.time()
+        while True:
+            if self.stop_flag or (cancel_check is not None and cancel_check()):
+                try: p.kill()
+                except Exception: pass
+                try: p.wait(timeout=3)
+                except Exception: pass
+                return False
+            try:
+                p.wait(timeout=poll)
+                return p.returncode == 0
+            except subprocess.TimeoutExpired:
+                now = time.time()
+                if on_tick is not None and t_start is not None and now - last_tick >= 1.0:
+                    last_tick = now
+                    try: on_tick(now - t_start)
+                    except Exception: pass
+                continue
+
+    def _metric_crf_search(self, path, preset, pix_fmt, metric, target,
+                            vf_list, cancel_check=None, on_tick=None, tune=0):
+        """Подбирает CRF (0-63) без внешних инструментов: вырезает из середины
+        файла короткий (~15с) сэмпл и бинарным поиском находит максимальный
+        CRF (= минимальный размер), при котором SVT-AV1 (tune — тот же
+        тюнинг, что и в финальном кодировании, см. _av1_encoder_args) всё ещё
+        даёт метрику (xpsnr, встроенный фильтр ffmpeg) не хуже target.
+
+        Сперва проверяется CRF=0 (лучшее возможное качество) — если даже он не
+        дотягивает до target, цель физически недостижима на этом материале
+        (типично для шумного/зернистого видео), и нет смысла тратить время на
+        полный бинарный поиск (было — до 6 пробных кодирований вслепую, минуты
+        на медленных preset'ах; стало — 1 пробa и мгновенный честный отказ).
+
+        preset для проб ограничен снизу (не медленнее _SEARCH_PRESET_FLOOR),
+        независимо от того, насколько медленный preset выбран для финального
+        кодирования — иначе один пробный энкод 1080p на preset=0-2 может идти
+        по несколько минут, и Стоп ждал бы своего часа между попытками. Более
+        быстрый preset для поиска — общепринятый компромисс (напр. в ab-av1):
+        качество при том же CRF на быстром preset обычно НЕ выше, чем на
+        медленном, поэтому финальный (медленный) preset с подобранным CRF
+        будет не хуже, а обычно даже с запасом.
+
+        Возвращает (crf:int|None, info:str) — при успехе info — достигнутое
+        значение метрики пробы, при неудаче — причина отказа."""
+        t_start = time.time()
+        search_preset = max(int(preset), self._SEARCH_PRESET_FLOOR)
+        try:
+            dur, *_ = get_media_info(path)
+        except Exception:
+            dur = 0.0
+        sample_path = path
+        sample_tmp = None
+        if dur and dur > 20:
+            sample_len = min(15.0, dur * 0.3)
+            start = max(0.0, dur / 2 - sample_len / 2)
+            sample_tmp = os.path.join(TEMP_DIR, f"metricsample_{uuid.uuid4().hex}"
+                                                 f"{os.path.splitext(path)[1] or '.mkv'}")
+            try:
+                cmd_cut = [FFMPEG, "-y", "-ss", f"{start:.3f}", "-i", path,
+                           "-t", f"{sample_len:.3f}", "-c", "copy", sample_tmp]
+                subprocess.run(cmd_cut, capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=60)
+                if os.path.exists(sample_tmp) and os.path.getsize(sample_tmp) > 0:
+                    sample_path = sample_tmp
+                else:
+                    sample_tmp = None
+            except Exception:
+                sample_tmp = None
+
+        def _cleanup_sample():
+            if sample_tmp:
+                try:
+                    if os.path.exists(sample_tmp): os.remove(sample_tmp)
+                except Exception: pass
+
+        def _cancelled():
+            return self.stop_flag or (cancel_check is not None and cancel_check())
+
+        def _trial(crf):
+            """Кодирует сэмпл с данным CRF и измеряет метрику. Возвращает
+            (score:float|None, err:str|None); err='отменено' при остановке."""
+            if _cancelled():
+                return None, "отменено"
+            tmp_out = os.path.join(TEMP_DIR, f"metrictrial_{uuid.uuid4().hex}.mkv")
+            cmd = ([FFMPEG, "-y", "-i", sample_path] +
+                   self._av1_encoder_args(crf, search_preset, pix_fmt, tune) + ["-an"])
+            if vf_list: cmd += ["-vf", ",".join(vf_list)]
+            cmd += ["-threads", "0", tmp_out]
+            ok = self._run_killable(cmd, cancel_check=cancel_check, on_tick=on_tick, t_start=t_start)
+            if not ok:
+                try:
+                    if os.path.exists(tmp_out): os.remove(tmp_out)
+                except Exception: pass
+                return None, ("отменено" if _cancelled() else "ошибка пробного кодирования")
+            score = self._measure_metric(sample_path, tmp_out, metric) if os.path.exists(tmp_out) else None
+            try:
+                if os.path.exists(tmp_out): os.remove(tmp_out)
+            except Exception: pass
+            if on_tick is not None:
+                try: on_tick(time.time() - t_start)
+                except Exception: pass
+            return score, (None if score is not None else "не удалось измерить метрику")
+
+        # Проверка достижимости: лучший возможный случай — CRF=0.
+        score0, err0 = _trial(0)
+        if err0 is not None:
+            _cleanup_sample()
+            return None, err0
+        if score0 < target:
+            _cleanup_sample()
+            return None, (f"даже CRF 0 (лучшее качество) даёт {metric.upper()} ≈{score0:.2f} "
+                          f"< цели {target:.2f} — недостижимо на этом материале")
+
+        lo, hi = 0, 63
+        best_crf, best_info = 0, f"{score0:.2f}"
+        tries, max_tries = 0, 5
+        while lo < hi and tries < max_tries:
+            mid = (lo + hi + 1) // 2
+            score, err = _trial(mid)
+            tries += 1
+            if err is not None:
+                break
+            if score >= target:
+                best_crf, best_info = mid, f"{score:.2f}"
+                lo = mid
+            else:
+                hi = mid - 1
+        _cleanup_sample()
+        return best_crf, best_info
+
+    def run_ffmpeg_capture(self, cmd, total_est_sec, percent_callback, label=None, eta_calc=None, cancel_check=None):
         si = subprocess.STARTUPINFO() if IS_WIN else None
         if IS_WIN and si is not None: si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         buf = deque(maxlen=8000)
@@ -1065,7 +1451,9 @@ class ProcessWorker(QThread):
         total_frames = getattr(eta_calc, 'total_frames', 0) if eta_calc is not None else 0
         try:
             while True:
-                if self.stop_flag:
+                # cancel_check: файл убрали из очереди во время обработки (см.
+                # MediaTab.rem) — прерываем ТОЛЬКО этот процесс, не весь stop_flag.
+                if self.stop_flag or (cancel_check is not None and cancel_check()):
                     try: p.kill()
                     except Exception: pass
                     try:
@@ -1144,15 +1532,20 @@ class ProcessWorker(QThread):
             stderr_tail = ''.join(buf)
             raise subprocess.CalledProcessError(p.returncode, cmd, output=None, stderr=stderr_tail)
 
-    def _estimate_total_frames(self, src_path, speed_factor, cmd):
+    def _estimate_total_frames(self, src_path, speed_factor, cmd, dur_override=None):
         """Оценка числа ВЫХОДНЫХ кадров видео для знаменателя ETA.
         Учитывает изменение скорости (setpts) и принудительный -r из cmd.
         Возвращает 0, если оценить не удалось (тогда ETA-калькулятор не создаётся
-        и работает старая оценка по доле прогресса)."""
+        и работает старая оценка по доле прогресса).
+
+        dur_override — длительность ВХОДА в секундах, если она уже известна и НЕ
+        равна полной длительности src_path (обрезка: кодируем не весь файл, а
+        отрезок [in_s,out_s) — иначе ETA считало бы кадры на весь исходник)."""
         try:
-            dur = 0.0
-            try: dur, *_ = get_media_info(src_path)
-            except Exception: dur = 0.0
+            dur = float(dur_override) if dur_override and dur_override > 0 else 0.0
+            if not dur:
+                try: dur, *_ = get_media_info(src_path)
+                except Exception: dur = 0.0
             if not dur or dur <= 0:
                 return 0
             sf = speed_factor if speed_factor and speed_factor > 0 else 1.0
@@ -1186,6 +1579,58 @@ class ProcessWorker(QThread):
             return "128k"
         return f"{sel_val}k"
 
+    @staticmethod
+    def _trim_seek_args(in_s, out_s, speed_factor=1.0):
+        """Тот же приём, что EditTab._execute_cut (edit_tab.py:8841-8876): быстрый
+        ВХОДНОЙ pre-seek (до ближайшей секунды перед резом) экономит декодирование
+        на длинных файлах, а частичный ВЫХОДНОЙ -ss/-t после него остаётся
+        кадрово-точным (секунды передаём как есть, без округления до HH:MM:SS —
+        погрешности форматирования нет, поэтому pre-seek компенсировать не нужно).
+
+        `-ss` тут ВЫХОДНОЙ (после -i, без второго -i дальше) — ffmpeg декодирует
+        и отбрасывает кадры до точки, PTS не обнуляются, а `-t` считает
+        длительность уже В ВЫХОДНОЙ (постфильтровой) шкале. Если включена смена
+        скорости — setpts потом делит PTS на speed_factor, поэтому сам `-t`
+        обязан быть уже поделен на speed_factor: иначе он ограничит ВЫХОД
+        нетронутыми «сырыми» секундами и декодер прочитает far больше входа,
+        чем нужно (проверено: без деления вместо 5с/1.5x=3.33с выходило
+        ровно 5с — «-t» душил по немасштабированному времени).
+
+        Возвращает (pre_args, post_args, t0): pre_args/post_args — куски cmd
+        (pre_args ДО `-i`, post_args ПОСЛЕ), t0 — время начала клипа в шкале
+        фильтрграфа, нужное чтобы сдвинуть st= у фейдов на правильную величину
+        (t0_video ниже уже сам делит на скорость там, где это нужно).
+
+        ВАЖНО про t0: шкалу времени фильтрграфа задаёт именно ВЫХОДНОЙ `-ss`
+        (значение после -i), а НЕ абсолютная позиция in_s. Когда есть входной
+        pre-seek (`-ss (in_s-PRESEEK)` до -i), он обнуляет тайминги в точке
+        pre-seek, и последующий выходной `-ss PRESEEK` выводит клип, начинающийся
+        в шкале фильтров с PRESEEK — а не с in_s. Поэтому t0 = значение выходного
+        `-ss`: PRESEEK в ветке с pre-seek, in_s — без него. Раньше здесь всегда
+        возвращалось in_s, из-за чего при in_s>6с (ветка pre-seek) afade/vfade
+        ставились на st ≈ in_s+dur (за пределами клипа) и фейды НЕ применялись,
+        хотя суффикс _fade в имени присутствовал (баг «пишет fade, а его нет»).
+        При in_s≤6с (без pre-seek) t0=in_s был и остаётся верным."""
+        PRESEEK = 3.0
+        dur = max(0.0, out_s - in_s)
+        sf = speed_factor if speed_factor else 1.0
+        out_dur = dur / sf
+        # ВЫХОДНОЙ `-ss` применяется к ПОСТфильтровой шкале — а видео там уже
+        # сжато setpts=(1/speed)*PTS (и звук atempo), поэтому seek обязан быть
+        # ПОДЕЛЁН на speed_factor РОВНО КАК `-t`. Раньше делили только `-t`, а
+        # `-ss` слали как есть (PRESEEK/in_s) — при speed≠100% старт уезжал вправо
+        # на seek*(speed−1) (напр. PRESEEK=3с ×0.07 = 0.21с ≈ 5 кадров при 107%:
+        # баг «обрезка сдвигает начало, первое слово срезается»). Проверено
+        # покадрово (SSIM) на реальном 25fps h264: с делением старт встаёт ровно
+        # на in_s, без — на in_s + PRESEEK*(speed−1). При speed=100% sf=1 → как было.
+        # t0 (шкала фильтрграфа для st= фейдов) остаётся в ИСХОДНОЙ до-setpts шкале
+        # (PRESEEK / in_s) — фейды считаются до atempo/после setpts по сырому t0.
+        if in_s > 2 * PRESEEK:
+            return (["-ss", f"{in_s - PRESEEK:.6f}"],
+                    ["-ss", f"{PRESEEK / sf:.6f}", "-t", f"{out_dur:.6f}"],
+                    PRESEEK)
+        return ([], ["-ss", f"{in_s / sf:.6f}", "-t", f"{out_dur:.6f}"], in_s)
+
     def process_media(self, item, cb):
         path = item['path']
         base, ext = os.path.splitext(path)
@@ -1198,6 +1643,25 @@ class ProcessWorker(QThread):
         speed_factor = float(speed_percent) / 100.0
         video_enabled = sv.get('enabled', True)
 
+        # Обрезка + «Обработка» одним проходом (кнопка «Обрезать и обработать» в
+        # Монтаже после неточной copy-обрезки): item['trim'] = (in_s, out_s) —
+        # режем диапазон исходника ПРЯМО в этом же кодировании, без отдельного
+        # x264-реэнкода перед «Обработкой» (которое раньше давало двойное
+        # поколение потерь). trim_pre/trim_post вставляются туда, где команда
+        # ПЕРВЫЙ раз читает оригинальный `path` (Pass-1, если он есть, иначе
+        # Pass-2/прямой проход) — при video_enabled=True Pass-1 архитектурно не
+        # запускается (см. step1_needed ниже), так что почти всегда это Pass-2.
+        trim = item.get('trim')
+        if trim:
+            trim_pre, trim_post, t0 = self._trim_seek_args(trim[0], trim[1], speed_factor)
+        else:
+            trim_pre, trim_post, t0 = [], [], 0.0
+        # t0 сдвинут видеофильтрам через setpts (он стоит РАНЬШЕ fade в vf_list —
+        # к моменту fade PTS уже поделены на speed_factor), а аудиофильтрам —
+        # БЕЗ деления (atempo в audio_filters добавляется В КОНЦЕ списка, после
+        # fade-фильтров, так что на момент afade PTS ещё исходные).
+        t0_video = (t0 / speed_factor) if speed_factor else t0
+
         vcodec = get_video_codec(path)
         is_video = (vcodec is not None)
 
@@ -1208,10 +1672,22 @@ class ProcessWorker(QThread):
             self.log.emit(f"Имя переименовано (AI-бренд): «{out_name}» → «{sanitized}»")
             out_name = sanitized
 
+        # Удалить аудио — при видео полностью вырезаем звуковую дорожку (-an),
+        # остальные аудио-настройки (loudnorm/fade/degrade/битрейт) тогда не
+        # имеют смысла. Для аудио-файлов (is_video=False) галочка игнорируется —
+        # вырезать звук из чистого аудио значило бы получить пустой файл.
+        remove_audio = bool(sa.get('remove')) and is_video
+
         suffix = ""
-        if is_video and video_enabled: suffix += f"_crf{crf}_speed{speed_percent}"
-        if sa.get('norm'): suffix += "_norm"
-        if sa.get('fade'): suffix += "_fade"
+        if is_video and video_enabled:
+            # При авто-подборе (xpsnr) фактический CRF станет известен только
+            # позже, для каждого файла свой — в имя пишем маркер режима
+            # вместо ручного crf, чтобы не соврать цифрой, взятой ДО подбора.
+            crf_tag = "autocrf" if sv.get('metric') == 'xpsnr' else f"crf{crf}"
+            suffix += f"_{crf_tag}_speed{speed_percent}"
+        if remove_audio: suffix += "_noaudio"
+        elif sa.get('norm'): suffix += "_norm"
+        if not remove_audio and sa.get('fade'): suffix += "_fade"
         out_name = out_name + suffix + out_ext
         out = os.path.join(out_dir, out_name)
 
@@ -1219,8 +1695,11 @@ class ProcessWorker(QThread):
         audio_bitrate = self.get_target_bitrate_str(path, sel_br)
 
         before_lufs = None
-        try: before_lufs = self.measure_loudness(path)
-        except Exception: pass
+        if not remove_audio:
+            try:
+                before_lufs = (self.measure_loudness(path, start=trim[0], dur=item.get('dur'))
+                                if trim else self.measure_loudness(path))
+            except Exception: pass
         # Замер громкости делается всегда (для «Было LUFS») и для длинных файлов
         # длится минуты — если за это время нажали «Стоп», прерываемся здесь же.
         if self.stop_flag:
@@ -1230,37 +1709,40 @@ class ProcessWorker(QThread):
             raise Exception("libsvtav1 не доступен в вашей сборке ffmpeg — скрипт настроен работать ТОЛЬКО с svt (libsvtav1).")
 
         audio_filters = []
-        if sa.get('norm'):
-            tgt_i = float(sa.get('tgt', -20.0))
-            lra = float(sa.get('lra', 11.0))
-            tp = float(sa.get('tp', -1.5))
-            audio_filters.append(f"loudnorm=I={tgt_i}:LRA={lra}:TP={tp}")
-        if sa.get('fade_in'):
-            fade_in_d = sa.get('fade_in_d', 1.0)
-            audio_filters.append(f"afade=t=in:st=0:d={fade_in_d}")
-        if sa.get('fade'):
-            fade_d = sa.get('fade_d', 1.0)
-            item_dur = item.get('dur') or 0.0
-            if item_dur <= 0.0:
-                # dur мог не считаться при добавлении (кириллика в пути, ffprobe упал) —
-                # читаем прямо сейчас, когда файл точно доступен
-                try:
-                    item_dur, *_ = get_media_info(path)
-                except Exception:
-                    item_dur = 0.0
-            audio_filters.append(f"afade=t=out:st={max(0.0, item_dur - fade_d):.3f}:d={fade_d}")
-        if sa.get('deg'):
-            audio_filters.append(f"lowpass=f={sa.get('lp', 3000)}")
-            audio_filters.append(f"highpass=f={sa.get('hp', 200)}")
-            hz = int(sa.get('hz', 44100))
-            if sa.get('u8'):
-                audio_filters.append(f"aformat=sample_fmts=u8:sample_rates={hz}")
-            gain_db = float(sa.get('deg_gain_db', 0.0))
-            if abs(gain_db) > 0.01:
-                audio_filters.append(f"volume={gain_db}dB")
-        
-        if abs(speed_factor - 1.0) > 0.01:
-            audio_filters.extend(_build_atempo_chain(speed_factor))
+        if not remove_audio:
+            if sa.get('norm'):
+                tgt_i = float(sa.get('tgt', -20.0))
+                lra = float(sa.get('lra', 11.0))
+                tp = float(sa.get('tp', -1.5))
+                audio_filters.append(f"loudnorm=I={tgt_i}:LRA={lra}:TP={tp}")
+            if sa.get('fade_in'):
+                fade_in_d = sa.get('fade_in_d', 1.0)
+                # st=t0: при обрезке (trim) seek не обнуляет PTS — фильтр видит
+                # исходное время клипа, поэтому фейд-ин должен начинаться от t0, а не 0.
+                audio_filters.append(f"afade=t=in:st={t0:.3f}:d={fade_in_d}")
+            if sa.get('fade'):
+                fade_d = sa.get('fade_d', 1.0)
+                item_dur = item.get('dur') or 0.0
+                if item_dur <= 0.0:
+                    # dur мог не считаться при добавлении (кириллика в пути, ffprobe упал) —
+                    # читаем прямо сейчас, когда файл точно доступен
+                    try:
+                        item_dur, *_ = get_media_info(path)
+                    except Exception:
+                        item_dur = 0.0
+                audio_filters.append(f"afade=t=out:st={max(0.0, t0 + item_dur - fade_d):.3f}:d={fade_d}")
+            if sa.get('deg'):
+                audio_filters.append(f"lowpass=f={sa.get('lp', 3000)}")
+                audio_filters.append(f"highpass=f={sa.get('hp', 200)}")
+                hz = int(sa.get('hz', 44100))
+                if sa.get('u8'):
+                    audio_filters.append(f"aformat=sample_fmts=u8:sample_rates={hz}")
+                gain_db = float(sa.get('deg_gain_db', 0.0))
+                if abs(gain_db) > 0.01:
+                    audio_filters.append(f"volume={gain_db}dB")
+
+            if abs(speed_factor - 1.0) > 0.01:
+                audio_filters.extend(_build_atempo_chain(speed_factor))
 
         temp_files = []
         attempted_out = out
@@ -1322,8 +1804,11 @@ class ProcessWorker(QThread):
             if src_dur_cap <= 0.0:
                 try: src_dur_cap, *_ = get_media_info(path)
                 except Exception: src_dur_cap = 0.0
+            # dur_cap дублировал бы наш собственный -t из trim_post тем же числом
+            # (src_dur_cap уже = item['dur'] = длине отрезка) — пропускаем, чтобы
+            # не слать ffmpeg два -t подряд.
             dur_cap = (["-t", f"{float(src_dur_cap):.3f}"]
-                       if (normal_speed and audio_filters and src_dur_cap > 0) else [])
+                       if (normal_speed and audio_filters and src_dur_cap > 0 and not trim) else [])
 
             if step1_needed:
                 # Промежуточный контейнер для видео — Matroska: он принимает копию
@@ -1337,21 +1822,52 @@ class ProcessWorker(QThread):
                 # Берём только НАСТОЯЩЕЕ видео+аудио (0:V? исключает обложки/
                 # attached_pic, 0:a? — аудио). Субтитры/вложения/данные не маппим:
                 # их кодеки несовместимы с контейнером → иначе ffmpeg падает.
-                cmd_step1 = [FFMPEG, "-y", "-i", current_input, "-map", "0:V?", "-map", "0:a?"]
-                cmd_step1 += ["-af", _opus_af(audio_filters)]
-                cmd_step1 += ["-c:a", audio_codec, "-b:a", audio_bitrate]
+                # current_input здесь всегда == path (Pass-1 — первый читатель
+                # оригинала), поэтому trim_pre/trim_post режут именно исходник.
+                cmd_step1 = [FFMPEG, "-y"] + trim_pre + ["-i", current_input] + trim_post \
+                            + ["-map", "0:V?"] + ([] if remove_audio else ["-map", "0:a?"]) \
+                            + ["-map_metadata", "-1"]
+                if remove_audio:
+                    cmd_step1 += ["-an"]
+                else:
+                    # Аудио-онли: этот Pass-1 И ЕСТЬ финальный файл (ветка else
+                    # ниже просто переносит .opus-посредник в вывод). Значит хвост
+                    # от latency loudnorm надо срезать ЗДЕСЬ, иначе итог длиннее
+                    # источника (без -t → 16.47→16.92). aresample=async=1 правит
+                    # старт/склейку, реальный кап длины даёт -t (ниже).
+                    if (not is_video) and normal_speed and audio_filters:
+                        af1 = ",".join(list(audio_filters)
+                                       + ["aresample=async=1", opus_layout_fix])
+                    else:
+                        af1 = _opus_af(audio_filters)
+                    cmd_step1 += ["-af", af1]
+                    cmd_step1 += ["-c:a", audio_codec, "-b:a", audio_bitrate]
                 if is_video: cmd_step1 += ["-c:v", "copy"]
-                else: cmd_step1 += ["-vn"]
+                else:
+                    cmd_step1 += ["-vn"]
+                    # Аудио-онли opus: контейнерная длительность = длине аудио-
+                    # дорожки. libopus ВСЕГДА добавляет фиксированную задержку
+                    # кодера (pre-skip 312 сэмплов = 6.5 мс @48кГц): эмпирически
+                    # итог = (-t) + 0.0065 РОВНО, независимо от длины/битрейта.
+                    # Поэтому -t компенсируем на pre-skip, чтобы длительность
+                    # совпала с источником точь-в-точь (иначе 16.470→16.4765,
+                    # округляется до 16.48). Срезаемые 6.5 мс — в самом конце, на
+                    # затухании, неслышны. Гейт как у dur_cap: нормальная скорость,
+                    # есть аудиофильтры, нет trim (при trim длину задаёт trim_post).
+                    if (not remove_audio and normal_speed and audio_filters
+                            and src_dur_cap > 0 and not trim):
+                        cmd_step1 += ["-t", f"{max(0.0, float(src_dur_cap) - 0.0065):.4f}"]
                 cmd_step1 += [temp_intermediate]
 
                 orig_size = os.path.getsize(path) if os.path.exists(path) else 1
-                self.run_ffmpeg_capture(cmd_step1, max(1, int(orig_size/1000000)), cb, label="Pass 1 (Audio)")
+                self.run_ffmpeg_capture(cmd_step1, max(1, int(orig_size/1000000)), cb, label="Pass 1 (Audio)", cancel_check=lambda: item["iid"] in self.removed_ids)
                 current_input = temp_intermediate
 
-                try:
-                    after_norm = self.measure_loudness(temp_intermediate)
-                    self.update_lufs_sig.emit(item['iid'], before_lufs, after_norm)
-                except Exception: pass
+                if not remove_audio:
+                    try:
+                        after_norm = self.measure_loudness(temp_intermediate)
+                        self.update_lufs_sig.emit(item['iid'], before_lufs, after_norm)
+                    except Exception: pass
 
             if is_video and video_enabled:
                 if not self.svt_available: raise Exception("libsvtav1 отсутствует — отмена перекодирования.")
@@ -1359,7 +1875,9 @@ class ProcessWorker(QThread):
                 # фильтры и кодируем opus прямо здесь. aresample=async=1 + отсутствие
                 # .mkv-кругового прохода убирают сдвиг/удлинение аудио. Без фильтров —
                 # копируем исходную дорожку без потерь.
-                if single_pass_video and audio_filters:
+                if remove_audio:
+                    step2_audio = ["-an"]
+                elif single_pass_video and audio_filters:
                     af_chain = list(audio_filters)
                     if abs(speed_factor - 1.0) <= 0.01:
                         # Выравниваем длину аудио к длине входной дорожки — убирает
@@ -1377,7 +1895,11 @@ class ProcessWorker(QThread):
                 timing_args = ["-fps_mode", "passthrough"] if keep_timing else []
                 # Только видео+аудио (см. step1): субтитры/вложения не маппим,
                 # чтобы не падать на контейнерах, которые их не поддерживают.
-                cmd_step2 = [FFMPEG, "-y", "-i", current_input, "-map", "0:V?", "-map", "0:a?"] + timing_args
+                # current_input здесь всегда == path: step1_needed исключает
+                # single_pass_video (см. выше), поэтому trim ещё не применён.
+                cmd_step2 = [FFMPEG, "-y"] + trim_pre + ["-i", current_input] + trim_post \
+                            + ["-map", "0:V?"] + ([] if remove_audio else ["-map", "0:a?"]) + timing_args \
+                            + ["-map_metadata", "-1", "-map_chapters", "-1"]
 
                 res_sel = sv.get('res', 'Исходное') or 'Исходное'
                 vf_list = []
@@ -1385,7 +1907,8 @@ class ProcessWorker(QThread):
                 # Обрезка чёрных полос — ПЕРВЫМ фильтром (до scale/fade), чтобы
                 # масштаб и фейды считались уже от обрезанного кадра.
                 if sv.get('crop_black'):
-                    crop = self._detect_crop(current_input, item.get('dur') or 0.0)
+                    crop = self._detect_crop(current_input, item.get('dur') or 0.0,
+                                              start=(trim[0] if trim else 0.0))
                     if crop:
                         vf_list.append(f"crop={crop}")
                         self.log.emit(f"✂ Обрезка чёрных полос: crop={crop}")
@@ -1409,12 +1932,18 @@ class ProcessWorker(QThread):
                             vf_list.append(f"scale={res_sel}:force_divisible_by=2")
                     else: vf_list.append(f"scale={res_sel}:force_divisible_by=2")
 
-                # Видео fade in / out (через чёрный). Тайминги — в выходной
-                # шкале времени (с учётом изменения скорости).
+                # Видео fade in / out (через чёрный).
+                # st фейд-ИНА берём в ИСХОДНОЙ (до-setpts) шкале — сырой t0, НЕ
+                # поделённый на скорость. Проверено эмпирически: fade-фильтр
+                # сопоставляет st по времени кадров ДО setpts, поэтому при обрезке
+                # со сменой скорости fade-in ловится ровно на st=t0 (=значение
+                # output-seek), а t0_video (t0/speed) промахивается и первый кадр
+                # остаётся не затемнённым. При нормальной скорости t0==t0_video,
+                # так что обычный (частый) случай не меняется.
                 if sv.get('vfade_in'):
                     vfi = float(sv.get('vfade_in_d', 1.0))
                     if vfi > 0:
-                        vf_list.append(f"fade=t=in:st=0:d={vfi}")
+                        vf_list.append(f"fade=t=in:st={t0:.3f}:d={vfi}")
                 if sv.get('vfade_out'):
                     vfo = float(sv.get('vfade_out_d', 1.0))
                     if vfo > 0:
@@ -1423,6 +1952,7 @@ class ProcessWorker(QThread):
                             try: src_dur, *_ = get_media_info(current_input)
                             except Exception: src_dur = 0.0
                         out_dur = (src_dur / speed_factor) if speed_factor else src_dur
+                        out_dur += t0_video
                         # Фейд должен ЗАВЕРШИТЬСЯ до последнего кадра, иначе кадр
                         # окажется на ~96% затемнения, а не на 100%. Сдвигаем фейд
                         # на запас (≥1.5 кадра) — фильтр держит чёрный после конца.
@@ -1447,35 +1977,114 @@ class ProcessWorker(QThread):
 
                 preset_mode = sv.get('preset_mode', 'std')
                 is_dark_scenes = (preset_mode == "dark")
+                # tune SVT-AV1 (0=VQ/1=PSNR/2=SSIM/4=MS-SSIM/5=VMAF), выбирается
+                # в настройках (c_tune в tabs.py) — см. _av1_encoder_args.
+                video_tune = int(sv.get('tune', 0))
+
+                # Метрика: 'none' — ручной CRF как есть; 'xpsnr' — CRF на этот
+                # файл подбирается самостоятельно (_metric_crf_search, без
+                # внешних инструментов) под целевое значение метрики (кодек
+                # всегда SVT-AV1, тюнинг энкодера — video_tune выше, тот же,
+                # что и в финальном кодировании — см. _av1_encoder_args).
+                vmetric = sv.get('metric', 'none')
+
+                # preset/pix_fmt для пробных кодирований (поиск CRF и/или разовый
+                # замер итоговой оценки XPSNR ниже) — те же, что пойдут в реальный
+                # финальный энкод этого профиля (см. is_dark_scenes/else дальше).
+                preset_for_search = sv.get('pre', 0) if is_dark_scenes else sv.get('pre', 8)
+                search_pix_fmt = self._choose_pix_fmt(self._source_has_alpha(current_input))
+                # Сэмпл для пробных замеров — вырезанный по тому же диапазону
+                # (trim_pre/trim_post), что реально пойдёт в финальный энкод: без
+                # этого замер (поиск CRF ИЛИ разовая оценка XPSNR) мог бы попасть
+                # на кадры вне вырезанного отрезка. Строится ОДИН раз и переживает
+                # и подбор CRF, и последующий разовый замер оценки — см. ниже.
+                metric_sample_input = current_input
+                metric_sample_tmp = None
+                if trim:
+                    metric_sample_tmp = os.path.join(
+                        TEMP_DIR, f"metricsample_{uuid.uuid4().hex}"
+                                  f"{os.path.splitext(current_input)[1] or '.mkv'}")
+                    try:
+                        cmd_cut = [FFMPEG, "-y"] + trim_pre + ["-i", current_input] + trim_post + ["-c", "copy", metric_sample_tmp]
+                        subprocess.run(cmd_cut, capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=120)
+                        if os.path.exists(metric_sample_tmp) and os.path.getsize(metric_sample_tmp) > 0:
+                            metric_sample_input = metric_sample_tmp
+                    except Exception:
+                        pass
+
+                # Авто-подбор CRF под целевую метрику (только когда метрика —
+                # XPSNR; ручной CRF из настроек остаётся фолбэком, если подбор
+                # не удался).
+                xpsnr_score = None   # для колонки «Оценка XPSNR» — заполняется ниже
+                if vmetric == 'xpsnr':
+                    target_metric = float(sv.get('target_metric', 40.0))
+                    search_target = target_metric
+                    metric_label = vmetric.upper()
+                    self.log.emit(f"🔍 подбор CRF под {metric_label} ≥{target_metric:.2f}…")
+                    cb(2, f"Подбор CRF под {metric_label} {target_metric:.2f}")
+                    found_crf, info = self._metric_crf_search(
+                        metric_sample_input, preset_for_search, search_pix_fmt,
+                        vmetric, search_target, vf_list, tune=video_tune,
+                        cancel_check=lambda: item["iid"] in self.removed_ids,
+                        on_tick=lambda el: cb(min(9, 2 + int(el // 3)),
+                                              f"Подбор CRF под {metric_label} {target_metric:.2f} ({int(el)}с)"))
+                    if found_crf is not None:
+                        crf = found_crf
+                        self.log.emit(f"✅ подобран CRF {crf} ({metric_label} ≈{info})")
+                        # info — уже измеренная оценка НА ЭТОМ ЖЕ crf (подбор
+                        # останавливается на первом подходящем значении), повторно
+                        # мерить не нужно.
+                        try: xpsnr_score = float(info)
+                        except (TypeError, ValueError): xpsnr_score = None
+                    else:
+                        self.log.emit(f"⚠ подбор CRF не удался: {info} → использован ручной CRF {crf}")
+
+                if xpsnr_score is None:
+                    # Ручной CRF (или неудавшийся подбор) — отдельного замера ещё не
+                    # было; разовое пробное кодирование сэмпла на итоговом crf даёт
+                    # представительную оценку без цены полного повторного прохода.
+                    xpsnr_score = self._measure_at_crf(
+                        metric_sample_input, crf, preset_for_search, search_pix_fmt,
+                        video_tune, vf_list, cancel_check=lambda: item["iid"] in self.removed_ids)
+                self.xpsnr_sig.emit(item['iid'], xpsnr_score)
+
+                if metric_sample_tmp:
+                    try:
+                        if os.path.exists(metric_sample_tmp): os.remove(metric_sample_tmp)
+                    except Exception: pass
 
                 if is_dark_scenes:
-                    # Профиль «Тёмные сцены»: 10-бит, tune=ssim, одно-проходный CRF AV1.
+                    # Профиль «Тёмные сцены»: 10-бит, одно-проходный CRF AV1.
                     # SVT-AV1 НЕ поддерживает multi-pass в режиме CRF
                     # ("CRF does not support multi-pass. Use single pass."),
                     # поэтому используем один проход. Для CRF (постоянное качество)
-                    # 2-pass всё равно не даёт выигрыша.
+                    # 2-pass всё равно не даёт выигрыша. crf — либо ручной, либо
+                    # уже подобран _metric_crf_search под целевую метрику (см. блок выше).
                     has_alpha = self._source_has_alpha(current_input)
-                    pix_fmt = self._choose_pix_fmt(has_alpha, ten_bit=True)
-                    svt_params = "tune=2"   # tune=ssim в SVT-AV1
-                    preset_val = str(max(0, min(13, sv.get('pre', 0))))
+                    pix_fmt = self._choose_pix_fmt(has_alpha)
+                    preset_val = max(0, min(13, sv.get('pre', 0)))
                     est = max(1, int(os.path.getsize(current_input)/400000)) if os.path.exists(current_input) else 10
 
                     cmd_dark = [
-                        FFMPEG, "-y", "-i", current_input, "-map", "0:V?", "-map", "0:a?",
-                    ] + timing_args + [
-                        "-c:v", "libsvtav1", "-crf", str(crf), "-preset", preset_val,
-                        "-svtav1-params", svt_params,
-                        "-pix_fmt", pix_fmt,
-                    ]
+                        FFMPEG, "-y",
+                    ] + trim_pre + ["-i", current_input] + trim_post + (
+                        ["-map", "0:V?"] if remove_audio else ["-map", "0:V?", "-map", "0:a?"]
+                    ) + timing_args + ["-map_metadata", "-1", "-map_chapters", "-1"] \
+                      + self._bt709_color_args(current_input) \
+                      + self._av1_encoder_args(crf, preset_val, pix_fmt, video_tune)
                     if vf_list:
                         cmd_dark += ["-vf", ",".join(vf_list)]
-                    cmd_dark += ["-threads", "0"] + step2_audio + dur_cap + [attempted_out]
+                    cmd_dark += ["-threads", "0"] + step2_audio + dur_cap
+                    if os.path.splitext(attempted_out)[1].lower() == ".mp4":
+                        cmd_dark += ["-movflags", "+faststart"]
+                    cmd_dark += [attempted_out]
 
                     self.log.emit("🌑 Тёмные сцены: кодирование (AV1 10-бит, CRF)...")
                     # Адаптивное ETA по окну FPS (один проход CRF → has_second_pass=False).
-                    _tf = self._estimate_total_frames(current_input, speed_factor, cmd_dark)
+                    _tf = self._estimate_total_frames(current_input, speed_factor, cmd_dark,
+                                                       dur_override=(item.get('dur') if trim else None))
                     _calc = RealETACalculator(_tf, pass_num=1, has_second_pass=False) if _tf > 0 else None
-                    self.run_ffmpeg_capture(cmd_dark, est, cb, label="AV1 кодирование (тёмные сцены)", eta_calc=_calc)
+                    self.run_ffmpeg_capture(cmd_dark, est, cb, label="AV1 кодирование (тёмные сцены)", eta_calc=_calc, cancel_check=lambda: item["iid"] in self.removed_ids)
 
                 else:
                     # Стандартный профиль
@@ -1483,31 +2092,38 @@ class ProcessWorker(QThread):
                     pix_fmt = self._choose_pix_fmt(has_alpha)
 
                     if has_alpha and 'libvpx-vp9' in detect_ffmpeg_encoders():
-                        # libsvtav1 не поддерживает yuva420p → переключаемся на VP9+WebM
+                        # libsvtav1 не поддерживает yuva420p → переключаемся на VP9+WebM.
+                        # 10-бит альфа (yuva420p10le) в libvpx-vp9 — экспериментальный
+                        # и «не широко поддерживаемый» формат (ffmpeg сам предупреждает
+                        # и требует -strict experimental), поэтому здесь принудительно
+                        # 8-бит yuva420p — единственный надёжно совместимый вариант для
+                        # прозрачного WebM.
                         self.log.emit("Альфа-канал → выход: VP9 WebM (SVT-AV1 alpha не поддерживает)")
                         attempted_out = os.path.splitext(attempted_out)[0] + ".webm"
                         out = attempted_out
                         cmd_step2 += ["-c:v", "libvpx-vp9",
                                       "-crf", str(crf), "-b:v", "0",
-                                      "-pix_fmt", pix_fmt]
+                                      "-pix_fmt", "yuva420p"]
                     elif has_alpha:
-                        self.log.emit("⚠ libvpx-vp9 недоступен — альфа будет потеряна (используется SVT-AV1)")
-                        cmd_step2 += ["-c:v", "libsvtav1",
-                                      "-crf", str(crf), "-preset", str(max(0, min(8, sv.get('pre', 8)))),
-                                      "-pix_fmt", "yuv420p"]
+                        self.log.emit("⚠ libvpx-vp9 недоступен — альфа будет потеряна (SVT-AV1 alpha не поддерживает)")
+                        cmd_step2 += self._bt709_color_args(current_input)
+                        cmd_step2 += self._av1_encoder_args(crf, max(0, min(8, sv.get('pre', 8))), self._choose_pix_fmt(False), video_tune)
                     else:
-                        cmd_step2 += ["-c:v", "libsvtav1",
-                                      "-crf", str(crf), "-preset", str(max(0, min(8, sv.get('pre', 8)))),
-                                      "-pix_fmt", pix_fmt]
+                        cmd_step2 += self._bt709_color_args(current_input)
+                        cmd_step2 += self._av1_encoder_args(crf, max(0, min(8, sv.get('pre', 8))), pix_fmt, video_tune)
 
                     if vf_list: cmd_step2 += ["-vf", ",".join(vf_list)]
-                    cmd_step2 += ["-threads", "0"] + step2_audio + dur_cap + [attempted_out]
+                    cmd_step2 += ["-threads", "0"] + step2_audio + dur_cap
+                    if os.path.splitext(attempted_out)[1].lower() == ".mp4":
+                        cmd_step2 += ["-movflags", "+faststart"]
+                    cmd_step2 += [attempted_out]
 
                     est = max(1, int(os.path.getsize(current_input)/400000)) if os.path.exists(current_input) else 10
                     # Адаптивное ETA по скользящему окну FPS (одно-проходный CRF).
-                    _tf = self._estimate_total_frames(current_input, speed_factor, cmd_step2)
+                    _tf = self._estimate_total_frames(current_input, speed_factor, cmd_step2,
+                                                       dur_override=(item.get('dur') if trim else None))
                     _calc = RealETACalculator(_tf, pass_num=1, has_second_pass=False) if _tf > 0 else None
-                    self.run_ffmpeg_capture(cmd_step2, est, cb, label="Pass 2 (Video)", eta_calc=_calc)
+                    self.run_ffmpeg_capture(cmd_step2, est, cb, label="Pass 2 (Video)", eta_calc=_calc, cancel_check=lambda: item["iid"] in self.removed_ids)
 
             else:
                 if current_input != path:
@@ -1524,7 +2140,7 @@ class ProcessWorker(QThread):
                         self.run_ffmpeg_capture(
                             cmd_remux,
                             max(1, int(os.path.getsize(current_input) / 1000000)),
-                            cb, label=None)
+                            cb, label=None, cancel_check=lambda: item["iid"] in self.removed_ids)
                 else:
                     # Один прямой проход (видео-копия с аудиофильтрами или аудио-онли).
                     # Для видео-копии (single_pass_copy): passthrough сохраняет VFR-
@@ -1535,11 +2151,19 @@ class ProcessWorker(QThread):
                                              + ["aresample=async=1", opus_layout_fix])
                     else:
                         af_direct = _opus_af(audio_filters)
-                    cmd_direct = [FFMPEG, "-y", "-i", path, "-map", "0:V?", "-map", "0:a?"]
+                    # Видео тут НЕ перекодируется (-c:v copy) — при заданном trim
+                    # рез всё равно останется привязан к ближайшему ключевому
+                    # кадру (как обычная copy-обрезка), кадровая точность здесь
+                    # принципиально недостижима без реэнкода видео.
+                    cmd_direct = [FFMPEG, "-y"] + trim_pre + ["-i", path] + trim_post \
+                                 + (["-map", "0:V?"] if remove_audio else ["-map", "0:V?", "-map", "0:a?"])
                     if is_video and keep_timing:
                         cmd_direct += ["-fps_mode", "passthrough"]
-                    cmd_direct += ["-af", af_direct]
-                    cmd_direct += ["-c:a", audio_codec, "-b:a", audio_bitrate]
+                    if remove_audio:
+                        cmd_direct += ["-an"]
+                    else:
+                        cmd_direct += ["-af", af_direct]
+                        cmd_direct += ["-c:a", audio_codec, "-b:a", audio_bitrate]
                     if is_video: cmd_direct += ["-c:v", "copy"]
                     else: cmd_direct += ["-vn"]
                     # Видео-КОПИЯ + аудиофильтры: loudnorm/opus добавляют «хвост»,
@@ -1547,19 +2171,21 @@ class ProcessWorker(QThread):
                     # источника) обрезает лишний аудиохвост — см. определение выше.
                     cmd_direct += dur_cap
                     cmd_direct += [out]
-                    self.run_ffmpeg_capture(cmd_direct, max(1, int(os.path.getsize(path)/1000000)), cb, label=None)
+                    self.run_ffmpeg_capture(cmd_direct, max(1, int(os.path.getsize(path)/1000000)), cb, label=None, cancel_check=lambda: item["iid"] in self.removed_ids)
 
             if os.path.exists(out):
                 # «После» LUFS: в одно-проходном режиме Pass-1 (где раньше мерили)
                 # пропущен — меряем по готовому файлу.
-                if (single_pass_video or single_pass_copy) and sa.get('norm'):
+                if not remove_audio and (single_pass_video or single_pass_copy) and sa.get('norm'):
                     try:
                         after_norm = self.measure_loudness(out)
                         self.update_lufs_sig.emit(item['iid'], before_lufs, after_norm)
                     except Exception: pass
                 size_new = os.path.getsize(out)
                 dur_new, br_str, _, a_br, a_codec = get_media_info(out)
-                self.update_item_sig.emit(item['iid'], human_size(size_new),
+                vcodec_new = get_video_codec_label(out) if is_video else None
+                size_label = f"{vcodec_new} {human_size(size_new)}" if vcodec_new else human_size(size_new)
+                self.update_item_sig.emit(item['iid'], size_label,
                                           fmt_bitrate_with_codec(a_codec, a_br or br_str))
                 self.update_dur_sig.emit(item['iid'], str(dur_new or 0.0))
                 return out
@@ -1651,12 +2277,17 @@ class ProcessWorker(QThread):
                 im = im.convert('RGBA') if im.mode in ('RGBA', 'LA', 'P', 'PA') else im.convert('RGB')
 
             # Лимит разрешения; для ICO жёсткий потолок 256px
-            cap = adim if (adim and adim > 0) else None
+            awidth = av.get('awidth', 0) or 0
+            aheight = av.get('aheight', 0) or 0
             if ext == 'ico':
-                cap = min(256, cap) if cap else 256
-            if cap and max(im.width, im.height) > cap:
-                sc = cap / max(im.width, im.height)
-                im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), Image.LANCZOS)
+                cap = min(256, adim) if (adim and adim > 0) else 256
+                if max(im.width, im.height) > cap:
+                    sc = cap / max(im.width, im.height)
+                    im = im.resize((max(1, int(im.width * sc)), max(1, int(im.height * sc))), Image.LANCZOS)
+            else:
+                tgt = self._target_dims(im.width, im.height, adim, awidth, aheight)
+                if tgt:
+                    im = im.resize(tgt, Image.LANCZOS)
 
             limit_kb = int(av.get('limit', 0) or 0) if av.get('limit_on', True) else 0
             if limit_kb <= 0:
@@ -1764,11 +2395,19 @@ class ProcessWorker(QThread):
         if orig_w * orig_h > 8500000:
             if aspd < 6: aspd = 6
 
+        # Ужимание: макс. сторона + отдельные лимиты ширины/высоты (самый строгий).
+        awidth = av.get('awidth', 0) or 0
+        aheight = av.get('aheight', 0) or 0
         vf = None
-        if adim and adim > 0: vf = f"scale=if(gt(iw\\,ih)\\,{adim}\\,-2):if(gt(ih\\,iw)\\,{adim}\\,-2)"
+        _tgt = self._target_dims(orig_w, orig_h, adim, awidth, aheight)
+        if _tgt:
+            vf = f"scale={_tgt[0]}:{_tgt[1]}"
+        elif (adim and adim > 0) and not (orig_w and orig_h):
+            # Размер исходника не удалось определить — падаем на выражение по макс. стороне.
+            vf = f"scale=if(gt(iw\\,ih)\\,{adim}\\,-2):if(gt(ih\\,iw)\\,{adim}\\,-2)"
 
         has_alpha = self._source_has_alpha(path)
-        pix_fmt_avif = self._choose_pix_fmt(has_alpha)
+        pix_fmt_avif = self._avif_pix_fmt(has_alpha, av.get('chroma', '420'))
 
         # Если есть альфа — удаляем старый .avif чтобы не оставалось двух файлов
         if has_alpha and os.path.exists(out):
@@ -1797,11 +2436,10 @@ class ProcessWorker(QThread):
             with Image.open(path) as im:
                 if ImageOps: im = ImageOps.exif_transpose(im)
                 im = im.convert('RGBA')
-                if adim and adim > 0 and max(im.width, im.height) > adim:
-                    scale = adim / max(im.width, im.height)
-                    im = im.resize(
-                        (max(1, int(im.width * scale)), max(1, int(im.height * scale))),
-                        Image.LANCZOS)
+                _tgt_a = self._target_dims(im.width, im.height, adim,
+                                           av.get('awidth', 0) or 0, av.get('aheight', 0) or 0)
+                if _tgt_a:
+                    im = im.resize(_tgt_a, Image.LANCZOS)
 
                 out_webp = os.path.splitext(out)[0] + ".webp"
                 limit_kb_l = int(av.get('limit', 0) or 0)
@@ -1828,13 +2466,22 @@ class ProcessWorker(QThread):
                 except Exception: pass
             return out_webp
 
+        # tune=iq («Image Quality») — режим тюнинга libaom-av1 именно под
+        # неподвижные изображения; передаётся напрямую через -aom-params, т.к.
+        # ffmpeg-обёртка -tune знает только psnr/ssim, а полный список тюнов
+        # (включая iq) доступен лишь через прямой проброс параметров в aom.
+        # Проверено: -aom-params валидирует ключи/значения по-настоящему
+        # (bogus-значение тут же роняет открытие энкодера с "Invalid value"),
+        # так что принятый без ошибки tune=iq — не тихая заглушка, а реально
+        # применяемый режим (подтверждено и разным размером файла на выходе).
         if 'libaom-av1' not in detect_ffmpeg_encoders():
             raise Exception("libaom-av1 не доступен в вашей сборке ffmpeg — AVIF перекодирование настроено работать ТОЛЬКО через libaom (libaom-av1).")
         limit_kb = int(av.get('limit', 0) or 0)
 
-        avif_enc = 'libaom-av1'
         if has_alpha:
-            self.log.emit("Альфа-канал обнаружен → AVIF с прозрачностью (alphaextract, libaom-av1)")
+            self.log.emit("Альфа-канал обнаружен → AVIF с прозрачностью (alphaextract, libaom-av1, tune=IQ)")
+        else:
+            self.log.emit("AVIF: libaom-av1, tune=IQ, 10-бит")
 
         # Подбор под лимит — несколько проб (подборов). Прогресс масштабируем в
         # долю текущей пробы: во время пробы n из total процент не превышает
@@ -1856,34 +2503,36 @@ class ProcessWorker(QThread):
         def _encode_to(tmp_out, crf_val, vf_override=None):
             pass_state['n'] += 1
             scale_vf = vf_override if vf_override is not None else vf
+            aom_common = ["-cpu-used", str(max(0, min(8, aspd))),
+                          "-aom-params", "tune=iq",
+                          "-tile-columns", "1", "-tile-rows", "1", "-row-mt", "1"]
             if has_alpha:
-                # AVIF с альфой: цвет (yuva420p) и извлечённая альфа (gray) — два
-                # av1-потока, avif-муксер сшивает их в файл с прозрачностью.
-                # ВАЖНО: split ДО scale — если масштабировать перед split, ffmpeg
-                # при согласовании форматов роняет альфу (alphaextract «could not
-                # choose format»). Поэтому делим из yuva420p, затем масштабируем
-                # каждую ветку отдельно (цвет и альфа имеют одинаковые размеры).
+                # AVIF с альфой: цвет (yuva420p10le) и извлечённая альфа
+                # (gray10le) — два av1-потока, avif-муксер сшивает их в файл
+                # с прозрачностью. ВАЖНО: split ДО scale — если масштабировать
+                # перед split, ffmpeg при согласовании форматов роняет альфу
+                # (alphaextract «could not choose format»). Поэтому делим из
+                # yuva420p10le, затем масштабируем каждую ветку отдельно
+                # (цвет и альфа имеют одинаковые размеры).
                 if scale_vf:
-                    fc = (f"[0:v]format=yuva420p,split[c][a];"
+                    fc = (f"[0:v]format=yuva420p10le,split[c][a];"
                           f"[c]{scale_vf}[main];[a]alphaextract,{scale_vf}[alf]")
                 else:
-                    fc = "[0:v]format=yuva420p,split[main][a];[a]alphaextract[alf]"
+                    fc = "[0:v]format=yuva420p10le,split[main][a];[a]alphaextract[alf]"
                 cmd = [FFMPEG, "-y", "-i", path, "-filter_complex", fc,
-                       "-map", "[main]", "-map", "[alf]",
-                       "-c:v", "libaom-av1", "-crf", str(crf_val),
-                       "-cpu-used", str(max(0, min(8, aspd))),
-                       "-still-picture", "1", "-threads", "0", tmp_out]
+                       "-map", "[main]", "-map", "[alf]", "-map_metadata", "-1",
+                       "-c:v", "libaom-av1", "-crf", str(crf_val)] + aom_common + \
+                      ["-still-picture", "1", "-threads", "0", tmp_out]
             else:
                 cmd = [FFMPEG, "-y", "-i", path]
                 if scale_vf: cmd += ["-vf", scale_vf]
-                cmd += ["-frames:v", "1", "-c:v", "libaom-av1",
-                        "-crf", str(crf_val), "-cpu-used", str(max(0, min(8, aspd))),
-                        "-pix_fmt", pix_fmt_avif,
-                        "-threads", "0", tmp_out]
+                cmd += ["-frames:v", "1", "-map_metadata", "-1", "-c:v", "libaom-av1",
+                        "-crf", str(crf_val)] + aom_common + \
+                       ["-pix_fmt", pix_fmt_avif, "-threads", "0", tmp_out]
             try:
                 orig_size = os.path.getsize(path) if os.path.exists(path) else 1
                 est_seconds = max(1, int(orig_size / 400_000))
-                self.run_ffmpeg_capture(cmd, est_seconds, _pass_cb)
+                self.run_ffmpeg_capture(cmd, est_seconds, _pass_cb, cancel_check=lambda: item["iid"] in self.removed_ids)
                 return True, None
             except subprocess.CalledProcessError as e: return False, (e.stderr[:4000] if hasattr(e, 'stderr') else str(e))
             except Exception as e: return False, str(e)
@@ -1891,7 +2540,7 @@ class ProcessWorker(QThread):
         if not limit_kb or limit_kb <= 0:
             tmp = os.path.join(TEMP_DIR, f"avif_{uuid.uuid4().hex}.avif")
             try:
-                ok, err = _encode_to(tmp, 35)
+                ok, err = _encode_to(tmp, int(av.get('cq', 30)))
                 if not ok:
                     if os.path.exists(tmp):
                         try: os.remove(tmp)

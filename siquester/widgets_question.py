@@ -283,7 +283,7 @@ class QuestionViewer(QWidget):
                             try: le.setStyleSheet(ss)
                             except RuntimeError: pass
                         qv._copy_hl_clear = _clear_hl
-                        mw = qv.window()
+                        mw = _find_mw(qv)
                         if mw and hasattr(mw, '_save_notif') and hasattr(mw, '_show_save_notification'):
                             mw._save_notif.setText("📋  Ответ скопирован")
                             mw._show_save_notification()
@@ -305,7 +305,7 @@ class QuestionViewer(QWidget):
                         if i < len(ans_list_ref):
                             ans_list_ref[i] = le.text()
                         save_fn()
-                        mw = qv.window()
+                        mw = _find_mw(qv)
                         datasets = getattr(mw, 'datasets', ())
                         qv._open_propagate_wrong_dialog(txt, datasets)
                     prop_b.clicked.connect(_propagate_wrong)
@@ -397,7 +397,7 @@ class QuestionViewer(QWidget):
                         label = f"[{rd['name']}] {th_['name']} — {q['price']}"
                         choices.append((label, ri, ti, qi, q["price"]))
             if not choices:
-                QMessageBox.information(viewer_r, "Перенос ответов", "Нет других вопросов в паке.")
+                msgbox_information(viewer_r, "Перенос ответов", "Нет других вопросов в паке.")
                 return
             labels = [c[0] for c in choices]
             item, ok = QInputDialog.getItem(
@@ -409,18 +409,18 @@ class QuestionViewer(QWidget):
             _, dst_ri, dst_ti, dst_qi, dst_price = choices[idx_chosen]
             new_ans = [a for a in ans_ref if a.strip()]
             if not new_ans:
-                QMessageBox.information(viewer_r, "Перенос ответов", "Нет ответов для переноса.")
+                msgbox_information(viewer_r, "Перенос ответов", "Нет ответов для переноса.")
                 return
             try:
                 siq_r.save_question(dst_ri, dst_ti, dst_qi, [], new_ans)
                 siq_r.rounds[dst_ri]["themes"][dst_ti]["questions"][dst_qi]["answers"] = new_ans
-                mw = viewer_r.window()
+                mw = _find_mw(viewer_r)
                 if hasattr(mw, '_save_notif') and hasattr(mw, '_show_save_notification'):
                     mw._save_notif.setText(f"✅  Ответы перенесены → {item}")
                     mw._show_save_notification()
                     _notif_reset(mw)
             except Exception as e:
-                QMessageBox.warning(viewer_r, "Ошибка переноса", str(e))
+                msgbox_warning(viewer_r, "Ошибка переноса", str(e))
 
         transfer_btn.clicked.connect(_transfer_answers)
         evl.addWidget(transfer_btn)
@@ -586,7 +586,7 @@ class QuestionViewer(QWidget):
             if q_obj: self.show_question(q_obj, rnd_idx=rnd, theme_idx=th)
         except Exception as e:
             _logger.warning(f"[add_text_item] {e}")
-            QMessageBox.warning(self, "Ошибка", str(e))
+            msgbox_warning(self, "Ошибка", str(e))
 
     def _do_add_media(self, rnd, th, q_idx, path, param_name="question"):
         # Push undo snapshot onto the parent ResultPage before modifying
@@ -600,7 +600,7 @@ class QuestionViewer(QWidget):
             q_obj = self.siq.find_question(rnd, th, self._current_price)
             if q_obj: self.show_question(q_obj, rnd_idx=rnd, theme_idx=th)
         else:
-            QMessageBox.warning(self, "Ошибка", "Не удалось добавить медиафайл.")
+            msgbox_warning(self, "Ошибка", "Не удалось добавить медиафайл.")
 
     # ── Drag-drop media files onto the viewer ───────────────────
     def dragEnterEvent(self, ev):
@@ -1505,7 +1505,7 @@ class QuestionViewer(QWidget):
         """Show round selector and copy wrong_text into wrong_answers of all questions in chosen rounds."""
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Скопировать неправильный ответ в другие вопросы")
+        dlg.setWindowTitle("Скопировать неправильный ответ в другие вопросы")
         dlg.setMinimumWidth(460); dlg.setMinimumHeight(400)
         dlg.setStyleSheet("QDialog{background:#181825;color:#cdd6f4;}"
                           "QTreeWidget{background:#1e1e2e;border:1px solid #45475a;border-radius:4px;"
@@ -1516,7 +1516,9 @@ class QuestionViewer(QWidget):
         vl = QVBoxLayout(dlg); vl.setContentsMargins(14,12,14,12); vl.setSpacing(8)
         vl.addWidget(_lbl("Выберите раунды для добавления неправильного ответа:",
                           "color:#cdd6f4;font-size:12px;font-weight:700;"))
-        vl.addWidget(_lbl(f"Текст: \u00ab{wrong_text}\u00bb", "color:#f9e2af;font-size:11px;"))
+        _wrong_txt_lbl = _lbl(f"Текст: \u00ab{wrong_text}\u00bb", "color:#f9e2af;font-size:11px;")
+        _wrong_txt_lbl.setWordWrap(True)
+        vl.addWidget(_wrong_txt_lbl)
         tree = QTreeWidget(); tree.setHeaderHidden(True)
         tree.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
         vl.addWidget(tree, stretch=1)
@@ -1544,10 +1546,29 @@ class QuestionViewer(QWidget):
         sel_none = AnimatedButton("\u2717 \u0421\u043d\u044f\u0442\u044c"); sel_none.setObjectName(_ON_BTN_SORT); sel_none.setFixedHeight(24)
         sel_all.clicked.connect(lambda: _set_all(True)); sel_none.clicked.connect(lambda: _set_all(False))
         cancel_btn = AnimatedButton("\u041e\u0442\u043c\u0435\u043d\u0430"); cancel_btn.clicked.connect(dlg.reject)
-        ok_btn = AnimatedButton("\u2192 \u0414\u043e\u0431\u0430\u0432\u0438\u0442\u044c"); ok_btn.setObjectName(_ON_BTN_ANALYZE)
+        # NB: intentionally NOT objectName(_ON_BTN_ANALYZE) \u2014 main_window.py's
+        # permanent "\ud83d\udd0d \u0410\u043d\u0430\u043b\u0438\u0437\u0438\u0440\u043e\u0432\u0430\u0442\u044c" button already uses that exact objectName
+        # and lives in the same widget tree (this dialog's QObject parent chain
+        # runs up through it). Two live widgets sharing an objectName confuses
+        # QStyleSheetStyle's rule cache and can leave one of them unpainted \u2014
+        # that's what was making this button vanish. Style it inline instead.
+        ok_btn = AnimatedButton("\u2192 \u0414\u043e\u0431\u0430\u0432\u0438\u0442\u044c")
+        ok_btn.setStyleSheet(
+            "QPushButton{background:#a6e3a1;color:#181825;border:none;font-weight:700;"
+            "border-radius:4px;padding:4px 12px;}"
+            "QPushButton:hover{background:#94e2d5;}"
+            "QPushButton:pressed{background:#94e2d5;}")
+        ok_btn.setMinimumWidth(120); ok_btn.setFixedHeight(28)
         ok_btn.clicked.connect(dlg.accept)
+        # Force each button to keep its full sizeHint width \u2014 a Preferred
+        # QPushButton is otherwise free to shrink under horizontal pressure,
+        # which can squeeze the last (rightmost) button in a tight row down
+        # to near-invisible on some DPI/font-metric setups.
+        for _b in (sel_all, sel_none, cancel_btn, ok_btn):
+            _b.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         bot.addWidget(sel_all); bot.addWidget(sel_none); bot.addWidget(cancel_btn); bot.addWidget(ok_btn)
         vl.addLayout(bot)
+        dlg.adjustSize()   # recompute geometry from live font metrics, not the static minimum
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         added_count = 0
@@ -1580,7 +1601,7 @@ class QuestionViewer(QWidget):
                     siq_t._save_xml(root_xml, ns_url)
                 except Exception as ex:
                     _logger.warning(f"[propagate_wrong] {ex}")
-        mw = self.window()
+        mw = _find_mw(self)
         if hasattr(mw, "_show_save_notification"):
             mw._save_notif.setText(f"\u2192 \u0414\u043e\u0431\u0430\u0432\u043b\u0435\u043d\u043e \u0432 {added_count} \u0432\u043e\u043f\u0440\u043e\u0441\u043e\u0432")
             mw._show_save_notification()

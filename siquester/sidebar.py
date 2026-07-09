@@ -90,7 +90,7 @@ class PackageList(QWidget):
 
 
 class Sidebar(QWidget):
-    item_selected=pyqtSignal(int); add_requested=pyqtSignal()
+    item_selected=pyqtSignal(int)
     delete_requested=pyqtSignal(int); reorder_requested=pyqtSignal(int,int)
     move_to_tab=pyqtSignal(int,int); rename_requested=pyqtSignal(int,str)
     def __init__(self,parent=None):

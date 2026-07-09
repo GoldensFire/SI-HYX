@@ -672,7 +672,7 @@ class QuestionEditorDialog(QDialog):
     def _pick_media_file(self, file_filter: str, itype: str, param_name: str):
         """Open file dialog, copy picked file into the SIQ zip, refresh the label list."""
         if not self.siq.path:
-            QMessageBox.warning(self, "Нет файла", "SIQ файл не прикреплён."); return
+            msgbox_warning(self, "Нет файла", "SIQ файл не прикреплён."); return
         path, _ = QFileDialog.getOpenFileName(self, "Выбрать файл", "", file_filter + ";;All (*)")
         if not path: return
         ok = self.siq.add_media_to_question(
@@ -686,9 +686,9 @@ class QuestionEditorDialog(QDialog):
                 insert_pos = max(0, self._qgrp_vl.count() - 2)
                 self._qgrp_vl.insertWidget(insert_pos, lbl)
             self._media_labels.append(lbl)
-            QMessageBox.information(self, "Добавлено", f"Файл добавлен: {fname}")
+            msgbox_information(self, "Добавлено", f"Файл добавлен: {fname}")
         else:
-            QMessageBox.warning(self, "Ошибка", "Не удалось добавить файл в .siq пакет.")
+            msgbox_warning(self, "Ошибка", "Не удалось добавить файл в .siq пакет.")
 
     # ── Helpers: regular answers ───────────────────────────────
     def _add_answer_row(self, text: str = ""):
@@ -776,7 +776,7 @@ class QuestionEditorDialog(QDialog):
         try:
             new_price = int(self._price_edit.text().strip())
         except ValueError:
-            QMessageBox.warning(self, "Ошибка", "Цена должна быть целым числом."); return
+            msgbox_warning(self, "Ошибка", "Цена должна быть целым числом."); return
 
         new_q_texts = [te.toPlainText().strip() for te in self._text_edits]
         cur_type = self._type_cb.currentData()
@@ -790,7 +790,7 @@ class QuestionEditorDialog(QDialog):
                 cy  = float(self._pt_y.text().strip())
                 dev = float(self._pt_dev.text().strip())
             except ValueError:
-                QMessageBox.warning(self, "Ошибка", "X, Y и допуск должны быть числами от 0 до 1."); return
+                msgbox_warning(self, "Ошибка", "X, Y и допуск должны быть числами от 0 до 1."); return
             ok = self.siq.save_point_question(
                 self.rnd_idx, self.theme_idx, self.q_idx,
                 new_price, new_q_texts, cx, cy, dev)
@@ -803,7 +803,7 @@ class QuestionEditorDialog(QDialog):
                 options[key] = le.text().strip()  # allow empty
                 if cb.isChecked(): correct_key = key
             if not options:
-                QMessageBox.warning(self, "Ошибка", "Добавьте хотя бы один вариант."); return
+                msgbox_warning(self, "Ошибка", "Добавьте хотя бы один вариант."); return
             if correct_key is None and options:
                 correct_key = next(iter(options))  # default to first
 
@@ -824,7 +824,7 @@ class QuestionEditorDialog(QDialog):
         if ok:
             self.saved.emit(); self.accept()
         else:
-            QMessageBox.warning(self, "Ошибка",
+            msgbox_warning(self, "Ошибка",
                 "Не удалось сохранить.\nУбедитесь, что файл не открыт другой программой.")
 
 __all__ = [

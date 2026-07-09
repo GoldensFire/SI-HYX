@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QDialog, QCheckBox, QDialogButtonBox, QFrame, QStyledItemDelegate,
     QStyleOptionViewItem, QStyle, QApplication,
 )
+from msgbox import msgbox_critical, msgbox_warning, msgbox_information, msgbox_question
 
 try:
     from config import get_icon, APP_NAME, APP_VERSION
@@ -62,12 +63,19 @@ except Exception:  # pragma: no cover
 try:
     from config import CONFIG_DIR
     _INDEX_CACHE_FILE = os.path.join(CONFIG_DIR, "shikimori_index_cache.json")
+    _COVERS_CACHE_DIR = os.path.join(CONFIG_DIR, "shikimori_covers")
 except Exception:  # pragma: no cover
     _INDEX_CACHE_FILE = ""
+    _COVERS_CACHE_DIR = ""
 # Просмотры/база медленно растут со временем — запись живёт 30 дней, потом
 # перезапрашивается. Ограничение числа записей бережёт размер файла.
 _INDEX_CACHE_TTL = 30 * 24 * 3600
 _INDEX_CACHE_MAX = 20000
+# Обложки на диске (по просьбе пользователя — не тянуть их заново по сети при
+# каждом запуске: за день афиши не меняются). Без TTL (постеры почти не
+# меняются), но число файлов ограничено — при переполнении трём самые старые
+# (по времени изменения) удаляются.
+_COVERS_CACHE_MAX = 8000
 
 # Слой API/фильтрации. Если requests недоступен — вкладка покажет заглушку.
 _IMPORT_ERROR = ""
@@ -194,6 +202,11 @@ _THUMB_W, _THUMB_H = 96, 136
 # (популярном) порядке.
 _VIEWS_SORT_MAX = 100
 _VIEWS_THROTTLE = 0.7   # сек между карточками (≈85 запросов/мин < лимита 90)
+
+# Автостоп поиска по достижению числа тайтлов ПОСЛЕ фильтрации (паки/франшизы/
+# оценка и т.д.) — по просьбе пользователя, чтобы не гонять поиск по всей базе,
+# если нужного числа уже достаточно. 0 = без лимита.
+_STOP_LIMIT_DEFAULT = 500
 
 
 def _user_agent() -> str:
@@ -397,6 +410,56 @@ class _GenresTask(QRunnable):
         finally:
             if client is not None:
                 client.close()
+
+
+def _cover_cache_path(anime_id: int) -> str:
+    return os.path.join(_COVERS_CACHE_DIR, f"{int(anime_id)}.jpg") if _COVERS_CACHE_DIR else ""
+
+
+def _load_cover_from_disk(anime_id: int) -> "Optional[QPixmap]":
+    """Синхронно читает обложку из дискового кеша (маленький файл, уже
+    уменьшенный до _THUMB_W×_THUMB_H — читать быстро, сети не требует)."""
+    path = _cover_cache_path(anime_id)
+    if not path or not os.path.isfile(path):
+        return None
+    pm = QPixmap(path)
+    return pm if not pm.isNull() else None
+
+
+def _save_cover_to_disk(anime_id: int, pm: "QPixmap"):
+    """Атомарно сохраняет уже уменьшенную обложку на диск (JPEG — постеры без
+    альфы, компактнее PNG)."""
+    if not _COVERS_CACHE_DIR:
+        return
+    try:
+        os.makedirs(_COVERS_CACHE_DIR, exist_ok=True)
+        path = _cover_cache_path(anime_id)
+        tmp = path + ".tmp"
+        if not pm.save(tmp, "JPG", 85):
+            return
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _prune_covers_cache():
+    """Если файлов накопилось больше _COVERS_CACHE_MAX — удаляет самые старые
+    (по времени изменения), чтобы кеш обложек не рос бесконечно."""
+    if not _COVERS_CACHE_DIR or not os.path.isdir(_COVERS_CACHE_DIR):
+        return
+    try:
+        names = [f for f in os.listdir(_COVERS_CACHE_DIR) if f.endswith(".jpg")]
+        if len(names) <= _COVERS_CACHE_MAX:
+            return
+        paths = [os.path.join(_COVERS_CACHE_DIR, n) for n in names]
+        paths.sort(key=lambda p: os.path.getmtime(p))
+        for p in paths[:len(paths) - _COVERS_CACHE_MAX]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 
 class _ThumbSignals(QObject):
@@ -874,6 +937,7 @@ class ShikimoriTab(QWidget):
         self.main = main_window
         self._pool = QThreadPool.globalInstance()
         self._task = None          # текущая поисковая задача (ссылка, чтобы жила)
+        self._cache_only = False   # True — «Найти по кэшу»: без дозагрузки просмотров
         self._genres_task = None
         self._results: list = []   # последние найденные Anime (после исключений)
         self._raw_results: list = []   # до применения исключения паков
@@ -897,6 +961,8 @@ class ShikimoriTab(QWidget):
         self._index_cache_save_timer.setSingleShot(True)
         self._index_cache_save_timer.timeout.connect(self._save_index_cache)
         self._load_index_cache()
+        # Подчистка дискового кеша обложек — с задержкой, чтобы не тормозить старт.
+        QTimer.singleShot(3000, _prune_covers_cache)
         self._views_task = None        # текущая задача дозагрузки просмотров
         self._anime_by_id: dict = {}   # anime_id -> Anime (для live-обновления строк)
         self._sel_genres: list = []    # выбранные id жанров/тем (текущий тип контента)
@@ -947,14 +1013,22 @@ class ShikimoriTab(QWidget):
         self.ed_query = QLineEdit()
         self.ed_query.setPlaceholderText("Название (можно пусто — тогда фильтры)…")
         self.ed_query.setClearButtonEnabled(True)
-        self.ed_query.returnPressed.connect(self.start_search)
+        self.ed_query.returnPressed.connect(lambda: self.start_search(False))
         self.ed_query.addAction(get_icon('fa5s.search'),
                                 QLineEdit.ActionPosition.LeadingPosition)
         self.btn_search = QPushButton("Найти")
         self.btn_search.setIcon(get_icon('fa5s.search', color='#11111b'))
         self.btn_search.setIconSize(QSize(16, 16))
         self.btn_search.setObjectName("b_primary")
-        self.btn_search.clicked.connect(self.start_search)
+        self.btn_search.clicked.connect(lambda: self.start_search(False))
+        self.btn_search_cache = QPushButton("По кэшу")
+        self.btn_search_cache.setIcon(get_icon('fa5s.database'))
+        self.btn_search_cache.setToolTip(
+            "Тот же поиск, но БЕЗ дозагрузки просмотров по сети для сортировки —\n"
+            "используются только уже закешированные ранее числа (за один день "
+            "просмотры почти не меняются).\nБыстрее, но новые/незнакомые тайтлы "
+            "могут остаться внизу списка (без данных).")
+        self.btn_search_cache.clicked.connect(lambda: self.start_search(True))
         self.btn_cancel = QPushButton("Стоп")
         self.btn_cancel.setIcon(get_icon('fa5s.stop'))
         self.btn_cancel.setToolTip("Остановить поиск (накопленные результаты останутся)")
@@ -967,6 +1041,7 @@ class ShikimoriTab(QWidget):
         search_row.addWidget(self.cb_content)
         search_row.addWidget(self.ed_query, 1)
         search_row.addWidget(self.btn_search)
+        search_row.addWidget(self.btn_search_cache)
         search_row.addWidget(self.btn_cancel)
         search_row.addWidget(self.btn_clear)
         root.addLayout(search_row)
@@ -1068,6 +1143,19 @@ class ShikimoriTab(QWidget):
             "(≈0.7 с на тайтл; лимит Shikimori ~90 запросов/мин).")
         self.cb_order.currentIndexChanged.connect(self._update_views_max_enabled)
 
+        # Автостоп поиска по достижению числа тайтлов ПОСЛЕ фильтрации (паки/
+        # франшизы/оценка и пр.) — не гонять поиск по всей базе, если нужного
+        # числа уже хватает. 0 = без лимита.
+        self.sp_stop_limit = QSpinBox()
+        self.sp_stop_limit.setRange(0, 100000)
+        self.sp_stop_limit.setSingleStep(50)
+        self.sp_stop_limit.setSpecialValueText("без лимита")
+        self.sp_stop_limit.setValue(_STOP_LIMIT_DEFAULT)
+        self.sp_stop_limit.setToolTip(
+            "Останавливать поиск автоматически, как только ПОСЛЕ фильтрации "
+            "(паки/франшизы/оценка и т.д.) наберётся столько тайтлов. "
+            "0 — без лимита.")
+
         self.sp_year_from = QSpinBox(); self.sp_year_from.setRange(0, 2099)
         self.sp_year_from.setSpecialValueText("—")
         self.sp_year_to = QSpinBox(); self.sp_year_to.setRange(0, 2099)
@@ -1098,6 +1186,7 @@ class ShikimoriTab(QWidget):
         # (под спецтекст «любая» + стрелки) держит панель широкой. С stretch колонок
         # 1/3 в доступной ширине они всё равно растянутся.
         for _s in (self.sp_score_min, self.sp_score_max, self.sp_views_max,
+                   self.sp_stop_limit,
                    self.sp_year_from, self.sp_year_to, self.sp_ep_min, self.sp_ep_max):
             _s.setMinimumWidth(58)
 
@@ -1111,6 +1200,9 @@ class ShikimoriTab(QWidget):
         self.lbl_views_max = lab("Проверять просмотров у")
         filt.addWidget(self.lbl_views_max, r, 0)
         filt.addWidget(self.sp_views_max, r, 1, 1, 3)
+        r += 1
+        filt.addWidget(lab("Остановиться после"), r, 0)
+        filt.addWidget(self.sp_stop_limit, r, 1, 1, 3)
         r += 1
         filt.addWidget(lab("Тип"), r, 0)
         filt.addWidget(self.cb_kind, r, 1, 1, 3)
@@ -1332,15 +1424,16 @@ class ShikimoriTab(QWidget):
             content_type=self._content_type(),
         )
 
-    def start_search(self):
+    def start_search(self, cache_only: bool = False):
         if self._task is not None:
             return  # уже идёт поиск
         criteria = self._collect_filter()
         err = criteria.validate()
         if err:
-            QMessageBox.warning(self, "Проверьте фильтры", err)
+            msgbox_warning(self, "Проверьте фильтры", err)
             return
         # Новый поиск — чистим список и потоково наполняем его по мере страниц.
+        self._cache_only = cache_only
         self._stop_views_task()
         self.list.clear()
         self._anime_by_id.clear()
@@ -1349,7 +1442,9 @@ class ShikimoriTab(QWidget):
         self._seen_franchises = set()
         self._set_actions_enabled(False)
         self._set_busy(True)
-        self.lbl_status.setText("Поиск… (нажмите «Стоп», чтобы остановить)")
+        self.lbl_status.setText(
+            "Поиск по кэшу… (нажмите «Стоп», чтобы остановить)" if cache_only
+            else "Поиск… (нажмите «Стоп», чтобы остановить)")
         task = _SearchTask(criteria)
         task.signals.batch.connect(self._on_search_batch)
         task.signals.finished.connect(self._on_search_finished)
@@ -1381,8 +1476,9 @@ class ShikimoriTab(QWidget):
         n = len(self._results)
         self._set_actions_enabled(n > 0)
         # Сортировка по просмотрам — досортируем то, что успели набрать (её тоже
-        # можно прервать «Стопом» — см. ветку выше).
-        if n and self._views_sort_active():
+        # можно прервать «Стопом» — см. ветку выше). При «поиске по кэшу»
+        # дозагрузку не запускаем — список уже отсортирован по кешу.
+        if n and self._views_sort_active() and not self._cache_only:
             self.lbl_status.setText(f"Остановлено, сортирую {self._sort_phrase()}…")
             self._begin_views_sort()
         else:
@@ -1411,6 +1507,13 @@ class ShikimoriTab(QWidget):
                 f"Поиск… страница {page}: найдено {len(self._raw_results)}, "
                 f"после фильтра {len(self._results)} (можно «Стоп»)")
 
+    def _stop_limit_value(self) -> int:
+        """0 — без лимита."""
+        try:
+            return int(self.sp_stop_limit.value())
+        except Exception:
+            return 0
+
     def _on_search_batch(self, items: list):
         """Потоково добавляет новые тайтлы страницы (с учётом исключения паков)."""
         if self._task is None:
@@ -1425,6 +1528,23 @@ class ShikimoriTab(QWidget):
             self._append_anime(a)
         self._load_visible_thumbs()
         self._set_actions_enabled(bool(self._results))
+        # Автостоп: набрали достаточно тайтлов ПОСЛЕ фильтрации — дальше искать
+        # незачем (по просьбе пользователя, по умолчанию 500).
+        limit = self._stop_limit_value()
+        if limit and len(self._results) >= limit and self._task is not None:
+            self._task.stop()
+            self._task = None
+            self._set_busy(False)
+            n = len(self._results)
+            self._set_actions_enabled(n > 0)
+            if n and self._views_sort_active() and not self._cache_only:
+                self.lbl_status.setText(
+                    f"Лимит {limit} достигнут, сортирую {self._sort_phrase()}…")
+                self._begin_views_sort()
+            else:
+                self.lbl_status.setText(
+                    f"Лимит {limit} достигнут. Найдено: {len(self._raw_results)}, "
+                    f"после фильтра: {n}")
 
     def _on_search_finished(self, results: list):
         self._task = None
@@ -1433,18 +1553,27 @@ class ShikimoriTab(QWidget):
         # дублей/исключений), даём финальный статус.
         self._raw_results = results
         self._apply_exclusions()
-        # Если выбрана сортировка по просмотрам — дозагрузим их и пересортируем.
         if self._results and self._views_sort_active():
-            self._begin_views_sort()
+            if self._cache_only:
+                # «По кэшу» — без дозагрузки по сети; список уже отсортирован
+                # кешем в _display_results (см. _apply_exclusions).
+                unknown = sum(1 for a in self._results if a.id not in self._views_cache)
+                if unknown:
+                    self.lbl_status.setText(
+                        self.lbl_status.text() + f" (по кэшу, без данных: {unknown})")
+            else:
+                # Иначе — дозагрузим просмотры и пересортируем.
+                self._begin_views_sort()
 
     def _on_search_failed(self, message: str):
         self._task = None
         self._set_busy(False)
         self.lbl_status.setText("Ошибка запроса.")
-        QMessageBox.critical(self, "Shikimori", f"Не удалось выполнить поиск:\n{message}")
+        msgbox_critical(self, "Shikimori", f"Не удалось выполнить поиск:\n{message}")
 
     def _set_busy(self, busy: bool):
         self.btn_search.setEnabled(not busy)
+        self.btn_search_cache.setEnabled(not busy)
         self.btn_cancel.setEnabled(busy)
 
     def _set_actions_enabled(self, on: bool):
@@ -1610,6 +1739,7 @@ class ShikimoriTab(QWidget):
         # «Стоп» активен и во время сортировки — её тоже можно прервать.
         self.btn_cancel.setEnabled(True)
         self.btn_search.setEnabled(False)
+        self.btn_search_cache.setEnabled(False)
         task = _ViewsTask(ids)
         task.signals.item.connect(self._on_views_item)
         task.signals.progress.connect(self._on_views_progress)
@@ -1679,6 +1809,7 @@ class ShikimoriTab(QWidget):
         # Сортировка завершилась сама — возвращаем кнопки в обычное состояние.
         self.btn_cancel.setEnabled(False)
         self.btn_search.setEnabled(True)
+        self.btn_search_cache.setEnabled(True)
         self._resort_by_views(done=True)
         # Дозагрузка карточек закончилась — сразу сохраняем кеш индекса на диск.
         self._save_index_cache()
@@ -1840,6 +1971,14 @@ class ShikimoriTab(QWidget):
             aid = it.data(Qt.ItemDataRole.UserRole + 1)
             if aid in self._thumb_cache or aid in self._thumb_pending:
                 continue
+            # Сперва — дисковый кеш (мгновенно, без сети): постеры за день не
+            # меняются, повторно качать их незачем.
+            pm = _load_cover_from_disk(aid)
+            if pm is not None:
+                icon = QIcon(pm)
+                self._thumb_cache[aid] = icon
+                it.setIcon(icon)
+                continue
             a = self._anime_by_id.get(aid)
             if a is None or not a.image_url:
                 continue
@@ -1857,6 +1996,7 @@ class ShikimoriTab(QWidget):
                        Qt.TransformationMode.SmoothTransformation)
         icon = QIcon(pm)
         self._thumb_cache[anime_id] = icon
+        _save_cover_to_disk(anime_id, pm)
         # Находим строку с этим id и ставим иконку (список мог быть перестроен).
         for i in range(self.list.count()):
             it = self.list.item(i)
@@ -1917,7 +2057,7 @@ class ShikimoriTab(QWidget):
     def _choose_packs(self):
         datasets = self._siq_datasets()
         if not datasets:
-            QMessageBox.information(
+            msgbox_information(
                 self, "Паки SiQuesterHYX",
                 "Нет загруженных паков.\n\nВключите вкладку «SiQuesterHYX» в "
                 "Настройках и откройте в ней .siq-пак(и), затем повторите.")
@@ -2003,7 +2143,7 @@ class ShikimoriTab(QWidget):
         if not items:
             # Список ещё не пришёл — подгрузим и попросим повторить чуть позже.
             self._load_genres_async(ct)
-            QMessageBox.information(
+            msgbox_information(
                 self, "Жанры и темы",
                 "Список жанров ещё загружается — повторите через секунду.")
             return
@@ -2048,6 +2188,7 @@ class ShikimoriTab(QWidget):
             "score_max": self.sp_score_max.value(),
             "order": self.cb_order.currentData() or "ranked",
             "views_max": int(self.sp_views_max.value()),
+            "stop_limit": int(self.sp_stop_limit.value()),
             "kind": self.cb_kind.currentData() or "",
             "status": self.cb_status.currentData() or "",
             "genres": list(self._sel_genres),
@@ -2085,6 +2226,8 @@ class ShikimoriTab(QWidget):
         self.sp_views_max.setValue(
             int(s.get("views_max", _VIEWS_SORT_MAX) or _VIEWS_SORT_MAX))
         self._update_views_max_enabled()
+        self.sp_stop_limit.setValue(
+            int(s.get("stop_limit", _STOP_LIMIT_DEFAULT) or 0))
         ki = self.cb_kind.findData(s.get("kind", ""))
         if ki >= 0:
             self.cb_kind.setCurrentIndex(ki)
@@ -2149,6 +2292,7 @@ class ShikimoriTab(QWidget):
         self.cb_order.setCurrentIndex(0)
         self.sp_views_max.setValue(_VIEWS_SORT_MAX)
         self._update_views_max_enabled()
+        self.sp_stop_limit.setValue(_STOP_LIMIT_DEFAULT)
         self.cb_kind.setCurrentIndex(0)
         self.cb_status.setCurrentIndex(0)
         self._sel_genres = []
@@ -2194,7 +2338,7 @@ class ShikimoriTab(QWidget):
                     w.writeheader()
                     w.writerows(rows)
         except Exception as e:
-            QMessageBox.critical(self, "Экспорт", f"Не удалось сохранить файл:\n{e}")
+            msgbox_critical(self, "Экспорт", f"Не удалось сохранить файл:\n{e}")
             return
         self.lbl_status.setText(f"Сохранено: {os.path.basename(path)} ({len(rows)})")
         if self.main is not None and hasattr(self.main, "log"):

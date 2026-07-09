@@ -510,6 +510,13 @@ class LaMaProcessInpainter:
             self._fallback = None
             self._device = "—"
 
+    def cancel(self):
+        """Прерывает ТЕКУЩИЙ inpaint(), заблокированный на recv() внутри
+        self._lock — в отличие от unload(), лок НЕ берём (иначе дедлок: поток
+        обработки держит лок, пока не разблокируется чтением из закрытого
+        пайпа). Закрытие пайпа/kill процесса безопасно вызывать конкурентно."""
+        self._kill_proc()
+
     def _kill_proc(self):
         try:
             if self._conn is not None:

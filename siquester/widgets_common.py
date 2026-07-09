@@ -3,6 +3,45 @@
 from .qt import *
 from .constants import *
 
+
+def _selectable_box(icon, parent, title, text, buttons, default_button):
+    """QMessageBox с выделяемым мышью и копируемым текстом (в отличие от
+    статических QMessageBox.critical/warning/information/question)."""
+    box = QMessageBox(parent)
+    box.setIcon(icon)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    box.setStandardButtons(buttons)
+    if default_button is not None:
+        box.setDefaultButton(default_button)
+    return box.exec()
+
+
+def msgbox_critical(parent, title, text,
+                     buttons=QMessageBox.StandardButton.Ok,
+                     defaultButton=QMessageBox.StandardButton.NoButton):
+    return _selectable_box(QMessageBox.Icon.Critical, parent, title, text, buttons, defaultButton)
+
+
+def msgbox_warning(parent, title, text,
+                    buttons=QMessageBox.StandardButton.Ok,
+                    defaultButton=QMessageBox.StandardButton.NoButton):
+    return _selectable_box(QMessageBox.Icon.Warning, parent, title, text, buttons, defaultButton)
+
+
+def msgbox_information(parent, title, text,
+                        buttons=QMessageBox.StandardButton.Ok,
+                        defaultButton=QMessageBox.StandardButton.NoButton):
+    return _selectable_box(QMessageBox.Icon.Information, parent, title, text, buttons, defaultButton)
+
+
+def msgbox_question(parent, title, text,
+                     buttons=QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                     defaultButton=QMessageBox.StandardButton.NoButton):
+    return _selectable_box(QMessageBox.Icon.Question, parent, title, text, buttons, defaultButton)
+
+
 class _HoverFilter(QObject):
     """Event filter that tracks Enter/Leave for a container widget.
     Defined at module level so Python doesn't reallocate the class
@@ -81,7 +120,9 @@ class GameProgressBar(QFrame):
         p.setBrush(QBrush(QColor(_C_BG4))); p.setPen(QColor(_C_BORDER)); p.drawRoundedRect(0,0,w,h,r,r)
         fw=max(0,int(w*self.pct/100))
         if fw>0:
-            g=QLinearGradient(0,0,fw,0); g.setColorAt(0,QColor("#313244")); g.setColorAt(1,QColor("#cba6f7"))
+            # Конец градиента НЕ должен совпадать с цветом текста (#cba6f7) —
+            # иначе на закрашенной части текст сливается с фоном и его не видно.
+            g=QLinearGradient(0,0,fw,0); g.setColorAt(0,QColor("#313244")); g.setColorAt(1,QColor("#89b4fa"))
             p.setBrush(QBrush(g)); p.setPen(Qt.PenStyle.NoPen)
             path=QPainterPath(); path.addRoundedRect(QRectF(0,0,fw,h),r,r)
             p.setClipPath(path); p.drawRect(0,0,fw,h); p.setClipping(False)
@@ -178,7 +219,7 @@ class DropEdit(QTextEdit):
                 if p.lower().endswith((".txt",".html",".htm")):
                     try:
                         with open(p,"r",encoding="utf-8") as f: self.setPlainText(f.read())
-                    except Exception as ex: QMessageBox.warning(self,"Ошибка",str(ex))
+                    except Exception as ex: msgbox_warning(self,"Ошибка",str(ex))
                     e.acceptProposedAction(); return
         else: super().dropEvent(e)
 
@@ -209,4 +250,8 @@ __all__ = [
     '_QProgressWidget',
     '_WheelToViewport',
     '_install_wheel_filter',
+    'msgbox_critical',
+    'msgbox_warning',
+    'msgbox_information',
+    'msgbox_question',
 ]
