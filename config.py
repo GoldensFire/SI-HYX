@@ -520,8 +520,15 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.5.2"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
+# Необязательное обновление: перед сборкой (build.bat) поставь True, если этот
+# релиз НЕ должен всплывать плашкой у уже установленных пользователей — сам
+# релиз на GitHub при этом остаётся обычным (не draft, не pre-release), новые
+# скачивания получают именно его. Узнать о таком обновлении можно только
+# вручную, кнопкой «Проверить обновления» (см. _check_updates в main.py). Не
+# забудь вернуть False перед следующим обычным (обязательным) релизом.
+SILENT_UPDATE = True
 # Репозиторий для автообновления (GitHub Releases)
 GITHUB_OWNER = "GoldensFire"
 GITHUB_REPO = "SI-HYX"
@@ -737,6 +744,29 @@ QTreeWidget::item:hover {
 QTreeWidget::item:selected {
     background-color: transparent;
     color: #cdd6f4;
+}
+QTableWidget {
+    background-color: #181825;
+    color: #cdd6f4;
+    border: 1px solid #45475a;
+    border-radius: 5px;
+    alternate-background-color: #1e1e2e;
+    gridline-color: #313244;
+    outline: none;
+}
+QTableWidget::item {
+    padding: 3px 2px;
+    border: none;
+}
+QTableWidget::item:hover {
+    background-color: #313244;
+}
+QTableWidget::item:selected {
+    background-color: #45475a;
+    color: #cdd6f4;
+}
+QTableWidget::item:selected:active {
+    background-color: #585b70;
 }
 QHeaderView::section {
     background-color: #24273a;

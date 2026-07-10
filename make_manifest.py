@@ -15,10 +15,14 @@
   2) python make_manifest.py manifest "dist\\SI-HYX vX.Y.Z" "dist" ^
             "dist\\...-update.zip" "dist\\...-full.zip"
      • пишет <dist>/manifest.json:
-         {"version", "bin_sha", "update_sha", "full_sha"}
+         {"version", "bin_sha", "update_sha", "full_sha", "silent"}
        где update_sha/full_sha — SHA256 готовых архивов. Апдейтер качает
        manifest первым, выбирает архив и СВЕРЯЕТ его хеш после загрузки —
-       битый или подменённый zip не распаковывается.
+       битый или подменённый zip не распаковывается. silent берётся из
+       config.SILENT_UPDATE — «необязательное» обновление: релиз обычный
+       (не draft/pre-release, новые скачивания получают его), но тихая
+       (авто) проверка при запуске программы не показывает плашку — см.
+       _check_updates в main.py.
      Делается ПОСЛЕ упаковки обоих архивов.
 
 Файл .binver в хеш НЕ включается (иначе хеш зависел бы сам от себя).
@@ -107,6 +111,7 @@ def cmd_manifest(app_dir: str, dist_dir: str, update_zip: str, full_zip: str):
         "bin_sha": compute_bin_sha(app_dir),
         "update_sha": _sha256_file(update_zip),
         "full_sha": _sha256_file(full_zip),
+        "silent": bool(getattr(config, "SILENT_UPDATE", False)),
     }
     out = os.path.join(dist_dir, "manifest.json")
     with open(out, "w", encoding="utf-8") as f:

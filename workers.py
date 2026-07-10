@@ -389,6 +389,7 @@ class YtdlpWorker(QThread):
 
         self._dl_start_ts = time.time()
         self._last_real_progress = time.time()
+        self._last_pct = 0.0  # новая попытка качает с нуля — не тянуть % с прошлой
         # Новая попытка снова начинается с извлечения — сбрасываем фазу загрузки.
         self._download_phase = False
         self._dl_phase_ts = None
@@ -523,16 +524,28 @@ class YtdlpWorker(QThread):
             # резолвим страницу в прямой m3u8 и качаем уже его.
             kodik = {}
             if not is_audio_only and is_embed_candidate(url):
-                try:
-                    want_h = self._height_from_fmt(self.c.get('fmt', ''))
-                    ep = self.c.get('kodik_episode')
-                    ep = int(ep) if ep else None
-                    kodik = resolve_kodik(url, want_height=want_h, proxy=proxy,
-                                          episode=ep,
-                                          translation=self.c.get('kodik_translation', ''),
-                                          log_fn=self.log_sig.emit)
-                except Exception as e:
-                    self.log_sig.emit(f"Kodik resolve error: {e}")
+                want_h = self._height_from_fmt(self.c.get('fmt', ''))
+                ep = self.c.get('kodik_episode')
+                ep = int(ep) if ep else None
+                tr = self.c.get('kodik_translation', '')
+                # Резолв Kodik/animego бывает флапающим (AJAX-плеер или сам
+                # Kodik временно не отвечает) — как и с TikTok, повтор почти
+                # всегда лечит: до 3 попыток с короткой паузой перед сдачей.
+                KODIK_MAX = 3
+                for kodik_try in range(1, KODIK_MAX + 1):
+                    try:
+                        kodik = resolve_kodik(url, want_height=want_h, proxy=proxy,
+                                              episode=ep, translation=tr,
+                                              log_fn=self.log_sig.emit)
+                    except Exception as e:
+                        self.log_sig.emit(f"Kodik resolve error: {e}")
+                        kodik = {}
+                    if kodik or not self.is_running:
+                        break
+                    if kodik_try < KODIK_MAX:
+                        self.log_sig.emit(
+                            f"Kodik: пустой ответ — повтор {kodik_try}/{KODIK_MAX}…")
+                        self._sleep_interruptible(1.5)
             if kodik:
                 self.log_sig.emit(f"Встроенный плеер Kodik → качаю {kodik['height']}p (m3u8)")
                 url = kodik['url']
@@ -561,11 +574,16 @@ class YtdlpWorker(QThread):
                     e_tag = f"{e_val}s" if e_val else "end"
                     outtmpl = os.path.join(out_dir, f'%(title)s [{s_tag}-{e_tag}].%(ext)s')
 
-            # Для Kodik имя из URL-страницы (иначе yt-dlp возьмёт «720.mp4:hls:manifest»)
+            # Для Kodik имя из URL-страницы (иначе yt-dlp возьмёт «720.mp4:hls:manifest»).
+            # raw_url — это страница АНИМЕ, одна на все серии, поэтому без номера
+            # серии в имени все серии тайтла бьются в один файл: первая скачивается,
+            # а любая следующая видит «уже скачано» и молча выходит без файла
+            # (rc=0, файла нет — выглядело как случайный сбой скачивания).
             if kodik:
                 from urllib.parse import urlparse as _urlparse
                 slug = os.path.splitext(os.path.basename(_urlparse(raw_url).path))[0] or "video"
-                outtmpl = os.path.join(out_dir, f"{slug} [{kodik['height']}p].%(ext)s")
+                ep_tag = f" - {ep} серия" if ep else ""
+                outtmpl = os.path.join(out_dir, f"{slug}{ep_tag} [{kodik['height']}p].%(ext)s")
 
             cmd = base + [
                 "--newline", "--no-playlist", "--no-mtime", "--progress",
@@ -608,6 +626,12 @@ class YtdlpWorker(QThread):
             # Kodik m3u8 требует Referer на домен плеера
             if kodik and kodik.get('referer'):
                 cmd += ["--add-header", f"Referer:{kodik['referer']}"]
+                # CDN Kodik троттлит КАЖДОЕ соединение (одиночный поток даёт
+                # десятки KiB/s) — сегменты HLS качаем параллельно, а не по
+                # одному, иначе загрузка ползёт часами. Прошлый сбой на 32
+                # был из-за коллизии имён файлов (см. outtmpl ниже), не из-за
+                # числа потоков.
+                cmd += ["--concurrent-fragments", "32"]
 
             if is_audio_only:
                 # ТОЛЬКО аудио: берём ЧИСТЫЙ аудиопоток (vcodec=none) — иначе на сайтах
@@ -772,7 +796,14 @@ class YtdlpWorker(QThread):
             if not final_path or not os.path.exists(final_path):
                 if rc not in (0, None):
                     raise Exception("\n".join(tail) or f"yt-dlp завершился с кодом {rc}")
-                raise Exception("yt-dlp завершил работу, но файл не найден (ошибка скачивания)")
+                # rc==0, но файла нет — раньше причина терялась молча. Тянем
+                # хвост вывода (может быть пуст, если процесс оборвался ДО
+                # первой текстовой строки — тогда явно указываем и это).
+                detail = "\n".join(tail).strip()
+                raise Exception(
+                    "yt-dlp завершил работу (код 0), но файл не найден"
+                    + (f":\n{detail}" if detail
+                       else " (вывод пуст — процесс оборвался без единой строки лога)."))
             out_fullpath = final_path
 
             # На некоторых роликах yt-dlp завершается с rc=0, но молча скатывается
@@ -847,6 +878,12 @@ class YtdlpWorker(QThread):
                 except Exception: msg = speed
             else:
                 msg = f"{speed} ETA: {eta}"
+            # С параллельными фрагментами (--concurrent-fragments) yt-dlp
+            # периодически пересчитывает total_bytes_estimate по среднему
+            # размеру уже скачанных сегментов — процент от этого может
+            # временно проседать, хотя реально скачанные байты не уменьшаются.
+            # Не даём прогресс-бару идти назад.
+            pct = max(pct, self._last_pct)
             self._enter_download_phase()  # реальный кадр прогресса = загрузка идёт
             self._last_real_progress = time.time()
             self._last_pct = pct

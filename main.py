@@ -1243,9 +1243,16 @@ class UnifiedWindow(QMainWindow):
                 if best_rel is not None and best_ver > parse_version(APP_VERSION):
                     # Выбираем ассет умно: только код (update-архив), если bin не
                     # менялся, иначе полный zip (см. _pick_update_asset). Третьим
-                    # элементом — ожидаемый sha256 для проверки после загрузки.
-                    best_url, best_size, best_sha = self._pick_update_asset(best_rel)
+                    # элементом — ожидаемый sha256, четвёртым — флаг «необязательное
+                    # обновление» (manifest["silent"]): такой релиз остаётся обычным
+                    # (не pre-release, не draft) — новые пользователи с GitHub качают
+                    # именно его, — но тихая (авто) проверка при запуске программы
+                    # НЕ показывает плашку; узнать о нём можно только вручную, кнопкой
+                    # «Проверить обновления».
+                    best_url, best_size, best_sha, best_silent = self._pick_update_asset(best_rel)
                     if best_url:
+                        if silent and best_silent:
+                            return
                         # запоминаем, тихая ли это проверка — слот решает, уважать ли «пропуск»
                         self._check_was_silent = silent
                         changelog = str(best_rel.get("body") or "").strip()
@@ -1284,9 +1291,12 @@ class UnifiedWindow(QMainWindow):
           (manifest.bin_sha == локальный bin/.binver);
         • full-архив (код + bin, ~сотни МБ) — если bin изменился, либо релиз
           старого формата (нет manifest.json / update-архива).
-        Возвращает (url, size_bytes, sha256). sha256 — ожидаемый хеш выбранного
-        архива из manifest (для проверки после загрузки); "" если проверить
-        нечем (старый формат / нет хеша в manifest)."""
+        Возвращает (url, size_bytes, sha256, silent). sha256 — ожидаемый хеш
+        выбранного архива из manifest (для проверки после загрузки); "" если
+        проверить нечем (старый формат / нет хеша в manifest). silent — флаг
+        manifest["silent"]: True у релиза, помеченного «необязательным» (см.
+        _check_updates) — старый формат релиза (без manifest) всегда даёт
+        False, т.е. ведёт себя как обычное обязательное обновление."""
         assets = rel.get("assets", [])
 
         def by(pred):
@@ -1308,9 +1318,10 @@ class UnifiedWindow(QMainWindow):
         # Проверить целостность нечем → sha = "".
         if not update_asset or not manifest:
             z = full_asset or by(lambda n: n.endswith(".zip"))
-            return (z.get("browser_download_url", ""), int(z.get("size", 0) or 0), "") if z else ("", 0, "")
+            return (z.get("browser_download_url", ""), int(z.get("size", 0) or 0), "", False) if z else ("", 0, "", False)
 
-        # Читаем manifest: bin_sha (что качать) + update_sha/full_sha (что проверять).
+        # Читаем manifest: bin_sha (что качать) + update_sha/full_sha (что проверять)
+        # + silent (необязательное обновление — см. _check_updates).
         man = {}
         try:
             with http_get(manifest.get("browser_download_url", ""),
@@ -1320,6 +1331,7 @@ class UnifiedWindow(QMainWindow):
         except Exception:
             man = {}
         remote_bin_sha = man.get("bin_sha", "") or ""
+        is_silent = bool(man.get("silent", False))
 
         bin_unchanged = bool(remote_bin_sha) and remote_bin_sha == self._local_bin_sha()
         if bin_unchanged and update_asset:
@@ -1328,7 +1340,7 @@ class UnifiedWindow(QMainWindow):
         else:
             chosen = full_asset or update_asset
             sha = (man.get("full_sha", "") or "") if chosen is full_asset else (man.get("update_sha", "") or "")
-        return (chosen.get("browser_download_url", ""), int(chosen.get("size", 0) or 0), sha) if chosen else ("", 0, "")
+        return (chosen.get("browser_download_url", ""), int(chosen.get("size", 0) or 0), sha, is_silent) if chosen else ("", 0, "", False)
 
     def _skip_file(self):
         return os.path.join(CONFIG_DIR, "skipped_update.txt")
