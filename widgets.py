@@ -30,7 +30,7 @@ from utils import (
     default_download_dir, human_size, load_pixmap_any, load_settings,
     move_to_trash, pil_to_qicon, rasterize_svg, save_settings
 )
-from msgbox import msgbox_critical, msgbox_warning, msgbox_information, msgbox_question
+from msgbox import msgbox_warning
 from PyQt6.QtWidgets import QSizePolicy, QAbstractButton, QStyleOptionSlider
 from PyQt6.QtCore import QUrl
 
@@ -720,7 +720,7 @@ class _RecentThumbWorker(QRunnable):
                         [FFPROBE, "-v", "error", "-show_entries", "format=duration",
                          "-of", "default=noprint_wrappers=1:nokey=1", self.path],
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                        text=True, creationflags=CREATE_NO_WINDOW, timeout=4)
+                        text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW, timeout=4)
                     d = float(probe.stdout.strip() or 0)
                     if d > 0:
                         h = int(d // 3600); m = int((d % 3600) // 60); s = int(d % 60)
@@ -2289,7 +2289,7 @@ def _probe_video_codec(path):
         r = subprocess.run(
             [FFPROBE, "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
-            capture_output=True, text=True, timeout=10, creationflags=CREATE_NO_WINDOW)
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, creationflags=CREATE_NO_WINDOW)
         return (r.stdout or "").strip().lower()
     except Exception:
         return ""

@@ -844,7 +844,7 @@ class YtdlpWorker(QThread):
                          "-show_entries", "stream=codec_type",
                          "-of", "csv=p=0", out_fullpath],
                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                        text=True, creationflags=CREATE_NO_WINDOW,
+                        text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW,
                     )
                     has_video = bool(vp.stdout.strip())
                 except Exception:
@@ -1147,7 +1147,7 @@ class ProcessWorker(QThread):
                  "-show_entries", "stream=pix_fmt",
                  "-of", "default=noprint_wrappers=1:nokey=1", path],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, creationflags=CREATE_NO_WINDOW,
+                text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW,
             )
             fmt = p.stdout.strip().lower()
             _NO_ALPHA = {'gray', 'grayf32le', 'grayf32be', 'rgb24', 'bgr24',
@@ -1175,7 +1175,7 @@ class ProcessWorker(QThread):
                  "-show_entries", "stream=color_primaries,color_transfer,color_space",
                  "-of", "default=noprint_wrappers=1:nokey=1", path],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, creationflags=CREATE_NO_WINDOW, timeout=15,
+                text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW, timeout=15,
             )
             vals = [v.strip().lower() for v in (p.stdout or "").splitlines()]
         except Exception:
@@ -1228,7 +1228,7 @@ class ProcessWorker(QThread):
                      "-show_entries", "stream=width,height",
                      "-of", "csv=p=0:s=x", path],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                    text=True, creationflags=CREATE_NO_WINDOW,
+                    text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW,
                 )
                 iw, ih = (int(v) for v in pr.stdout.strip().split("x")[:2])
                 # Полосы реально есть только если рамка заметно меньше кадра
@@ -2569,7 +2569,7 @@ class ProcessWorker(QThread):
         if not orig_w:
             try:
                 p = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
-                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, creationflags=CREATE_NO_WINDOW)
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
                 parts = p.stdout.strip().split('x')
                 if len(parts) == 2: orig_w, orig_h = int(parts[0]), int(parts[1])
             except Exception: pass

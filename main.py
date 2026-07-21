@@ -1682,9 +1682,9 @@ class UnifiedWindow(QMainWindow):
         # 1) Планировщик задач (register.cmd сам делает /Create и /Run)
         try:
             subprocess.run(["cmd", "/c", register_cmd], creationflags=flags,
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, errors="replace", timeout=30)
             chk = subprocess.run(["schtasks", "/Query", "/TN", task_name],
-                                 creationflags=flags, capture_output=True, text=True, timeout=15)
+                                 creationflags=flags, capture_output=True, text=True, errors="replace", timeout=15)
             if chk.returncode == 0:
                 self.log("Апдейтер запущен через Планировщик задач (вне job-объекта).")
                 return True

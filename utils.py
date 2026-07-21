@@ -1024,7 +1024,7 @@ def get_media_info(path):
 def get_fps_float(path):
     try:
         cmd = [FFPROBE, "-v", "0", "-of", "csv=p=0", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", path]
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, creationflags=CREATE_NO_WINDOW)
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
         val = p.stdout.strip()
         if '/' in val:
             num, den = val.split('/', 1)
@@ -1037,7 +1037,7 @@ def get_fps_float(path):
 def get_video_codec(path):
     try:
         p = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", path],
-                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, creationflags=CREATE_NO_WINDOW)
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
         return p.stdout.strip().lower() or None
     except Exception:
         return None
@@ -1330,7 +1330,7 @@ def move_to_trash(path, hwnd=None):
 def detect_ffmpeg_encoders():
     """Определяет доступные кодеки FFmpeg. Результат кешируется — ffmpeg запускается только один раз."""
     try:
-        p = subprocess.run([FFMPEG, "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, creationflags=CREATE_NO_WINDOW)
+        p = subprocess.run([FFMPEG, "-hide_banner", "-encoders"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
         encs = set()
         for line in (p.stdout or "").splitlines():
             m = re.match(r'^\s*[A-Z\.]+\s+([a-z0-9_\-]+)\s+', line, re.I)

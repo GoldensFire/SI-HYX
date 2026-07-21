@@ -292,7 +292,7 @@ def _measure_lufs(path: str) -> str:
         result = _subprocess.run(
             ["ffmpeg", "-hide_banner", "-i", path,
              "-af", "loudnorm=print_format=json", "-f", "null", "-"],
-            capture_output=True, text=True, timeout=8,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=8,
             creationflags=getattr(_subprocess, "CREATE_NO_WINDOW", 0)
         )
         output = result.stderr
