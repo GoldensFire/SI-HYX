@@ -1,9 +1,16 @@
 """Audio / video player widgets built on QtMultimedia (QMediaPlayer)."""
 
-from .qt import *
-from .constants import *
-from .util import *
-from .media import *
+from .qt import (
+    _threading, math, os, pyqtSignal, QApplication, QAudioOutput, QBrush, QColor,
+    QHBoxLayout, QLabel, QMediaMetaData, QMediaPlayer, QMenu, QPainter, QPainterPath,
+    QRectF, QSize, QSlider, Qt, QTimer, QUrl, QVBoxLayout, QVideoWidget, QWidget
+)
+from .constants import _AlignVC, _Expand, _Pref, _SS_LABEL_DIM
+from .media import (
+    _extract_waveform_bars, _get_media_info, _get_ui_bridge, _m4a_audio_bitrate_kbps,
+    _measure_lufs, _mp4_video_size
+)
+from .util import _lbl, fmt_dur
 
 class SeekSlider(QSlider):
     """QSlider that emits user_seek(value) on any mouse interaction."""

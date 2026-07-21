@@ -1,6 +1,9 @@
 """Pure-python media probing (durations, bitrates, waveform, LUFS), image cache and the UI thread bridge."""
 
-from .qt import *
+from .qt import (
+    _logger, _subprocess, json, math, os, pyqtSignal, QImage, QImageReader, QObject,
+    QPixmap, Qt, random, struct
+)
 
 _MP4_PROBE_SIZE = 1 << 15   # 32 KB — enough for moov header at start of well-formed MP4
 

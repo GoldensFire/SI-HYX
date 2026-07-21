@@ -1,6 +1,6 @@
 """Small shared helpers: layout tightening, screen scaling, XML/price lookups, label/checkbox helpers."""
 
-from .qt import *
+from .qt import functools, QApplication, QLabel, urllib
 
 def _tight(layout):
     """Set zero margins and spacing on *layout* in one call."""

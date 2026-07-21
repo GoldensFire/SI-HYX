@@ -2,15 +2,31 @@
 
 from PyQt6.QtGui import QDesktopServices
 
-from .qt import *
-from .constants import *
-from .util import *
-from .persistence import *
-from .media import *
-from .siq_package import *
-from .widgets_common import *
-from .widgets_players import *
-from .widgets_editors import *
+from .qt import (
+    _logger, _shutil, _threading, ET, os, Path, pyqtSignal, QApplication, QByteArray,
+    QDrag, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
+    QMimeData, QPainter, QPixmap, QPushButton, QRect, QScrollArea, QSizePolicy, Qt,
+    QTextEdit, QTextOption, QTimer, QUrl, QVBoxLayout, QWidget, zipfile
+)
+from .constants import (
+    _AlignC, _AlignVC, _DEL_SS_HIDDEN, _DEL_SS_SHOWN, _DH_SS_HIDDEN, _DH_SS_SHOWN,
+    _ITEM_JOIN_SS, _MEDIA_EXTS, _MIME_ANS, _MIME_BLOCK, _ON_BTN_ANALYZE,
+    _ON_BTN_COMPARE, _ON_BTN_DEL, _ON_BTN_SORT, _ON_BTN_UPDATE, _Pref, _RB_ACTIVE,
+    _RB_HOV, _RB_OFF, _SB_HOV, _SB_OFF, _SB_ON, _SS_BADGE_MUTED, _SS_TOPBAR_LABEL,
+    _SS_TRANSPARENT, _TB_HOV, _TB_OFF, _TB_ON
+)
+from .media import _get_ui_bridge, _img_size_from_path, _load_qimage
+from .persistence import _notif_reset
+from .siq_package import _safe_replace, SiqPackage
+from .util import (
+    _find_mw, _lbl, _parse_hms, _q_idx, _screen_scale, _unquote, _xml_nav_q, fmt_dur
+)
+from .widgets_common import (
+    _HoverFilter, _install_wheel_filter, AnimatedButton, msgbox_information,
+    msgbox_warning
+)
+from .widgets_editors import _AnsEdit, _InlineTextEdit, PointOnImageWidget
+from .widgets_players import AudioPlayerWidget, MpvVideoPlayerWidget
 
 class QuestionViewer(QWidget):
     edit_requested = pyqtSignal(int, int, int)   # rnd_idx, theme_idx, price
@@ -464,7 +480,7 @@ class QuestionViewer(QWidget):
             qs = siq.rounds[rnd]["themes"][th]["questions"]
             q_idx_c = _q_idx(qs, price)
             q_comment = qs[q_idx_c].get("comment","")
-        except: pass
+        except Exception: pass
 
         comm_hdr = QLabel("💬  Комментарий (заметка к вопросу)")
         comm_hdr.setStyleSheet("color:#585b70;font-size:9px;font-weight:700;"
@@ -718,7 +734,7 @@ class QuestionViewer(QWidget):
         """Stop all media players. MPV stop is async to avoid blocking the UI."""
         for mw in self._media_widgets:
             try: mw.stop()
-            except: pass
+            except Exception: pass
         self._media_widgets.clear()
 
     def _clear_lay(self, lay: QVBoxLayout):
@@ -1088,7 +1104,7 @@ class QuestionViewer(QWidget):
             try:
                 _p = existing_dur.strip().split(":")
                 _tb_secs = int(_p[0])*3600 + int(_p[1])*60 + int(_p[2]) if len(_p)==3 else int(_p[0])*60 + int(_p[1])
-            except: pass
+            except Exception: pass
         _tb_label = f"⏱ {_tb_secs}с" if _tb_secs > 0 else "⏱"
         timer_btn = QPushButton(_tb_label)
         timer_btn.setFixedHeight(20)

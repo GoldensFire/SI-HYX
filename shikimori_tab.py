@@ -25,6 +25,10 @@ import os
 import re
 import time
 import webbrowser
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # только для аннотаций в кавычках — на рантайме не нужен
+    from typing import Optional
 
 from PyQt6.QtCore import (
     Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QSize, QRect, QEvent, QTimer,

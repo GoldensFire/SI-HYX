@@ -1,6 +1,6 @@
 """UI constants: colour palette, Qt enum aliases, stylesheet fragments, MIME types, sort flags."""
 
-from .qt import *
+from .qt import QSizePolicy, Qt, re
 
 _AlignC   = Qt.AlignmentFlag.AlignCenter
 

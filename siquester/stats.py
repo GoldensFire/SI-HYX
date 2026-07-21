@@ -1,6 +1,6 @@
 """Stats dataset aggregation helpers."""
 
-from .qt import *
+from .qt import re
 
 _RE_STATS_PCT = re.compile(r'\((\d+)%\)')
 

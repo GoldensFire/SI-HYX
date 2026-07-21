@@ -1,8 +1,8 @@
 """Application entry point: builds QApplication and shows MainWindow."""
 
-from .qt import *
-from .constants import *
-from .main_window import *
+from .qt import _logger, _time, os, QApplication, QColor, QPalette, sys
+from .constants import STYLESHEET
+from .main_window import MainWindow
 
 def main():
     import traceback as _tb, sys as _sys_eh

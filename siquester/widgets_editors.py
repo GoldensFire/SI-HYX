@@ -1,9 +1,21 @@
 """Inline text editors, the point-on-image widget and the question/compare dialogs."""
 
-from .qt import *
-from .constants import *
-from .util import *
-from .widgets_common import *
+from .qt import (
+    _logger, ET, os, Path, pyqtSignal, QBrush, QCheckBox, QColor, QComboBox, QDialog,
+    QFileDialog, QGroupBox, QHBoxLayout, QImage, QImageReader, QInputDialog, QLabel,
+    QLineEdit, QMenu, QPainter, QPixmap, QPushButton, QScrollArea, QSize,
+    QStackedWidget, Qt, QTextEdit, QTextOption, QVBoxLayout, QWidget
+)
+from .constants import (
+    _AlignC, _C_BG2, _C_RED, _C_TEXT4, _Expand, _MEDIA_EXTS, _ON_BTN_ANALYZE,
+    _ON_BTN_COMPARE, _ON_BTN_DEL, _Pref, _SS_TRANSPARENT
+)
+from .util import _lbl, _q_idx, _style_cb
+from .widgets_common import AnimatedButton, msgbox_information, msgbox_warning
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:  # только для аннотаций — на рантайме не импортируется
+    from .siq_package import SiqPackage
 
 def _editor_context_menu(widget, e):
     """Shared context menu for editable QTextEdit subclasses."""

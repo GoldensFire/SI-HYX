@@ -1,9 +1,16 @@
 """Tile drag-and-drop board and the package-info dialog."""
 
-from .qt import *
-from .constants import *
-from .util import *
-from .widgets_common import *
+from .qt import (
+    pyqtSignal, QByteArray, QDialog, QDrag, QEasingCurve, QFrame, QHBoxLayout, QLabel,
+    QLineEdit, QMenu, QMimeData, QPropertyAnimation, QScrollArea, Qt, QTextEdit,
+    QVBoxLayout, QWidget, struct
+)
+from .constants import (
+    _AlignC, _AlignL, _AlignVC, _ON_BTN_ANALYZE, _RE_TILE_BORDER, _SS_TRANSPARENT,
+    TILE_MIME
+)
+from .util import _lbl
+from .widgets_common import AnimatedButton, msgbox_warning
 
 class _TileDropArea(QWidget):
     """Horizontal flow of question tiles with animated insertion-gap on drag-over."""

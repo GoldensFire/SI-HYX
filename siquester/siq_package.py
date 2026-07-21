@@ -1,9 +1,12 @@
 """The SiqPackage model: parse / edit / repack a .siq archive (incl. the robust _safe_replace save)."""
 
-from .qt import *
-from .constants import *
-from .util import *
-from .media import *
+from .qt import (
+    _ctypes, _et_fromstring, _ET_IS_LXML, _logger, _shutil, _stat, _time, ET, os, re,
+    shutil, tempfile, zipfile
+)
+from .constants import _AUDIO_EXTS, _HTML_EXTS, _IMG_EXTS, _VIDEO_EXTS
+from .media import mp3_duration, mp4_duration
+from .util import _make_tag_fn, _qs_price_map, _unquote
 import siq_duration
 
 def _safe_replace(tmp: str, dst: str) -> None:
@@ -344,7 +347,7 @@ class SiqPackage:
         answer_deviation = 0.1
         for p in params_by_name.get('answerDeviation', []):
             try: answer_deviation = float((p.text or '0.1').strip()); break
-            except: pass
+            except Exception: pass
 
         q_comment = ''
         q_info_el = q_el.find(tag('info'))
@@ -402,7 +405,7 @@ class SiqPackage:
             try:
                 if self._zip is not None:
                     try: self._zip.close()
-                    except: pass
+                    except Exception: pass
                 self._zip = zipfile.ZipFile(self.path, 'r')
                 _do_extract(self._zip)
                 self._extract_cache[zpath] = out
@@ -537,10 +540,10 @@ class SiqPackage:
             _logger.warning(f"[save_siq] {e}")
             if os.path.exists(tmp):
                 try: os.remove(tmp)
-                except: pass
+                except Exception: pass
             if self._zip is None:
                 try: self._zip = zipfile.ZipFile(self.path, 'r')
-                except: pass
+                except Exception: pass
             return False
 
     def _load_xml_root(self):
@@ -742,7 +745,7 @@ class SiqPackage:
             try:
                 self.rounds[rnd_idx]["type"] = rnd_type
                 self.rounds[rnd_idx]["comment"] = comment
-            except: pass
+            except Exception: pass
             return self._save_xml(root, ns_url)
         except Exception as e:
             _logger.warning(f"[save_round_info] {e}"); return False
@@ -765,7 +768,7 @@ class SiqPackage:
                 comm_el = info_el.find(tag_fn('comments'))
                 if comm_el is not None: info_el.remove(comm_el)
             try: self.rounds[rnd_idx]["themes"][theme_idx]["questions"][q_idx]["comment"] = comment
-            except: pass
+            except Exception: pass
             return self._save_xml(root, ns_url)
         except Exception as e:
             _logger.warning(f"[save_question_comment] {e}"); return False
@@ -777,7 +780,7 @@ class SiqPackage:
             rnd_el, tag = self._nav_to_round(root, tag, rnd_idx)
             rnd_el.set('name', new_name)
             try: self.rounds[rnd_idx]["name"] = new_name
-            except: pass
+            except Exception: pass
             return self._save_xml(root, ns_url)
         except Exception as e:
             _logger.warning(f"[save_round_name] {e}")
@@ -852,7 +855,7 @@ class SiqPackage:
             theme_el.set('name', new_name)
             # Update in-memory
             try: self.rounds[rnd_idx]["themes"][theme_idx]["name"] = new_name
-            except: pass
+            except Exception: pass
             return self._save_xml(root, ns_url)
         except Exception as e:
             _logger.warning(f"[save_theme_name] {e}")
@@ -866,7 +869,7 @@ class SiqPackage:
             q_el, tag = self._nav_to_question(root, tag, rnd_idx, theme_idx, q_idx)
             q_el.set('price', str(new_price))
             try: self.rounds[rnd_idx]["themes"][theme_idx]["questions"][q_idx]["price"] = new_price
-            except: pass
+            except Exception: pass
             return self._save_xml(root, ns_url)
         except Exception as e:
             _logger.warning(f"[save_price] {e}")
@@ -1181,10 +1184,10 @@ class SiqPackage:
                 _logger.warning(f"[add_media zip] {e}")
                 if os.path.exists(tmp):
                     try: os.remove(tmp)
-                    except: pass
+                    except Exception: pass
                 if self._zip is None:
                     try: self._zip = zipfile.ZipFile(self.path, 'r')
-                    except: pass
+                    except Exception: pass
                 return False
         except Exception as e:
             _logger.warning(f"[add_media] {e}")

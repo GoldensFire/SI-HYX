@@ -1,11 +1,17 @@
 """PackageList and Sidebar widgets."""
 
-from .qt import *
-from .constants import *
-from .util import *
-from .stats import *
-from .persistence import *
-from .widgets_common import *
+from .qt import (
+    pyqtSignal, QFrame, QHBoxLayout, QInputDialog, QLabel, QListWidgetItem, QMenu,
+    QPushButton, QScrollArea, QSize, Qt, QTabWidget, QVBoxLayout, QWidget
+)
+from .constants import (
+    _AlignTop, _ON_BTN_DEL, _ON_BTN_SORT, _SS_TOPBAR, _SS_TRANSPARENT, SORT_COMPLETION,
+    SORT_NONE, SORT_RIGHT, SORT_TRIES
+)
+from .persistence import load_tabs, save_datasets, save_tabs
+from .stats import ds_avgs, get_hl, stats_pct
+from .util import _lbl, fmt_dur
+from .widgets_common import AnimatedButton, PkgListWidget
 
 class PackageList(QWidget):
     item_selected=pyqtSignal(int); delete_requested=pyqtSignal(int)

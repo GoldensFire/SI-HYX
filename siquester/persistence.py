@@ -1,6 +1,6 @@
 """On-disk settings / datasets / tabs and the background save worker."""
 
-from .qt import *
+from .qt import _logger, _queue, _threading, json, Path, QTimer
 
 SAVE_FILE = Path.home() / ".sigame_stats_save.json"
 
@@ -15,14 +15,14 @@ def save_settings(settings: dict):
     try:
         with open(SETTINGS_FILE,"w",encoding="utf-8") as f:
             json.dump(settings, f, ensure_ascii=False)
-    except: pass
+    except Exception: pass
 
 
 def load_settings() -> dict:
     if not SETTINGS_FILE.exists(): return {}
     try:
         with open(SETTINGS_FILE,"r",encoding="utf-8") as f: return json.load(f)
-    except: return {}
+    except Exception: return {}
 
 
 _SAVE_QUEUE: "_queue.Queue[str | None]" = _queue.Queue(maxsize=1)
@@ -73,21 +73,21 @@ def load_datasets():
     if not SAVE_FILE.exists(): return []
     try:
         with open(SAVE_FILE,"r",encoding="utf-8") as f: return json.load(f)
-    except: return []
+    except Exception: return []
 
 
 def save_tabs(tabs):
     try:
         with open(TABS_FILE,"w",encoding="utf-8") as f:
             json.dump(tabs, f, ensure_ascii=False, indent=2)
-    except: pass
+    except Exception: pass
 
 
 def load_tabs():
     if not TABS_FILE.exists(): return [{"id":0,"name":"Все"}]
     try:
         with open(TABS_FILE,"r",encoding="utf-8") as f: return json.load(f)
-    except: return [{"id":0,"name":"Все"}]
+    except Exception: return [{"id":0,"name":"Все"}]
 
 
 def _notif_reset(mw, delay: int = 3100):

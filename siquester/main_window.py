@@ -1,16 +1,23 @@
 """Top-level pages (EmptyPage) and the MainWindow."""
 
-from .qt import *
-from .constants import *
-from .util import *
-from .stats import *
-from .persistence import *
-from .media import *
-from .siq_package import *
-from .widgets_common import *
-from .widgets_editors import *
-from .result_page import *
-from .sidebar import *
+from .qt import (
+    _dt, _logger, _threading, os, pyqtSignal, QApplication, QCheckBox, QComboBox,
+    QEasingCurve, QEvent, QFileDialog, QFrame, QHBoxLayout, QImageReader, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QPixmap, QPropertyAnimation,
+    QPushButton, QScrollArea, QStackedWidget, Qt, QTextEdit, QTimer, QVBoxLayout,
+    QWidget, sys
+)
+from .constants import (
+    _AlignC, _Expand, _ON_BTN_DEL, _Pref, _SS_DROP_ZONE_LG, _SS_INPUT_LARGE,
+    _SS_LABEL_DIM, _SS_PANEL_BRD2, _SS_TOPBAR, _WASD_MAP
+)
+from .media import _get_ui_bridge
+from .persistence import load_datasets, load_settings, save_datasets, save_settings
+from .result_page import ResultPage
+from .sidebar import Sidebar
+from .siq_package import SiqPackage
+from .util import _find_mw, _lbl, _unquote, fmt_dur
+from .widgets_common import AnimatedButton, msgbox_warning
 from . import auto_stats
 
 class EmptyPage(QWidget):
@@ -438,7 +445,7 @@ class MainWindow(QMainWindow):
                         path = siq.extract_media(fname)
                         if not path: continue
                         try: sz = os.path.getsize(path)
-                        except: sz = 0
+                        except Exception: sz = 0
                         dur_sec = it.get("dur", 0.0)
                         results.append((itype, base, path, sz, dur_sec, th_name, q["price"], ri, ti))
 
@@ -763,9 +770,9 @@ class MainWindow(QMainWindow):
             else "Свернуть боковую панель")
         self._sidebar_anim.stop()
         try: self._sidebar_anim.valueChanged.disconnect()
-        except: pass
+        except Exception: pass
         try: self._sidebar_anim.finished.disconnect()
-        except: pass
+        except Exception: pass
         start = self.sidebar.width()
         end   = expanded_w if self._sidebar_visible else 0
 
@@ -1044,7 +1051,7 @@ class MainWindow(QMainWindow):
         ds=self.datasets[real_idx]; w=ds["widget"]
         if hasattr(w,"_siq") and w._siq:
             try: w._siq.close()
-            except: pass
+            except Exception: pass
         self.stack.removeWidget(w); w.deleteLater(); self.datasets.pop(real_idx)
         self.sidebar.rebuild(self.datasets); self._update_info()
         save_datasets(self.datasets)   # saves immediately with item removed
@@ -1096,7 +1103,7 @@ class MainWindow(QMainWindow):
             w=ds["widget"]
             if hasattr(w,"_siq") and w._siq:
                 try: w._siq.close()
-                except: pass
+                except Exception: pass
         e.accept()
         # Force exit so any stuck daemon threads don't keep the process alive —
         # ТОЛЬКО в standalone-режиме (окно top-level, без родителя). Встроенное в

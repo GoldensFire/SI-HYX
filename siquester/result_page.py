@@ -1,15 +1,27 @@
 """ResultPage — the per-package round/theme/question board."""
 
-from .qt import *
-from .constants import *
-from .util import *
-from .stats import *
-from .persistence import *
-from .siq_package import *
-from .widgets_common import *
-from .widgets_editors import *
-from .widgets_question import *
-from .widgets_tiles import *
+from .qt import (
+    _collections, _dt, _logger, _time, copy, ET, json, os, Path, QApplication,
+    QByteArray, QCheckBox, QDrag, QEasingCurve, QFrame, QGraphicsOpacityEffect,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMimeData, QPropertyAnimation,
+    QPushButton, QSplitter, Qt, QTimer, QVBoxLayout, QWidget
+)
+from .constants import (
+    _AlignC, _DH_SS_HIDDEN, _DH_SS_SHOWN, _Fixed, _MEDIA_EXTS, _ON_BTN_ANALYZE,
+    _ON_BTN_COMPARE, _ON_BTN_DEL, _ON_BTN_SORT, _Pref, _SS_DARK_BASE, _SS_TRANSPARENT,
+    _THEME_MIME
+)
+from .persistence import _notif_reset, _schedule_save
+from .siq_package import SiqPackage
+from .stats import stats_pct
+from .util import _find_mw, _lbl, _q_idx, _screen_scale, fmt_dur
+from .widgets_common import (
+    _OutsideClickFilter, _QProgressWidget, AnimatedButton, GameProgressBar,
+    msgbox_warning, SmoothScrollArea
+)
+from .widgets_editors import QuestionEditorDialog
+from .widgets_question import QuestionViewer
+from .widgets_tiles import _TileDropArea, PackageInfoDialog
 
 class ResultPage(QWidget):
     def __init__(self, ds, parent=None):
@@ -887,7 +899,7 @@ class ResultPage(QWidget):
                             try:
                                 self._siq.save_theme_name(ri, ti, new_name)
                                 try: self.ds["rounds"][ri]["themes"][ti]["name"] = new_name
-                                except: pass
+                                except Exception: pass
                                 lbl.setText(new_name)
                             except Exception as ex:
                                 _logger.warning(f"[inline_rename] {ex}")
@@ -1397,7 +1409,7 @@ class ResultPage(QWidget):
                         themes_el.remove(th_els[theme_idx])
                 if rnd_idx < len(self._siq.rounds):
                     try: self._siq.rounds[rnd_idx]["themes"].pop(theme_idx)
-                    except: pass
+                    except Exception: pass
                 self._siq._save_xml(root, ns_url)
             except Exception as e:
                 _logger.warning(f"[delete_theme] {e}")
@@ -1524,14 +1536,14 @@ class ResultPage(QWidget):
                 try:
                     qs = self.ds["rounds"][rnd_idx]["themes"][theme_idx]["questions"]
                     qs[:] = [q for q in qs if q["price"] != suggested]
-                except: pass
+                except Exception: pass
                 msgbox_warning(self, "Ошибка", "Не удалось добавить вопрос в .siq файл.")
                 return
             # Ensure ds and siq are in sync
             try:
                 self.ds["rounds"][rnd_idx]["themes"][theme_idx]["questions"][-1] = \
                     self._siq.rounds[rnd_idx]["themes"][theme_idx]["questions"][-1]
-            except: pass
+            except Exception: pass
 
         self._rebuild_content(animated=False)
         mw = self._mw_ref
