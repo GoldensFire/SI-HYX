@@ -128,7 +128,7 @@ class TestDb:
     def test_migration_columns(self, sigstats_db):
         cols = {r[1] for r in sigstats_db.execute("PRAGMA table_info(packages)")}
         assert {"answer_rate", "correct_rate", "duration_sec",
-                "modern_codec_share"} <= cols
+                "modern_codec_share", "source", "steam_id"} <= cols
         qcols = {r[1] for r in sigstats_db.execute("PRAGMA table_info(questions)")}
         assert {"duration_sec", "answer_media_json"} <= qcols
 
@@ -140,6 +140,21 @@ class TestDb:
         assert json.loads(row["authors_json"]) == ["Автор"]
         assert row["authors_display"] == "Автор"
         assert row["length_group"] == "Средние"
+
+    def test_upsert_defaults_source_sibrowser(self, sigstats_db):
+        pid = sdb.upsert_package(sigstats_db, _pkg())
+        row = sigstats_db.execute("SELECT source, steam_id FROM packages WHERE id=?",
+                                  (pid,)).fetchone()
+        assert row["source"] == "sibrowser"
+        assert row["steam_id"] is None
+
+    def test_upsert_steam_source(self, sigstats_db):
+        pid = sdb.upsert_package(sigstats_db, _pkg(
+            sibrowser_id=None, source="steam", steam_id="999"))
+        row = sigstats_db.execute("SELECT source, steam_id FROM packages WHERE id=?",
+                                  (pid,)).fetchone()
+        assert row["source"] == "steam"
+        assert row["steam_id"] == "999"
 
     def test_upsert_dedup_by_name_norm(self, sigstats_db):
         pid1 = sdb.upsert_package(sigstats_db, _pkg())

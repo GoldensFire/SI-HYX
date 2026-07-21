@@ -117,17 +117,17 @@ def _pkg_df():
     return pd.DataFrame([
         {"name": "Топ пак", "authors": ["Ася"], "has_stats": 1,
          "completion_rate": 0.9, "completion_pct": 90.0,
-         "completion_rank_in_group": 95.0, "started_games": 100,
+         "started_games": 100,
          "completed_games": 90, "question_count": 100,
          "length_group": "Средние", "download_count": 500},
         {"name": "Слабый пак", "authors": [], "has_stats": 1,
          "completion_rate": 0.1, "completion_pct": 10.0,
-         "completion_rank_in_group": 5.0, "started_games": 10,
+         "started_games": 10,
          "completed_games": 1, "question_count": 50,
          "length_group": "Короткие", "download_count": 100},
         {"name": "Без статистики", "authors": ["Вова"], "has_stats": 0,
          "completion_rate": None, "completion_pct": float("nan"),
-         "completion_rank_in_group": float("nan"), "started_games": float("nan"),
+         "started_games": float("nan"),
          "completed_games": float("nan"), "question_count": 80,
          "length_group": "Короткие", "download_count": 5},
     ])
@@ -164,11 +164,11 @@ class TestExportPackages:
 def _theme_df():
     return pd.DataFrame([
         {"theme": "🎶Музыка", "n_packages": 10, "rarity": "частая",
-         "avg_completion_pct": 66.0, "avg_pct_in_group": 70.0},
+         "avg_completion_pct": 66.0},
         {"theme": "Редкая тема", "n_packages": 1, "rarity": "редкая",
-         "avg_completion_pct": 50.0, "avg_pct_in_group": 50.0},
+         "avg_completion_pct": 50.0},
         {"theme": "Без данных", "n_packages": 5, "rarity": "средняя",
-         "avg_completion_pct": float("nan"), "avg_pct_in_group": float("nan")},
+         "avg_completion_pct": float("nan")},
     ])
 
 

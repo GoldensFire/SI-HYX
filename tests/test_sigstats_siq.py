@@ -158,6 +158,13 @@ class TestItemSeconds:
     def test_image_five_seconds(self):
         assert siq._item_seconds(self._info(type="image"), None, None) == 5.0
 
+    def test_html_no_timer_like_image(self):
+        assert siq._item_seconds(self._info(type="html"), None, None) == 5.0
+
+    def test_html_timer_overrides(self):
+        info = self._info(type="html", dur_attr=12.0)
+        assert siq._item_seconds(info, None, None) == 12.0
+
     def test_text_by_length(self):
         info = self._info(raw="х" * 40)
         assert siq._item_seconds(info, None, None) == pytest.approx(2.0)

@@ -41,9 +41,14 @@ def qapp():
 # ── Изоляция настроек приложения ─────────────────────────────────────────────
 @pytest.fixture(autouse=True)
 def isolate_settings(tmp_path, monkeypatch):
-    """Подменяет SETTINGS_FILE во ВСЕХ модулях, которые его скопировали через
-    `from config import *` (config, utils, workers, …). Никогда не пишем в
-    реальный %APPDATA% пользователя."""
+    """Подменяет SETTINGS_FILE во ВСЕХ модулях, которые его к себе скопировали.
+
+    `from config import SETTINGS_FILE` создаёт СВОЮ привязку имени в модуле-
+    импортёре, поэтому патча одного config недостаточно — правим каждый модуль.
+    Список ниже намеренно шире фактического (сейчас имя есть только у config и
+    utils; hasattr-гард пропускает остальные) — чтобы фикстура продолжала
+    защищать, если имя начнёт импортировать ещё какой-то модуль. Никогда не
+    пишем в реальный %APPDATA% пользователя."""
     fake = str(tmp_path / "settings.json")
     for mod_name in ("config", "utils", "workers", "tabs", "widgets"):
         mod = sys.modules.get(mod_name)

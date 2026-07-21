@@ -13,6 +13,8 @@ from typing import Callable, Iterator
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from . import config
 from .normalize import normalize_name, normalize_theme, display_theme
@@ -24,6 +26,16 @@ _SIZE_RE = re.compile(r"([\d.,]+)\s*(КБ|МБ|ГБ|KB|MB|GB)", re.IGNORECASE)
 _PCT_RE = re.compile(r"(\d+)\s*%")
 _CONTENT_LABELS = {"Текст": "pct_text", "Фото": "pct_photo",
                    "Звук": "pct_audio", "Видео": "pct_video"}
+_SIQ_SUFFIX_RE = re.compile(r"\.siq$", re.IGNORECASE)
+# Не баг sibrowser.ru — некоторые авторы оставляют внутреннее название пакета
+# (<package name="…"> в content.xml, именно оно попадает в <h1>) одинаковым
+# для всех своих паков, различая их только именем .siq-файла при загрузке.
+# Из-за этого паки такого автора получали одинаковый name_norm и затирали
+# друг друга в БД при upsert (соберёшь 5 паков автора — в базе останется
+# только последний). Фолбэк: если <h1> совпадает с этим известным «дефолтным»
+# названием, берём в качестве имени itemprop="alternateName" (имя .siq-файла)
+# — оно у таких авторов и есть единственное реально уникальное поле.
+_AUTHOR_PAGE_GENERIC_TITLE = "Вопросы SIGame"
 
 
 @dataclass
@@ -43,6 +55,7 @@ class Card:
     pct_photo: int | None = None
     pct_audio: int | None = None
     pct_video: int | None = None
+    description: str | None = None
     themes: list[dict] = field(default_factory=list)
 
     def as_package(self) -> dict:
@@ -55,6 +68,20 @@ def make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": config.USER_AGENT,
                       "Accept-Language": "ru,en;q=0.8"})
+    # sibrowser.ru иногда рвёт соединение посреди ответа (ConnectionResetError
+    # 10054) — транзиентная ошибка сервера/сети, не повод обрывать весь обход
+    # каталога на первой же странице. Ретраим на уровне адаптера с backoff.
+    retry = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=1.5,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
     return s
 
 
@@ -148,6 +175,11 @@ def _parse_card(article) -> Card | None:
     # название
     h1 = article.find("h1")
     name = h1.get_text(strip=True) if h1 else None
+    if not name or name == _AUTHOR_PAGE_GENERIC_TITLE:
+        alt_el = article.find(attrs={"itemprop": "alternateName"})
+        if alt_el:
+            alt_name = _SIQ_SUFFIX_RE.sub("", alt_el.get_text(strip=True)).strip()
+            name = alt_name or name
     if not name:
         return None
 
@@ -209,6 +241,10 @@ def _parse_card(article) -> Card | None:
     themes = _parse_themes(article)
     round_count = (max((t["round_index"] for t in themes), default=-1) + 1) or None
 
+    # описание пака (свободный текст автора) — лежит прямо в карточке списка.
+    desc_el = article.find(attrs={"itemprop": "description"})
+    description = desc_el.get_text(strip=True) if desc_el else None
+
     return Card(
         sibrowser_id=pid,
         name=name,
@@ -221,6 +257,7 @@ def _parse_card(article) -> Card | None:
         date_published=date_pub,
         tags=[t for t in tags if t],
         categories=categories,
+        description=description or None,
         themes=themes,
         **pct,
     )
@@ -239,6 +276,23 @@ def parse_list(html: str) -> list[Card]:
     return cards
 
 
+def _friendly_network_error(e: Exception) -> str:
+    """Ретраи в make_session() уже покрывают разовые обрывы соединения — если
+    ошибка всё равно долетела сюда, значит sibrowser.ru недоступен систематически
+    (обрывает КАЖДУЮ попытку, включая повторные с задержкой). На практике для
+    пользователей из РФ это обычно не баг сайта/приложения, а блокировка на
+    уровне провайдера (сброс TCP-соединения — тот же почерк, что у операторских
+    DPI-блокировок), а не временный сетевой сбой — сырой текст исключения этого
+    не объясняет и выглядит как поломка приложения."""
+    if isinstance(e, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return (f"{e}\n"
+                "Похоже, sibrowser.ru недоступен на уровне сети/провайдера (соединение "
+                "обрывается даже после повторных попыток) — это не ошибка приложения. "
+                "Попробуйте VPN или прокси (переменные окружения HTTP_PROXY/HTTPS_PROXY "
+                "перед запуском SI-HYX — requests подхватывает их автоматически).")
+    return str(e)
+
+
 def fetch_list_html(session: requests.Session, page: int,
                     sort: str | None = "download_count",
                     category_slug: str | None = None) -> str:
@@ -255,6 +309,24 @@ def fetch_list_html(session: requests.Session, page: int,
     resp = session.get(url, timeout=config.REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.text
+
+
+def fetch_full_description(session: requests.Session, sibrowser_id: str) -> str | None:
+    """Полное описание пака со СТРАНИЦЫ ПАКА (не карточки списка — там описание
+    урезано автором сайта многоточием, см. _parse_card). Запрашивается лениво,
+    по одному пакету, только когда пользователь открывает его карточку в
+    интерфейсе — не во время массового сбора (иначе N лишних запросов на
+    каждый пак, ради чего карточки списка и парсятся без похода на саму
+    страницу, см. модульный docstring)."""
+    url = f"{config.SIBROWSER_BASE}/packages/{sibrowser_id}"
+    resp = session.get(url, timeout=config.REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "lxml")
+    p = soup.select_one("p.pt-2")
+    if p is None:
+        return None
+    text = p.get_text(strip=True)
+    return text or None
 
 
 def _category_pct(card: Card, category_slug: str | None) -> int | None:
@@ -322,7 +394,7 @@ def iter_cards(
             html = fetch_list_html(session, page, sort=sort, category_slug=category_slug)
         except Exception as e:
             if progress_cb:
-                progress_cb(f"Ошибка загрузки страницы {page}: {e}")
+                progress_cb(f"Ошибка загрузки страницы {page}: {_friendly_network_error(e)}")
             break
         cards = parse_list(html)
         if not cards:
@@ -357,9 +429,20 @@ def download_url(sibrowser_id: str) -> str:
     return f"{config.SIBROWSER_BASE}/packages/{sibrowser_id}/direct_download"
 
 
+def play_url(sibrowser_id: str, name: str) -> str:
+    """URL SIGame с уже подставленным паком — повторяет то, что делает кнопка
+    «Играть» на sibrowser.ru (переход на /packages/<id>/direct_play в итоге
+    редиректит именно на этот адрес, см. запрос в devtools:
+    sigame.vladimirkhil.com/?packageUri=<direct_download url>&packageName=<имя>)."""
+    import urllib.parse
+    package_uri = download_url(sibrowser_id)
+    return (f"{config.SIGAME_BASE}/?packageUri={urllib.parse.quote(package_uri, safe='')}"
+            f"&packageName={urllib.parse.quote(name, safe='')}")
+
+
 def fetch_author_html(session: requests.Session, author: str, page: int = 1) -> str:
     import urllib.parse
-    url = f"{config.SIBROWSER_BASE}/authors/{urllib.parse.quote(author)}?page={page}"
+    url = f"{config.SIBROWSER_BASE}/authors/{urllib.parse.quote(author, safe='')}?page={page}"
     resp = session.get(url, timeout=config.REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.text
@@ -381,7 +464,9 @@ def iter_author_cards(
             progress_cb(f"Страница автора {page}…")
         try:
             html = fetch_author_html(session, author, page)
-        except Exception:
+        except Exception as e:
+            if progress_cb:
+                progress_cb(f"Ошибка загрузки страницы автора {page}: {_friendly_network_error(e)}")
             break
         cards = parse_list(html)
         fresh = [c for c in cards if c.name_norm not in seen]

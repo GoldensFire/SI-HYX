@@ -33,6 +33,7 @@ _MEDIA_EXTS = frozenset({
     '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.avif',
     '.mp3', '.ogg', '.wav', '.aac', '.flac', '.m4a',
     '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm',
+    '.html', '.htm',
 })
 
 
@@ -43,6 +44,9 @@ _AUDIO_EXTS = frozenset({'.mp3', '.ogg', '.wav', '.aac', '.flac', '.m4a'})
 
 
 _VIDEO_EXTS = frozenset({'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.webm'})
+
+
+_HTML_EXTS  = frozenset({'.html', '.htm'})
 
 
 _DH_SS_HIDDEN = ("QPushButton{background:transparent;color:transparent;border:none;"
@@ -422,6 +426,7 @@ __all__ = [
     '_DH_SS_SHOWN',
     '_Expand',
     '_Fixed',
+    '_HTML_EXTS',
     '_IMG_EXTS',
     '_ITEM_FOCUS_SS',
     '_ITEM_INNER_SS',

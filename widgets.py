@@ -7,10 +7,31 @@
 # License v3 (или новее) от Free Software Foundation. БЕЗ ВСЯКИХ ГАРАНТИЙ.
 # Полный текст — в файле LICENSE (https://www.gnu.org/licenses/gpl-3.0.txt).
 # widgets.py — кастомные виджеты, делегаты, превью, info-подсказки
-from config import *
-from utils import *
+import io
+import os
+import subprocess
+import uuid
+from pathlib import Path
+from config import (
+    ALLOWED_AUDIO, ALLOWED_IMG, ALLOWED_MEDIA, COLOR_DONE, COLOR_ERR,
+    COLOR_PROC, CREATE_NO_WINDOW, DEFAULT_TAG, FFMPEG, FFPROBE,
+    ITEM_AUDIO_ROLE, ITEM_COMPARE_ROLE, ITEM_STATUS_ROLE, Image, ImageOps,
+    QAbstractItemView, QAbstractSpinBox, QApplication, QBrush, QByteArray,
+    QColor, QComboBox, QDialog, QEvent, QFileDialog, QFont, QFrame,
+    QHBoxLayout, QHeaderView, QIcon, QInputDialog, QKeySequence,
+    QKeySequenceEdit, QLabel, QMenu, QObject, QPainter, QPen, QPixmap,
+    QPoint, QPointF, QPushButton, QRect, QRectF, QRunnable, QScrollArea,
+    QSize, QSlider, QSpinBox, QStyle, QStyledItemDelegate, QThread,
+    QThreadPool, QTimer, QToolButton, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget, Qt, RIBBON_IMG, TEMP_DIR, USER_AGENT, get_icon,
+    get_icon_pixmap, http_get, icon_html, pyqtSignal
+)
+from utils import (
+    default_download_dir, human_size, load_pixmap_any, load_settings,
+    move_to_trash, pil_to_qicon, rasterize_svg, save_settings
+)
 from msgbox import msgbox_critical, msgbox_warning, msgbox_information, msgbox_question
-from PyQt6.QtWidgets import QSizePolicy, QAbstractButton
+from PyQt6.QtWidgets import QSizePolicy, QAbstractButton, QStyleOptionSlider
 from PyQt6.QtCore import QUrl
 
 
@@ -2828,3 +2849,57 @@ def show_video_compare(src_path, out_path, parent=None, use_filenames=False):
     подписи показывают имена файлов вместо «Исходник»/«Результат»."""
     dlg = VideoCompareViewer(src_path, out_path, parent, use_filenames)
     return _present_fullscreen(dlg, parent)
+
+
+# ─── Общие мелкие виджеты, используемые несколькими вкладками ────────────────
+# Раньше жили в tabs.py, но нужны и «Обработке»/«Загрузчику», и «Редактированию
+# фото» (photo_tab.py). Держим здесь, чтобы tabs.py и photo_tab.py не зависели
+# друг от друга (иначе получался бы циклический импорт).
+
+def _icon_btn(text, icon, size=20, color=None):
+    """QPushButton с векторной иконкой qtawesome (см. get_icon в config.py).
+    color=None → мягкий светлый значок (для тёмных кнопок). На светлой заливке
+    (b_run/b_stop) передавайте тёмный цвет (#1e1e2e), чтобы значок не «выцветал»."""
+    b = QPushButton(text)
+    b.setIcon(get_icon(icon) if color is None else get_icon(icon, color))
+    b.setIconSize(QSize(size, size))
+    return b
+
+
+class _JumpSlider(QSlider):
+    """QSlider, который при клике по дорожке СРАЗУ прыгает в точку клика.
+    Стандартный QSlider лишь шагает на pageStep — поэтому при значении 100 и
+    клике у отметки 10 ползунок «полз» к 80, а не вставал на 10. Здесь клик и
+    протаскивание по дорожке выставляют значение по позиции курсора."""
+
+    def _value_at(self, ev):
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, opt,
+            QStyle.SubControl.SC_SliderGroove, self)
+        handle = self.style().subControlRect(
+            QStyle.ComplexControl.CC_Slider, opt,
+            QStyle.SubControl.SC_SliderHandle, self)
+        if self.orientation() == Qt.Orientation.Horizontal:
+            pos = int(ev.position().x() - groove.x() - handle.width() / 2)
+            span = groove.width() - handle.width()
+        else:
+            pos = int(ev.position().y() - groove.y() - handle.height() / 2)
+            span = groove.height() - handle.height()
+        return QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), pos, max(1, span), opt.upsideDown)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.setValue(self._value_at(ev))
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if ev.buttons() & Qt.MouseButton.LeftButton:
+            self.setValue(self._value_at(ev))
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)

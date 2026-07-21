@@ -69,9 +69,11 @@ class TestParse:
 
     def test_duration_from_xml_timer(self, pkg):
         qb = pkg.rounds[0]["themes"][1]["questions"][0]
-        # duration="00:00:26" на видео-элементе
-        assert qb["dur"] == pytest.approx(26.0)
-        assert pkg.total_duration >= 26.0
+        # duration="00:00:26" на видео-элементе вопроса (26.0) + обычный
+        # текстовый ответ «Видео-ответ» без своего таймера/медиа (+3.0 сек,
+        # см. siq_duration.ANSWER_TEXT_SEC) — та же логика, что в «Поиск пакетов».
+        assert qb["dur"] == pytest.approx(29.0)
+        assert pkg.total_duration >= 29.0
 
     def test_image_five_seconds(self, pkg):
         q200 = pkg.rounds[0]["themes"][0]["questions"][1]
@@ -413,6 +415,22 @@ class TestEdits:
         f = tmp_path / "данные.xyz"
         f.write_bytes(b"x")
         assert pkg.add_media_to_question(0, 0, 0, str(f)) is False
+
+    def test_add_media_html(self, pkg, tmp_path):
+        game_file = tmp_path / "minigame.html"
+        game_file.write_bytes(b"<html><body>game</body></html>")
+        assert pkg.add_media_to_question(0, 0, 0, str(game_file))
+        with zipfile.ZipFile(pkg.path) as zf:
+            assert "Html/minigame.html" in zf.namelist()
+        p2 = SiqPackage(pkg.path)
+        try:
+            q = p2.rounds[0]["themes"][0]["questions"][0]
+            refs = [i for i in q["items"] if i["is_ref"]]
+            html_items = [i for i in refs if i["text"] == "minigame.html"]
+            assert html_items and html_items[0]["type"] == "html"
+            assert html_items[0]["dur"] == 5.0
+        finally:
+            p2.close()
 
     def test_media_survives_edits(self, pkg):
         """Правка XML не должна портить медиа-файлы в архиве."""

@@ -7,7 +7,23 @@
 # License v3 (или новее) от Free Software Foundation. БЕЗ ВСЯКИХ ГАРАНТИЙ.
 # Полный текст — в файле LICENSE (https://www.gnu.org/licenses/gpl-3.0.txt).
 # utils.py — вспомогательные функции (ffmpeg/ffprobe, cookies, deno, и т.п.)
-from config import *
+import base64
+import functools
+import io
+import json
+import os
+import re
+import requests
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+from config import (
+    COOKIE_PATHS, CREATE_NO_WINDOW, FFMPEG, FFPROBE, IS_WIN, Image,
+    ImageOps, QByteArray, QIcon, QPainter, QPixmap, QtGuiImage,
+    SETTINGS_FILE, TEMP_DIR, USER_AGENT, http_get
+)
 
 
 # ── Маскировка JS в HTML под VK ──────────────────────────────────────────────

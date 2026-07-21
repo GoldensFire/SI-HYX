@@ -7,16 +7,40 @@
 # License v3 (или новее) от Free Software Foundation. БЕЗ ВСЯКИХ ГАРАНТИЙ.
 # Полный текст — в файле LICENSE (https://www.gnu.org/licenses/gpl-3.0.txt).
 # main.py — главное окно, HTTP-сервер расширения, точка входа
-from config import *
-from utils import *
-from widgets import *
-from workers import *
-from tabs import *
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+from config import (
+    APP_ICON, APP_NAME, APP_TITLE, APP_VERSION, CONFIG_DIR,
+    CREATE_NO_WINDOW, DISCORD_URL, GITHUB_OWNER, GITHUB_REPO, GITHUB_URL,
+    GUIDE_URL, HTTP_PORT, IS_WIN, QAbstractSpinBox, QApplication,
+    QCheckBox, QComboBox, QDialog, QEvent, QGroupBox, QHBoxLayout, QIcon,
+    QKeySequence, QLabel, QLineEdit, QListWidget, QLocalServer,
+    QLocalSocket, QMainWindow, QMenu, QProgressBar, QPushButton,
+    QScrollArea, QSlider, QTabWidget, QTextCursor, QTextEdit, QThreadPool,
+    QTimer, QToolButton, QVBoxLayout, QWidget, Qt, STYLESHEET, USER_AGENT,
+    get_icon, http_get, icon_html, pyqtSignal, strip_default_tag,
+    ytdlp_base_cmd
+)
+from utils import (check_ffmpeg, load_settings, parse_version, save_settings)
+from widgets import (
+    LatinKeySequenceEdit, RecentFilesStrip, WheelBlocker, combo_set_value,
+    info_badge, install_hover_tips
+)
+from msgbox import msgbox_critical
+from tabs import (Base64Tab, MediaTab, PromptTab, YtdlpTab)
+from photo_tab import PhotoTab
 from edit_tab import EditTab
 from taskbar import TaskbarProgress
 from PyQt6.QtCore import qInstallMessageHandler, QSize, QTranslator, QLibraryInfo, QLocale
 from PyQt6.QtWidgets import QTabBar
-import qtawesome as qta
 import hashlib
 
 
@@ -423,8 +447,20 @@ class UnifiedWindow(QMainWindow):
         self._sigstats_tab_enabled = bool(s.get("sigstats_tab_enabled", False))
         self._prompt_tab_enabled = bool(s.get("prompt_tab_enabled", False))
         self._tab_order = list(s.get("tab_order", []) or [])
+        m = s.get("media", {})
+
+        # Секции ниже НАРОЧНО в отдельных try/except каждая (а не одном общем):
+        # раньше один общий try оборачивал вообще всё восстановление настроек
+        # подряд (аудио → видео → папка экспорта → yt-dlp → AVIF), и исключение
+        # на ЛЮБОМ раннем поле (например, из-за правки кода, сломавшей метод
+        # виджета) тихо обрывало загрузку — все поля, что шли ПОСЛЕ сбойного
+        # (папка загрузки, скорость AVIF, cookie_path — они ближе к концу),
+        # оставались с дефолтом виджета и выглядели «сброшенными». Первое же
+        # следующее изменение любой настройки тут же затирало settings.json
+        # этими дефолтами через автосохранение. Изоляция по секциям гарантирует,
+        # что падение одной секции не блокирует восстановление остальных.
         try:
-            m = s.get("media", {}); a = m.get("audio", {})
+            a = m.get("audio", {})
             tm.ck_no_audio.setChecked(a.get("remove", False))
             tm.ck_norm.setChecked(a.get("norm", True))
             tm.s_tgt.setValue(a.get("tgt", -20.0))
@@ -441,7 +477,10 @@ class UnifiedWindow(QMainWindow):
             tm.s_hp.setValue(a.get("hp", 200))
             tm.s_deg_gain.setValue(a.get("deg_gain_db", 0.0))
             tm.c_abitrate.setCurrentText(a.get("bitrate", "128"))
+        except Exception as e:
+            self.log(f"_load_settings(audio) error: {e}")
 
+        try:
             v = m.get("video", {})
             tm.chk_enable_video.setChecked(v.get("enabled", True))
             tm.s_spd.setValue(v.get("speed", 100))
@@ -463,12 +502,18 @@ class UnifiedWindow(QMainWindow):
             tm.s_vfade_in.setValue(v.get("vfade_in_d", 1.0))
             tm.ck_vfade_out.setChecked(v.get("vfade_out", False))
             tm.s_vfade_out.setValue(v.get("vfade_out_d", 1.0))
+        except Exception as e:
+            self.log(f"_load_settings(video) error: {e}")
 
+        try:
             # Папка экспорта (пусто = рядом с исходником)
             tm.export_dir = m.get("export_dir", "") or ""
             try: tm._update_export_label()
             except Exception: pass
+        except Exception as e:
+            self.log(f"_load_settings(export_dir) error: {e}")
 
+        try:
             y = s.get("ytdlp", {})
             saved_outdir = y.get("outdir", "")
             if saved_outdir and os.path.isdir(saved_outdir):
@@ -484,7 +529,10 @@ class UnifiedWindow(QMainWindow):
             saved_proxy = y.get("proxy", "")
             if saved_proxy:
                 ty.proxy_edit.setText(saved_proxy)
+        except Exception as e:
+            self.log(f"_load_settings(ytdlp) error: {e}")
 
+        try:
             av = s.get("avif", {})
             tm.s_lim.setValue(av.get("limit", tm.s_lim.value()))
             tm.ck_lim.setChecked(av.get("limit_on", True))
@@ -510,13 +558,13 @@ class UnifiedWindow(QMainWindow):
                 _chroma = str(av.get("chroma", "420"))
                 combo_set_value(tm.c_chroma, {"420": "4:2:0", "422": "4:2:2", "444": "4:4:4"}.get(_chroma, "4:2:0"))
             except Exception: pass
-
-            # Обновляем стрип последних файлов по восстановленной папке
-            try:
-                self.recent_strip.refresh(ty.out.text())
-            except Exception: pass
         except Exception as e:
-            self.log(f"_load_settings error: {e}")
+            self.log(f"_load_settings(avif) error: {e}")
+
+        # Обновляем стрип последних файлов по восстановленной папке
+        try:
+            self.recent_strip.refresh(ty.out.text())
+        except Exception: pass
 
     def _on_ipc_connection(self):
         try:

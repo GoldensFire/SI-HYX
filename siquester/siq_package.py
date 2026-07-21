@@ -4,6 +4,7 @@ from .qt import *
 from .constants import *
 from .util import *
 from .media import *
+import siq_duration
 
 def _safe_replace(tmp: str, dst: str) -> None:
     """Replace *dst* with the freshly-written *tmp*, as robustly as Windows allows.
@@ -176,7 +177,7 @@ class SiqPackage:
         return rounds, total_duration
 
     def _parse_q(self, q_el, tag):
-        price = int(q_el.get('price', 0)); items = []; dur = 0.0
+        price = int(q_el.get('price', 0)); items = []
 
         # ── Collect all params into a list (document order) AND a name-dict ──
         # Single findall call — second loop below reuses this list instead of
@@ -252,12 +253,18 @@ class SiqPackage:
         # Python attribute lookups on every iteration.
         _item_tag = tag('item')
         _true_set = frozenset(('true', '1', 'yes'))
+        _MEDIA_ITEM_TYPES = ('image', 'audio', 'video', 'html')  # a_items normalizes voice→audio
+        # q_items/a_items — тот же формат, что sigstats/siq.py::_item_info, для
+        # общей логики группировки/итога длительности из siq_duration.py (см.
+        # question_duration ниже). Отдельно от items[] (используется в
+        # UI-редакторе вопроса, формат которого не меняем).
+        q_items: list[dict] = []
+        a_items: list[dict] = []
         for param in all_params:
             pname = param.get('name', '')
             if pname in ('answerType', 'answerOptions'):
                 continue
             is_background_param = (pname == 'background')
-            is_q_or_bg = is_background_param or pname == 'question'
             for item in param.findall(_item_tag):
                 iget      = item.get
                 itype     = iget('type', 'text')
@@ -271,10 +278,11 @@ class SiqPackage:
                                or is_background_param \
                                or (placement == 'background')
 
+                dur_attr = siq_duration.parse_dur_attr(xml_duration) if xml_duration else None
                 item_dur = 0.0
-                if xml_duration:
-                    item_dur = _parse_hms(xml_duration) or 0.0
-                elif is_ref and itype in ('video', 'audio'):
+                if dur_attr is not None:
+                    item_dur = max(0.0, dur_attr)
+                elif is_ref and itype in ('video', 'audio', 'voice'):
                     fname = _unquote(text)
                     mm = self._media_map
                     zpath = mm.get(fname) or mm.get(fname.split('/')[-1])
@@ -289,16 +297,48 @@ class SiqPackage:
                         except Exception:
                             pass
                 elif itype == 'image':
-                    item_dur = 5.0
+                    item_dur = siq_duration.IMAGE_SEC
+                elif itype == 'html':
+                    # No reliable way to know how long an interactive minigame
+                    # runs — treat it like a static image unless timed.
+                    item_dur = siq_duration.IMAGE_SEC
                 elif itype == 'text' and placement != 'replic':
-                    item_dur = (len(text) / 20 * 60 / 60 + 2) if text else 0.0
+                    item_dur = (len(text) / siq_duration.CHARS_PER_SEC) if text else 0.0
                 items.append({"param": pname, "type": itype, "text": text,
                               "is_ref": is_ref, "dur": item_dur,
                               "placement": placement, "simultaneous": simultaneous,
                               "wait_for_finish": wait_for_finish,
                               "xml_duration": xml_duration})
-                if is_q_or_bg:
-                    dur += item_dur
+
+                # Классификация для siq_duration — та же, что sigstats/siq.py:
+                # только пункты из params "question"/"answer" (не "background" —
+                # у sigstats тоже нет спецобработки по имени параметра, только по
+                # атрибуту placement на самом пункте), группировка одновременного
+                # показа — по placement=="background"/waitForFinish=="false".
+                if pname in ('question', 'answer'):
+                    dest = q_items if pname == 'question' else a_items
+                    dest.append({
+                        "type": "audio" if itype == "voice" else itype,
+                        "raw": text,
+                        "placement": placement.lower(),
+                        "wait_false": wait_for_finish.lower() == "false",
+                        "duration": item_dur,
+                    })
+
+        # «время на ответ»: таймер на вопросе целиком или на блоке ответа
+        # (та же семантика, что sigstats/siq.py::_parse_question).
+        answer_time = siq_duration.parse_dur_attr(q_el.get('duration'))
+        for p in params_by_name.get('answer', []):
+            if answer_time is None:
+                answer_time = siq_duration.parse_dur_attr(p.get('duration'))
+            if answer_time is not None:
+                break
+        has_answer_content = any(
+            it["raw"] or it["type"] in _MEDIA_ITEM_TYPES for it in a_items)
+        has_plain_answer = any(a and a.strip() for a in right_ans)
+        dur = siq_duration.question_duration(
+            q_items, a_items, answer_time, has_answer_content, has_plain_answer,
+            lambda it: it["duration"])
 
         # ── answerDeviation (for q_type == "point") ────────────────
         answer_deviation = 0.1
@@ -1057,6 +1097,7 @@ class SiqPackage:
         if   ext in _IMG_EXTS:   itype, folder = 'image', 'Images'
         elif ext in _AUDIO_EXTS: itype, folder = 'audio', 'Audio'
         elif ext in _VIDEO_EXTS: itype, folder = 'video', 'Video'
+        elif ext in _HTML_EXTS:  itype, folder = 'html', 'Html'
         else:
             print(f"[add_media] unsupported extension: {ext}")
             return False
@@ -1131,7 +1172,7 @@ class SiqPackage:
                     q_obj = self.rounds[rnd_idx]["themes"][theme_idx]["questions"][q_idx]
                     q_obj["items"].append({"param": param_name, "type": itype,
                                            "text": ref_text, "is_ref": True,
-                                           "dur": 5.0 if itype == 'image' else 0.0,
+                                           "dur": 5.0 if itype in ('image', 'html') else 0.0,
                                            "placement": "", "simultaneous": False,
                                            "wait_for_finish": "True", "xml_duration": ""})
                 except Exception as _e: _logger.debug(str(_e))

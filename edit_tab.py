@@ -3,4012 +3,68 @@
 # SI-HYX — медиа-загрузчик и перекодировщик.
 # Copyright (C) 2026 GoldensFire
 #
-# Свободное ПО: распространяется/изменяется на условиях GNU General Public
-# License v3 (или новее) от Free Software Foundation. БЕЗ ВСЯКИХ ГАРАНТИЙ.
-# Полный текст — в файле LICENSE (https://www.gnu.org/licenses/gpl-3.0.txt).
-# edit_tab.py — вкладка «Монтаж»: видеорезка с волной, превью и экспортом через ffmpeg.
-# Адаптировано из standalone-редактора Edit.py (JashaLava) под вкладку SI-HYX.
-
-import os
-import sys
+# Свободное ПО: GNU GPL v3 (или новее). БЕЗ ВСЯКИХ ГАРАНТИЙ. См. LICENSE.
+# edit_tab.py — вкладка «Монтаж»: класс EditTab (UI + логика резки/экспорта).
+#
+# Исторически вся вкладка была одним файлом на ~12,5к строк, что мешало навигации
+# и правкам. Сейчас она разложена по слоям (зависимости строго в одну сторону):
+#   edit_tab_base    — константы, палитра, чистые хелперы (время, ffprobe, ASS)
+#   edit_tab_workers — фоновые QThread-воркеры (резка, прокси, волна, субтитры)
+#   edit_tab_widgets — виджеты (волна, холст видео, полный экран, превью)
+#   edit_tab_dialogs — диалоги (маска, редактор/конструктор субтитров, пикселизация)
+#   edit_tab.py      — сам EditTab и standalone-entry main() (этот файл)
+#
+# ВАЖНО: edit_tab_base стоит первым в цепочке — он выставляет env-переменные
+# Qt-бэкенда (QSG_RHI_BACKEND/QT_MEDIA_BACKEND) ДО создания QApplication, что
+# критично для видео, и определяет флаги _HAS_MULTIMEDIA / LIBASS_AVAILABLE.
 import json
 import math
-import wave
-import uuid
-import tempfile
+import os
 import subprocess
-import threading
+import sys
+import tempfile
 import time
-from pathlib import Path
-from functools import partial
+import uuid
 from collections import deque
-
-# Бэкенды Qt нужно выбрать ДО создания QMediaPlayer/QVideoWidget. Модуль
-# импортируется в main.py до создания QApplication, поэтому setdefault здесь
-# срабатывает вовремя и не перетирает значения, заданные пользователем извне.
-from config import SETTINGS_FILE as _SETTINGS_FILE
-from msgbox import msgbox_critical, msgbox_warning, msgbox_information, msgbox_question
-from widgets import info_badge
-
-
-def _read_bool_setting(key, default=False):
-    """Читает булев флаг прямо из settings.json (нужно ДО создания QApplication)."""
-    try:
-        with open(_SETTINGS_FILE, encoding="utf-8") as _f:
-            return bool(json.load(_f).get(key, default))
-    except Exception:
-        return default
-
-
-# Программный рендер видео отключён всегда (настройка убрана из UI): окно видео
-# идёт по аппаратному D3D/GL-свопчейну.
-os.environ.setdefault("QSG_RHI_BACKEND", "opengl")
-# QT_FFMPEG_DECODING_HW_DEVICE_TYPES (HW-декодер H.264/HEVC) задаёт config.py,
-# импортируемый выше, — он читает настройку video_hw_decode.
-os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")
-
-from PyQt6.QtCore import (
-    Qt, QUrl, QThread, pyqtSignal, QTimer, QEvent, QPoint, QRect, QSize,
-    QIODevice, QPointF, QRectF
+from functools import partial
+from pathlib import Path
+from config import (
+    CONFIG_DIR, CREATE_NO_WINDOW, FFMPEG, FFPROBE, QAction, QApplication,
+    QCheckBox, QComboBox, QCursor, QDialog, QEvent, QFileDialog, QFont,
+    QFontMetrics, QFrame, QHBoxLayout, QKeySequence, QLabel, QLineEdit,
+    QMenu, QMessageBox, QPoint, QProgressBar, QPushButton, QScrollArea,
+    QSize, QSlider, QSpinBox, QTimer, QVBoxLayout, QWidget, Qt, get_icon,
+    icon_html
 )
-from PyQt6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QSlider, QScrollBar, QFileDialog, QLineEdit, QSpinBox, QComboBox,
-    QMessageBox, QProgressBar, QStyle, QStyleOptionSlider, QCheckBox, QToolTip,
-    QFrame, QScrollArea, QSizePolicy, QMenu, QDialog, QPlainTextEdit,
-    QDialogButtonBox
+from widgets import (info_badge)
+from msgbox import (
+    msgbox_critical, msgbox_information, msgbox_question, msgbox_warning
 )
-from PyQt6.QtGui import (
-    QKeySequence, QPainter, QColor, QPen, QBrush, QAction, QShortcut,
-    QFont, QLinearGradient, QPainterPath, QPixmap, QFontMetrics, QIcon, QImage,
-    QCursor
+from edit_tab_base import (
+    C, EDITOR_SETTINGS_PATH, LIBASS_AVAILABLE, QAudioOutput, QMediaPlayer,
+    QVideoWidget,
+    _HAS_MULTIMEDIA, _cues_to_ass, _fmt_channels, _fullscreen_icon,
+    _libass, _parse_srt, _pixelize_block_sequence, _unique_output,
+    format_fps, make_divider, make_icon_btn, run_ffprobe, s_to_time,
+    time_to_s
 )
-
-# Нативный рендер ASS/SSA для превью (libass). Если DLL нет/не загрузились —
-# LIBASS_AVAILABLE=False, и субтитры показываются обычным текстовым оверлеем.
-try:
-    import libass_renderer as _libass
-    LIBASS_AVAILABLE = bool(_libass.AVAILABLE)
-except Exception:
-    _libass = None
-    LIBASS_AVAILABLE = False
-
-# Мультимедиа PyQt6 поставляется вместе с основным wheel'ом, но на некоторых
-# урезанных сборках его может не быть — деградируем мягко (заглушка во вкладке).
-try:
-    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
-    from PyQt6.QtMultimediaWidgets import QVideoWidget
-    _HAS_MULTIMEDIA = True
-except Exception:
-    _HAS_MULTIMEDIA = False
-
-# Пути к ffmpeg/ffprobe и флаг скрытия консоли берём из общей конфигурации SI-HYX,
-# чтобы редактор работал и в собранном .exe с bundled-ffmpeg.
-from config import (FFMPEG, FFPROBE, CREATE_NO_WINDOW, CONFIG_DIR,
-                    get_icon, get_icon_pixmap, icon_html)
-import qtawesome as qta
-
-EDITOR_SETTINGS_PATH = os.path.join(CONFIG_DIR, "editor_settings.json")
-
-
-# ─── Color Palette ───────────────────────────────────────────────────────────
-# Палитра вкладки приведена к общему стилю приложения (Catppuccin Mocha,
-# см. STYLESHEET в config.py), чтобы «Монтаж» не выбивался из остальных вкладок.
-C = {
-    "bg":        "#1e1e2e",   # base
-    "surface":   "#181825",   # mantle
-    "surface2":  "#24273a",   # surface0-ish (панели)
-    "surface3":  "#313244",   # surface0 (поля/кнопки)
-    "border":    "#45475a",   # surface1
-    "border2":   "#585b70",   # surface2
-    "accent":    "#89b4fa",   # blue
-    "accent2":   "#b4befe",   # lavender (hover)
-    "green":     "#a6e3a1",   # green
-    "green2":    "#94e2d5",   # teal
-    "red":       "#f38ba8",   # red
-    "red2":      "#eba0ac",   # maroon
-    "yellow":    "#f9e2af",   # yellow
-    "text":      "#cdd6f4",   # text
-    "text2":     "#a6adc8",   # subtext0
-    "text3":     "#6c7086",   # overlay0
-    "playhead":  "#f9e2af",   # yellow
-    "wave_bg":   "#45475a",
-    "wave_sel":  "#89b4fa",
-}
-
-
-# ─── Helpers ─────────────────────────────────────────────────────────────────
-def run_ffprobe(path):
-    cmd = [FFPROBE, "-v", "quiet", "-print_format", "json",
-           "-show_format", "-show_streams", str(path)]
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, check=True,
-                           encoding="utf-8", errors="replace",
-                           creationflags=CREATE_NO_WINDOW)
-        return json.loads(p.stdout)
-    except Exception:
-        return None
-
-
-def time_to_s(hms_str: str) -> float:
-    parts = [p for p in hms_str.split(':') if p]
-    if not parts:
-        return 0.0
-    try:
-        partsf = [float(p) for p in parts]
-    except Exception:
-        return 0.0
-    if len(partsf) == 3:
-        h, m, s = partsf
-        return h * 3600 + m * 60 + s
-    elif len(partsf) == 2:
-        m, s = partsf
-        return m * 60 + s
-    else:
-        return partsf[0]
-
-
-def s_to_time(seconds: float) -> str:
-    if seconds is None:
-        return "00:00:00.000"
-    s = float(seconds)
-    if not math.isfinite(s) or s < 0:
-        return "00:00:00.000"
-    h = int(s // 3600)
-    m = int((s % 3600) // 60)
-    sec = s - h * 3600 - m * 60
-    return f"{h:02d}:{m:02d}:{sec:06.3f}"
-
-
-def format_fps(fps):
-    if fps is None:
-        return "—"
-    try:
-        f = float(fps)
-    except Exception:
-        return str(fps)
-    if abs(f - round(f)) < 1e-9:
-        return str(int(round(f)))
-    else:
-        txt = f"{f:.3f}"
-        txt = txt.rstrip('0').rstrip('.')
-        return txt
-
-
-def _fmt_channels(ainfo):
-    """Человекочитаемое описание числа каналов аудио: 1 → «моно», 2 → «стерео»,
-    6 → «5.1», 8 → «7.1», иначе «Nch». Берётся channel_layout, если он есть."""
-    info = ainfo or {}
-    try:
-        ch = int(info.get('channels'))
-    except Exception:
-        ch = None
-    layout = (info.get('channel_layout') or '').lower()
-    if ch == 1 or layout == 'mono':
-        return "моно"
-    if ch == 2 or layout == 'stereo':
-        return "стерео"
-    if ch == 6 or layout.startswith('5.1'):
-        return "5.1"
-    if ch == 8 or layout.startswith('7.1'):
-        return "7.1"
-    if ch:
-        return f"{ch}ch"
-    return "—"
-
-
-def _unique_output(path: str) -> str:
-    """Возвращает путь, которого ещё нет на диске: к имени добавляется _1, _2…
-    перед расширением (foo_обрез.mp4 → foo_обрез_1.mp4). Используется, когда
-    «Перезаписать» выключено, а файл с целевым именем уже существует —
-    результат просто сохраняется под новым именем."""
-    if not os.path.exists(path):
-        return path
-    base, ext = os.path.splitext(path)
-    i = 1
-    while True:
-        cand = f"{base}_{i}{ext}"
-        if not os.path.exists(cand):
-            return cand
-        i += 1
-
-
-class ShareDeleteIODevice(QIODevice):
-    """QIODevice поверх файла, открытого с FILE_SHARE_DELETE (Windows).
-
-    Зачем: QMediaPlayer, играя файл напрямую (setSource(file://…)), держит его
-    так, что Проводник не даёт файл удалить («занят другим процессом»). Если же
-    скормить плееру этот девайс (setSourceDevice), файл открыт с правом общего
-    удаления — пользователь спокойно удаляет исходник прямо во время монтажа
-    (Windows физически уберёт его, когда плеер отпустит хэндл). Перемотка
-    работает: девайс произвольного доступа (isSequential=False, есть seek)."""
-
-    def __init__(self, path, parent=None):
-        super().__init__(parent)
-        self._path = str(path)
-        self._h = None
-        try:
-            self._sz = os.path.getsize(self._path)
-        except Exception:
-            self._sz = 0
-
-    def open(self, mode=QIODevice.OpenModeFlag.ReadOnly):
-        if os.name != 'nt':
-            return False
-        try:
-            import ctypes
-            from ctypes import wintypes
-            k32 = ctypes.windll.kernel32
-            k32.CreateFileW.restype = wintypes.HANDLE
-            k32.CreateFileW.argtypes = [
-                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-            GENERIC_READ = 0x80000000
-            SHARE_ALL = 0x1 | 0x2 | 0x4          # READ | WRITE | DELETE
-            OPEN_EXISTING = 3
-            NORMAL = 0x80
-            INVALID = ctypes.c_void_p(-1).value
-            h = k32.CreateFileW(self._path, GENERIC_READ, SHARE_ALL, None,
-                                OPEN_EXISTING, NORMAL, None)
-            if not h or h == INVALID:
-                return False
-            self._h = h
-            self._k32 = k32
-            return super().open(QIODevice.OpenModeFlag.ReadOnly)
-        except Exception:
-            return False
-
-    def isSequential(self):
-        return False
-
-    def size(self):
-        return self._sz
-
-    def seek(self, pos):
-        try:
-            import ctypes
-            from ctypes import wintypes
-            self._k32.SetFilePointerEx.argtypes = [
-                wintypes.HANDLE, ctypes.c_longlong,
-                ctypes.POINTER(ctypes.c_longlong), wintypes.DWORD]
-            self._k32.SetFilePointerEx(wintypes.HANDLE(self._h),
-                                       ctypes.c_longlong(int(pos)), None, 0)
-        except Exception:
-            return False
-        return super().seek(pos)
-
-    def readData(self, maxlen):
-        if not self._h:
-            return b''
-        try:
-            import ctypes
-            from ctypes import wintypes
-            n = int(maxlen)
-            if n <= 0:
-                return b''
-            buf = ctypes.create_string_buffer(n)
-            rd = wintypes.DWORD(0)
-            ok = self._k32.ReadFile(wintypes.HANDLE(self._h), buf, n,
-                                    ctypes.byref(rd), None)
-            if not ok:
-                return b''
-            return bytes(buf.raw[:rd.value])
-        except Exception:
-            return b''
-
-    def close(self):
-        try:
-            if self._h:
-                import ctypes
-                from ctypes import wintypes
-                self._k32.CloseHandle(wintypes.HANDLE(self._h))
-        except Exception:
-            pass
-        self._h = None
-        try:
-            super().close()
-        except Exception:
-            pass
-
-
-def start_share_delete_feeder(path, stdin, stop_flag=None):
-    """Фоновый поток: читает файл с FILE_SHARE_DELETE и пишет его байты в stdin
-    запущенного ffmpeg (вход «pipe:0»). Зачем: ffmpeg, открывая файл напрямую,
-    держит его без права удаления, и Проводник не даёт удалить исходник (а тем
-    более папку с ним), пока крутится фоновый воркер (волна/прокси). Если же
-    кормить ffmpeg через этот поток, файл открыт нами с FILE_SHARE_DELETE —
-    пользователь спокойно удаляет исходник прямо во время монтажа.
-
-    stop_flag — необязательный callable → True для досрочной остановки. Возвращает
-    запущенный поток-демон. stdin закрывается по достижении конца файла."""
-    out = getattr(stdin, "buffer", stdin)   # бинарный канал даже при text=True
-
-    def _pump():
-        h = None
-        k32 = None
-        f = None
-        try:
-            if os.name == 'nt':
-                import ctypes
-                from ctypes import wintypes
-                k32 = ctypes.windll.kernel32
-                k32.CreateFileW.restype = wintypes.HANDLE
-                k32.CreateFileW.argtypes = [
-                    wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
-                    ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-                GENERIC_READ = 0x80000000
-                SHARE_ALL = 0x1 | 0x2 | 0x4          # READ | WRITE | DELETE
-                OPEN_EXISTING = 3
-                NORMAL = 0x80
-                INVALID = ctypes.c_void_p(-1).value
-                hh = k32.CreateFileW(str(path), GENERIC_READ, SHARE_ALL, None,
-                                     OPEN_EXISTING, NORMAL, None)
-                if hh and hh != INVALID:
-                    h = hh
-                if h is not None:
-                    buf = ctypes.create_string_buffer(1 << 20)
-                    rd = wintypes.DWORD(0)
-                    while stop_flag is None or not stop_flag():
-                        ok = k32.ReadFile(wintypes.HANDLE(h), buf, len(buf),
-                                          ctypes.byref(rd), None)
-                        if not ok or rd.value == 0:
-                            break
-                        try:
-                            out.write(buf.raw[:rd.value])
-                        except Exception:
-                            break
-            else:
-                f = open(str(path), 'rb')
-                while stop_flag is None or not stop_flag():
-                    data = f.read(1 << 20)
-                    if not data:
-                        break
-                    try:
-                        out.write(data)
-                    except Exception:
-                        break
-        except Exception:
-            pass
-        finally:
-            if h is not None:
-                try:
-                    import ctypes
-                    from ctypes import wintypes
-                    ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(h))
-                except Exception:
-                    pass
-            if f is not None:
-                try: f.close()
-                except Exception: pass
-            try: stdin.close()
-            except Exception: pass
-
-    t = threading.Thread(target=_pump, daemon=True)
-    t.start()
-    return t
-
-
-# ─── Workers ─────────────────────────────────────────────────────────────────
-class FfmpegWorker(QThread):
-    progress = pyqtSignal(float)
-    finished = pyqtSignal(bool, str)
-
-    def __init__(self, cmd, duration=None, parent=None):
-        super().__init__(parent)
-        self.cmd = cmd
-        self.duration = duration
-        self.proc = None
-        self._stopped = False
-
-    def run(self):
-        try:
-            self.proc = subprocess.Popen(
-                self.cmd, stderr=subprocess.PIPE, text=True,
-                encoding="utf-8", errors="replace",
-                creationflags=CREATE_NO_WINDOW)
-        except Exception as e:
-            self.finished.emit(False, f"Не удалось запустить ffmpeg: {e}")
-            return
-
-        proc = self.proc
-        if self.duration is None:
-            rc = proc.wait()
-            self.finished.emit(rc == 0 and not self._stopped, f"Код: {rc}")
-            return
-
-        try:
-            for line in proc.stderr:
-                if self._stopped:
-                    break
-                if 'time=' in line:
-                    try:
-                        idx = line.index('time=')
-                        tpart = line[idx + 5:].split()[0]
-                        tsec = time_to_s(tpart)
-                        perc = min(100.0, max(0.0, (tsec / self.duration) * 100.0)) if self.duration > 0 else 0.0
-                        self.progress.emit(perc)
-                    except Exception:
-                        pass
-            rc = proc.wait()
-            if self._stopped:
-                self.finished.emit(False, "Отменено")
-            else:
-                self.finished.emit(rc == 0, f"Код: {rc}")
-        except Exception as e:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            self.finished.emit(False, f"Ошибка ffmpeg: {e}")
-
-    def stop(self):
-        """Помечает воркер отменённым и убивает ffmpeg-процесс (без зомби)."""
-        self._stopped = True
-        p = self.proc
-        if p and p.poll() is None:
-            try:
-                p.kill()
-            except Exception:
-                pass
-
-
-class SmartCutWorker(QThread):
-    """Умная обрезка (Smart Cut). Основная часть видео между опорными кадрами
-    копируется БЕЗ перекодирования (оригинальное качество и скорость), а
-    перекодируются только короткие граничные участки от точек реза до ближайших
-    ключевых кадров. Итог склеивается concat-демуксером.
-
-    head: [in, kf_start)  — перекодировка (точное начало реза)
-    mid:  [kf_start, kf_end) — copy видео (без потерь), аудио → AAC (для ровной склейки)
-    tail: [kf_end, out)   — перекодировка (точный конец реза)
-
-    Если умную обрезку выполнить нельзя (нет опорных кадров внутри отрезка, чужой
-    видеокодек, ошибка склейки) — ПРОЗРАЧНЫЙ ОТКАТ на полную перекодировку отрезка,
-    чтобы пользователь всегда получил корректный файл."""
-    progress = pyqtSignal(float)
-    status = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)
-
-    def __init__(self, src, in_s, out_s, out_path, venc, audio_index=None,
-                 parent=None):
-        super().__init__(parent)
-        self.src = str(src)
-        self.in_s = float(in_s)
-        self.out_s = float(out_s)
-        self.out_path = out_path
-        self.venc = list(venc)
-        # Абсолютный индекс выбранной аудиодорожки (None → первая: 0:a:0). Без
-        # него Smart Cut всегда брал дорожку по умолчанию, игнорируя выбор.
-        self.audio_index = audio_index
-        self._stopped = False
-        self._procs = []
-        self._tmpdir = None
-
-    def stop(self):
-        self._stopped = True
-        for p in list(self._procs):
-            try:
-                if p.poll() is None:
-                    p.kill()
-            except Exception:
-                pass
-
-    def _run(self, cmd):
-        if self._stopped:
-            return 1
-        try:
-            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL,
-                                 creationflags=CREATE_NO_WINDOW)
-        except Exception:
-            return 1
-        self._procs.append(p)
-        rc = p.wait()
-        try: self._procs.remove(p)
-        except ValueError: pass
-        return rc
-
-    def _video_codec(self):
-        try:
-            r = subprocess.run(
-                [FFPROBE, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", self.src],
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", creationflags=CREATE_NO_WINDOW, timeout=30)
-            return (r.stdout or "").strip()
-        except Exception:
-            return ""
-
-    def _keyframes(self):
-        """Тайминги ключевых кадров видео в окрестности [in, out] (по флагам
-        пакетов, без декодирования — быстро)."""
-        cmd = [FFPROBE, "-v", "error", "-select_streams", "v:0",
-               "-show_entries", "packet=pts_time,flags",
-               "-read_intervals", f"{max(0.0, self.in_s - 2):.3f}%{self.out_s + 2:.3f}",
-               "-of", "csv=p=0", self.src]
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               encoding="utf-8", errors="replace",
-                               creationflags=CREATE_NO_WINDOW, timeout=60)
-        except Exception:
-            return []
-        kfs = []
-        for line in (r.stdout or "").splitlines():
-            parts = line.split(",")
-            if len(parts) >= 2 and parts[0] not in ("", "N/A") and "K" in parts[1]:
-                try:
-                    kfs.append(float(parts[0]))
-                except Exception:
-                    pass
-        return sorted(kfs)
-
-    # Общий timescale для всех сегментов: без него re-encode (libx264) и copy
-    # имеют разную временную базу, и concat-демуксер вставляет рассинхрон на
-    # стыке. 90000 — стандарт для видео.
-    _TS = "90000"
-
-    def _media_dur(self, path):
-        """Длительность готового файла по контейнеру (для подгонки аудио к видео)."""
-        try:
-            r = subprocess.run(
-                [FFPROBE, "-v", "error", "-show_entries", "format=duration",
-                 "-of", "csv=p=0", path], capture_output=True, text=True,
-                encoding="utf-8", errors="replace",
-                creationflags=CREATE_NO_WINDOW, timeout=30)
-            return float((r.stdout or "0").strip() or 0.0)
-        except Exception:
-            return 0.0
-
-    def _max_frame_gap(self, path):
-        """(max_gap, median_gap) между соседними видео-пакетами склейки. Щель на
-        стыке сегментов (open-GOP роняет хвостовые B-кадры у границы GOP при
-        lossless-copy → дырка в 2–3 кадра) даёт max_gap заметно больше медианного
-        интервала. Нужен, чтобы поймать НЕровную склейку и честно откатиться на
-        полный реэнкод (он всегда кадрово-непрерывен)."""
-        try:
-            r = subprocess.run(
-                [FFPROBE, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "packet=pts_time", "-of", "csv=p=0", path],
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", creationflags=CREATE_NO_WINDOW, timeout=60)
-        except Exception:
-            return (0.0, 0.0)
-        ts = sorted(
-            float(x.replace(",", "")) for x in (r.stdout or "").split()
-            if x.strip() and x.replace(",", "") not in ("", "N/A"))
-        if len(ts) < 3:
-            return (0.0, 0.0)
-        gaps = sorted(ts[i + 1] - ts[i] for i in range(len(ts) - 1))
-        return (gaps[-1], gaps[len(gaps) // 2])
-
-    def _encode_seg(self, start, dur, out_file):
-        """Перекодирует ВИДЕО граничного участка [start, start+dur) без звука.
-
-        Ключевые моменты (выверены экспериментально на h264/aac):
-        • ВХОДНОЙ seek (-ss ДО -i) + -t — первый кадр сегмента встаёт в 0.000;
-          двухступенчатый seek (вход к ключевому + выход к точке) оставлял
-          смещение ~0.08с и щель на стыке → «зависание первых кадров».
-        • `-bf 0` — без B-кадров у границы нет задержки переупорядочивания
-          (иначе первый PTS = 2 кадра → щель/смещение при concat).
-        • общий `-video_track_timescale` — ровная склейка с copy-серединой.
-
-        Звук НЕ кодируем посегментно: на каждом стыке AAC-кодер добавил бы
-        priming/padding → провал звука. Берём звук единым проходом (_encode_audio).
-
-        Тайминги форматируем с точностью .6f: округление до мс смещало срез на доли
-        кадра — у copy это вырезало кадр у границы (дырка → щель на стыке)."""
-        cmd = [FFMPEG, "-y", "-ss", f"{start:.6f}", "-i", self.src,
-               "-t", f"{dur:.6f}"] + self.venc + \
-              ["-bf", "0", "-an", "-sn", "-video_track_timescale", self._TS,
-               "-avoid_negative_ts", "make_zero", out_file]
-        return self._run(cmd) == 0
-
-    def _copy_seg(self, start, end, out_file):
-        """Копирует середину [start, end) без перекодирования видео и БЕЗ звука.
-        ВХОДНОЙ seek на ключевой кадр `start` + ОГРАНИЧЕНИЕ ДЛИТЕЛЬНОСТЬЮ `-t`.
-
-        КРИТИЧНО: здесь НЕЛЬЗЯ `-avoid_negative_ts make_zero`. Он сдвигает
-        таймстемпы в ноль, и тогда `-t`/`-to` перестают резать по длительности —
-        copy захватывает ЛИШНИЕ GOP (замерено: с make_zero копия [106.4,127.2) =
-        2 GOP давала 31с/749 кадров вместо 21с/498 → склейка длиннее запроса →
-        предохранитель всегда откатывал на полный реэнкод; а если overshoot <1.5с,
-        он проскакивал → «застывший кадр + лишняя секунда звука в конце»). Без
-        make_zero `-t` режет ровно по длительности (498–500 кадров). Нулевой старт
-        для стыка обеспечивает уже сам concat (`make_zero` на склейке). Общий
-        `-video_track_timescale` оставляем — ровная склейка с re-encode-границами."""
-        dur = max(0.0, end - start)
-        cmd = [FFMPEG, "-y", "-ss", f"{start:.6f}", "-i", self.src,
-               "-t", f"{dur:.6f}", "-c:v", "copy", "-an", "-sn",
-               "-video_track_timescale", self._TS, out_file]
-        return self._run(cmd) == 0
-
-    def _encode_audio(self, dur, out_file):
-        """Кодирует звук ВЫБРАННОЙ дорожки от in_s РОВНО длиной dur (= длине
-        склеенного видео) ОДНИМ проходом в AAC. `apad` добивает тишиной до полной
-        длины, поэтому звук покрывает и ПОСЛЕДНИЙ кадр (без apad `-shortest` в mux
-        обрезал звук по последнему ВИДЕО-пакету и на финальном кадре звука не было
-        — «звук обрывается в конце»). Единый поток → нет провалов на стыках.
-        Дорожка — self.audio_index (выбор пользователя), иначе первая 0:a:0.
-        Возвращает True только если файл создан (источник без звука → False)."""
-        amap = f"0:{self.audio_index}" if self.audio_index is not None else "0:a:0"
-        cmd = [FFMPEG, "-y", "-ss", f"{self.in_s:.6f}", "-i", self.src,
-               "-t", f"{max(0.1, dur):.6f}", "-vn", "-sn",
-               "-map", amap, "-af", "apad", "-c:a", "aac", "-b:a", "192k",
-               "-avoid_negative_ts", "make_zero", out_file]
-        return (self._run(cmd) == 0 and os.path.exists(out_file)
-                and os.path.getsize(out_file) > 0)
-
-    def _mux(self, video_file, audio_file, out_file):
-        """Сводит готовую видео-дорожку с единой аудио-дорожкой без перекодировки.
-        Звук уже точно равен длине видео (apad + -t = video_dur), поэтому БЕЗ
-        `-shortest`: и последний кадр озвучен, и нет «застывшего» хвоста видео.
-        muxdelay/muxpreload 0 + make_zero убирают начальное смещение контейнера."""
-        cmd = [FFMPEG, "-y", "-i", video_file, "-i", audio_file,
-               "-map", "0:v:0", "-map", "1:a:0", "-c", "copy",
-               "-avoid_negative_ts", "make_zero", "-muxpreload", "0",
-               "-muxdelay", "0", out_file]
-        return self._run(cmd) == 0
-
-    def _full_reencode(self, out_file):
-        """Откат: полная перекодировка отрезка одним проходом. ВХОДНОЙ seek
-        (-ss ДО -i) + re-encode даёт кадрово-точный старт и не декодирует файл с
-        нуля (выходной seek на in_s=100с тормозил бы). Один проход → звук
-        непрерывен, провалов на стыках нет.
-
-        КРИТИЧНО — маппим ВЫБРАННУЮ аудиодорожку. Без -map ffmpeg по умолчанию
-        берёт дорожку с НАИБОЛЬШИМ числом каналов (напр. 5.1), а не выбранную
-        пользователем 2.0 → «после обрезки звук стал другой». apad держит звук до
-        последнего кадра (только когда дорожка точно есть)."""
-        if self.audio_index is not None:
-            amap = ["-map", "0:v:0", "-map", f"0:{self.audio_index}"]
-            aenc = ["-c:a", "aac", "-b:a", "192k", "-af", "apad"]
-        else:
-            # Дорожка не выбрана: optional-map первой аудио (источник без звука не
-            # упадёт); apad НЕ ставим — на безаудийном входе фильтр бы ошибся.
-            amap = ["-map", "0:v:0", "-map", "0:a:0?"]
-            aenc = ["-c:a", "aac", "-b:a", "192k"]
-        cmd = [FFMPEG, "-y", "-ss", f"{self.in_s:.6f}", "-i", self.src,
-               "-t", f"{self.out_s - self.in_s:.6f}"] + amap + self.venc + \
-              aenc + ["-sn", out_file]
-        return self._run(cmd) == 0
-
-    def run(self):
-        # Промежуточные сегменты ВСЕГДА в .mp4: только mp4-муксер уважает общий
-        # -video_track_timescale, без которого re-encode и copy склеиваются со
-        # сдвигом (mkv свой timescale игнорирует → щель на стыке mid→tail). В
-        # пользовательский контейнер (mkv/…) перекладываем уже готовый результат
-        # финальным mux/remux без перекодировки.
-        ext = ".mp4"
-        try:
-            self._tmpdir = tempfile.mkdtemp(prefix="sihyx_smartcut_")
-        except Exception:
-            self.finished.emit(False, "Не удалось создать временную папку"); return
-
-        def _finish(ok, msg):
-            try:
-                import shutil
-                if self._tmpdir:
-                    shutil.rmtree(self._tmpdir, ignore_errors=True)
-            except Exception:
-                pass
-            self.finished.emit(ok and not self._stopped, msg)
-
-        try:
-            self.status.emit("Smart Cut: анализ ключевых кадров…")
-            self.progress.emit(3.0)
-            vcodec = self._video_codec()
-            kfs = self._keyframes()
-            # Опорные кадры строго ВНУТРИ отрезка (с зазором, чтобы участки не
-            # вырождались в ноль).
-            inner = [t for t in kfs if self.in_s + 0.10 < t < self.out_s - 0.10]
-            kf_before_in = max([t for t in kfs if t <= self.in_s + 0.001], default=0.0)
-
-            # Условия применимости умной обрезки: знаем кодек и есть ХОТЯ БЫ ДВА
-            # опорных кадра внутри (нужны старт И конец copy-середины). При одном
-            # kf_start==kf_end → copy «-ss X -to X» падает («-to value smaller than
-            # -ss») и весь Smart Cut откатывался на реэнкод. Короткий клип (короче
-            # ~2 GOP, частый случай: ~15с при GOP ~10с) копировать нечего — сразу
-            # честный полный реэнкод (он теперь уважает выбранную аудиодорожку).
-            if self._stopped:
-                _finish(False, "Отменено"); return
-            if vcodec not in ("h264", "hevc", "h265") or len(inner) < 2:
-                self.status.emit("Smart Cut недоступен для отрезка — полная перекодировка…")
-                self.progress.emit(10.0)
-                ok = self._full_reencode(self.out_path)
-                _finish(ok, "Готово (перекодировка)" if ok else "Ошибка перекодировки")
-                return
-
-            kf_start, kf_end = inner[0], inner[-1]
-            head = os.path.join(self._tmpdir, f"head{ext}")
-            mid  = os.path.join(self._tmpdir, f"mid{ext}")
-            tail = os.path.join(self._tmpdir, f"tail{ext}")
-            segs = []
-
-            # head: [in, kf_start) — только видео (входной seek прямо в in_s)
-            self.status.emit("Smart Cut: граница начала…"); self.progress.emit(20.0)
-            if kf_start - self.in_s > 0.04:
-                if not self._encode_seg(self.in_s, kf_start - self.in_s, head):
-                    raise RuntimeError("head encode failed")
-                segs.append(head)
-
-            # mid: [kf_start, kf_end) — copy без перекодировки (только видео)
-            self.status.emit("Smart Cut: копирование середины…"); self.progress.emit(40.0)
-            if not self._copy_seg(kf_start, kf_end, mid):
-                raise RuntimeError("mid copy failed")
-            segs.append(mid)
-
-            # tail: [kf_end, out) — только видео
-            self.status.emit("Smart Cut: граница конца…"); self.progress.emit(60.0)
-            if self.out_s - kf_end > 0.04:
-                if not self._encode_seg(kf_end, self.out_s - kf_end, tail):
-                    raise RuntimeError("tail encode failed")
-                segs.append(tail)
-
-            if self._stopped:
-                _finish(False, "Отменено"); return
-
-            # Склейка ВИДЕО-сегментов (без звука) в единую дорожку.
-            self.status.emit("Smart Cut: склейка…"); self.progress.emit(75.0)
-            video_only = os.path.join(self._tmpdir, f"video{ext}")
-            listfile = os.path.join(self._tmpdir, "list.txt")
-            with open(listfile, "w", encoding="utf-8") as f:
-                for s in segs:
-                    f.write(f"file '{s.replace(chr(39), chr(92) + chr(39))}'\n")
-            rc = self._run([FFMPEG, "-y", "-f", "concat", "-safe", "0",
-                            "-i", listfile, "-c", "copy", "-an",
-                            "-avoid_negative_ts", "make_zero",
-                            "-muxpreload", "0", "-muxdelay", "0", video_only])
-            ok = (rc == 0 and os.path.exists(video_only)
-                  and os.path.getsize(video_only) > 0)
-            if not ok:
-                # Склейка не удалась → откат на полную перекодировку.
-                self.status.emit("Склейка не удалась — полная перекодировка…")
-                ok = self._full_reencode(self.out_path)
-                _finish(ok, "Готово (перекодировка)" if ok else "Ошибка Smart Cut")
-                return
-
-            if self._stopped:
-                _finish(False, "Отменено"); return
-
-            # ПРЕДОХРАНИТЕЛЬ ДЛИТЕЛЬНОСТИ: head/tail режутся точно по in_s/out_s, а
-            # mid ограничен ключевыми кадрами внутри [in,out] — поэтому склейка
-            # обязана быть ≈ (out_s−in_s). Если она заметно длиннее/короче (битый
-            # индекс/таймстемпы редкого контейнера → copy захватил лишнее: «обрезал
-            # 15с, получил 21с»), Smart Cut НЕНАДЁЖЕН для этого файла — честно
-            # откатываемся на полную перекодировку (она всегда кадрово-точна).
-            requested = self.out_s - self.in_s
-            vdur = self._media_dur(video_only) or requested
-            if abs(vdur - requested) > 1.5:
-                self.status.emit("Smart Cut неточен для файла — полная перекодировка…")
-                ok = self._full_reencode(self.out_path)
-                _finish(ok, "Готово (перекодировка)" if ok else "Ошибка Smart Cut")
-                return
-
-            # ПРЕДОХРАНИТЕЛЬ СТЫКА: у open-GOP исходника (B-кадры ссылаются на
-            # СЛЕДУЮЩИЙ ключевой) lossless-copy роняет 2–3 хвостовых B-кадра на
-            # границе GOP → щель на стыке mid→tail (микро-рывок «застывший кадр»).
-            # Кадров реально нет — концат её не закроет (проверено: даже filter-
-            # concat с реэнкодом оставляет ту же щель). Если на склейке есть
-            # аномальный разрыв между видео-пакетами (> 1.8× медианного интервала),
-            # склейка неровная → честный откат на полный реэнкод (кадрово-непрерывен).
-            # Чистая склейка (быстрый путь) проходит дальше без потерь.
-            maxgap, medgap = self._max_frame_gap(video_only)
-            if medgap > 0 and maxgap > medgap * 1.8:
-                self.status.emit("Smart Cut: неровный стык — полная перекодировка…")
-                ok = self._full_reencode(self.out_path)
-                _finish(ok, "Готово (перекодировка)" if ok else "Ошибка Smart Cut")
-                return
-
-            # Звук единым проходом → подмешиваем к видео. Так на стыках сегментов
-            # нет провалов AAC-priming (баг «звук обрывается и снова идёт»). Длину
-            # звука берём РОВНО по длине склеенного видео (apad добьёт тишиной),
-            # чтобы озвучить и последний кадр. Источник без звука → видео как есть.
-            self.status.emit("Smart Cut: звук…"); self.progress.emit(88.0)
-            audio = os.path.join(self._tmpdir, "audio.m4a")
-            if self._encode_audio(vdur, audio):
-                if not self._mux(video_only, audio, self.out_path):
-                    self.status.emit("Сведение не удалось — полная перекодировка…")
-                    ok = self._full_reencode(self.out_path)
-                    _finish(ok, "Готово (перекодировка)" if ok else "Ошибка Smart Cut")
-                    return
-            else:
-                # Нет аудио-дорожки — перекладываем видео в контейнер результата
-                # без перекодировки (intermediate всегда mp4, цель может быть mkv).
-                rc = self._run([FFMPEG, "-y", "-i", video_only, "-c", "copy",
-                                "-an", "-avoid_negative_ts", "make_zero",
-                                "-muxpreload", "0", "-muxdelay", "0",
-                                self.out_path])
-                if rc != 0 or not os.path.exists(self.out_path):
-                    import shutil
-                    shutil.copyfile(video_only, self.out_path)
-            ok = (os.path.exists(self.out_path)
-                  and os.path.getsize(self.out_path) > 0)
-            if not ok:
-                raise RuntimeError("final output missing")
-            self.progress.emit(100.0)
-            _finish(True, "Готово (Smart Cut)")
-        except Exception as e:
-            if self._stopped:
-                _finish(False, "Отменено"); return
-            # Любая ошибка пайплайна → надёжный откат на полный реэнкод.
-            try:
-                self.status.emit(f"Smart Cut: откат на перекодировку ({e})")
-                ok = self._full_reencode(self.out_path)
-                _finish(ok, "Готово (перекодировка)" if ok else f"Ошибка Smart Cut: {e}")
-            except Exception as e2:
-                _finish(False, f"Ошибка Smart Cut: {e2}")
-
-
-class VideoInpaintWorker(QThread):
-    """Покадровое удаление объекта (водяной знак/эмодзи и т.п.) с ВИДЕО в отдельном
-    потоке, чтобы интерфейс не зависал.
-
-    Принципиально НЕ содержит собственной реализации инпейнтинга: для каждого кадра
-    вызывается ТОТ ЖЕ движок LaMa (inpainter.inpaint), что и при удалении объекта с
-    одиночного изображения в фоторедакторе. Пайплайн целиком на FFmpeg + LaMa:
-
-      1) FFmpeg разбивает видео на PNG-кадры (полное разрешение, дисплейная
-         ориентация — autorotate по умолчанию, без потерь);
-      2) каждый кадр прогоняется через inpainter.inpaint(frame, mask) — функция
-         сама обрабатывает только ROI вокруг маски (см. lama_inpaint.py), поэтому
-         для небольшого знака весь кадр через сеть НЕ гоняется и это быстро;
-      3) FFmpeg собирает кадры обратно, сохраняя исходные FPS, разрешение,
-         ориентацию и аудиодорожку оригинала.
-
-    Маска ОДНА на всё видео (закрашивается на одном кадре в диалоге) — рассчитано
-    на статичные объекты, что и нужно для водяных знаков/логотипов/эмодзи.
-
-    Отмена (cancel) прерывает на любом этапе; временная папка удаляется ВСЕГДА —
-    и при успехе, и при ошибке, и при отмене.
-    """
-    progress = pyqtSignal(int, str)      # (процент 0..100; -1 = «busy», текст фазы)
-    done = pyqtSignal(str)               # путь готового файла
-    failed = pyqtSignal(str)             # текст ошибки ("Отменено" при отмене)
-
-    def __init__(self, inpainter, src, mask, fps, out_path, venc, has_audio):
-        super().__init__()
-        self._inp = inpainter
-        # Абсолютный путь: ffmpeg для разных этапов вызывается в разное время, и
-        # относительный путь ненадёжен (рабочий каталог процесса мог измениться).
-        self._src = os.path.abspath(str(src))
-        self._mask = mask                # numpy (H,W) uint8 {0,255}
-        self._fps = float(fps) if fps and fps > 0 else 25.0
-        self._out = str(out_path)
-        self._venc = list(venc)          # аргументы видеокодировщика (как у «Обрезать»)
-        self._has_audio = bool(has_audio)
-        self._cancel = False
-        self._proc = None                # текущий subprocess ffmpeg (для отмены)
-        self._tmp = None
-
-    def cancel(self):
-        """Просит прервать обработку (потокобезопасно по флагу) и убивает текущий
-        ffmpeg, если он запущен, чтобы отмена была мгновенной."""
-        self._cancel = True
-        p = self._proc
-        if p is not None and p.poll() is None:
-            try:
-                p.terminate()
-            except Exception:
-                pass
-
-    # Алиас для единообразной остановки в EditTab.shutdown (как у остальных воркеров).
-    def stop(self):
-        self.cancel()
-
-    def _run_ffmpeg(self, cmd):
-        """Запускает ffmpeg и ждёт завершения, периодически проверяя отмену.
-        Возвращает returncode (или -1, если прервали по cancel)."""
-        kw = {}
-        if os.name == 'nt':
-            kw['creationflags'] = CREATE_NO_WINDOW
-        self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
-                                      stderr=subprocess.DEVNULL, **kw)
-        try:
-            while True:
-                try:
-                    return self._proc.wait(timeout=0.2)
-                except subprocess.TimeoutExpired:
-                    if self._cancel:
-                        try:
-                            self._proc.terminate()
-                        except Exception:
-                            pass
-                        try:
-                            self._proc.wait(timeout=5)
-                        except Exception:
-                            pass
-                        return -1
-        finally:
-            self._proc = None
-
-    def run(self):
-        # Загрузчик/сохранятель кадров — те же, что использует фоторедактор
-        # (Unicode-безопасные обёртки над OpenCV). Импорт ленивый: тяжёлые
-        # зависимости подтягиваются только при реальном запуске обработки.
-        from lama_inpaint import load_bgr, save_bgr
-        import shutil
-        try:
-            self._tmp = tempfile.mkdtemp(prefix="sihyx_vinp_")
-            frames_dir = os.path.join(self._tmp, "frames")
-            os.makedirs(frames_dir, exist_ok=True)
-            patt = os.path.join(frames_dir, "%08d.png")
-
-            # 1) Разбор видео на кадры (полное разрешение, дисплейная ориентация).
-            self.progress.emit(-1, "Разбор видео на кадры…")
-            if self._run_ffmpeg([FFMPEG, "-y", "-i", self._src, patt]) != 0 or self._cancel:
-                raise RuntimeError("Отменено" if self._cancel
-                                   else "Не удалось извлечь кадры из видео")
-
-            frames = sorted(f for f in os.listdir(frames_dir) if f.endswith(".png"))
-            total = len(frames)
-            if total == 0:
-                raise RuntimeError("В видео не найдено кадров")
-
-            # 2) Прогрев модели ДО цикла (её загрузка длится ~10–25 c) — чтобы
-            #    прогресс по кадрам шёл ровно, а не «застрял» на первом кадре.
-            self.progress.emit(-1, "Загрузка модели LaMa…")
-            try:
-                self._inp.warmup()
-            except Exception:
-                pass
-            if self._cancel:
-                raise RuntimeError("Отменено")
-
-            # 3) Покадровый инпейнт ТЕМ ЖЕ движком, что и для фото. Маска одна на
-            #    всё видео; inpaint сам работает только по ROI вокруг неё.
-            for i, name in enumerate(frames):
-                if self._cancel:
-                    raise RuntimeError("Отменено")
-                fp = os.path.join(frames_dir, name)
-                res = self._inp.inpaint(load_bgr(fp), self._mask)
-                save_bgr(fp, res)        # перезаписываем кадр результатом (экономит диск)
-                pct = 5 + int(88 * (i + 1) / total)
-                self.progress.emit(pct, f"Удаление объекта… кадр {i + 1}/{total}")
-
-            if self._cancel:
-                raise RuntimeError("Отменено")
-
-            # 4) Сборка обратно: исходные FPS + аудиодорожка из оригинала.
-            self.progress.emit(95, "Сборка видео…")
-            out_tmp = os.path.join(self._tmp, "out" + os.path.splitext(self._out)[1])
-
-            def _assemble(copy_audio):
-                cmd = [FFMPEG, "-y", "-framerate", f"{self._fps:.6f}", "-i", patt]
-                if self._has_audio:
-                    # Аудио берём из оригинала; copy — без потерь; при несовместимости
-                    # контейнера/кодека (редко) ниже откатываемся на перекодировку в AAC.
-                    cmd += ["-i", self._src, "-map", "0:v:0", "-map", "1:a?"]
-                    cmd += (["-c:a", "copy"] if copy_audio
-                            else ["-c:a", "aac", "-b:a", "192k"])
-                else:
-                    cmd += ["-map", "0:v:0"]
-                cmd += self._venc + ["-pix_fmt", "yuv420p",
-                                     "-movflags", "+faststart", "-shortest", out_tmp]
-                return self._run_ffmpeg(cmd)
-
-            rc = _assemble(copy_audio=True)
-            if rc != 0 and not self._cancel and self._has_audio:
-                # Аудио не скопировалось (несовместимый кодек для контейнера) —
-                # пробуем ещё раз, перекодировав звук в AAC. Дорожка сохраняется.
-                rc = _assemble(copy_audio=False)
-            if rc != 0 or self._cancel:
-                raise RuntimeError("Отменено" if self._cancel
-                                   else "Не удалось собрать видео")
-
-            # Переносим результат во финальное имя (терпимо к занятому файлу — как
-            # обычная обрезка; см. EditTab._replace_tolerant).
-            final = EditTab._replace_tolerant(out_tmp, self._out)
-            self.done.emit(final)
-        except Exception as e:
-            msg = str(e)
-            if self._cancel or msg == "Отменено":
-                self.failed.emit("Отменено")
-            else:
-                self.failed.emit(msg)
-        finally:
-            # Уборка временных файлов — безусловная.
-            try:
-                if self._tmp and os.path.isdir(self._tmp):
-                    shutil.rmtree(self._tmp, ignore_errors=True)
-            except Exception:
-                pass
-
-
-class _VideoMaskDialog(QDialog):
-    """Диалог рисования маски удаления на одном кадре видео. ПЕРЕИСПОЛЬЗУЕТ
-    InpaintCanvas из фоторедактора — то же самое рисование маски кистью, что и при
-    удалении объекта с изображения (никакой новой логики рисования). Возвращает
-    бинарную маску (numpy H×W uint8) через get_mask(); затем она применяется ко
-    ВСЕМ кадрам видео в VideoInpaintWorker."""
-
-    def __init__(self, frame_bgr, parent=None):
-        super().__init__(parent)
-        # Импорт холста ленивый: тянем тяжёлый модуль только при открытии диалога.
-        from tabs import InpaintCanvas
-        self._InpaintCanvas = InpaintCanvas
-        self._mask = None
-        self.setWindowTitle("Удаление объекта с видео")
-        self.resize(960, 700)
-
-        v = QVBoxLayout(self)
-        hint = QLabel(
-            "Закрасьте кистью объект (водяной знак, эмодзи, логотип и т.п.), который "
-            "нужно убрать со ВСЕГО видео. Маска применяется ко всем кадрам, поэтому "
-            "лучше всего подходит для статичных объектов в одном месте экрана.")
-        hint.setWordWrap(True)
-        hint.setStyleSheet(f"color:{C['text2']}; font-size:12px;")
-        v.addWidget(hint)
-
-        self.canvas = InpaintCanvas()
-        self.canvas.set_image_bgr(frame_bgr)
-        self.canvas.set_tool(InpaintCanvas.TOOL_MASK)
-        self.canvas.set_brush(30)
-        v.addWidget(self.canvas, 1)
-
-        ctl = QHBoxLayout()
-        lbl = QLabel("Размер кисти:")
-        lbl.setStyleSheet(f"color:{C['text2']};")
-        ctl.addWidget(lbl)
-        sl = QSlider(Qt.Orientation.Horizontal)
-        sl.setRange(4, 160)
-        sl.setValue(30)
-        sl.setFixedWidth(220)
-        sl.valueChanged.connect(self.canvas.set_brush)
-        ctl.addWidget(sl)
-        btn_clear = make_icon_btn("Очистить", icon='fa5s.eraser')
-        btn_clear.clicked.connect(self.canvas.clear_mask)
-        ctl.addWidget(btn_clear)
-        ctl.addStretch(1)
-        v.addLayout(ctl)
-
-        bb = QDialogButtonBox()
-        self.btn_ok = bb.addButton("Удалить объект с видео",
-                                   QDialogButtonBox.ButtonRole.AcceptRole)
-        bb.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
-        bb.accepted.connect(self._accept)
-        bb.rejected.connect(self.reject)
-        v.addWidget(bb)
-
-    def _accept(self):
-        m = self.canvas.get_mask()
-        if m is None or int(m.max()) == 0:
-            msgbox_information(
-                self, "Маска пуста",
-                "Сначала закрасьте кистью объект, который нужно удалить.")
-            return
-        self._mask = m
-        self.accept()
-
-    def get_mask(self):
-        return self._mask
-
-
-class ProxyWorker(QThread):
-    finished = pyqtSignal(bool, str, str)
-    progress = pyqtSignal(str)   # текст прогресса для волны: «Создание превью… N%»
-
-    def __init__(self, input_path, output_path, parent=None, scale=1.0,
-                 duration=0.0, limit_sec=0.0):
-        super().__init__(parent)
-        self.input_path = input_path
-        self.output_path = output_path
-        # scale<1.0 → прокси меньшего разрешения (быстрее воспроизведение/перемотка,
-        # как «качество предпросмотра» в Filmora). 1.0 → только смена кодека.
-        self.scale = float(scale) if scale else 1.0
-        # limit_sec>0 → прокси только для первых N секунд файла (быстрее собрать
-        # для тяжёлых/длинных видео; предпросмотр ограничен этим отрезком).
-        self.limit_sec = float(limit_sec or 0.0)
-        full = float(duration or 0.0)
-        # Для процентов: если прокси усечён, ориентируемся на длину отрезка.
-        self.total_dur = (min(full, self.limit_sec)
-                          if (self.limit_sec > 0 and full > 0) else full)
-        self.proc = None
-        self._stopped = False
-
-    def _run_with_progress(self, cmd, feed_path=None):
-        """Запуск ffmpeg с -progress pipe:1 — по out_time_us показываем проценты
-        создания прокси (как при извлечении аудио для H.264).
-
-        stderr читаем ОТДЕЛЬНЫМ потоком, а не через communicate() после цикла по
-        stdout. Иначе — взаимная блокировка: уже стартовый баннер ffmpeg (сведения
-        о входе, libdav1d/libx264, длинная строка опций x264) больше буфера
-        анонимного pipe в Windows (~4 КБ). ffmpeg повисает на записи в stderr →
-        не пишет прогресс в stdout → наш `for line in stdout` ждёт строку, которой
-        не будет → communicate() (он же дренаж stderr) недостижим. Для AV1 это
-        100% дедлок («бесконечное создание превью»): AV1 — единственный путь, что
-        вообще идёт через прокси (H.264 играется напрямую)."""
-        full = cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:]
-        self.proc = subprocess.Popen(
-            full, stdin=(subprocess.PIPE if feed_path else None),
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-            creationflags=CREATE_NO_WINDOW)
-        if feed_path:
-            start_share_delete_feeder(
-                feed_path, self.proc.stdin, stop_flag=lambda: self._stopped)
-        # Фоновый слив stderr — держим pipe пустым, чтобы ffmpeg не блокировался.
-        err_chunks = []
-        def _drain_err(pipe):
-            try:
-                for line in pipe:
-                    err_chunks.append(line)
-            except Exception:
-                pass
-        err_thread = threading.Thread(target=_drain_err, args=(self.proc.stderr,),
-                                      daemon=True)
-        err_thread.start()
-        last_pct = -1
-        try:
-            for line in self.proc.stdout:
-                if self._stopped:
-                    break
-                line = line.strip()
-                if self.total_dur > 0 and line.startswith("out_time_us="):
-                    try:
-                        us = int(line.split("=", 1)[1])
-                        pct = max(0, min(99, int(us / (10000.0 * self.total_dur))))
-                        if pct != last_pct:
-                            last_pct = pct
-                            self.progress.emit(f"Создание превью… {pct}%")
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        self.proc.wait()
-        err_thread.join(timeout=2.0)
-        return self.proc.returncode, "".join(err_chunks)
-
-    def run(self):
-        # scale filter ensures even dimensions required by libx264. При scale<1
-        # дополнительно уменьшаем кадр (превью-прокси).
-        if self.scale < 0.999:
-            vf = f"scale=trunc(iw*{self.scale}/2)*2:trunc(ih*{self.scale}/2)*2"
-        else:
-            vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
-        # Прокси оптимизирован под ПЕРЕМОТКУ (как proxy/optimized media в Filmora),
-        # а не под размер:
-        #   -g 12 -keyint_min 12 -sc_threshold 0 — ключевой кадр каждые ~0.5 с.
-        #     При перемотке декодер стартует с ближайшего ключевого кадра; частые
-        #     keyframe'ы = почти мгновенный seek (у исходных аниме-BDRip GOP до
-        #     250+ кадров → каждый скраб декодирует секунды видео).
-        #   -tune fastdecode — отключает deblock/CABAC ради скорости ДЕКОДИРОВАНИЯ
-        #     (для превью-прокси качество вторично, важна лёгкость проигрывания).
-        #   -pix_fmt yuv420p — 8-бит 4:2:0: 10-битные/4:4:4 источники иначе тянут
-        #     медленный software-путь в QtMultimedia.
-        #   +faststart — moov в начало файла: плеер открывает и сикает сразу.
-        # -t N (выходная опция, после -i) — кодируем только первые N секунд.
-        limit = ["-t", f"{self.limit_sec:.3f}"] if self.limit_sec > 0 else []
-
-        def _base(src):
-            return [
-                FFMPEG, "-y", "-i", src,
-            ] + limit + [
-                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "fastdecode",
-                "-crf", "23", "-pix_fmt", "yuv420p",
-                "-g", "12", "-keyint_min", "12", "-sc_threshold", "0",
-                "-vf", vf,
-                "-movflags", "+faststart",
-            ]
-
-        # -map 0:v:0 + -map 0:a? — берём первое видео и ВСЕ аудиодорожки
-        # исходника, чтобы в превью-режиме (когда играет прокси) переключение
-        # озвучки работало так же, как на оригинале. Без явного -map ffmpeg клал
-        # в прокси только дорожку по умолчанию → выбор другой озвучки в превью
-        # не срабатывал (плеер видел всего одну дорожку).
-        # Сначала кормим вход через FILE_SHARE_DELETE-пайп (исходник остаётся
-        # удаляемым из Проводника, пока строится прокси); при неудаче — прямой вход.
-        feed = str(self.input_path) if os.name == 'nt' else None
-        cmds = []
-        if feed:
-            pbase = _base("pipe:0")
-            cmds += [(pbase + ["-map", "0:v:0", "-map", "0:a?", "-c:a", "aac",
-                               self.output_path], feed),
-                     (pbase + ["-map", "0:v:0", "-an", self.output_path], feed)]
-        fbase = _base(str(self.input_path))
-        cmds += [(fbase + ["-map", "0:v:0", "-map", "0:a?", "-c:a", "aac",
-                           self.output_path], None),
-                 (fbase + ["-map", "0:v:0", "-an", self.output_path], None)]
-        last_error = "неизвестная ошибка"
-        for cmd, feed_path in cmds:
-            if self._stopped:
-                self.finished.emit(False, "Отменено", "")
-                return
-            try:
-                self.progress.emit("Создание превью…")
-                rc, err = self._run_with_progress(cmd, feed_path=feed_path)
-                if self._stopped:
-                    self.finished.emit(False, "Отменено", "")
-                    return
-                # rc==0 не гарантия успеха: mov/mp4 с moov в конце файла (не
-                # +faststart) через НЕ-seekable pipe:0 ffmpeg демуксит с ошибкой
-                # «partial file»/«Invalid data…», но всё равно завершается кодом 0,
-                # написав пустой (~200 байт, только ftyp) выходной файл — баг
-                # воспроизводился на реальном AV1+Opus исходнике без faststart
-                # (итог: «в Монтаже ни картинки, ни звука»). Поэтому после pipe-
-                # попытки проверяем реальный размер результата, а не только rc —
-                # иначе следующая (рабочая) команда с прямым файловым входом даже
-                # не пробуется.
-                if rc == 0 and self._looks_like_real_output(err):
-                    self.finished.emit(True, "OK", self.output_path)
-                    return
-                last_error = (err or "")[-600:] or f"код {rc}"
-            except Exception as e:
-                last_error = str(e)
-        self.finished.emit(False, last_error, "")
-
-    def _looks_like_real_output(self, err_text=""):
-        if "Output file is empty" in (err_text or ""):
-            return False
-        try:
-            return os.path.getsize(self.output_path) > 4096
-        except OSError:
-            return False
-
-    def stop(self):
-        self._stopped = True
-        p = self.proc
-        if p and p.poll() is None:
-            try:
-                p.kill()
-            except Exception:
-                pass
-
-
-class AudioWaveformLoader(QThread):
-    # samples (combined max L/R для рисовки), duration, left, right (раздельные
-    # огибающие каналов — для честного стерео-индикатора уровня).
-    finished = pyqtSignal(list, float, list, list)
-    progress = pyqtSignal(str)
-
-    def __init__(self, filepath, audio_index, duration=0.0, parent=None):
-        super().__init__(parent)
-        self.filepath = str(filepath)
-        self.audio_index = audio_index
-        self.total_dur = float(duration or 0.0)   # для процентов извлечения
-        self.tmp_wav = None
-        self.proc = None
-        self._stopped = False
-
-    def _run_ffmpeg(self, cmd, feed_path=None):
-        # -progress pipe:1 даёт машинный прогресс (out_time_us=…) — по нему
-        # показываем проценты. -nostats глушит обычный лог в stderr.
-        # feed_path задан → вход «pipe:0» кормим файлом через FILE_SHARE_DELETE
-        # (исходник остаётся удаляемым из Проводника во время построения волны).
-        full = cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:]
-        self.proc = subprocess.Popen(
-            full, stdin=(subprocess.PIPE if feed_path else None),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace",
-            creationflags=CREATE_NO_WINDOW)
-        feeder = None
-        if feed_path:
-            feeder = start_share_delete_feeder(
-                feed_path, self.proc.stdin, stop_flag=lambda: self._stopped)
-        last_pct = -1
-        try:
-            for line in self.proc.stdout:
-                if self._stopped:
-                    break
-                line = line.strip()
-                if self.total_dur > 0 and line.startswith("out_time_us="):
-                    try:
-                        us = int(line.split("=", 1)[1])
-                        pct = max(0, min(99, int(us / (10000.0 * self.total_dur))))
-                        if pct != last_pct:
-                            last_pct = pct
-                            self.progress.emit(f"Извлечение аудио… {pct}%")
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        self.proc.wait()
-        return self.proc.returncode == 0
-
-    def run(self):
-        self.progress.emit("Извлечение аудио...")
-        tf = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        tf.close()
-        self.tmp_wav = tf.name
-
-        tail = []
-        if self.audio_index is not None:
-            tail += ["-map", f"0:{self.audio_index}"]
-        # -ac 2: тянем ДВА канала (mono-источник ffmpeg продублирует — L==R, как и
-        # положено; 5.1 сведёт в стерео) → у индикатора уровня честные L и R.
-        tail += ["-af", "aresample=6000,asetpts=PTS-STARTPTS",
-                 "-ac", "2", "-ar", "6000", "-f", "wav", self.tmp_wav]
-        cmd_pipe = [FFMPEG, "-y", "-i", "pipe:0", "-vn"] + tail
-        cmd_file = [FFMPEG, "-y", "-i", self.filepath, "-vn"] + tail
-
-        ok = False
-        # Сначала через FILE_SHARE_DELETE-пайп (исходник остаётся удаляемым во
-        # время построения волны). Не для всех контейнеров pipe:0 годится
-        # (moov в конце mp4 без faststart) — ffmpeg тогда может отрапортовать
-        # rc=0, при этом записав ПУСТОЙ wav (см. тот же баг в ProxyWorker), так
-        # что дополнительно проверяем реальное число сэмплов, а не только rc.
-        if os.name == 'nt':
-            try:
-                ok = self._run_ffmpeg(cmd_pipe, feed_path=self.filepath) and self._wav_has_frames(self.tmp_wav)
-            except Exception:
-                ok = False
-        if not ok and not self._stopped:
-            try:
-                ok = self._run_ffmpeg(cmd_file) and self._wav_has_frames(self.tmp_wav)
-            except Exception:
-                ok = False
-
-        if not ok and not self._stopped:
-            try:
-                ok = self._run_ffmpeg(
-                    [FFMPEG, "-y", "-i", self.filepath, "-vn",
-                     "-ac", "2", "-ar", "6000", "-f", "wav", self.tmp_wav]) and self._wav_has_frames(self.tmp_wav)
-            except Exception:
-                ok = False
-
-        if self._stopped or not ok or not os.path.exists(self.tmp_wav):
-            self._cleanup_tmp()
-            self.finished.emit([], 0.0, [], [])
-            return
-
-        self.progress.emit("Генерация волны...")
-        try:
-            samples, duration, left, right = self.read_wav_chunked(
-                self.tmp_wav, target_samples=8000)
-        except Exception:
-            samples, duration, left, right = [], 0.0, [], []
-        self._cleanup_tmp()
-        self.finished.emit(samples, duration, left, right)
-
-    @staticmethod
-    def _wav_has_frames(path):
-        try:
-            wf = wave.open(path, 'rb')
-            try:
-                return wf.getnframes() > 0
-            finally:
-                wf.close()
-        except Exception:
-            return False
-
-    def _cleanup_tmp(self):
-        try:
-            if self.tmp_wav and os.path.exists(self.tmp_wav):
-                os.remove(self.tmp_wav)
-        except Exception:
-            pass
-
-    def stop(self):
-        self._stopped = True
-        p = self.proc
-        if p and p.poll() is None:
-            try:
-                p.kill()
-            except Exception:
-                pass
-
-    def read_wav_chunked(self, wav_path, target_samples=8000):
-        """Возвращает (combined, duration, left, right): combined — поканальный
-        максимум (для рисовки волны), left/right — раздельные огибающие каналов
-        (для честного стерео-индикатора). Кадры деинтерливим (буфер L,R,L,R…)
-        и считаем пики L и R в одних и тех же бакетах, чтобы шкалы были выровнены."""
-        import array as _array
-        try:
-            wf = wave.open(wav_path, 'rb')
-        except Exception:
-            return [], 0.0, [], []
-
-        n_frames  = wf.getnframes()
-        framerate = wf.getframerate()
-        sampwidth = wf.getsampwidth()
-        nchan     = max(1, wf.getnchannels())
-        duration  = n_frames / framerate if framerate > 0 else 0.0
-
-        if n_frames == 0:
-            wf.close()
-            return [], duration, [], []
-
-        samples_per_pixel = max(1, n_frames // target_samples)
-        chunk_size_frames = 256 * 1024
-
-        if sampwidth == 1:
-            typecode = 'B'; scale = 128.0; bias = 128
-        elif sampwidth == 2:
-            typecode = 'h'; scale = 32768.0; bias = 0
-        elif sampwidth == 4:
-            typecode = 'i'; scale = 2147483648.0; bias = 0
-        else:
-            wf.close()
-            return [], duration, [], []
-
-        def _peak(seg):
-            if not len(seg):
-                return 0.0
-            hi = max(seg); lo = min(seg)
-            if bias:
-                return max(abs(hi - bias), abs(lo - bias)) / scale
-            return max(abs(hi), abs(lo)) / scale
-
-        comb: list[float] = []; left: list[float] = []; right: list[float] = []
-        cur_l = 0.0; cur_r = 0.0; acc = 0
-
-        processed = 0
-        while processed < n_frames:
-            if self._stopped:
-                break
-            raw = wf.readframes(chunk_size_frames)
-            if not raw:
-                break
-            buf = _array.array(typecode, raw)
-            if typecode != 'B' and sys.byteorder == 'big':
-                buf.byteswap()
-            if nchan >= 2:
-                lbuf = buf[0::nchan]; rbuf = buf[1::nchan]
-            else:
-                lbuf = buf; rbuf = buf
-            frames_in_chunk = len(lbuf)
-            i = 0
-            while i < frames_in_chunk:
-                take = min(samples_per_pixel - acc, frames_in_chunk - i)
-                if take <= 0:
-                    break
-                pl = _peak(lbuf[i: i + take])
-                pr = _peak(rbuf[i: i + take])
-                if pl > cur_l: cur_l = pl
-                if pr > cur_r: cur_r = pr
-                acc += take
-                i += take
-                if acc >= samples_per_pixel:
-                    left.append(cur_l); right.append(cur_r)
-                    comb.append(cur_l if cur_l > cur_r else cur_r)
-                    cur_l = 0.0; cur_r = 0.0; acc = 0
-            processed += frames_in_chunk
-
-        wf.close()
-        if not comb:
-            return [0.0], duration, [0.0], [0.0]
-        return comb, duration, left, right
-
-
-# ─── Waveform Widget ──────────────────────────────────────────────────────────
-class WaveformWidget(QWidget):
-    seekRequested       = pyqtSignal(float)
-    playSeekRequested   = pyqtSignal(float)
-    inSetRequested      = pyqtSignal(float)
-    outSetRequested     = pyqtSignal(float)
-    selectionChanged    = pyqtSignal(float, float)
-    viewChanged         = pyqtSignal(float, float)
-    interactionStarted  = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.samples = []
-        self.disp_samples = []   # нормированные+перцептивные значения для рисовки
-        self.l_samples = []      # сырые огибающие каналов (для индикатора уровня)
-        self.r_samples = []
-        self.disp_l = []         # те же огибающие, нормированные как disp_samples
-        self.disp_r = []
-        self._norm = 1.0
-        self.duration = 0.0
-        self.in_s = 0.0
-        self.out_s = 0.0
-        self.playhead_s = 0.0
-        self.setMinimumHeight(90)
-        # ClickFocus: при клике/перетаскивании по волне фокус уходит на сам виджет
-        # (а не остаётся на нативной видео-поверхности, которая исключена из
-        # WidgetWithChildrenShortcut) — иначе Ctrl+Z/Ctrl+Y после работы с волной
-        # не доходили до undo/redo.
-        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.setMouseTracking(True)
-        self.hover_x = None
-        self.dragging = None
-        self.drag_start_x = None
-        self.orig_in = 0.0
-        self.orig_out = 0.0
-        self.tooltip_visible = False
-        self.zoom = 1.0
-        self.view_offset = 0.0
-        self.loading_text = None
-        self._anim_dots = 0
-        self._anim_timer = QTimer(self)
-        self._anim_timer.timeout.connect(self._tick_anim)
-        self._cache: QPixmap | None = None
-        self._cache_key = None
-
-    def _tick_anim(self):
-        self._anim_dots = (self._anim_dots + 1) % 4
-        self.update()
-
-    def set_loading(self, text, animated=True):
-        """Текст по центру полосы вместо волны. animated=True — «бегущие» точки
-        (идёт процесс: создание превью/извлечение аудио). animated=False — статичная
-        подсказка БЕЗ анимации точек (напр. «включите Пикселизацию» для картинки):
-        бегущие точки там выглядят как несуществующий процесс и раздражают."""
-        self.loading_text = text
-        self.samples = []
-        if animated:
-            self._anim_timer.start(400)
-        else:
-            self._anim_timer.stop()
-            self._anim_dots = 0
-        self.update()
-
-    def _compute_display_samples(self):
-        """Готовит значения для рисовки: нормирует амплитуду по 97-му перцентилю
-        (устойчиво к одиночным щелчкам) и прогоняет через перцептивную кривую.
-        У типичного контента линейный пик низкий, поэтому без этого волна «прибита»
-        к центру и кажется, что звука нет — хотя он есть. Так волна заполняет полосу
-        там, где звук реально присутствует."""
-        s = self.samples
-        if not s:
-            self.disp_samples = []
-            self.disp_l = []
-            self.disp_r = []
-            self._norm = 1.0
-            return
-        ordered = sorted(s)
-        ref = ordered[min(len(ordered) - 1, int(len(ordered) * 0.97))]
-        ref = max(ref, 0.06)   # пол: чтобы тишина/фон не раздувались на всю высоту
-        norm = 1.0 / ref
-        self._norm = norm
-        self.disp_samples = [min(1.0, (v * norm) ** 0.62) for v in s]
-        # Каналы нормируем тем же эталоном/кривой, что и общую волну — иначе шкалы
-        # L/R «жили» бы в своём масштабе и не сравнивались между собой.
-        self.disp_l = [min(1.0, (v * norm) ** 0.62) for v in self.l_samples]
-        self.disp_r = [min(1.0, (v * norm) ** 0.62) for v in self.r_samples]
-
-    def level_at(self, t):
-        """Перцептивный уровень (0..1) на позиции t — кормит индикатор громкости."""
-        ds = self.disp_samples
-        if not ds or self.duration <= 0:
-            return 0.0
-        idx = int(t / self.duration * len(ds))
-        idx = max(0, min(len(ds) - 1, idx))
-        return ds[idx]
-
-    def level_at_lr(self, t):
-        """Перцептивные уровни (L, R) на позиции t — для честного стерео-индикатора.
-        Если поканальных данных нет (старый путь/моно) — оба равны общему уровню."""
-        if self.duration <= 0:
-            return 0.0, 0.0
-        dl, dr = self.disp_l, self.disp_r
-        if not dl or not dr:
-            lvl = self.level_at(t)
-            return lvl, lvl
-        il = max(0, min(len(dl) - 1, int(t / self.duration * len(dl))))
-        ir = max(0, min(len(dr) - 1, int(t / self.duration * len(dr))))
-        return dl[il], dr[ir]
-
-    def set_data(self, samples, duration, samples_l=None, samples_r=None):
-        self.loading_text = None
-        self._anim_timer.stop()
-        self.samples = samples
-        self.l_samples = samples_l or []
-        self.r_samples = samples_r or []
-        self._compute_display_samples()
-        self.duration = max(0.0, float(duration))
-        if self.duration <= 0:
-            self.in_s = 0.0; self.out_s = 0.0
-        else:
-            if not (0.0 <= self.in_s < self.out_s <= self.duration):
-                self.in_s = 0.0; self.out_s = max(0.001, self.duration)
-        self.zoom = 1.0
-        self.view_offset = 0.0
-        self.viewChanged.emit(self.view_offset, max(0.001, self.duration / self.zoom))
-        self.update()
-
-    def reset_markers(self):
-        """Полный сброс волны к «пустому» состоянию при загрузке НОВОГО файла:
-        границы IN/OUT (красная/зелёная полоски), плейхед, зум и окно обзора.
-        Без этого при добавлении нового файла маркеры предыдущего оставались
-        на месте (старые in/out + старая длительность задавали их пиксельную
-        позицию), пока не догрузится новая волна — выглядело как «не сбросились»."""
-        self.samples = []
-        self.disp_samples = []
-        self.l_samples = []
-        self.r_samples = []
-        self.disp_l = []
-        self.disp_r = []
-        self.duration = 0.0
-        self.in_s = 0.0
-        self.out_s = 0.0
-        self.playhead_s = 0.0
-        self.zoom = 1.0
-        self.view_offset = 0.0
-        self._cache = None
-        self._cache_key = None
-        self.update()
-
-    def prime_duration(self, duration):
-        """Сообщает волне длительность файла РАНЬШЕ, чем достроятся семплы.
-        Длительность уже известна из ffprobe/контейнера сразу при загрузке файла,
-        но до этого метода self.duration оставалась 0.0 (см. reset_markers) —
-        из-за этого клик по полосе волны во время «Загрузка волны…»/«Создание
-        превью…» ВСЕГДА сикал в начало (mousePressEvent считал волну неготовой),
-        хотя сам плеер уже мог играть с любой позиции. Семплы/loading_text не
-        трогаем — визуально полоса остаётся в состоянии загрузки."""
-        d = max(0.0, float(duration or 0.0))
-        if d <= 0:
-            return
-        self.duration = d
-        if not (0.0 <= self.in_s < self.out_s <= self.duration):
-            self.in_s = 0.0
-            self.out_s = self.duration
-        self.update()
-
-    def set_in_out(self, in_s, out_s, keep_view=False):
-        self.in_s = max(0.0, min(in_s, self.duration))
-        self.out_s = max(0.0, min(out_s, self.duration))
-        if self.out_s <= self.in_s:
-            self.out_s = min(self.duration, self.in_s + 0.001)
-        # keep_view=True: не дёргаем окно обзора при ручной обрезке (иначе при
-        # зуме виджет каждый раз перецентрируется на выделение).
-        if not keep_view:
-            self.ensure_view_contains(self.in_s, self.out_s)
-        self.selectionChanged.emit(self.in_s, self.out_s)
-        self.update()
-
-    def set_playhead(self, t):
-        self.playhead_s = max(0.0, min(t, self.duration))
-        self.update()
-
-    def ensure_view_contains(self, a, b):
-        if self.duration <= 0:
-            return
-        visible = max(0.001, self.duration / self.zoom)
-        sel_center = (a + b) / 2.0
-        left = self.view_offset; right = self.view_offset + visible
-        if a < left or b > right:
-            new_left = sel_center - visible / 2.0
-            new_left = max(0.0, min(new_left, max(0.0, self.duration - visible)))
-            self.view_offset = new_left
-            self.viewChanged.emit(self.view_offset, visible)
-
-    def _draw_static(self, painter, w, h):
-        """Draw all static elements (everything except playhead and hover cursor)."""
-        mid = h / 2.0
-
-        grad = QLinearGradient(0, 0, 0, h)
-        grad.setColorAt(0.0, QColor(30, 30, 46))   # base
-        grad.setColorAt(1.0, QColor(24, 24, 37))   # mantle
-        painter.fillRect(0, 0, w, h, QBrush(grad))
-
-        painter.setPen(QPen(QColor(69, 71, 90), 1))  # surface1
-        painter.drawLine(0, int(mid), w, int(mid))
-
-        if self.loading_text:
-            dots = "." * self._anim_dots
-            txt = f"{self.loading_text}{dots}"
-            painter.setPen(QPen(QColor(137, 180, 250)))  # blue
-            font = painter.font()
-            font.setPointSize(10)
-            font.setFamily("Segoe UI" if os.name == 'nt' else "SF Pro Display")
-            painter.setFont(font)
-            painter.drawText(QRect(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, txt)
-            return
-
-        visible_duration = max(0.001, self.duration / self.zoom)
-
-        def time_to_x(t):
-            rel = (t - self.view_offset) / visible_duration
-            return int(rel * w)
-
-        if self.disp_samples and self.duration > 0:
-            n = len(self.disp_samples)
-            scale_bg = (h / 2) * 0.86
-            for i in range(0, w):
-                t = self.view_offset + (i / max(1, w)) * visible_duration
-                if t > self.duration:
-                    break  # за пределами клипа (при отдалении zoom<1) — пусто
-                idx = int((t / self.duration) * n)
-                idx = max(0, min(n - 1, idx))
-                val = self.disp_samples[idx]
-                v = val * 0.92
-                y1 = int(mid - v * scale_bg)
-                y2 = int(mid + v * scale_bg)
-                alpha = int(110 + val * 70)
-                painter.setPen(QPen(QColor(108, 117, 161, alpha)))  # muted blue/overlay
-                painter.drawLine(i, y1, i, y2)
-        else:
-            if self.duration > 0:
-                painter.setPen(QPen(QColor(C["text3"])))
-                font = painter.font(); font.setPointSize(9)
-                painter.setFont(font)
-                painter.drawText(QRect(0, 0, w, h), Qt.AlignmentFlag.AlignCenter, "Нет аудио данных")
-            else:
-                painter.setPen(QPen(QColor(C["text3"])))
-                font = painter.font(); font.setPointSize(10)
-                painter.setFont(font)
-                painter.drawText(QRect(0, 0, w, h), Qt.AlignmentFlag.AlignCenter,
-                                 "Перетащите видео или аудио файл сюда")
-
-        painter.setPen(QPen(QColor(C["border"]), 1))
-        painter.drawLine(0, 0, w, 0)
-        painter.drawLine(0, h - 1, w, h - 1)
-
-        if self.duration <= 0:
-            return
-
-        x_in  = time_to_x(self.in_s)
-        x_out = time_to_x(self.out_s)
-        if x_out < x_in:
-            x_in, x_out = x_out, x_in
-
-        sel_w = max(1, x_out - x_in)
-        painter.setBrush(QBrush(QColor(137, 180, 250, 28)))  # blue selection wash
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawRect(x_in, 0, sel_w, h)
-
-        if self.disp_samples and self.duration > 0:
-            n = len(self.disp_samples)
-            scale_sel = (h / 2) * 0.92
-            left_i = max(0, x_in); right_i = min(w - 1, x_out)
-            for i in range(left_i, right_i + 1):
-                t = self.view_offset + (i / max(1, w)) * visible_duration
-                idx = int((t / self.duration) * n)
-                if idx >= n:
-                    break
-                val = self.disp_samples[idx]
-                v = val * 1.04
-                y1 = int(mid - v * scale_sel)
-                y2 = int(mid + v * scale_sel)
-                alpha = int(180 + val * 60)
-                painter.setPen(QPen(QColor(137, 180, 250, alpha)))  # blue
-                painter.drawLine(i, y1, i, y2)
-
-        painter.setPen(QPen(QColor(C["red"]), 2))
-        painter.drawLine(x_in, 0, x_in, h)
-        painter.setPen(QPen(QColor(C["green"]), 2))
-        painter.drawLine(x_out, 0, x_out, h)
-
-        handle_r = max(5, int(h * 0.055))
-        painter.setBrush(QBrush(QColor(C["red"])))
-        painter.setPen(QPen(QColor(C["bg"]), 1))
-        painter.drawEllipse(QPoint(x_in, int(mid)), handle_r, handle_r)
-        painter.setBrush(QBrush(QColor(C["green"])))
-        painter.setPen(QPen(QColor(C["bg"]), 1))
-        painter.drawEllipse(QPoint(x_out, int(mid)), handle_r, handle_r)
-
-        painter.setPen(QPen(QColor(C["text"])))
-        font = painter.font(); font.setPointSize(6); font.setBold(True)
-        painter.setFont(font)
-        fm = QFontMetrics(font)
-        for label, x_pos, col in [("I", x_in, C["red"]), ("O", x_out, C["green"])]:
-            lw = fm.horizontalAdvance(label)
-            painter.setPen(QPen(QColor(col)))
-            painter.drawText(x_pos - lw // 2, int(mid) + fm.ascent() // 2, label)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w = self.width(); h = self.height()
-
-        # Cache key covers everything that affects static drawing.
-        # Playhead and hover cursor are drawn dynamically on top.
-        cache_key = (w, h, id(self.samples), len(self.samples),
-                     self.duration, self.zoom, self.view_offset,
-                     self.in_s, self.out_s, self.loading_text, self._anim_dots)
-        if self._cache is None or self._cache_key != cache_key:
-            self._cache = QPixmap(w, h)
-            self._cache_key = cache_key
-            cp = QPainter(self._cache)
-            cp.setRenderHint(QPainter.RenderHint.Antialiasing)
-            self._draw_static(cp, w, h)
-            cp.end()
-
-        painter.drawPixmap(0, 0, self._cache)
-
-        if self.loading_text or self.duration <= 0:
-            return
-
-        visible_duration = max(0.001, self.duration / self.zoom)
-
-        def time_to_x(t):
-            rel = (t - self.view_offset) / visible_duration
-            return int(rel * w)
-
-        # Playhead
-        if 0.0 <= self.playhead_s <= self.duration:
-            vis_end = self.view_offset + visible_duration
-            if self.view_offset <= self.playhead_s <= vis_end:
-                x_ph = time_to_x(self.playhead_s)
-                painter.setPen(QPen(QColor(C["playhead"]), 2, Qt.PenStyle.SolidLine))
-                painter.drawLine(x_ph, 0, x_ph, h)
-                path = QPainterPath()
-                path.moveTo(x_ph - 5, 0)
-                path.lineTo(x_ph + 5, 0)
-                path.lineTo(x_ph, 8)
-                path.closeSubpath()
-                painter.setBrush(QBrush(QColor(C["playhead"])))
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.drawPath(path)
-
-        # Hover cursor
-        if self.hover_x is not None:
-            hx = int(self.hover_x)
-            painter.setPen(QPen(QColor(255, 255, 255, 40), 1, Qt.PenStyle.DotLine))
-            painter.drawLine(hx, 0, hx, h)
-
-    # ── Mouse events ───────────────────────────────────────────────────────
-    def mousePressEvent(self, ev):
-        # ПКМ — не сик/перетаскивание, а контекстное меню обрезки (его поднимает
-        # customContextMenuRequested). Иначе правый клик дёргал бы плейхед.
-        if ev.button() == Qt.MouseButton.RightButton:
-            ev.ignore(); return
-        # Забираем клавиатурный фокус НА СЕБЯ: метод переопределён и не зовёт
-        # super().mousePressEvent(), поэтому штатный перехват фокуса по ClickFocus
-        # не срабатывает, и фокус оставался на нативной видео-поверхности
-        # (исключена из WidgetWithChildrenShortcut) → Ctrl+Z/Ctrl+Y после
-        # перетаскивания полоски не доходили до undo/redo.
-        self.setFocus(Qt.FocusReason.MouseFocusReason)
-        try:
-            x = ev.position().x()
-        except Exception:
-            x = ev.x()
-        if self.duration <= 0:
-            self.seekRequested.emit(0.0); return
-        w = max(1, self.width()); x = max(0, min(w, x))
-
-        def time_to_x_local(t):
-            visible = max(0.001, self.duration / self.zoom)
-            rel = (t - self.view_offset) / visible
-            return int(rel * w)
-
-        x_in  = time_to_x_local(self.in_s)
-        x_out = time_to_x_local(self.out_s)
-        threshold = 8
-        modifiers = QApplication.keyboardModifiers()
-        if not (modifiers & Qt.KeyboardModifier.ControlModifier):
-            if abs(x - x_in) <= threshold:
-                self.interactionStarted.emit()
-                self.dragging = 'in'; self.drag_start_x = x; self.orig_in = self.in_s
-                self.show_tooltip_for_pos(ev); return
-            if abs(x - x_out) <= threshold:
-                self.interactionStarted.emit()
-                self.dragging = 'out'; self.drag_start_x = x; self.orig_out = self.out_s
-                self.show_tooltip_for_pos(ev); return
-            left = min(x_in, x_out); right = max(x_in, x_out)
-            if (right - left) > (threshold * 3) and (left + threshold < x < right - threshold):
-                self.interactionStarted.emit()
-                self.dragging = 'maybe_move'; self.drag_start_x = x
-                self.orig_in = self.in_s; self.orig_out = self.out_s
-                self.show_tooltip_for_pos(ev); return
-        rel = x / w
-        t = self.view_offset + rel * max(0.001, self.duration / self.zoom)
-        t = max(0.0, min(self.duration, t))
-        self.seekRequested.emit(t)
-
-    def mouseMoveEvent(self, ev):
-        try:
-            mx = ev.position().x(); gpos = ev.globalPosition()
-        except Exception:
-            mx = ev.x(); gpos = ev.globalPos()
-        self.hover_x = mx
-        if self.dragging and self.duration > 0:
-            w = max(1, self.width()); mx = max(0, min(w, mx))
-            if self.dragging == 'maybe_move':
-                if abs(mx - (self.drag_start_x if self.drag_start_x is not None else mx)) < 6:
-                    self.show_tooltip_at_global_pos(gpos, self.hover_time_from_x(mx))
-                    self.update(); return
-                else:
-                    self.dragging = 'move'; self.orig_in = self.in_s; self.orig_out = self.out_s
-            visible = max(0.001, self.duration / self.zoom)
-            if self.dragging == 'in':
-                t = self.view_offset + (mx / w) * visible
-                new_in = max(0.0, min(t, self.out_s - (1.0 / 1000.0)))
-                self.in_s = new_in
-                self.inSetRequested.emit(self.in_s); self.selectionChanged.emit(self.in_s, self.out_s)
-            elif self.dragging == 'out':
-                t = self.view_offset + (mx / w) * visible
-                new_out = min(self.duration, max(t, self.in_s + (1.0 / 1000.0)))
-                self.out_s = new_out
-                self.outSetRequested.emit(self.out_s); self.selectionChanged.emit(self.in_s, self.out_s)
-            elif self.dragging == 'move':
-                start_t = self.view_offset + ((self.drag_start_x if self.drag_start_x is not None else mx) / w) * visible
-                cur_t   = self.view_offset + (mx / w) * visible
-                shift = cur_t - start_t
-                new_in = self.orig_in + shift; new_out = self.orig_out + shift
-                if new_in < 0:
-                    shift_c = -new_in; new_in += shift_c; new_out += shift_c
-                if new_out > self.duration:
-                    shift_c = new_out - self.duration; new_in -= shift_c; new_out -= shift_c
-                self.in_s = new_in; self.out_s = new_out
-                self.inSetRequested.emit(self.in_s)
-                self.outSetRequested.emit(self.out_s)
-                self.selectionChanged.emit(self.in_s, self.out_s)
-            self.show_tooltip_at_global_pos(gpos, self.hover_time_from_x(mx))
-            self.update(); return
-        self.update()
-
-    def mouseReleaseEvent(self, ev):
-        try:
-            rx = ev.position().x()
-        except Exception:
-            rx = ev.x()
-        if self.dragging == 'maybe_move':
-            w = max(1, self.width()); rx = max(0, min(w, rx))
-            visible = max(0.001, self.duration / self.zoom)
-            t = self.view_offset + (rx / w) * visible
-            t = max(0.0, min(self.duration, t))
-            self.playSeekRequested.emit(t)
-        self.dragging = None; self.drag_start_x = None
-        self.orig_in = 0.0; self.orig_out = 0.0
-        QToolTip.hideText(); self.tooltip_visible = False
-
-    def leaveEvent(self, ev):
-        self.hover_x = None; QToolTip.hideText(); self.tooltip_visible = False; self.update()
-
-    def hover_time_from_x(self, x):
-        w = max(1, self.width())
-        rel = max(0.0, min(1.0, x / w))
-        visible = max(0.001, self.duration / self.zoom)
-        return self.view_offset + rel * visible
-
-    def show_tooltip_for_pos(self, ev):
-        try:
-            gpos = ev.globalPosition(); x = ev.position().x()
-        except Exception:
-            gpos = ev.globalPos(); x = ev.x()
-        t = self.hover_time_from_x(x)
-        self.show_tooltip_at_global_pos(gpos, t)
-
-    def show_tooltip_at_global_pos(self, gpos, t):
-        try:
-            if hasattr(gpos, 'toPoint'):
-                gp = gpos.toPoint()
-            elif hasattr(gpos, 'x'):
-                gp = QPoint(int(gpos.x()), int(gpos.y()))
-            else:
-                gp = gpos
-        except Exception:
-            gp = None
-        txt = s_to_time(t)
-        if gp:
-            QToolTip.showText(gp, txt, self); self.tooltip_visible = True
-        else:
-            QToolTip.hideText(); self.tooltip_visible = False
-
-    def wheelEvent(self, event):
-        modifiers = QApplication.keyboardModifiers()
-        if not (modifiers & Qt.KeyboardModifier.ControlModifier):
-            event.ignore(); return
-        delta = 0
-        try:
-            delta = event.angleDelta().y()
-        except Exception:
-            delta = event.delta()
-        if delta == 0:
-            return
-        try:
-            cursor_x = event.position().x()
-        except Exception:
-            cursor_x = event.x()
-        w = max(1, self.width())
-        visible_before = max(0.001, self.duration / self.zoom)
-        t_at_cursor = self.view_offset + (cursor_x / w) * visible_before
-        factor = 1.15 if delta > 0 else (1.0 / 1.15)
-        # min 0.25 — можно отдалиться так, что клип займёт ~1/4 ширины (как в
-        # типичных видеоредакторах), оставив свободное место справа.
-        new_zoom = max(0.25, min(self.zoom * factor, 200.0))
-        visible_after = max(0.001, self.duration / new_zoom)
-        new_view = t_at_cursor - (cursor_x / w) * visible_after
-        # Зум у самого края: «5%» считаем ВИЗУАЛЬНЫМИ — 5% от ширины видимого
-        # окна, а не от всей длительности клипа. Иначе на длинном клипе порог
-        # (5% длительности) огромен в секундах и при зуме где-то у начала окно
-        # ни с того ни с сего «прыгало» в 0. Теперь снап срабатывает, только
-        # когда край клипа реально близок к краю экрана (≤5% видимой части).
-        edge = 0.05 * visible_after
-        if t_at_cursor <= edge:
-            new_view = 0.0
-        elif t_at_cursor >= self.duration - edge:
-            new_view = max(0.0, self.duration - visible_after)
-        new_view = max(0.0, min(new_view, max(0.0, self.duration - visible_after)))
-        self.zoom = new_zoom; self.view_offset = new_view
-        self.viewChanged.emit(self.view_offset, visible_after)
-        self.update(); event.accept()
-
-    def set_view_offset(self, offset):
-        visible = max(0.001, self.duration / self.zoom)
-        offset = max(0.0, min(offset, max(0.0, self.duration - visible)))
-        self.view_offset = offset
-        self._cache = None
-        self.viewChanged.emit(self.view_offset, visible)
-        self.update()
-
-    def set_zoom(self, zoom):
-        self.zoom = max(0.25, min(zoom, 200.0))
-        visible = max(0.001, self.duration / self.zoom)
-        self.view_offset = max(0.0, min(self.view_offset, max(0.0, self.duration - visible)))
-        self._cache = None
-        self.viewChanged.emit(self.view_offset, visible)
-        self.update()
-
-
-# ─── Small UI helpers ─────────────────────────────────────────────────────────
-def make_divider():
-    line = QFrame()
-    line.setFrameShape(QFrame.Shape.HLine)
-    line.setStyleSheet(f"color: {C['border']}; border: none; border-top: 1px solid {C['border']};")
-    line.setFixedHeight(1)
-    return line
-
-
-def make_icon_btn(text, icon_std=None, accent=False, danger=False, w=None, icon=None):
-    btn = QPushButton(text)
-    # На светлой заливке (accent/danger) — тёмные значок и текст: контраст лучше,
-    # чем белый по светло-голубому/розовому (ср. кнопку «НАЧАТЬ» — тёмное по зелёному).
-    on_fill = accent or danger
-    fg = "#11111b" if on_fill else C["text"]
-    if icon:
-        # Векторная иконка qtawesome (см. get_icon в config.py).
-        btn.setIcon(get_icon(icon, color=fg))
-        btn.setIconSize(QSize(20, 20))
-    elif icon_std:
-        btn.setIcon(QApplication.style().standardIcon(icon_std))
-    base_bg = C["accent"] if accent else (C["red"] if danger else C["surface3"])
-    hover_bg = C["accent2"] if accent else (C["red2"] if danger else C["border2"])
-    btn.setStyleSheet(f"""
-        QPushButton {{
-            background: {base_bg};
-            color: {fg};
-            border: 1px solid {C['border2'] if not accent and not danger else 'transparent'};
-            border-radius: 6px;
-            padding: 7px 14px;
-            font-weight: 500;
-            font-size: 13px;
-        }}
-        QPushButton:hover {{ background: {hover_bg}; }}
-        QPushButton:pressed {{ background: {C['surface2']}; }}
-        QPushButton:disabled {{
-            background: {C['surface2']};
-            color: {C['text3']};
-            border: 1px solid {C['border2']};
-        }}
-    """)
-    if w:
-        btn.setFixedWidth(w)
-    return btn
-
-
-def _fullscreen_icon(expand=True, color="#ffffff", size=32):
-    """Рисует значок полноэкранного режима «как на YouTube» — четыре уголка.
-    expand=True  → уголки в углах рамки (войти в полноэкранный режим);
-    expand=False → уголки сдвинуты к центру (выйти из полноэкранного)."""
-    pm = QPixmap(size, size)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor(color))
-    pen.setWidthF(max(2.0, size * 0.085))
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    p.setPen(pen)
-    m = size * 0.22          # отступ уголков от края рамки
-    arm = size * 0.20        # длина «плеча» уголка
-    cen = size / 2.0
-    if expand:
-        # Уголки в четырёх углах, плечи смотрят внутрь.
-        corners = [(m, m, 1, 1), (size - m, m, -1, 1),
-                   (m, size - m, 1, -1), (size - m, size - m, -1, -1)]
-    else:
-        # Уголки стянуты к центру, плечи смотрят наружу (к углам экрана).
-        g = size * 0.10
-        corners = [(cen - g, cen - g, -1, -1), (cen + g, cen - g, 1, -1),
-                   (cen - g, cen + g, -1, 1), (cen + g, cen + g, 1, 1)]
-    for cx, cy, dx, dy in corners:
-        p.drawLine(int(cx), int(cy), int(cx + dx * arm), int(cy))
-        p.drawLine(int(cx), int(cy), int(cx), int(cy + dy * arm))
-    p.end()
-    return QIcon(pm)
-
-
-class VolumeSlider(QSlider):
-    """Ползунок громкости: колёсико над ним всегда меняет громкость шагом 5
-    (как и над значком динамика), независимо от глобальной опции «колесо меняет
-    значения». Помечен свойством wheelAlways, чтобы WheelBlocker его не глушил."""
-
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
-        self.setProperty("wheelAlways", True)
-
-    def wheelEvent(self, ev):
-        step = 5 if ev.angleDelta().y() > 0 else -5
-        self.setValue(max(self.minimum(), min(self.maximum(), self.value() + step)))
-        ev.accept()
-
-
-class VolumeLabel(QLabel):
-    """Значок динамика: прокрутка колёсиком над ним меняет громкость.
-    slider_getter — функция, возвращающая связанный QSlider громкости."""
-
-    def __init__(self, slider_getter, parent=None):
-        super().__init__(parent)
-        self._slider_getter = slider_getter
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Громкость — прокрутите колёсиком над динамиком")
-        self.update_glyph(100)
-
-    def update_glyph(self, vol):
-        name = ('fa5s.volume-mute' if vol <= 0
-                else ('fa5s.volume-down' if vol < 55 else 'fa5s.volume-up'))
-        self.setPixmap(get_icon_pixmap(name, 18))
-
-    def wheelEvent(self, ev):
-        sl = self._slider_getter() if self._slider_getter else None
-        if sl is None:
-            super().wheelEvent(ev)
-            return
-        step = 5 if ev.angleDelta().y() > 0 else -5
-        sl.setValue(max(sl.minimum(), min(sl.maximum(), sl.value() + step)))
-        ev.accept()
-
-
-# ─── Info Card ────────────────────────────────────────────────────────────────
-class InfoCard(QFrame):
-    def __init__(self, title, parent=None):
-        super().__init__(parent)
-        self.setObjectName("InfoCard")
-        self.setStyleSheet(f"""
-            #InfoCard {{
-                background: {C['surface2']};
-                border: 1px solid {C['border']};
-                border-radius: 8px;
-            }}
-        """)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(6)
-        title_lbl = QLabel(title)
-        title_lbl.setStyleSheet(f"color: {C['text3']}; font-size: 10px; font-weight: 700; letter-spacing: 1px;")
-        # Заголовок не должен распирать карточку/панель по своей длине.
-        _sp = title_lbl.sizePolicy(); _sp.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
-        title_lbl.setSizePolicy(_sp)
-        layout.addWidget(title_lbl)
-        self._body = QVBoxLayout()
-        self._body.setSpacing(4)
-        layout.addLayout(self._body)
-
-    def add_row(self, label, value_attr):
-        row = QHBoxLayout()
-        lbl = QLabel(label)
-        lbl.setStyleSheet(f"color: {C['text3']}; font-size: 12px;")
-        val = QLabel("—")
-        val.setStyleSheet(f"color: {C['text']}; font-size: 12px; font-weight: 500;")
-        val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        row.addWidget(lbl)
-        row.addStretch()
-        row.addWidget(val)
-        self._body.addLayout(row)
-        setattr(self, value_attr, val)
-        return val
-
-
-# ─── Audio level meter (VU) ────────────────────────────────────────────────────
-class AudioMeter(QWidget):
-    """Стерео-индикатор уровня звука: две вертикальные шкалы (зелёный→жёлтый→
-    красный) с пик-маркерами и плавным спадом. Уровни 0..1 подаёт плеер во время
-    воспроизведения (берутся из аудиоволны на позиции плейхеда)."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumWidth(56)
-        self.setMaximumWidth(96)
-        self.setMinimumHeight(120)
-        self._l = 0.0
-        self._r = 0.0
-        self._pk_l = 0.0
-        self._pk_r = 0.0
-        self._timer = QTimer(self)
-        self._timer.setInterval(45)
-        self._timer.timeout.connect(self._decay)
-        self._timer.start()
-
-    def set_levels(self, l, r=None):
-        if r is None:
-            r = l
-        self._l = max(0.0, min(1.0, float(l)))
-        self._r = max(0.0, min(1.0, float(r)))
-        if self._l > self._pk_l: self._pk_l = self._l
-        if self._r > self._pk_r: self._pk_r = self._r
-        self.update()
-
-    def reset(self):
-        self._l = self._r = self._pk_l = self._pk_r = 0.0
-        self.update()
-
-    def _decay(self):
-        changed = False
-        for a, d in (('_l', 0.08), ('_r', 0.08), ('_pk_l', 0.02), ('_pk_r', 0.02)):
-            v = getattr(self, a)
-            if v > 0:
-                setattr(self, a, max(0.0, v - d)); changed = True
-        if changed:
-            self.update()
-
-    def paintEvent(self, e):
-        p = QPainter(self)
-        w = self.width(); h = self.height()
-        p.fillRect(0, 0, w, h, QColor(C["bg"]))
-        m_top, m_bot = 10, 16
-        bar_h = max(1, h - m_top - m_bot)
-        gap = 6
-        bw = max(6, int((w - gap * 3) / 2))
-        data = [(self._l, self._pk_l, "L"), (self._r, self._pk_r, "R")]
-        for i, (lvl, pk, label) in enumerate(data):
-            x = gap + i * (bw + gap)
-            y = m_top
-            grad = QLinearGradient(0, y, 0, y + bar_h)
-            grad.setColorAt(0.0, QColor(C["red"]))
-            grad.setColorAt(0.45, QColor(C["yellow"]))
-            grad.setColorAt(1.0, QColor(C["green"]))
-            # Тусклый «трек» во всю высоту
-            p.setOpacity(0.16); p.fillRect(x, y, bw, bar_h, QBrush(grad)); p.setOpacity(1.0)
-            # Яркая заполненная часть снизу до текущего уровня
-            fill_h = int(bar_h * lvl)
-            if fill_h > 0:
-                p.setClipRect(x, y + bar_h - fill_h, bw, fill_h)
-                p.fillRect(x, y, bw, bar_h, QBrush(grad))
-                p.setClipping(False)
-            # Пик-маркер
-            if pk > 0:
-                py = y + bar_h - int(bar_h * pk)
-                p.setPen(QPen(QColor(C["text"]), 1))
-                p.drawLine(x, py, x + bw, py)
-            # Подпись канала
-            p.setPen(QPen(QColor(C["text3"])))
-            f = p.font(); f.setPointSize(8); p.setFont(f)
-            p.drawText(QRect(x, h - m_bot + 1, bw, m_bot - 1),
-                       Qt.AlignmentFlag.AlignCenter, label)
-        p.end()
-
-
-def _parse_srt(text):
-    """Простой парсер SRT → список (start_s, end_s, text). Теги (<...>, {\\...})
-    вырезаются — для превью нужен чистый текст в стиле VLC."""
-    import re
-    cues = []
-    if not text:
-        return cues
-
-    def _ts(s):
-        s = s.replace(',', '.').strip()
-        try:
-            hh, mm, rest = s.split(':')
-            return int(hh) * 3600 + int(mm) * 60 + float(rest)
-        except Exception:
-            return None
-
-    blocks = re.split(r'\r?\n\r?\n', text.strip())
-    tag_re = re.compile(r'<[^>]+>|\{[^}]*\}')
-    time_re = re.compile(r'(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3})')
-    for b in blocks:
-        lines = [ln for ln in b.splitlines() if ln.strip() != '']
-        if not lines:
-            continue
-        # Находим строку с таймкодами (может быть после номера-индекса).
-        ti = None
-        for i, ln in enumerate(lines):
-            m = time_re.search(ln)
-            if m:
-                ti = i; tm = m; break
-        if ti is None:
-            continue
-        start = _ts(tm.group(1)); end = _ts(tm.group(2))
-        if start is None or end is None:
-            continue
-        body = "\n".join(lines[ti + 1:]).strip()
-        body = tag_re.sub('', body).strip()
-        if body:
-            cues.append((start, end, body))
-    cues.sort(key=lambda c: c[0])
-    return cues
-
-
-class SubtitleExtractor(QThread):
-    """Извлекает выбранную текстовую дорожку субтитров в SRT и парсит её —
-    в фоне, чтобы не подвешивать GUI."""
-    done = pyqtSignal(int, object)   # (token, cues|None)
-
-    def __init__(self, src, sub_index, token):
-        super().__init__()
-        self.src = str(src)
-        self.sub_index = int(sub_index)
-        self.token = int(token)
-
-    def run(self):
-        cues = None
-        tmp = None
-        try:
-            tf = tempfile.NamedTemporaryFile(delete=False, suffix=".srt")
-            tmp = tf.name; tf.close()
-            cmd = [FFMPEG, "-y", "-i", self.src,
-                   "-map", f"0:s:{self.sub_index}", tmp]
-            kw = {}
-            if os.name == 'nt':
-                kw['creationflags'] = CREATE_NO_WINDOW
-            subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=90, **kw)
-            if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-                with open(tmp, 'r', encoding='utf-8', errors='replace') as f:
-                    cues = _parse_srt(f.read())
-        except Exception:
-            cues = None
-        finally:
-            if tmp:
-                try: os.remove(tmp)
-                except Exception: pass
-        self.done.emit(self.token, cues)
-
-
-class AssExtractor(QThread):
-    """Извлекает выбранную дорожку субтитров в .ass (для рендера через libass) —
-    в фоне. Эмитит (token, путь_к_ass|None)."""
-    done = pyqtSignal(int, object)   # (token, ass_path|None)
-
-    def __init__(self, src, sub_index, token):
-        super().__init__()
-        self.src = str(src)
-        self.sub_index = int(sub_index)
-        self.token = int(token)
-
-    def run(self):
-        out = None
-        try:
-            tf = tempfile.NamedTemporaryFile(delete=False, suffix=".ass")
-            out = tf.name; tf.close()
-            cmd = [FFMPEG, "-y", "-i", self.src,
-                   "-map", f"0:s:{self.sub_index}", "-c:s", "ass", out]
-            kw = {}
-            if os.name == 'nt':
-                kw['creationflags'] = CREATE_NO_WINDOW
-            subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=120, **kw)
-            if not (os.path.exists(out) and os.path.getsize(out) > 0):
-                try: os.remove(out)
-                except Exception: pass
-                out = None
-        except Exception:
-            if out:
-                try: os.remove(out)
-                except Exception: pass
-            out = None
-        self.done.emit(self.token, out)
-
-
-def _paint_subtitle(painter, rect, text="", px=28, image=None, image_pos=(0, 0)):
-    """Рисует субтитры в области rect: либо готовый кадр от libass (image,
-    приоритетнее), либо стиль VLC — белый жирный текст с чёрной обводкой снизу
-    по центру. Используется и оверлеем-окном, и встроенным рендером в кадр."""
-    if image is not None and not image.isNull():
-        painter.drawImage(rect.left() + image_pos[0], rect.top() + image_pos[1], image)
-        return
-    if not text:
-        return
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-    f = QFont("Arial"); f.setBold(True); f.setPixelSize(px)
-    painter.setFont(f)
-    margin_v = max(10, int(rect.height() * 0.05))
-    side = int(rect.width() * 0.05)
-    area = QRect(rect.left() + side, rect.top(),
-                 max(10, rect.width() - 2 * side),
-                 max(10, rect.height() - margin_v))
-    flags = (Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom
-             | Qt.TextFlag.TextWordWrap)
-    o = max(2, px // 11)   # толщина обводки
-    painter.setPen(QPen(QColor(0, 0, 0)))
-    for dx in (-o, 0, o):
-        for dy in (-o, 0, o):
-            if dx == 0 and dy == 0:
-                continue
-            painter.drawText(area.translated(dx, dy), flags, text)
-    painter.setPen(QPen(QColor(255, 255, 255)))
-    painter.drawText(area, flags, text)
-
-
-class SubtitleOverlay(QWidget):
-    """Оверлей субтитров в стиле VLC/PotPlayer: белый жирный текст с чёрной
-    обводкой, без подложки.
-
-    ВАЖНО: QVideoWidget рендерит видео через нативную поверхность (RHI), поэтому
-    обычный дочерний/соседний виджет рисуется ПОД видео и не виден. Чтобы текст
-    стабильно был поверх кадра, оверлей сделан отдельным БЕСРАМОЧНЫМ полупрозрачным
-    окном-«насадкой» со сквозным вводом, которое подгоняется под экранную область
-    видео (см. EditTab._position_overlay)."""
-
-    def __init__(self, parent=None):
-        flags = (Qt.WindowType.FramelessWindowHint
-                 | Qt.WindowType.Tool
-                 | Qt.WindowType.WindowStaysOnTopHint
-                 | Qt.WindowType.WindowTransparentForInput)
-        super().__init__(parent, flags)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self._text = ""
-        self._px = 28
-        self._image = None       # кадр субтитров от libass (QImage) — приоритетнее текста
-        self._image_pos = (0, 0) # позиция левого верхнего угла картинки в оверлее
-
-    def place_over(self, widget):
-        """Подгоняет окно-оверлей под экранную область целевого виджета (видео)."""
-        if widget is None or not widget.isVisible():
-            self.hide()
-            return
-        tl = widget.mapToGlobal(QPoint(0, 0))
-        w, h = widget.width(), widget.height()
-        if w <= 1 or h <= 1:
-            self.hide()
-            return
-        self.setGeometry(tl.x(), tl.y(), w, h)
-        self.set_video_height(h)
-
-    def set_text(self, text):
-        text = text or ""
-        if text != self._text:
-            self._text = text
-            self.update()
-
-    def set_image(self, qimg, x=0, y=0):
-        """Кадр субтитров от libass (обрезанный QImage) с позицией (x,y) в кадре,
-        или None."""
-        self._image = qimg
-        self._image_pos = (int(x), int(y))
-        self.update()
-
-    # Единый API субтитров (совместим с VideoCanvas, см. EditTab._update_subtitle).
-    def set_subtitle_image(self, qimg, x=0, y=0):
-        self.set_image(qimg, x, y)
-
-    def set_subtitle_text(self, text):
-        self.set_image(None)
-        self.set_text(text)
-
-    def clear_subtitle(self):
-        self._text = ""
-        self.set_image(None)
-
-    def subtitle_area_size(self):
-        return self.width(), self.height()
-
-    def set_video_height(self, h):
-        px = max(15, int(h * 0.052))   # ~5% высоты кадра, как в плеерах
-        if px != self._px:
-            self._px = px
-            self.update()
-
-    def paintEvent(self, ev):
-        p = QPainter(self)
-        _paint_subtitle(p, self.rect(), self._text, self._px,
-                        self._image, self._image_pos)
-        p.end()
-
-
-class VideoCanvas(QWidget):
-    """Холст видео: сам рисует кадры (через QVideoSink + QPainter) и накладывает
-    субтитры ПРЯМО В КАДР, как VLC. В отличие от QVideoWidget не использует
-    нативную RHI-поверхность, поэтому субтитры корректно обрезаются по видео и
-    перекрываются любыми панелями/окнами сверху. Кадр вписывается с сохранением
-    пропорций (letterbox). Совместим по API субтитров с SubtitleOverlay.
-
-    Чуть дороже QVideoWidget (кадр конвертируется в QImage на ЦП), поэтому в
-    настройках можно вернуть старый метод (QVideoWidget + окно-оверлей)."""
-
-    # Кадр пришёл с PTS за границей OUT (см. set_play_bound) — плеер надо ставить
-    # на паузу ДО показа этого кадра (защита от проскока правой границы).
-    boundaryReached = pyqtSignal()
-    # Кадрирование видео завершено кнопкой «Применить»/«Отмена» на холсте (как в
-    # «Редактировании фото») — вкладка снимает чек с кнопки «Кадрировать».
-    cropApplied = pyqtSignal()
-    cropCancelled = pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
-        self.setAutoFillBackground(False)
-        self._sink = QVideoSink(self)
-        self._sink.videoFrameChanged.connect(self._on_frame)
-        self._bound_us = None          # граница OUT (µs) для блокировки кадров
-        self._frame_img = None
-        self._text = ""
-        self._image = None
-        self._image_pos = (0, 0)
-        self._bg = QColor(C["bg"])
-        # Текст-заглушка, когда у файла нет видеоряда (редактируем чистое аудио).
-        self._audio_only_msg = ""
-        # Зум/панорама превью (Ctrl+колесо приближает, ЛКМ-перетаскивание двигает).
-        self._zoom = 1.0
-        self._pan = QPoint(0, 0)
-        self._panning = False
-        self._pan_last = None
-        # Кадрирование видео — РОВНО как в «Редактировании фото» (InpaintCanvas):
-        # рамку с 8 ручками (углы/стороны) и «ручкой-перемещением» правят прямо на
-        # холсте, плавающие кнопки «Применить»/«Отмена» всплывают у рамки. При
-        # «Обрезать» итоговое видео кадрируется по рамке (и «Сохранить кадр» тоже).
-        # Храним нормализованно (QRectF 0..1 от кадра) — не зависит от разрешения
-        # (важно для превью-прокси и crop=… через ffmpeg по iw/ih).
-        self._crop_mode = False
-        self._crop_norm = None          # QRectF 0..1 или None
-        self._crop_drag = None          # активная ручка: tl/tr/bl/br/t/b/l/r/move
-        self._crop_anchor = None        # позиция мыши (norm) на момент захвата
-        self._crop_start_rect = None    # рамка (QRectF) на момент захвата
-        # Во время активной перемотки (протяжка слайдера/волны) кадры сыпятся
-        # часто и ненадолго — плавное (билинейное) масштабирование каждого из них
-        # даёт заметную лишнюю нагрузку без пользы (кадр всё равно тут же сменится).
-        # На это время рисуем ближайшим соседом (быстрее), а как только перемотка
-        # утихла — возвращаем сглаживание для финального кадра. См. set_scrub_active.
-        self._scrub_active = False
-        # То же и во время ВОСПРОИЗВЕДЕНИЯ: кадр сменится через ~16 мс, сглаживание
-        # на нём не разглядеть, зато билинейный ресайз каждого кадра зря грузит ЦП
-        # (главный поток и так занят frame.toImage()). На паузе/стопе — сглаживаем
-        # (чёткий стоп-кадр). См. set_playing.
-        self._playing = False
-        self.setMouseTracking(True)
-        # Плавающие кнопки «Применить/Отмена» прямо на холсте (как в Photoshop).
-        self._crop_apply_btn = make_icon_btn("Применить", icon='fa5s.check', accent=True)
-        self._crop_apply_btn.setParent(self)
-        self._crop_apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._crop_apply_btn.setToolTip("Применить кадрирование (Enter)")
-        self._crop_apply_btn.clicked.connect(self.apply_crop)
-        self._crop_cancel_btn = make_icon_btn("Отмена", icon='fa5s.times')
-        self._crop_cancel_btn.setParent(self)
-        self._crop_cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._crop_cancel_btn.setToolTip("Отменить кадрирование (Esc)")
-        self._crop_cancel_btn.clicked.connect(self.cancel_crop)
-        for _b in (self._crop_apply_btn, self._crop_cancel_btn):
-            _b.setVisible(False)
-
-    # ── Кадрирование видео (как в «Редактировании фото») ──────────────────────
-    def set_crop_mode(self, on):
-        on = bool(on)
-        if on == self._crop_mode:
-            return
-        self._crop_mode = on
-        if on:
-            # При входе в режим — рамка СРАЗУ на весь кадр (как в InpaintCanvas),
-            # если ещё не задана (можно тут же тянуть за ручки). Если рамка уже
-            # «вооружена» прошлым применением — продолжаем её правку.
-            if self._crop_norm is None:
-                self._crop_norm = QRectF(0.0, 0.0, 1.0, 1.0)
-            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-            self.setFocus()
-        else:
-            self._crop_drag = None
-        self.setCursor(Qt.CursorShape.CrossCursor if on else Qt.CursorShape.ArrowCursor)
-        self._update_crop_buttons()
-        self.update()
-
-    def set_scrub_active(self, on: bool):
-        """Включает/выключает быстрый (без сглаживания) режим отрисовки на время
-        активной перемотки — см. комментарий у self._scrub_active."""
-        on = bool(on)
-        if on != self._scrub_active:
-            self._scrub_active = on
-
-    def set_playing(self, on: bool):
-        """Быстрый (без сглаживания) ресайз кадра во время воспроизведения — см.
-        комментарий у self._playing. На паузе/стопе возвращаем сглаживание и
-        перерисовываем текущий кадр уже сглаженно (чёткий стоп-кадр)."""
-        on = bool(on)
-        if on != self._playing:
-            self._playing = on
-            if not on and self._frame_img is not None:
-                self.update()
-
-    def has_crop(self) -> bool:
-        return self._crop_norm is not None
-
-    def crop_norm(self):
-        """Нормализованная рамка кадрирования (QRectF 0..1) или None. Полный кадр
-        (≈ весь экран) трактуем как «без кадрирования»."""
-        n = self._crop_norm
-        if n is None:
-            return None
-        if n.width() >= 0.999 and n.height() >= 0.999:
-            return None
-        return n
-
-    def clear_crop(self):
-        if self._crop_norm is not None or self._crop_drag is not None:
-            self._crop_norm = None
-            self._crop_drag = None
-            self._update_crop_buttons()
-            self.update()
-
-    def apply_crop(self):
-        """«Применить»: фиксируем рамку (её прочитает экспорт/«Сохранить кадр»),
-        выходим из режима правки. Полный кадр трактуем как сброс кадрирования."""
-        n = self._crop_norm
-        if n is not None and n.width() >= 0.999 and n.height() >= 0.999:
-            self._crop_norm = None     # рамка = весь кадр → кадрирования нет
-        self._crop_mode = False
-        self._crop_drag = None
-        self.setCursor(Qt.CursorShape.ArrowCursor)
-        self._update_crop_buttons()
-        self.update()
-        self.cropApplied.emit()
-
-    def cancel_crop(self):
-        """«Отмена»: сбрасываем рамку и выходим из режима правки."""
-        self._crop_norm = None
-        self._crop_mode = False
-        self._crop_drag = None
-        self.setCursor(Qt.CursorShape.ArrowCursor)
-        self._update_crop_buttons()
-        self.update()
-        self.cropCancelled.emit()
-
-    def _widget_to_norm(self, wpt, clamp=True):
-        vr = self.video_rect()
-        if vr.width() <= 0 or vr.height() <= 0:
-            return None
-        nx = (wpt.x() - vr.left()) / vr.width()
-        ny = (wpt.y() - vr.top()) / vr.height()
-        if clamp:
-            nx = min(1.0, max(0.0, nx)); ny = min(1.0, max(0.0, ny))
-        return QPointF(nx, ny)
-
-    def _crop_rect_screen(self):
-        """Текущая рамка кадрирования в ЭКРАННЫХ координатах (для ручек/кнопок)."""
-        n = self._crop_norm
-        vr = self.video_rect()
-        if n is None or vr.width() <= 0:
-            return QRectF()
-        return QRectF(vr.left() + n.left() * vr.width(),
-                      vr.top() + n.top() * vr.height(),
-                      n.width() * vr.width(), n.height() * vr.height())
-
-    def _crop_handle_at(self, wpt):
-        """Какую «ручку» рамки задевает курсор (коорд. виджета): tl/tr/bl/br/t/b/
-        l/r/move или None."""
-        if not self.has_crop():
-            return None
-        r = self._crop_rect_screen()
-        tol = 10.0
-        mx, my = wpt.x(), wpt.y()
-        if not (r.left() - tol <= mx <= r.right() + tol
-                and r.top() - tol <= my <= r.bottom() + tol):
-            return None
-        near_l = abs(mx - r.left()) <= tol
-        near_r = abs(mx - r.right()) <= tol
-        near_t = abs(my - r.top()) <= tol
-        near_b = abs(my - r.bottom()) <= tol
-        if near_t and near_l: return 'tl'
-        if near_t and near_r: return 'tr'
-        if near_b and near_l: return 'bl'
-        if near_b and near_r: return 'br'
-        if near_t: return 't'
-        if near_b: return 'b'
-        if near_l: return 'l'
-        if near_r: return 'r'
-        if r.left() < mx < r.right() and r.top() < my < r.bottom():
-            return 'move'
-        return None
-
-    @staticmethod
-    def _crop_cursor(handle):
-        cur = {
-            'tl': Qt.CursorShape.SizeFDiagCursor, 'br': Qt.CursorShape.SizeFDiagCursor,
-            'tr': Qt.CursorShape.SizeBDiagCursor, 'bl': Qt.CursorShape.SizeBDiagCursor,
-            't': Qt.CursorShape.SizeVerCursor,  'b': Qt.CursorShape.SizeVerCursor,
-            'l': Qt.CursorShape.SizeHorCursor,  'r': Qt.CursorShape.SizeHorCursor,
-            'move': Qt.CursorShape.SizeAllCursor,
-        }
-        return cur.get(handle, Qt.CursorShape.CrossCursor)
-
-    def _drag_crop(self, npt):
-        """Двигает активную ручку рамки. npt — позиция мыши в НОРМ. координатах."""
-        d = self._crop_drag
-        sr = self._crop_start_rect
-        if sr is None:
-            return
-        l, t, r, bo = sr.left(), sr.top(), sr.right(), sr.bottom()
-        minsz = 0.02
-        if d == 'move':
-            bw, bh = r - l, bo - t
-            dx = npt.x() - self._crop_anchor.x()
-            dy = npt.y() - self._crop_anchor.y()
-            nl = min(max(l + dx, 0.0), 1.0 - bw)
-            nt = min(max(t + dy, 0.0), 1.0 - bh)
-            self._crop_norm = QRectF(nl, nt, bw, bh)
-            return
-        x = min(max(npt.x(), 0.0), 1.0)
-        y = min(max(npt.y(), 0.0), 1.0)
-        if 'l' in d: l = min(x, r - minsz)
-        if 'r' in d: r = max(x, l + minsz)
-        if 't' in d: t = min(y, bo - minsz)
-        if 'b' in d: bo = max(y, t + minsz)
-        self._crop_norm = QRectF(l, t, r - l, bo - t)
-
-    def _update_crop_buttons(self):
-        """Показывает/прячет и позиционирует «Применить/Отмена» у рамки (плавающая
-        панель, как в Photoshop). Зовётся при любом изменении рамки/зума/размера."""
-        show = (self._crop_mode and self.has_crop()
-                and self._frame_img is not None)
-        if not show:
-            if self._crop_apply_btn.isVisible():
-                self._crop_apply_btn.setVisible(False)
-                self._crop_cancel_btn.setVisible(False)
-            return
-        r = self._crop_rect_screen()
-        aw = self._crop_apply_btn.sizeHint()
-        cw = self._crop_cancel_btn.sizeHint()
-        gap = 6
-        h = max(aw.height(), cw.height())
-        total = aw.width() + cw.width() + gap
-        x = int(r.right() - total)
-        y = int(r.bottom() + gap)
-        if y + h > self.height():
-            y = int(r.bottom() - h - gap)
-        x = max(2, min(x, self.width() - total - 2))
-        y = max(2, min(y, self.height() - h - 2))
-        self._crop_apply_btn.setGeometry(x, y, aw.width(), h)
-        self._crop_cancel_btn.setGeometry(x + aw.width() + gap, y, cw.width(), h)
-        self._crop_apply_btn.setVisible(True)
-        self._crop_cancel_btn.setVisible(True)
-        self._crop_apply_btn.raise_()
-        self._crop_cancel_btn.raise_()
-
-    def resizeEvent(self, ev):
-        super().resizeEvent(ev)
-        self._update_crop_buttons()
-
-    def keyPressEvent(self, ev):
-        if self._crop_mode and self.has_crop():
-            if ev.key() == Qt.Key.Key_Escape:
-                self.cancel_crop(); ev.accept(); return
-            if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-                self.apply_crop(); ev.accept(); return
-        super().keyPressEvent(ev)
-
-    def videoSink(self):
-        return self._sink
-
-    def setAspectRatioMode(self, *a, **k):   # совместимость с QVideoWidget
-        pass
-
-    def clear_frame(self):
-        self._frame_img = None
-        self.update()
-
-    def set_static_image(self, qimg):
-        """Показывает СТАТИЧНУЮ картинку на холсте (режим «картинка → видео»):
-        кадр рисуется как обычный видеокадр, но не от плеера, а напрямую. Сбрасывает
-        субтитры/зум, чтобы картинка вписалась целиком."""
-        self._text = ""
-        self._image = None
-        self._audio_only_msg = ""
-        self._frame_img = qimg if (qimg is not None and not qimg.isNull()) else None
-        self.reset_view()
-        self.update()
-
-    def current_frame_image(self):
-        """Точная копия кадра, который СЕЙЧАС показан на холсте (полное
-        разрешение видео, без субтитров — они рисуются отдельно). Нужна для
-        «Сохранить кадр»: берём ровно то, что видит пользователь, а не
-        пере-извлекаем кадр через ffmpeg по позиции (там seek по HEVC мог
-        отдать СЛЕДУЮЩИЙ кадр)."""
-        img = self._frame_img
-        if img is not None and not img.isNull():
-            return img.copy()
-        return None
-
-    def set_audio_only_message(self, text):
-        """Текст по центру холста, когда видеоряда нет (редактируется аудио).
-        Пустая строка — обычный режим (показ кадров)."""
-        text = text or ""
-        # Включаем режим «нет видео» — стираем последний кадр ПРЕДЫДУЩЕГО файла.
-        # paintEvent рисует _frame_img в приоритете над сообщением, поэтому без
-        # сброса старое видео «зависало» на холсте при загрузке аудиофайла
-        # (менялась только волна, а картинка оставалась прежней).
-        if text:
-            self._frame_img = None
-        if text == self._audio_only_msg:
-            return
-        self._audio_only_msg = text
-        self.update()
-
-    # ── Зум / панорама ───────────────────────────────────────────────────────
-    def reset_view(self):
-        """Сброс зума/панорамы (на 100%). Вызывается при загрузке нового файла."""
-        changed = (self._zoom != 1.0) or (self._pan != QPoint(0, 0))
-        self._zoom = 1.0
-        self._pan = QPoint(0, 0)
-        self._panning = False
-        # Рамку кадрирования сбрасываем, чтобы не переносить её на новый файл
-        # (режим кадрирования при этом не выключаем — кнопкой управляет вкладка).
-        if self._crop_norm is not None or self._crop_drag is not None:
-            self._crop_norm = None
-            self._crop_drag = None
-            self._update_crop_buttons()
-            changed = True
-        self.unsetCursor()
-        if changed:
-            self.update()
-
-    def _base_video_rect(self):
-        """Прямоугольник кадра при зуме 100% (letterbox по пропорциям)."""
-        w, h = self.width(), self.height()
-        img = self._frame_img
-        if img is None or w <= 0 or h <= 0 or img.width() <= 0 or img.height() <= 0:
-            return QRect(0, 0, max(0, w), max(0, h))
-        scale = min(w / img.width(), h / img.height())
-        rw = max(1, int(img.width() * scale))
-        rh = max(1, int(img.height() * scale))
-        return QRect((w - rw) // 2, (h - rh) // 2, rw, rh)
-
-    def _clamp_pan(self):
-        """Не даём утащить кадр так, чтобы по краям появился фон (когда кадр
-        крупнее окна). По осям, где кадр меньше окна, держим его по центру."""
-        base = self._base_video_rect()
-        rw = base.width() * self._zoom
-        rh = base.height() * self._zoom
-        mx = max(0, (rw - self.width()) / 2.0)
-        my = max(0, (rh - self.height()) / 2.0)
-        x = max(-mx, min(mx, self._pan.x()))
-        y = max(-my, min(my, self._pan.y()))
-        self._pan = QPoint(int(x), int(y))
-
-    def wheelEvent(self, ev):
-        # Зум только с зажатым Ctrl (как в редакторах) и при наличии кадра.
-        if (ev.modifiers() & Qt.KeyboardModifier.ControlModifier
-                and self._frame_img is not None):
-            old = self._zoom
-            new = (min(8.0, old * 1.2) if ev.angleDelta().y() > 0
-                   else max(1.0, old / 1.2))
-            if abs(new - old) < 1e-6:
-                ev.accept(); return
-            vr = self.video_rect()
-            px = ev.position().x(); py = ev.position().y()
-            s = new / old
-            # Масштабируем текущий прямоугольник относительно точки под курсором,
-            # чтобы она оставалась на месте при приближении/отдалении.
-            new_left = px - (px - vr.left()) * s
-            new_top = py - (py - vr.top()) * s
-            new_w = vr.width() * s
-            new_h = vr.height() * s
-            base = self._base_video_rect()
-            self._zoom = new
-            if new <= 1.0001:
-                self._pan = QPoint(0, 0)
-            else:
-                cx = new_left + new_w / 2.0
-                cy = new_top + new_h / 2.0
-                self._pan = QPoint(int(cx - base.center().x()),
-                                   int(cy - base.center().y()))
-                self._clamp_pan()
-            self._update_crop_buttons()   # рамка/кнопки следуют за зумом
-            self.update()
-            ev.accept()
-            return
-        super().wheelEvent(ev)
-
-    def mousePressEvent(self, ev):
-        if (self._crop_mode and ev.button() == Qt.MouseButton.LeftButton
-                and self._frame_img is not None):
-            handle = self._crop_handle_at(ev.position())
-            if handle is not None:
-                # Захватили ручку/тело существующей рамки — тянем её.
-                self._crop_drag = handle
-                self._crop_anchor = self._widget_to_norm(ev.position(), clamp=False)
-                self._crop_start_rect = QRectF(self._crop_norm)
-            else:
-                # Клик вне рамки — рисуем НОВУЮ рамку от этой точки (тянем угол br).
-                n = self._widget_to_norm(ev.position())
-                if n is not None:
-                    self._crop_norm = QRectF(n.x(), n.y(), 0.0, 0.0)
-                    self._crop_drag = 'br'
-                    self._crop_anchor = n
-                    self._crop_start_rect = QRectF(self._crop_norm)
-            self._update_crop_buttons()
-            self.update()
-            ev.accept()
-            return
-        if self._zoom > 1.0 and ev.button() == Qt.MouseButton.LeftButton:
-            self._panning = True
-            self._pan_last = ev.position()
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            ev.accept()
-            return
-        super().mousePressEvent(ev)
-
-    def mouseMoveEvent(self, ev):
-        if self._crop_mode and self._frame_img is not None:
-            if self._crop_drag and (ev.buttons() & Qt.MouseButton.LeftButton):
-                npt = self._widget_to_norm(ev.position(), clamp=False)
-                if npt is not None:
-                    self._drag_crop(npt)
-                    self._update_crop_buttons()
-                    self.update()
-                ev.accept()
-                return
-            # Без зажатой кнопки — курсор подсказывает доступную ручку.
-            self.setCursor(self._crop_cursor(self._crop_handle_at(ev.position())))
-            ev.accept()
-            return
-        if self._panning and self._pan_last is not None:
-            d = ev.position() - self._pan_last
-            self._pan_last = ev.position()
-            self._pan = QPoint(self._pan.x() + int(d.x()),
-                               self._pan.y() + int(d.y()))
-            self._clamp_pan()
-            self.update()
-            ev.accept()
-            return
-        super().mouseMoveEvent(ev)
-
-    def mouseReleaseEvent(self, ev):
-        if (self._crop_mode and self._crop_drag is not None
-                and ev.button() == Qt.MouseButton.LeftButton):
-            self._crop_drag = None
-            # Совсем крошечная рамка (случайный клик) = весь кадр, чтобы не остаться
-            # с пустым выделением (правят дальше ручками или жмут «Применить»).
-            n = self._crop_norm
-            if n is not None and (n.width() < 0.02 or n.height() < 0.02):
-                self._crop_norm = QRectF(0.0, 0.0, 1.0, 1.0)
-            else:
-                self._crop_norm = QRectF(n).normalized()
-            self._update_crop_buttons()
-            self.update()
-            ev.accept()
-            return
-        if self._panning and ev.button() == Qt.MouseButton.LeftButton:
-            self._panning = False
-            self.unsetCursor()
-            ev.accept()
-            return
-        super().mouseReleaseEvent(ev)
-
-    def set_play_bound(self, out_seconds):
-        """Граница OUT для блокировки кадров при воспроизведении (None — снять)."""
-        self._bound_us = (int(out_seconds * 1_000_000)
-                          if (out_seconds and out_seconds > 0) else None)
-
-    def _on_frame(self, frame):
-        # Аудиофайл (видеоряда нет): игнорируем любые «поздние» кадры от плеера
-        # (например, финальный кадр прошлого источника при смене файла), иначе
-        # старое видео вновь заполнит _frame_img и перекроет сообщение «нет видео».
-        if self._audio_only_msg:
-            return
-        # Граница OUT по PTS кадра — ПРОВЕРЯЕМ ДО конвертации в QImage и показа.
-        # Кадр за границей не рисуем и просим плеер на паузу (анти-overshoot).
-        if frame is not None and self._bound_us is not None:
-            try: pts = frame.startTime()    # µs, -1 если неизвестно
-            except Exception: pts = -1
-            if pts >= 0 and pts >= self._bound_us:
-                self.boundaryReached.emit()
-                return
-        img = None
-        try:
-            if frame is not None and frame.isValid():
-                img = frame.toImage()
-        except Exception:
-            img = None
-        if img is not None and not img.isNull():
-            self._frame_img = img
-            if self.isVisible():
-                self.update()
-
-    def _paint_crop_overlay(self, p, vr):
-        """Затемняет всё вне рамки кадрирования + рисует границу и сетку третей
-        (в пределах видимой части кадра). vr — прямоугольник кадра на экране."""
-        n = self._crop_norm
-        r = QRectF(vr.left() + n.left() * vr.width(),
-                   vr.top() + n.top() * vr.height(),
-                   n.width() * vr.width(), n.height() * vr.height())
-        clip = QRectF(vr).intersected(QRectF(self.rect()))
-        r = r.intersected(clip)
-        p.save()
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(0, 0, 0, 120))
-        p.drawRect(QRectF(clip.left(), clip.top(), clip.width(), r.top() - clip.top()))
-        p.drawRect(QRectF(clip.left(), r.bottom(), clip.width(), clip.bottom() - r.bottom()))
-        p.drawRect(QRectF(clip.left(), r.top(), r.left() - clip.left(), r.height()))
-        p.drawRect(QRectF(r.right(), r.top(), clip.right() - r.right(), r.height()))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(255, 255, 255, 80), 1))
-        for i in (1, 2):
-            gx = r.left() + r.width() * i / 3.0
-            gy = r.top() + r.height() * i / 3.0
-            p.drawLine(QPointF(gx, r.top()), QPointF(gx, r.bottom()))
-            p.drawLine(QPointF(r.left(), gy), QPointF(r.right(), gy))
-        p.setPen(QPen(QColor("#cdd6f4"), 1.5))
-        p.drawRect(r)
-        # Ручки по углам и серединам сторон (как в «Редактировании фото»).
-        hs = 7.0
-        p.setPen(QPen(QColor("#11111b"), 1))
-        p.setBrush(QColor("#cdd6f4"))
-        cx, cy = (r.left() + r.right()) / 2.0, (r.top() + r.bottom()) / 2.0
-        for hx, hy in ((r.left(), r.top()), (r.right(), r.top()),
-                       (r.left(), r.bottom()), (r.right(), r.bottom()),
-                       (cx, r.top()), (cx, r.bottom()),
-                       (r.left(), cy), (r.right(), cy)):
-            p.drawRect(QRectF(hx - hs / 2, hy - hs / 2, hs, hs))
-        p.restore()
-
-    def _paint_crop_indicator(self, p, vr):
-        """Тонкая пунктирная рамка «вооружённого» кадрирования вне режима правки —
-        показывает, какую область получит итоговое видео при «Обрезать»."""
-        n = self._crop_norm
-        r = QRectF(vr.left() + n.left() * vr.width(),
-                   vr.top() + n.top() * vr.height(),
-                   n.width() * vr.width(), n.height() * vr.height())
-        r = r.intersected(QRectF(vr).intersected(QRectF(self.rect())))
-        p.save()
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor("#89b4fa"), 1.5, Qt.PenStyle.DashLine))
-        p.drawRect(r)
-        p.restore()
-
-    def video_rect(self):
-        """Прямоугольник, где реально показан кадр (letterbox + текущий зум/пан)."""
-        base = self._base_video_rect()
-        if self._frame_img is None or self._zoom == 1.0:
-            return base
-        rw = max(1, int(base.width() * self._zoom))
-        rh = max(1, int(base.height() * self._zoom))
-        cx = base.center().x() + self._pan.x()
-        cy = base.center().y() + self._pan.y()
-        return QRect(int(cx - rw / 2.0), int(cy - rh / 2.0), rw, rh)
-
-    # ── Единый API субтитров (как у SubtitleOverlay) ─────────────────────────
-    def subtitle_area_size(self):
-        r = self.video_rect()
-        return r.width(), r.height()
-
-    def set_subtitle_image(self, qimg, x=0, y=0):
-        self._image = qimg
-        self._image_pos = (int(x), int(y))
-        self.update()
-
-    def set_subtitle_text(self, text):
-        text = text or ""
-        if self._image is None and text == self._text:
-            return
-        self._image = None
-        self._text = text
-        self.update()
-
-    def clear_subtitle(self):
-        if self._image is None and not self._text:
-            return
-        self._image = None
-        self._text = ""
-        self.update()
-
-    def paintEvent(self, ev):
-        p = QPainter(self)
-        p.fillRect(self.rect(), self._bg)
-        img = self._frame_img
-        if img is not None and not img.isNull():
-            vr = self.video_rect()
-            # Во время протяжки/воспроизведения — без сглаживания (быстрее, кадр всё
-            # равно сейчас сменится); на устоявшемся стоп-кадре — со сглаживанием
-            # (качество).
-            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,
-                            not (self._scrub_active or self._playing))
-            p.drawImage(vr, img)
-            # Субтитры рисуем в ВИДИМОЙ части кадра (пересечение зумированного vr
-            # с областью виджета), а не во всём vr. Иначе при приближении кадра
-            # низ vr уходит далеко за нижнюю границу виджета, и субтитры,
-            # привязанные к низу кадра, «улетают» за экран (баг с приближением).
-            sub_rect = vr.intersected(self.rect())
-            if sub_rect.width() < 10 or sub_rect.height() < 10:
-                sub_rect = self.rect()
-            px = max(15, int(min(sub_rect.height(), self.height()) * 0.052))
-            _paint_subtitle(p, sub_rect, self._text, px, self._image, self._image_pos)
-            # Рамка кадрирования видео (как в «Редактировании фото»): в режиме
-            # правки — затемнение/сетка/ручки, иначе (рамка «вооружена») — тонкая
-            # пунктирная подсказка, что экспорт кадрируется по ней.
-            if self._crop_mode and self._crop_norm is not None:
-                self._paint_crop_overlay(p, vr)
-            elif self._crop_norm is not None:
-                self._paint_crop_indicator(p, vr)
-        elif self._audio_only_msg:
-            # Видеоряда нет — рисуем иконку ноты и поясняющий текст по центру.
-            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            icon_px = max(28, int(min(self.width(), self.height()) * 0.16))
-            pm = get_icon_pixmap('fa5s.music', icon_px, C['text3'])
-            gap = 14
-            font = p.font()
-            font.setPointSize(11)
-            font.setFamily("Segoe UI" if os.name == 'nt' else "SF Pro Display")
-            p.setFont(font)
-            fm = QFontMetrics(font)
-            text_rect = fm.boundingRect(
-                QRect(0, 0, max(60, self.width() - 40), 1000),
-                int(Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap),
-                self._audio_only_msg)
-            ih = (icon_px + gap) if (pm is not None and not pm.isNull()) else 0
-            total_h = ih + text_rect.height()
-            top = (self.height() - total_h) // 2
-            if pm is not None and not pm.isNull():
-                ix = (self.width() - icon_px) // 2
-                p.drawPixmap(QRect(ix, top, icon_px, icon_px), pm)
-            p.setPen(QPen(QColor(C['text3'])))
-            tr = QRect((self.width() - text_rect.width()) // 2, top + ih,
-                       text_rect.width(), text_rect.height())
-            p.drawText(tr, int(Qt.AlignmentFlag.AlignHCenter
-                               | Qt.TextFlag.TextWordWrap), self._audio_only_msg)
-        p.end()
-
-
-# ─── Полоса воспроизведения с мгновенной перемоткой по клику ────────────────────
-class SeekSlider(QSlider):
-    """Полоса воспроизведения как в обычных плеерах: клик/перетаскивание мгновенно
-    перематывает в точку под курсором (стандартный QSlider лишь «подкрадывается»
-    page-step'ами). Пока пользователь держит ползунок, плеер не перебивает его
-    значение (см. is_user_seeking)."""
-
-    # Максимальная частота РЕАЛЬНЫХ seek'ов (sliderMoved → player.setPosition) во
-    # время протяжки мышью — на тяжёлом H.264/HEVC (редкие кейфреймы) плеер не
-    # успевает отрабатывать seek на каждый пиксель движения курсора (mouseMoveEvent
-    # может сыпаться намного чаще) и «копит» очередь — перемотка ощущается с
-    # запозданием, хотя каждый отдельный seek сам по себе быстрый. Ручку слайдера
-    # (setValue) НЕ троттлим — она остаётся под курсором мгновенно, как обычно;
-    # троттлится только фактическая перемотка видео. Покадрового шага стрелками
-    # (step_frame/step_frame_scrub) это не касается — тот путь вызывает
-    # player.setPosition() напрямую, минуя sliderMoved.
-    _SEEK_THROTTLE_S = 0.05
-
-    def __init__(self, *a, **kw):
-        super().__init__(*a, **kw)
-        self._seeking = False
-        self._last_seek_emit = 0.0
-        self._seek_pending_v = None
-        self._seek_flush_timer = QTimer(self)
-        self._seek_flush_timer.setSingleShot(True)
-        self._seek_flush_timer.timeout.connect(self._flush_pending_seek)
-
-    def is_user_seeking(self):
-        return self._seeking
-
-    def _emit_seek(self, v):
-        """Троттлит sliderMoved во время протяжки (см. _SEEK_THROTTLE_S); клик и
-        отпускание кнопки — всегда мгновенно, без троттлинга."""
-        now = time.monotonic()
-        if now - self._last_seek_emit >= self._SEEK_THROTTLE_S:
-            self._last_seek_emit = now
-            self._seek_pending_v = None
-            self._seek_flush_timer.stop()
-            self.sliderMoved.emit(v)
-        else:
-            self._seek_pending_v = v
-            if not self._seek_flush_timer.isActive():
-                remaining = max(1, int((self._SEEK_THROTTLE_S - (now - self._last_seek_emit)) * 1000))
-                self._seek_flush_timer.start(remaining)
-
-    def _flush_pending_seek(self):
-        if self._seek_pending_v is not None and self._seeking:
-            self._last_seek_emit = time.monotonic()
-            v, self._seek_pending_v = self._seek_pending_v, None
-            self.sliderMoved.emit(v)
-
-    def _value_at(self, x):
-        opt = QStyleOptionSlider()
-        self.initStyleOption(opt)
-        groove = self.style().subControlRect(
-            QStyle.ComplexControl.CC_Slider, opt,
-            QStyle.SubControl.SC_SliderGroove, self)
-        handle = self.style().subControlRect(
-            QStyle.ComplexControl.CC_Slider, opt,
-            QStyle.SubControl.SC_SliderHandle, self)
-        span = (groove.right() - groove.left() - handle.width())
-        pos = x - groove.left() - handle.width() // 2
-        if span <= 0:
-            return self.minimum()
-        return QStyle.sliderValueFromPosition(
-            self.minimum(), self.maximum(), pos, span)
-
-    def mousePressEvent(self, ev):
-        if (ev.button() == Qt.MouseButton.LeftButton
-                and self.orientation() == Qt.Orientation.Horizontal):
-            self._seeking = True
-            self._last_seek_emit = time.monotonic()  # свежее окно троттлинга для нового драга
-            v = self._value_at(int(ev.position().x()))
-            self.setValue(v)
-            self.sliderMoved.emit(v)
-            ev.accept()
-            return
-        super().mousePressEvent(ev)
-
-    def mouseMoveEvent(self, ev):
-        # Превью обновляем на КАЖДОЕ движение курсора по полосе (а не только при
-        # входе) — иначе чтобы увидеть другой кадр, приходилось уводить курсор и
-        # наводиться заново.
-        try: self._show_preview(ev)
-        except Exception: pass
-        if (self._seeking
-                and self.orientation() == Qt.Orientation.Horizontal):
-            v = self._value_at(int(ev.position().x()))
-            self.setValue(v)        # ручка следует за курсором мгновенно, без троттлинга
-            self._emit_seek(v)      # а сам seek видео — троттлится (см. _SEEK_THROTTLE_S)
-            ev.accept()
-            return
-        super().mouseMoveEvent(ev)
-
-    def mouseReleaseEvent(self, ev):
-        if self._seeking and ev.button() == Qt.MouseButton.LeftButton:
-            self._seeking = False
-            # Финальную позицию отпускания отдаём немедленно, не дожидаясь
-            # отложенного флаша троттлера — иначе итоговый кадр «доедет» с задержкой.
-            self._seek_flush_timer.stop()
-            if self._seek_pending_v is not None:
-                v, self._seek_pending_v = self._seek_pending_v, None
-                self._last_seek_emit = time.monotonic()
-                self.sliderMoved.emit(v)
-            ev.accept()
-            return
-        super().mouseReleaseEvent(ev)
-
-    # ── Превью кадров при наведении (как на YouTube) ──────────────────────────
-    def attach_preview(self, preview):
-        """Привязывает общий контроллер превью (SeekPreview). Включает отслеживание
-        мыши, чтобы показывать миниатюру кадра под курсором без зажатой кнопки."""
-        self._preview = preview
-        self.setMouseTracking(True)
-
-    def _show_preview(self, ev):
-        pv = getattr(self, "_preview", None)
-        if pv is None or self.orientation() != Qt.Orientation.Horizontal:
-            return
-        x = int(ev.position().x())
-        pv.show_at(self, x, self._value_at(x))
-
-    def enterEvent(self, ev):
-        # При входе курсора покажем превью сразу (положение возьмём из события).
-        try: self._show_preview(ev)
-        except Exception: pass
-        super().enterEvent(ev)
-
-    def leaveEvent(self, ev):
-        pv = getattr(self, "_preview", None)
-        if pv is not None:
-            try: pv.hide()
-            except Exception: pass
-        super().leaveEvent(ev)
-
-
-class _SeekThumbnailer(QThread):
-    """Фоновый извлекатель кадров для превью полосы воспроизведения. Держит одну
-    «целевую» позицию; пока идёт извлечение, новые запросы лишь обновляют цель
-    (промежуточные отбрасываются — на быстром движении мыши не копится очередь)."""
-    ready = pyqtSignal(float, object)   # quantized_sec, QImage
-
-    def __init__(self):
-        super().__init__()
-        self._src = None
-        self._pending = None
-        self._stop = False
-        self._cond = threading.Condition()
-
-    def set_source(self, src):
-        with self._cond:
-            self._src = str(src) if src else None
-            self._pending = None
-
-    def request(self, sec):
-        with self._cond:
-            self._pending = float(sec)
-            self._cond.notify()
-
-    def stop(self):
-        with self._cond:
-            self._stop = True
-            self._cond.notify()
-
-    def run(self):
-        while True:
-            with self._cond:
-                while self._pending is None and not self._stop:
-                    self._cond.wait()
-                if self._stop:
-                    return
-                sec = self._pending; src = self._src
-                self._pending = None
-            if src is None:
-                continue
-            img = self._extract(src, sec)
-            if img is not None and not img.isNull():
-                self.ready.emit(sec, img)
-
-    @staticmethod
-    def _extract(src, sec):
-        try:
-            # Скорость превью важнее точности кадра, поэтому жертвуем качеством:
-            #   -noaccurate_seek — прыжок СРАЗУ на ближайший ключевой кадр, без
-            #     декодирования от него до точной позиции (главный источник
-            #     задержки при наведении);
-            #   -probesize/-analyzeduration — короткий анализ входа (не сканируем
-            #     весь файл ради одного кадра);
-            #   scale=160 + -q:v 8 — мелкий кадр пониженного качества кодируется и
-            #     передаётся через pipe быстрее.
-            cmd = [FFMPEG, "-nostdin",
-                   "-probesize", "2M", "-analyzeduration", "0",
-                   "-noaccurate_seek", "-ss", f"{max(0.0, sec):.3f}",
-                   "-i", str(src), "-frames:v", "1", "-an", "-sn",
-                   "-vf", "scale=160:-2", "-q:v", "8", "-threads", "1",
-                   "-f", "image2pipe", "-vcodec", "mjpeg", "-"]
-            pr = subprocess.run(cmd, capture_output=True,
-                                creationflags=CREATE_NO_WINDOW, timeout=8)
-            if pr.returncode == 0 and pr.stdout:
-                im = QImage.fromData(pr.stdout, "JPG")
-                return im
-        except Exception:
-            pass
-        return None
-
-
-class SeekPreview:
-    """Превью кадра под курсором над полосой воспроизведения (как на YouTube).
-    Один экземпляр обслуживает обе полосы — в окне и в полноэкранном режиме.
-
-    Устройство попапа: миниатюра СВЕРХУ, время — отдельным лейблом СНИЗУ (в самой
-    картинке цифры не рисуются). Фон попапа прозрачный — никакого серого
-    «паспарту»: где нет картинки, остаётся пусто (как превью в проводнике Windows).
-
-    Чтобы не было рывка «сначала цифры, потом кадр»: при переходе на новую
-    позицию предыдущая миниатюра остаётся на экране, пока ffmpeg извлекает
-    новую; время при этом обновляется мгновенно. Кадры кэшируются."""
-
-    _QUANT = 1.0   # шаг квантования позиции (сек) — ограничивает число кадров
-
-    def __init__(self, get_duration):
-        self._get_duration = get_duration
-        self._cache = {}
-        self._cur_q = None
-        self._anchor = None   # (slider, local_x)
-        self._popup = QWidget(None, Qt.WindowType.ToolTip
-                              | Qt.WindowType.FramelessWindowHint)
-        self._popup.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self._popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        lay = QVBoxLayout(self._popup)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
-        self._img_lbl = QLabel()
-        self._img_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._img_lbl.setStyleSheet("background:transparent;")
-        self._img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._time_lbl = QLabel()
-        self._time_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._time_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._time_lbl.setStyleSheet(
-            "color:#ffffff;background:rgba(11,11,18,0.88);border:1px solid #585b70;"
-            "border-radius:5px;padding:2px 10px;font-weight:bold;font-size:13px;")
-        lay.addWidget(self._img_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
-        lay.addWidget(self._time_lbl, 0, Qt.AlignmentFlag.AlignHCenter)
-        self._th = _SeekThumbnailer()
-        self._th.ready.connect(self._on_ready)
-        self._th.start()
-
-    def set_source(self, src):
-        self._cache.clear()
-        self._cur_q = None
-        self._img_lbl.clear()
-        self._img_lbl.setFixedSize(0, 0)
-        self._th.set_source(src)
-        # Префетч одного кадра, чтобы первое наведение уже имело картинку.
-        try:
-            dur = float(self._get_duration() or 0.0)
-            if dur > 0:
-                self._th.request(self._quant(dur / 2.0))
-        except Exception:
-            pass
-
-    def _quant(self, sec):
-        return round(sec / self._QUANT) * self._QUANT
-
-    def show_at(self, slider, local_x, value):
-        dur = 0.0
-        try: dur = float(self._get_duration() or 0.0)
-        except Exception: dur = 0.0
-        if dur <= 0:
-            self.hide(); return
-        sec = max(0.0, min(dur, (value / 1000.0) * dur))
-        q = self._quant(sec)
-        self._cur_q = q
-        self._anchor = (slider, local_x)
-        # Время — всегда мгновенно.
-        self._time_lbl.setText(self._fmt(sec))
-        # Картинку обновляем только из кэша; если её нет — оставляем предыдущую
-        # (никаких «сначала цифры, потом кадр») и заказываем извлечение.
-        pm = self._cache.get(q)
-        if pm is not None and not pm.isNull():
-            self._set_image(pm)
-        elif q not in self._cache:
-            self._th.request(q)
-        self._reposition()
-        self._popup.show(); self._popup.raise_()
-
-    def _set_image(self, pm):
-        self._img_lbl.setFixedSize(pm.width(), pm.height())
-        self._img_lbl.setPixmap(pm)
-
-    def _on_ready(self, sec, img):
-        try:
-            pm = QPixmap.fromImage(img)
-            if not pm.isNull():
-                self._cache[sec] = pm
-                # Если курсор всё ещё на этой позиции — показываем кадр.
-                if self._cur_q == sec and self._popup.isVisible() and self._anchor:
-                    self._set_image(pm)
-                    self._reposition()
-        except Exception:
-            pass
-
-    def _reposition(self):
-        if self._anchor is None:
-            return
-        slider, local_x = self._anchor
-        try:
-            self._popup.adjustSize()
-            gp = slider.mapToGlobal(QPoint(local_x, 0))
-            x = gp.x() - self._popup.width() // 2
-            y = gp.y() - self._popup.height() - 10
-            scr = slider.screen().availableGeometry()
-            if x < scr.left() + 2: x = scr.left() + 2
-            if x + self._popup.width() > scr.right(): x = scr.right() - self._popup.width() - 2
-            if y < scr.top() + 2:
-                y = gp.y() + 18   # не помещается сверху — показываем снизу
-            self._popup.move(x, y)
-        except Exception:
-            pass
-
-    @staticmethod
-    def _fmt(sec):
-        sec = int(max(0, sec))
-        h = sec // 3600; m = (sec % 3600) // 60; s = sec % 60
-        return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
-
-    def hide(self):
-        try: self._popup.hide()
-        except Exception: pass
-
-    def shutdown(self):
-        try: self._th.stop(); self._th.wait(1500)
-        except Exception: pass
-
-
-# ─── Полноэкранное окно видео ──────────────────────────────────────────────────
-class FullscreenVideo(QWidget):
-    """Отдельное полноэкранное окно для видео вкладки «Монтаж».
-
-    Внизу — панель управления как в обычных видеоплеерах: кнопка play/pause,
-    текущее/общее время и полоса воспроизведения. Панель и курсор авто-скрываются
-    при бездействии и снова появляются при движении мыши. Esc / F / двойной клик —
-    выход из полноэкранного режима."""
-
-    def __init__(self, edit_tab):
-        super().__init__()
-        self.edit = edit_tab
-        self.setWindowTitle("SI-HYX — Полный экран")
-        self.setStyleSheet("background:#000;")
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-
-        # Видео занимает всё окно; панель управления накладывается поверх снизу.
-        # Субтитры рисует общий оверлей EditTab (отдельное окно), он подгоняется
-        # под видео этого окна — см. EditTab._position_overlay.
-        self._video = None
-
-        # ── Панель управления ────────────────────────────────────────────
-        # ВАЖНО: QVideoWidget рисует видео через нативную поверхность и
-        # перекрывает обычные дочерние виджеты (та же причина, по которой не было
-        # видно субтитров). Поэтому панель — отдельное БЕЗРАМОЧНОЕ окно «поверх
-        # всех», но КЛИКАБЕЛЬНОЕ (кнопки/полоса), привязанное к этому окну.
-        self.bar = QFrame(self, Qt.WindowType.FramelessWindowHint
-                          | Qt.WindowType.Tool
-                          | Qt.WindowType.WindowStaysOnTopHint)
-        self.bar.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self.bar.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.bar.setObjectName("FsBar")
-        self.bar.setStyleSheet(
-            "#FsBar { background: rgba(15,15,18,0.88); "
-            "border-top: 1px solid rgba(255,255,255,0.10); }"
-            # Та же тёмная подсказка, что и во вкладке (см. EditTab.apply_theme) —
-            # чтобы штатные tooltip'ы кнопок панели выглядели одинаково.
-            f"QToolTip {{ background: {C['surface3']}; color: {C['text']}; "
-            f"border: 1px solid {C['border2']}; border-radius: 4px; "
-            f"padding: 4px 8px; font-size: 12px; }}")
-        bl = QVBoxLayout(self.bar)
-        bl.setContentsMargins(22, 10, 22, 12)
-        bl.setSpacing(8)
-
-        # Полоса воспроизведения + тайминги в одной строке (клик по полосе —
-        # мгновенная перемотка; SeekSlider это уже умеет).
-        seek_row = QHBoxLayout()
-        seek_row.setContentsMargins(0, 0, 0, 0)
-        seek_row.setSpacing(12)
-        _mono = QFont("Courier New" if os.name == 'nt' else "Courier")
-        _mono.setBold(True); _mono.setPointSize(12)
-        self.lbl_cur = QLabel("00:00:00.000", self.bar)
-        self.lbl_cur.setFont(_mono)
-        self.lbl_cur.setStyleSheet("color:#a6e3a1; background:transparent;")
-        seek_row.addWidget(self.lbl_cur)
-        self.slider = SeekSlider(Qt.Orientation.Horizontal, self.bar)
-        self.slider.setRange(0, 1000)
-        self.slider.setStyleSheet(self._fs_slider_style())
-        # Полоса не должна перехватывать фокус — иначе Пробел уходит ей, а не окну.
-        self.slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.slider.sliderMoved.connect(self._on_slider_moved)
-        # Тот же контроллер превью кадров, что и у полосы в окне.
-        try:
-            pv = getattr(self.edit, "seek_preview", None)
-            if pv is not None:
-                self.slider.attach_preview(pv)
-        except Exception:
-            pass
-        seek_row.addWidget(self.slider, 1)
-        self.lbl_tot = QLabel("00:00:00.000", self.bar)
-        self.lbl_tot.setFont(_mono)
-        self.lbl_tot.setStyleSheet("color:#bac2de; background:transparent;")
-        seek_row.addWidget(self.lbl_tot)
-        bl.addLayout(seek_row)
-
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
-
-        _fsbtn_css = (
-            "QPushButton { background: rgba(255,255,255,0.08); border: none;"
-            " border-radius: 7px; } "
-            "QPushButton:hover { background: rgba(255,255,255,0.18); } "
-            "QPushButton:pressed { background: rgba(255,255,255,0.30); }")
-        _fsbtn_accent_css = (
-            "QPushButton { background: rgba(137,180,250,0.85); border: none;"
-            " border-radius: 7px; } "
-            "QPushButton:hover { background: rgba(180,190,254,0.95); } "
-            "QPushButton:pressed { background: rgba(137,180,250,0.65); }")
-
-        def _fsbtn(icon_std, tip, slot, size=(42, 34), accent=False, icon=None):
-            b = QPushButton(self.bar)
-            b.setIcon(icon if icon is not None
-                      else self.style().standardIcon(icon_std))
-            b.setIconSize(QSize(18, 18))
-            b.setFixedSize(*size)
-            b.setCursor(Qt.CursorShape.PointingHandCursor)
-            # Подсказка — ШТАТНЫМ механизмом Qt (setToolTip), ровно как у кнопки
-            # «Сохранить кадр» на боковой панели. Раньше здесь была самописная
-            # подсказка через QToolTip.showText на Enter/Leave (см. eventFilter):
-            # она МЕРЦАЛА (повторные show/hide при каждом входе курсора) и рисовала
-            # инородную рамку. НЕ ВОЗВРАЩАТЬ — стиль подсказки задаётся через
-            # QToolTip в self.bar.setStyleSheet (тёмная тема, как во вкладке).
-            b.setToolTip(tip)
-            b.setStyleSheet(_fsbtn_accent_css if accent else _fsbtn_css)
-            # Кнопки не держат фокус: после клика по «Стоп» Пробел должен идти
-            # окну (воспроизведение/пауза), а не повторно жать ту же кнопку.
-            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            b.clicked.connect(slot)
-            row.addWidget(b)
-            return b
-
-        self.btn_stop = _fsbtn(QStyle.StandardPixmap.SP_MediaStop,
-                               "Стоп — к началу зоны", self.edit.stop_playback)
-        self.btn_step_back = _fsbtn(QStyle.StandardPixmap.SP_MediaSeekBackward,
-                                    "Кадр назад (←)",
-                                    partial(self.edit.step_frame_scrub, -1))
-        self.btn_play = _fsbtn(QStyle.StandardPixmap.SP_MediaPlay,
-                               "Воспроизвести / пауза (Пробел)",
-                               self.edit.toggle_play, size=(50, 34), accent=True)
-        self.btn_step_fwd = _fsbtn(QStyle.StandardPixmap.SP_MediaSeekForward,
-                                   "Кадр вперёд (→)",
-                                   partial(self.edit.step_frame_scrub, 1))
-        self.btn_jump_end = _fsbtn(QStyle.StandardPixmap.SP_MediaSkipForward,
-                                   "Перейти к концу зоны (OUT)",
-                                   lambda: self.edit.seek_to(self.edit.current_out))
-
-        row.addSpacing(10)
-        self.btn_save_frame = _fsbtn(None,
-                                     "Сохранить текущий кадр в PNG",
-                                     self.edit.save_frame,
-                                     icon=get_icon('fa5s.save', color='#ffffff'))
-
-        row.addStretch(1)
-
-        # Громкость — связана с основным ползунком вкладки (он управляет звуком).
-        self.vol_lbl = VolumeLabel(lambda: getattr(self, "vol_slider", None), self.bar)
-        self.vol_lbl.setStyleSheet("color:#cdd6f4; font-size:15px; background:transparent;")
-        row.addWidget(self.vol_lbl)
-        self.vol_slider = VolumeSlider(Qt.Orientation.Horizontal, self.bar)
-        self.vol_slider.setRange(0, 100)
-        self.vol_slider.setValue(int(self.edit.vol_slider.value()))
-        self.vol_slider.setFixedWidth(120)
-        # Прозрачный жёлоб (а не тёмный surface3) и белый бегунок без чёрной
-        # окантовки — чтобы за ползунком громкости не было чёрного прямоугольника.
-        self.vol_slider.setStyleSheet(
-            "QSlider { background: transparent; }"
-            "QSlider::groove:horizontal { background: rgba(255,255,255,0.22);"
-            " height: 6px; border-radius: 3px; }"
-            "QSlider::sub-page:horizontal { background: #cdd6f4; border-radius: 3px; }"
-            "QSlider::add-page:horizontal { background: rgba(255,255,255,0.22);"
-            " border-radius: 3px; }"
-            "QSlider::handle:horizontal { background: #ffffff; width: 13px;"
-            " height: 13px; margin: -4px 0; border-radius: 7px; }")
-        self.vol_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.vol_slider.valueChanged.connect(self._on_volume_changed)
-        row.addWidget(self.vol_slider)
-
-        row.addSpacing(10)
-        self.btn_exit = _fsbtn(QStyle.StandardPixmap.SP_TitleBarNormalButton,
-                               "Выйти из полноэкранного режима (Esc)",
-                               self.edit.exit_fullscreen,
-                               icon=_fullscreen_icon(expand=False))
-
-        bl.addLayout(row)
-
-        # Авто-скрытие панели/курсора при бездействии.
-        self._hide_timer = QTimer(self)
-        self._hide_timer.setInterval(2500)
-        self._hide_timer.setSingleShot(True)
-        self._hide_timer.timeout.connect(self._hide_bar)
-        # Клавиши (Esc/пробел/стрелки), пойманные окном панели, шлём в это окно.
-        self.bar.installEventFilter(self)
-
-    @staticmethod
-    def _fs_slider_style():
-        """Полоса воспроизведения для полноэкранного режима: высокий жёлоб с
-        закруглёнными концами, видимая заполненная часть и заметный бегунок."""
-        ph = C["playhead"]
-        return f"""
-            QSlider {{ min-height: 18px; background: transparent; }}
-            QSlider::groove:horizontal {{
-                background: rgba(255,255,255,0.22);
-                border-radius: 4px;
-                height: 8px;
-            }}
-            QSlider::sub-page:horizontal {{
-                background: {ph};
-                border-radius: 4px;
-            }}
-            QSlider::add-page:horizontal {{
-                background: rgba(255,255,255,0.22);
-                border-radius: 4px;
-            }}
-            QSlider::handle:horizontal {{
-                background: #ffffff;
-                border: 2px solid {ph};
-                width: 16px; height: 16px;
-                margin: -5px 0;
-                border-radius: 9px;
-            }}
-            QSlider::handle:horizontal:hover {{ background: {ph}; }}
-        """
-
-    # ── Видео ──────────────────────────────────────────────────────────────
-    def attach_video(self, video_widget):
-        self._video = video_widget
-        video_widget.setParent(self)
-        video_widget.show()
-        self._relayout()
-        self._show_bar()
-
-    def _relayout(self):
-        if self._video is not None:
-            self._video.setGeometry(0, 0, self.width(), self.height())
-        # Субтитры рисует общий оверлей EditTab — переподгоняем под это окно.
-        try:
-            self.edit._position_overlay()
-        except Exception:
-            pass
-        # Панель — отдельное окно: позиционируем в ГЛОБАЛЬНЫХ координатах внизу.
-        bar_h = max(64, self.bar.sizeHint().height())
-        tl = self.mapToGlobal(QPoint(0, self.height() - bar_h))
-        self.bar.setGeometry(tl.x(), tl.y(), self.width(), bar_h)
-        if self.bar.isVisible():
-            self.bar.raise_()   # поверх оверлея субтитров
-        # self.bar — WA_TranslucentBackground + WindowType.Tool получает нативный
-        # хэндл сразу при создании (до первого setGeometry), поэтому его QScreen
-        # застревает на том экране, где он появился на свет (обычно первичный
-        # монитор) — даже когда полноэкранное окно реально открыто на ДРУГОМ
-        # мониторе. Из-за этого стандартный hover-tooltip кнопок панели считает
-        # границы экрана по чужому монитору и получается «за пределами экрана».
-        # Перепривязываем окно панели к экрану, где она физически оказалась.
-        try:
-            scr = QApplication.screenAt(tl)
-            wh = self.bar.windowHandle()
-            if scr is not None and wh is not None and wh.screen() is not scr:
-                wh.setScreen(scr)
-        except Exception:
-            pass
-
-    def resizeEvent(self, ev):
-        super().resizeEvent(ev)
-        self._relayout()
-
-    # ── Синхронизация со плеером ─────────────────────────────────────────────
-    def sync_from_player(self):
-        e = self.edit
-        dur = e.duration or 0.0
-        pos_s = e.player.position() / 1000.0
-        self.lbl_cur.setText(s_to_time(pos_s))
-        self.lbl_tot.setText(s_to_time(dur))
-        if dur > 0 and not self.slider.is_user_seeking():
-            # Плеер авто-паузится за кадр до конца, поэтому у самого конца
-            # «дотягиваем» полосу до 100%, чтобы она доходила до края.
-            frac = 1.0 if pos_s >= (dur - 0.08) else (pos_s / dur)
-            self.slider.blockSignals(True)
-            self.slider.setValue(int(frac * 1000))
-            self.slider.blockSignals(False)
-
-    def update_play_icon(self, playing):
-        ic = QStyle.StandardPixmap.SP_MediaPause if playing else QStyle.StandardPixmap.SP_MediaPlay
-        self.btn_play.setIcon(self.style().standardIcon(ic))
-
-    def _on_slider_moved(self, value):
-        dur = self.edit.duration or 0.0
-        if dur > 0:
-            self.edit.seek_to((value / 1000.0) * dur)
-        self._show_bar()
-
-    def _on_volume_changed(self, v):
-        # Звуком управляет основной ползунок вкладки — отражаем туда значение
-        # (он применит его к audio_output и обновит свой значок).
-        try:
-            self.edit.vol_slider.setValue(int(v))
-        except Exception:
-            pass
-        try:
-            self.vol_lbl.update_glyph(int(v))
-        except Exception:
-            pass
-        self._show_bar()
-
-    def sync_volume(self):
-        """Подтягивает текущую громкость из основного ползунка вкладки."""
-        try:
-            v = int(self.edit.vol_slider.value())
-            self.vol_slider.blockSignals(True)
-            self.vol_slider.setValue(v)
-            self.vol_slider.blockSignals(False)
-            self.vol_lbl.update_glyph(v)
-        except Exception:
-            pass
-
-    # ── Авто-скрытие панели/курсора ──────────────────────────────────────────
-    def _show_bar(self):
-        self._relayout()
-        self.bar.show(); self.bar.raise_()
-        self.unsetCursor()
-        self._hide_timer.start()
-
-    def _hide_bar(self):
-        # Не прячем, пока курсор над самой панелью (пользователь ей пользуется).
-        # geometry() панели теперь в глобальных координатах (отдельное окно).
-        if self.bar.geometry().contains(self.cursor().pos()):
-            self._hide_timer.start()
-            return
-        self.bar.hide()
-        self.setCursor(Qt.CursorShape.BlankCursor)
-
-    def mouseMoveEvent(self, ev):
-        self._show_bar()
-        super().mouseMoveEvent(ev)
-
-    def mouseDoubleClickEvent(self, ev):
-        self.edit.exit_fullscreen()
-
-    def eventFilter(self, obj, ev):
-        # Esc/стрелки, нажатые когда активно окно панели, перенаправляем сюда.
-        if obj is self.bar and ev.type() == QEvent.Type.KeyPress:
-            self.keyPressEvent(ev)
-            if ev.isAccepted():
-                return True
-        # ЗАПРЕЩЕНО: показывать подсказки кнопок через QToolTip.showText на
-        # Enter/Leave. Этот самописный механизм МЕРЦАЛ и рисовал инородную рамку.
-        # Подсказки кнопок теперь штатные (b.setToolTip в _fsbtn) — как у кнопки
-        # «Сохранить кадр» вне полноэкранного режима. Не возвращать сюда tip-логику.
-        return super().eventFilter(obj, ev)
-
-    def keyPressEvent(self, ev):
-        k = ev.key()
-        if k in (Qt.Key.Key_Escape, Qt.Key.Key_F):
-            self.edit.exit_fullscreen()
-        elif k == Qt.Key.Key_Space:
-            self.edit.toggle_play()
-        elif k == Qt.Key.Key_Left:
-            self.edit.step_frame_scrub(-1)
-        elif k == Qt.Key.Key_Right:
-            self.edit.step_frame_scrub(1)
-        else:
-            super().keyPressEvent(ev)
-
-    def closeEvent(self, ev):
-        # Панель — отдельное окно: прячем явно, чтобы не зависла на экране.
-        try: self.bar.hide()
-        except Exception: pass
-        # Если окно закрыли системно (Alt+F4) — аккуратно вернём видео обратно.
-        if getattr(self.edit, "_fs_window", None) is self:
-            self.edit.exit_fullscreen()
-        super().closeEvent(ev)
-
-
-class SubtitleEditDialog(QDialog):
-    """Простой редактор субтитров в формате SRT. Сохранение НЕ трогает оригинал —
-    EditTab записывает результат в отдельный .srt и делает его активной дорожкой,
-    так что и превью, и вшивание при обрезке используют отредактированный текст."""
-
-    def __init__(self, srt_text, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Редактирование субтитров")
-        self.resize(660, 540)
-        self.setStyleSheet(f"""
-            QDialog {{ background: {C['bg']}; }}
-            QLabel {{ color: {C['text2']}; font-size: 12px; }}
-            QPlainTextEdit {{
-                background: {C['surface3']}; color: {C['text']};
-                border: 1px solid {C['border2']}; border-radius: 6px;
-                padding: 6px; selection-background-color: {C['accent']};
-            }}
-            QPushButton {{
-                background: {C['surface3']}; color: {C['text']};
-                border: 1px solid {C['border2']}; border-radius: 6px;
-                padding: 6px 16px;
-            }}
-            QPushButton:hover {{ background: {C['border2']}; border-color: {C['accent']}; }}
-        """)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 14, 14, 12)
-        lay.setSpacing(8)
-        info = QLabel(
-            "Формат SRT: номер реплики, строка тайм-кода "
-            "«00:00:01,000 --> 00:00:03,000», затем текст; реплики разделяются "
-            "пустой строкой. Оригинальный файл не изменяется.")
-        info.setWordWrap(True)
-        lay.addWidget(info)
-        self.editor = QPlainTextEdit()
-        self.editor.setPlainText(srt_text)
-        mono = QFont("Consolas" if os.name == 'nt' else "Monospace")
-        mono.setPointSize(10)
-        self.editor.setFont(mono)
-        self.editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-        lay.addWidget(self.editor, 1)
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Save
-                              | QDialogButtonBox.StandardButton.Cancel)
-        bb.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить")
-        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-
-    def text(self):
-        return self.editor.toPlainText()
-
-
-# Минимальный размер блока для ПРЕДпоследнего (последнего «блочного») шага.
-# Раньше геометрия шла до 1px, и предпоследний шаг выходил ~2px — а 2px визуально
-# почти неотличим от чёткого кадра, шаг получался «пустым». Держим пол в 6px:
-# последний блочный шаг всегда заметно пикселизирован, потом сразу «чётко».
-_PIXELIZE_MIN_BLOCK = 6
-
-
-def _pixelize_block_sequence(block0, steps):
-    """Размеры блока (px) по шагам проявления: геометрически убывают от block0 до
-    пола (_PIXELIZE_MIN_BLOCK), а самый последний шаг — «чётко» (1). Каждый
-    следующий блок мельче → «пикселей становится больше», пока кадр не прояснится.
-    При steps==1 — один статичный уровень (block0) без финального прояснения.
-    Предпоследний шаг не опускается ниже пола (5px), чтобы не было «пустого» 2px-
-    шага у самой чёткости."""
-    block0 = max(2, int(block0)); steps = max(1, int(steps))
-    if steps == 1:
-        return [max(1, min(1024, block0))]
-    floor = min(block0, _PIXELIZE_MIN_BLOCK)   # пол не выше самого block0
-    n_block = steps - 1                        # шаги до финального «чётко»
-    seq = []
-    for i in range(n_block):
-        if n_block == 1:
-            b = block0
-        else:
-            # i=0 → block0, i=n_block-1 → floor (геометрически между ними).
-            t = i / (n_block - 1)
-            b = block0 * (floor / block0) ** t
-        seq.append(max(1, min(1024, int(round(b)))))
-    seq.append(1)                              # финальный шаг — чётко
-    return seq
-
-
-class _PixelizeDialog(QDialog):
-    """Настройка эффекта «проявление из пикселей»: число шагов и стартовый размер
-    блока. Превью показывает, как блок мельчает по шагам до чёткой картинки."""
-
-    def __init__(self, steps=6, block=64, parent=None,
-                 image_mode=False, duration=5.0, fps=25):
-        super().__init__(parent)
-        self._image_mode = bool(image_mode)
-        self.setWindowTitle("Пикселизация — проявление")
-        self.setStyleSheet(f"""
-            QDialog {{ background: {C['bg']}; }}
-            QLabel {{ color: {C['text2']}; font-size: 12px; }}
-            QSpinBox {{
-                background: {C['surface3']}; color: {C['text']};
-                border: 1px solid {C['border2']}; border-radius: 6px;
-                padding: 5px 8px; font-size: 13px; min-width: 64px;
-            }}
-            QSpinBox:focus {{ border-color: {C['accent']}; }}
-            QPushButton {{
-                background: {C['surface3']}; color: {C['text']};
-                border: 1px solid {C['border2']}; border-radius: 6px;
-                padding: 6px 16px;
-            }}
-            QPushButton:hover {{ background: {C['border2']}; border-color: {C['accent']}; }}
-        """)
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(16, 14, 16, 12); lay.setSpacing(10)
-        if self._image_mode:
-            info = QLabel(
-                "Из картинки получится ВИДЕО: кадр начнётся крупными «пикселями» и за "
-                "несколько шагов прояснится. Задай длительность ролика и параметры "
-                "проявления. Готовое видео сохранится кнопкой «Обрезать».")
-        else:
-            info = QLabel(
-                "Видео начнётся крупными «пикселями» и с каждым шагом будет становиться "
-                "чётче, пока не прояснится полностью. Идеально для угадайки. Эффект "
-                "применяется при «Обрезать» и требует перекодировки.")
-        info.setWordWrap(True); lay.addWidget(info)
-
-        # Для картинки нужна длительность результата (у изображения её нет) и FPS.
-        self.sp_dur = None; self.sp_fps = None
-        if self._image_mode:
-            rowd = QHBoxLayout(); rowd.setSpacing(8)
-            rowd.addWidget(QLabel("Длительность видео, сек"))
-            self.sp_dur = QSpinBox(); self.sp_dur.setRange(1, 120)
-            self.sp_dur.setValue(max(1, int(round(float(duration)))))
-            rowd.addStretch(1); rowd.addWidget(self.sp_dur)
-            lay.addLayout(rowd)
-
-            rowf = QHBoxLayout(); rowf.setSpacing(8)
-            rowf.addWidget(QLabel("Кадров в секунду (FPS)"))
-            self.sp_fps = QSpinBox(); self.sp_fps.setRange(1, 60)
-            self.sp_fps.setValue(max(1, int(fps)))
-            rowf.addStretch(1); rowf.addWidget(self.sp_fps)
-            lay.addLayout(rowf)
-
-        row1 = QHBoxLayout(); row1.setSpacing(8)
-        row1.addWidget(QLabel("Число шагов проявления"))
-        self.sp_steps = QSpinBox(); self.sp_steps.setRange(1, 20); self.sp_steps.setValue(int(steps))
-        row1.addStretch(1); row1.addWidget(self.sp_steps)
-        lay.addLayout(row1)
-
-        row2 = QHBoxLayout(); row2.setSpacing(8)
-        row2.addWidget(QLabel("Начальный размер блока, px"))
-        self.sp_block = QSpinBox(); self.sp_block.setRange(4, 256)
-        self.sp_block.setSingleStep(4); self.sp_block.setValue(int(block))
-        row2.addStretch(1); row2.addWidget(self.sp_block)
-        lay.addLayout(row2)
-
-        self.preview = QLabel()
-        self.preview.setWordWrap(True)
-        self.preview.setStyleSheet(f"color: {C['text3']}; font-size: 11px; font-weight: 700;")
-        lay.addWidget(self.preview)
-
-        self.sp_steps.valueChanged.connect(self._update_preview)
-        self.sp_block.valueChanged.connect(self._update_preview)
-        self._update_preview()
-
-        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
-                              | QDialogButtonBox.StandardButton.Cancel)
-        bb.button(QDialogButtonBox.StandardButton.Ok).setText("Применить")
-        bb.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
-        bb.accepted.connect(self.accept)
-        bb.rejected.connect(self.reject)
-        lay.addWidget(bb)
-
-    def _update_preview(self):
-        seq = _pixelize_block_sequence(self.sp_block.value(), self.sp_steps.value())
-        parts = [f"{b}px" if b > 1 else "чётко" for b in seq]
-        self.preview.setText("Блоки по шагам:   " + "   →   ".join(parts))
-
-    def values(self):
-        return int(self.sp_steps.value()), int(self.sp_block.value())
-
-    def image_values(self):
-        """Длительность (сек) и FPS — только в режиме картинки."""
-        dur = int(self.sp_dur.value()) if self.sp_dur is not None else 5
-        fps = int(self.sp_fps.value()) if self.sp_fps is not None else 25
-        return dur, fps
-
+from edit_tab_workers import (
+    AssExtractor, AudioSegmentWaveformLoader, AudioWaveformLoader,
+    FfmpegWorker, ProxyWorker, ShareDeleteIODevice, SmartCutWorker,
+    SubtitleExtractor, VideoInpaintWorker
+)
+from edit_tab_widgets import (
+    AudioMeter, FullscreenVideo, InfoCard, SeekPreview, SeekSlider,
+    SubtitleOverlay, VideoCanvas, VolumeLabel, VolumeSlider,
+    WaveformWidget
+)
+from edit_tab_dialogs import (
+    SubtitleCreatorDialog, SubtitleEditDialog, _PixelizeDialog,
+    _VideoMaskDialog
+)
+from PyQt6.QtCore import (QUrl)
+from PyQt6.QtGui import (QImage, QShortcut)
+from PyQt6.QtWidgets import (QScrollBar, QSizePolicy, QStyle, QToolTip)
 
 # ─── Edit Tab ─────────────────────────────────────────────────────────────────
 class EditTab(QWidget):
@@ -4055,6 +111,7 @@ class EditTab(QWidget):
         # на источник: ('emb', i) встроенная дорожка | ('ext', path) внешний файл.
         self._audio_ext = []
         self._sub_ext = []
+        self._sub_ext_hidden = []   # отфильтровано _scan_external_subs, см. _expand_external_subs
         self._audio_entries = []
         self._sub_entries = []
         # Внешняя озвучка: отдельный аудиоплеер, синхронный с основным (звук видео
@@ -4108,6 +165,10 @@ class EditTab(QWidget):
         self._scrub_audio_src = None
         self._scrub_blip_timer = None
         self._scrub_blip_player = None
+        self._scrub_blip_output = None
+        self._scrub_hard_pause_timer = None
+        self._scrub_pending = None
+        self._scrub_media_status_wired = False
         # Папка экспорта обрезки ("" = рядом с исходником)
         self.export_dir = ""
         self.undo_stack: deque = deque(maxlen=50)
@@ -4150,6 +211,8 @@ class EditTab(QWidget):
         self.ffmpeg_thread = None
         self.proxy_thread = None
         self.audio_worker = None
+        self._audio_partial_worker = None   # быстрый предпросмотр волны выделения при смене дорожки
+        self._waveform_gen = 0              # отбрасывает устаревшие ответы воркеров волны
         self._waveform_cache = {}   # (path, mtime, size, audio_index) -> (samples, duration, left, right)
         self._subtitle_fonts_cache = {}   # (path, mtime, size) -> fonts_dir
 
@@ -4185,11 +248,36 @@ class EditTab(QWidget):
         lay.addStretch()
 
     # ── UI Construction ────────────────────────────────────────────────────
+    # ── UI Construction ────────────────────────────────────────────────────
     def init_ui(self):
+        """Сборка интерфейса вкладки.
+
+        Раньше это был один метод на ~900 строк. Разбит на секции-строители
+        по тем же границам, что были обозначены комментариями внутри; порядок
+        вызовов и сами операции не изменились. Промежуточные контейнеры
+        передаются явными параметрами (а не через self), чтобы было видно,
+        какая секция что использует."""
+        root = self._build_root_layout()
+        sidebar, sb_outer, sb_scroll, sb_content, sb_layout = self._build_sidebar()
+        pbq_card = self._build_quality_card()
+        self._build_proxy_card(pbq_card, sb_content, sb_layout, sb_outer, sb_scroll)
+        self._build_cut_summary(sb_outer)
+        center = self._build_center_area()
+        self._build_player_bar(center)
+        self._build_timeline_panel(center, root, sidebar)
+
+    def _build_root_layout(self):
+        """Корневой горизонтальный layout вкладки. Возвращает root."""
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        return root
+
+    def _build_sidebar(self):
+        """Правая боковая панель (инфо/экспорт) внутри QScrollArea.
+        Возвращает саму панель и её внутренние контейнеры — они нужны
+        секциям «прокси» и «итог», которые дозаполняют ту же панель."""
         # ── Right sidebar (прокручиваемая) ────────────────────────────────
         # Содержимое (инфо/экспорт) живёт в QScrollArea — если по высоте не
         # умещается, появляется вертикальный скроллбар. Кнопки «Итог» и
@@ -4411,6 +499,11 @@ class EditTab(QWidget):
 
         sb_layout.addWidget(export_card)
 
+        return sidebar, sb_outer, sb_scroll, sb_content, sb_layout
+
+    def _build_quality_card(self):
+        """Карточка «Качество воспроизведения» в боковой панели. Возвращает карточку
+        (следующая секция вставляет карточку прокси сразу после неё)."""
         # ── Качество воспроизведения (как в Filmora) ──────────────────────────
         # Понижает разрешение ТОЛЬКО предпросмотра (через прокси), чтобы плеер и
         # перемотка работали шустрее на слабом железе/тяжёлых файлах. На экспорт
@@ -4440,6 +533,10 @@ class EditTab(QWidget):
         pbq_card._body.addWidget(pbq_lbl)
         pbq_card._body.addWidget(self.cmb_pb_quality)
 
+        return pbq_card
+
+    def _build_proxy_card(self, pbq_card, sb_content, sb_layout, sb_outer, sb_scroll):
+        """Карточка «Прокси только для части файла» — ставится под карточкой качества."""
         # ── Прокси только для части файла ─────────────────────────────────────
         # Сколько МИНУТ исходника превращать в прокси (0 = весь файл). Усечённый
         # прокси собирается быстрее на длинных/тяжёлых видео; предпросмотр тогда
@@ -4488,6 +585,8 @@ class EditTab(QWidget):
         for _w in sb_content.findChildren(QComboBox):
             self._install_wheel_scroll(_w)
 
+    def _build_cut_summary(self, sb_outer):
+        """Итог обрезки и кнопка «Обрезать» — закреплены СНИЗУ, вне прокрутки."""
         # ── Итог + кнопка обрезки — закреплены СНИЗУ (вне прокрутки) ───────
         # Высота блока = высоте полосы таймлайна (BAND_H ниже) → «Итог»/«Обрезать»
         # визуально на одной строке с виджетом аудио-визуализации слева.
@@ -4550,6 +649,8 @@ class EditTab(QWidget):
         # Сайдбар добавляется ПОСЛЕ центральной области (root.addWidget ниже),
         # чтобы видео и плеер были слева, а панель информации/экспорта — справа.
 
+    def _build_center_area(self):
+        """Центральная область: холст видео и его оверлеи. Возвращает layout center."""
         # ── Center area ───────────────────────────────────────────────────
         center = QVBoxLayout()
         center.setContentsMargins(0, 0, 0, 0)
@@ -4753,6 +854,18 @@ class EditTab(QWidget):
             "кистью на кадре — нейросеть LaMa уберёт его со всех кадров")
         self.btn_remove_object.clicked.connect(self.remove_object_from_video)
         self.btn_remove_object.setEnabled(False)
+        # «Создать субтитры» — реплики (текст+тайминг) и позиция на экране задаются
+        # в отдельном окне (SubtitleCreatorDialog), результат — новая .ass-дорожка.
+        self.btn_create_subs = make_icon_btn("")
+        self.btn_create_subs.setIcon(get_icon('fa5s.closed-captioning'))
+        self.btn_create_subs.setIconSize(QSize(18, 18))
+        self._relax_width(self.btn_create_subs)
+        self.btn_create_subs.setToolTip(
+            "Создать субтитры: текст, тайминг и позиция на экране "
+            "задаются в отдельном окне. Если сейчас выбрана дорожка "
+            "субтитров — открывает её же на редактирование")
+        self.btn_create_subs.clicked.connect(self.create_subtitles)
+        self.btn_create_subs.setEnabled(False)
         self.btn_delete_source = make_icon_btn("", danger=True)
         self.btn_delete_source.setIcon(get_icon('fa5s.trash-alt', color='#11111b'))
         self.btn_delete_source.setIconSize(QSize(18, 18))
@@ -4761,15 +874,29 @@ class EditTab(QWidget):
         self.btn_delete_source.clicked.connect(self.delete_source_file)
         self.btn_delete_source.setEnabled(False)
 
-        # Левая колонка — кнопки, прижаты к низу (высота — под ровно 8 значков).
-        btn_col = QVBoxLayout(); btn_col.setContentsMargins(0, 0, 0, 0)
-        btn_col.setSpacing(self._MSIDE_GAP)
-        btn_col.addStretch(1)
+        # Две колонки по 4 квадратные кнопки (место под 8 штук) — левая и правая,
+        # каждая прижата к низу (симметрично высоте шкалы уровня звука справа).
+        # Правая колонка нарочно короче: «Удалить исходник» (опасная, красная)
+        # держим самой нижней — как и раньше в одной колонке.
         self._montage_side_btns = [self.btn_crop_frame, self.btn_pixelize,
                                    self.btn_save_frame, self.btn_remove_object,
-                                   self.btn_delete_source]
-        for _b in self._montage_side_btns:
-            btn_col.addWidget(_b)
+                                   self.btn_create_subs, self.btn_delete_source]
+        col_l = QVBoxLayout(); col_l.setContentsMargins(0, 0, 0, 0)
+        col_l.setSpacing(self._MSIDE_GAP)
+        col_l.addStretch(1)
+        for _b in (self.btn_crop_frame, self.btn_pixelize,
+                   self.btn_save_frame, self.btn_remove_object):
+            col_l.addWidget(_b)
+        col_r = QVBoxLayout(); col_r.setContentsMargins(0, 0, 0, 0)
+        col_r.setSpacing(self._MSIDE_GAP)
+        col_r.addStretch(1)
+        for _b in (self.btn_create_subs, self.btn_delete_source):
+            col_r.addWidget(_b)
+        btn_col = QHBoxLayout(); btn_col.setContentsMargins(0, 0, 0, 0)
+        btn_col.setSpacing(self._MSIDE_GAP)
+        btn_col.addLayout(col_l)
+        btn_col.addLayout(col_r)
+        btn_col.addStretch(1)   # не растягивать колонки шире квадратных кнопок
 
         # Правая колонка — подпись + шкала, отцентрованная под текстом.
         vu_col = QVBoxLayout(); vu_col.setContentsMargins(0, 0, 0, 0); vu_col.setSpacing(3)
@@ -4796,6 +923,10 @@ class EditTab(QWidget):
         video_row.addWidget(side, 0)
         center.addLayout(video_row, stretch=1)
 
+        return center
+
+    def _build_player_bar(self, center):
+        """Панель плеера под видео: play/pause, время, громкость, покадровый шаг."""
         # ── Player bar (прямо под видео) ──────────────────────────────────
         # Компактный плеер как в обычном видеоплеере: полоса воспроизведения,
         # тайминги (текущее/общее), кнопки и громкость — всё под самим видео.
@@ -4986,6 +1117,8 @@ class EditTab(QWidget):
         # Состояние полноэкранного режима (окно создаётся по запросу).
         self._fs_window = None
 
+    def _build_timeline_panel(self, center, root, sidebar):
+        """Нижняя панель таймлайна (волна, субтитры) и финальная сборка вкладки."""
         # ── Timeline panel ────────────────────────────────────────────────
         # Высота полосы таймлайна фиксирована и совпадает с нижним блоком правой
         # панели («Итог» + «Обрезать»), чтобы они визуально были одной строкой.
@@ -5629,6 +1762,10 @@ class EditTab(QWidget):
             for p in self._sub_ext:
                 self.cmb_subs.addItem(get_icon('fa5s.file'), os.path.basename(p))
                 self._sub_entries.append(('ext', p))
+            if getattr(self, "_sub_ext_hidden", None):
+                self.cmb_subs.addItem(get_icon('fa5s.folder-open'),
+                                       f"Показать другие файлы в папке… ({len(self._sub_ext_hidden)})")
+                self._sub_entries.append(('more', None))
             self.cmb_subs.setEnabled(len(self._sub_entries) > 0)
         finally:
             self._loading_tracks = False
@@ -5653,8 +1790,10 @@ class EditTab(QWidget):
             except Exception:
                 pass
             # Инфо-метки (кодек/каналы/битрейт) и аудиоволна — под новую дорожку.
+            # prioritize_selection: сперва быстро строим волну на выделенном
+            # отрезке, полный файл досчитывается следом в фоне.
             self._update_audio_info_labels(st)
-            self._start_waveform(self.actual_source_file, st.get('index'))
+            self._start_waveform(self.actual_source_file, st.get('index'), prioritize_selection=True)
         else:
             # Внешний файл озвучки → играет отдельный синхронный плеер.
             self.selected_audio_abs_index = None
@@ -5662,7 +1801,7 @@ class EditTab(QWidget):
             self._set_external_audio(ref)
             self._update_audio_info_labels(self._probe_audio_stream(ref))
             # Волну строим из самого файла озвучки (единственная дорожка).
-            self._start_waveform(ref, None)
+            self._start_waveform(ref, None, prioritize_selection=True)
 
     def _update_audio_info_labels(self, ainfo):
         """Обновляет метки «кодек/каналы» и «битрейт» под выбранную аудиодорожку
@@ -5774,25 +1913,99 @@ class EditTab(QWidget):
         except Exception:
             pass
 
-    def _scan_external_subs(self, src):
-        """Ищет внешние файлы субтитров рядом с видео и в подпапках (до 3 уровней)."""
-        found = []
+    # Типовые названия папок с субтитрами — подпапка с таким именем считается
+    # «своей» для видео даже если её имя не перекликается со стемом файла.
+    _SUB_FOLDER_NAMES = {'subs', 'sub', 'subtitles', 'subtitle', 'ass', 'srt',
+                          'субтитры', 'сабы'}
+
+    @classmethod
+    def _path_relates_to_stem(cls, rel_dir, stem):
+        """True, если относительный путь подпапки (от папки видео) похож на
+        подпапку ИМЕННО этого фильма/серии — по имени сегмента пути или по
+        типовому названию папки субтитров. Не считаем «своей» произвольную
+        подпапку общего каталога с раздачами — см. _scan_external_subs."""
+        if not rel_dir:
+            return True
+        for seg in rel_dir.replace('\\', '/').split('/'):
+            seg_l = seg.lower()
+            if seg_l in cls._SUB_FOLDER_NAMES:
+                return True
+            if stem and (stem in seg_l or seg_l in stem):
+                return True
+        return False
+
+    def _scan_external_subs(self, src, expanded=False):
+        """Ищет внешние файлы субтитров рядом с видео и в подпапках (до 3
+        уровней). По умолчанию (expanded=False) включает только «свои»:
+        файлы прямо в папке видео + файлы в подпапках самого фильма/серии
+        (см. _path_relates_to_stem) — иначе общая папка с чужими раздачами
+        (шрифты/сабы десятков разных тайтлов лежат рядом) засоряла список
+        посторонними файлами. Отфильтрованные складываются в
+        self._sub_ext_hidden — доступны через пункт «Показать другие файлы»
+        в списке дорожек (см. _expand_external_subs)."""
+        found, hidden = [], []
         try:
             base = os.path.dirname(str(src))
             if not base or not os.path.isdir(base):
+                self._sub_ext_hidden = []
                 return []
+            stem = os.path.splitext(os.path.basename(str(src)))[0].lower()
             for root, dirs, files in os.walk(base):
-                depth = root[len(base):].count(os.sep)
+                rel_dir = root[len(base):].lstrip(os.sep)
+                depth = rel_dir.count(os.sep) + (1 if rel_dir else 0)
                 if depth >= 3:
                     dirs[:] = []
+                related = expanded or self._path_relates_to_stem(rel_dir, stem)
                 for fn in files:
                     if os.path.splitext(fn)[1].lower() in self._SUB_EXTS:
-                        found.append(os.path.join(root, fn))
-                        if len(found) >= 200:
+                        p = os.path.join(root, fn)
+                        (found if related else hidden).append(p)
+                        if len(found) + len(hidden) >= 500:
+                            self._sub_ext_hidden = self._sort_external_subs(hidden, src)
                             return self._sort_external_subs(found, src)
         except Exception:
             pass
+        self._sub_ext_hidden = self._sort_external_subs(hidden, src)
         return self._sort_external_subs(found, src)
+
+    def _expand_external_subs(self):
+        """«Показать другие файлы» — досыпает в cmb_subs файлы, отфильтрованные
+        _scan_external_subs как не относящиеся к этому фильму/серии."""
+        hidden = getattr(self, "_sub_ext_hidden", None)
+        if not hidden:
+            return
+        self._sub_ext_hidden = []
+        for p in hidden:
+            if p not in self._sub_ext:
+                self._sub_ext.append(p)
+        self._populate_track_combos_subs_only()
+
+    def _populate_track_combos_subs_only(self):
+        """Перестраивает только cmb_subs (список дорожек субтитров), не трогая
+        аудио/сброс текущего показа — используется _expand_external_subs, чтобы
+        клик «Показать другие файлы» не гасил уже выбранную дорожку."""
+        cur_kind_ref = (self._sub_entries[self.cmb_subs.currentIndex() - 1]
+                        if self.cmb_subs.currentIndex() > 0 else None)
+        self._loading_tracks = True
+        try:
+            self.cmb_subs.clear()
+            self.cmb_subs.addItem("Выкл")
+            self._sub_entries = []
+            for i, s in enumerate(self._sub_streams):
+                self.cmb_subs.addItem(self._track_label(s, i, "Субтитры", total=len(self._sub_streams)))
+                self._sub_entries.append(('emb', i))
+            for p in self._sub_ext:
+                self.cmb_subs.addItem(get_icon('fa5s.file'), os.path.basename(p))
+                self._sub_entries.append(('ext', p))
+            if getattr(self, "_sub_ext_hidden", None):
+                self.cmb_subs.addItem(get_icon('fa5s.folder-open'),
+                                       f"Показать другие файлы в папке… ({len(self._sub_ext_hidden)})")
+                self._sub_entries.append(('more', None))
+            self.cmb_subs.setEnabled(len(self._sub_entries) > 0)
+            if cur_kind_ref is not None and cur_kind_ref in self._sub_entries:
+                self.cmb_subs.setCurrentIndex(self._sub_entries.index(cur_kind_ref) + 1)
+        finally:
+            self._loading_tracks = False
 
     @staticmethod
     def _sort_external_subs(paths, src):
@@ -5832,8 +2045,18 @@ class EditTab(QWidget):
         if path not in self._sub_ext:
             self._sub_ext.append(path)
             self._loading_tracks = True
-            self._sub_entries.append(target)
-            self.cmb_subs.addItem(get_icon('fa5s.file'), os.path.basename(path))
+            # «Показать другие файлы…», если есть, всегда должен остаться
+            # последним пунктом списка — новую дорожку вставляем ПЕРЕД ним,
+            # а не просто в конец (иначе выбор «Показать другие» смещался бы).
+            more_at = next((i for i, e in enumerate(self._sub_entries)
+                            if e[0] == 'more'), None)
+            if more_at is None:
+                self._sub_entries.append(target)
+                self.cmb_subs.addItem(get_icon('fa5s.file'), os.path.basename(path))
+            else:
+                self._sub_entries.insert(more_at, target)
+                self.cmb_subs.insertItem(more_at + 1, get_icon('fa5s.file'),
+                                          os.path.basename(path))
             self.cmb_subs.setEnabled(True)
             self._loading_tracks = False
         try:
@@ -5892,6 +2115,43 @@ class EditTab(QWidget):
                 except Exception: pass
         return None
 
+    def _extract_srt_for_entry(self, kind, ref):
+        """Текст произвольной дорожки (self._sub_entries) в виде SRT — не
+        трогает текущий выбор в cmb_subs/состояние плеера, в отличие от
+        _current_subs_as_srt (та работает только с АКТИВНОЙ дорожкой). Нужен
+        для «Создать субтитры» → «Редактировать существующую», где дорожка,
+        которую правит пользователь, может отличаться от активной."""
+        if kind == 'emb':
+            src, idx = self.actual_source_file, ref
+        else:
+            src, idx = ref, 0
+            if str(ref).lower().endswith('.srt'):
+                try:
+                    with open(ref, 'r', encoding='utf-8', errors='replace') as f:
+                        return f.read()
+                except Exception:
+                    pass
+        if not src:
+            return None
+        tmp = None
+        try:
+            tf = tempfile.NamedTemporaryFile(delete=False, suffix=".srt")
+            tmp = tf.name; tf.close()
+            cmd = [FFMPEG, "-y", "-i", str(src), "-map", f"0:s:{idx}", tmp]
+            kw = {'creationflags': CREATE_NO_WINDOW} if os.name == 'nt' else {}
+            subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=60, **kw)
+            if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                with open(tmp, 'r', encoding='utf-8', errors='replace') as f:
+                    return f.read()
+        except Exception:
+            return None
+        finally:
+            if tmp:
+                try: os.remove(tmp)
+                except Exception: pass
+        return None
+
     def edit_subtitles(self):
         if self.cmb_subs.currentIndex() <= 0:
             msgbox_information(self, "Субтитры",
@@ -5904,7 +2164,11 @@ class EditTab(QWidget):
                 "Не удалось получить текст субтитров для редактирования "
                 "(возможно, это субтитры-картинки).")
             return
-        dlg = SubtitleEditDialog(srt, self)
+        try:
+            cur_t = self.player.position() / 1000.0
+        except Exception:
+            cur_t = None
+        dlg = SubtitleEditDialog(srt, self, current_time_s=cur_t)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         new_text = dlg.text()
@@ -5938,6 +2202,128 @@ class EditTab(QWidget):
                 self.cmb_subs.setCurrentIndex(idx)
         else:
             self._add_external_sub(path)
+
+    def create_subtitles(self):
+        """«Создать субтитры»: диалог с репликами (текст+тайминг) и позицией на
+        экране. Если в Монтаже сейчас выбрана дорожка субтитров (cmb_subs) —
+        сразу редактируем ЕЁ (без лишнего диалога-выбора — раньше он всплывал
+        каждый раз и раздражал); если ничего не выбрано — начинаем с чистого
+        листа. Результат — новый .ass, добавляется как внешняя дорожка (та же
+        логика, что и для отредактированного файла в edit_subtitles)."""
+        if not self.actual_source_file and not getattr(self, "is_still_image", False):
+            msgbox_information(self, "Субтитры", "Сначала откройте видео.")
+            return
+        # Пока пересобирается прокси (смена качества предпросмотра), self.filepath
+        # на мгновение указывает на уже удалённый временный файл (см.
+        # _on_pb_quality_changed) — второй плеер диалога открыл бы то, чего нет.
+        if self.proxy_thread and self.proxy_thread.isRunning():
+            msgbox_information(self, "Субтитры",
+                               "Дождитесь подготовки превью и повторите.")
+            return
+        cues_arg = None
+        idx = self.cmb_subs.currentIndex()
+        if 0 < idx <= len(self._sub_entries):
+            kind, ref = self._sub_entries[idx - 1]
+            if kind != 'more':
+                srt = self._extract_srt_for_entry(kind, ref)
+                cues_arg = _parse_srt(srt) if srt else None
+                if not cues_arg:
+                    msgbox_warning(
+                        self, "Субтитры",
+                        "Не удалось получить текст этой дорожки для "
+                        "редактирования (возможно, это субтитры-картинки).")
+                    return
+        # Диапазон — ровно та обрезка, что выделена в Монтаже (current_in/
+        # current_out), а не всё видео целиком: превью/таймлайн диалога
+        # показывают только его.
+        range_start = self.current_in
+        range_end = self.current_out if self.current_out > range_start else None
+        start_hint = range_start
+        try:
+            pos = self.player.position() / 1000.0
+            if range_end is not None:
+                start_hint = max(range_start, min(pos, range_end))
+            else:
+                start_hint = max(range_start, pos)
+        except Exception:
+            pass
+        # self.filepath — РЕАЛЬНО проигрываемый файл (== actual_source_file, либо
+        # H.264-прокси для AV1/пониженного качества, см. create_proxy_for_preview) —
+        # тот же путь, что и в основном плеере Монтажа. Диалог держит СВОЙ, второй
+        # независимый QMediaPlayer (см. _SubtitlePreview) — если скормить ему сырой
+        # AV1-исходник напрямую, QtMultimedia молча не отдаёт ни одного кадра
+        # (ровно то, ради чего в самом Монтаже и строится прокси).
+        source_path = (self.filepath or self.actual_source_file
+                       or getattr(self, "still_image_path", None))
+        partial_proxy = bool(getattr(self, "is_proxy_active", False)
+                             and getattr(self, "_proxy_partial", False))
+        # Звук превью — та же дорожка, что выбрана в Монтаже (cmb_audio), а не
+        # дефолтная первая дорожка файла (была жалоба на именно это).
+        audio_track_index, audio_ext_path = None, None
+        ext_path = getattr(self, "selected_audio_ext_path", None)
+        if ext_path:
+            audio_ext_path = ext_path
+        else:
+            aidx = self.cmb_audio.currentIndex()
+            if 0 <= aidx < len(self._audio_entries):
+                kind, ref = self._audio_entries[aidx]
+                if kind == 'emb':
+                    audio_track_index = ref
+        dlg = SubtitleCreatorDialog(source_path=source_path, cues=cues_arg,
+                                    start_hint=start_hint,
+                                    range_start=range_start, range_end=range_end,
+                                    ignore_media_duration=partial_proxy,
+                                    default_style=getattr(self, '_last_subtitle_style', None),
+                                    audio_track_index=audio_track_index,
+                                    audio_ext_path=audio_ext_path,
+                                    parent=self)
+        # Диалог декодирует ТОТ ЖЕ файл вторым, независимым QMediaPlayer — на
+        # некоторых GPU аппаратный декодер (d3d11va/dxva2, см. video_hw_decode)
+        # держит лимит одновременных сессий на кодек, и второй сеанс тогда
+        # молча не получает ни одного видеокадра (аудио/позиция при этом
+        # тикают нормально — подтверждено логом watchdog'а: NoError, позиция и
+        # BufferedMedia в порядке, а кадра нет). stop() освобождает декодер
+        # плеера Монтажа на время диалога, не трогая источник/дорожки —
+        # позиция и воспроизведение восстанавливаются простым seek()'ом после.
+        was_playing = self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+        resume_pos_ms = self.player.position()
+        self.player.stop()
+        try:
+            result = dlg.exec()
+        finally:
+            try:
+                self.player.setPosition(resume_pos_ms)
+                if was_playing:
+                    self.player.play()
+            except Exception:
+                pass
+        if result != QDialog.DialogCode.Accepted:
+            return
+        # Запоминаем стиль (шрифт/размер/цвет/…), которым закончил работу
+        # пользователь — следующее открытие «Создать субтитры» стартует с него
+        # (см. default_style выше и save_settings/load_settings).
+        try:
+            self._last_subtitle_style = dlg.last_style()
+            self.save_settings()
+        except Exception:
+            pass
+        cues = dlg.cues()
+        if not cues:
+            return
+        ass_text = _cues_to_ass(cues)
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            base = self.actual_source_file.stem if self.actual_source_file else "subs"
+            path = os.path.join(CONFIG_DIR, f"{base}_created.ass")
+            n = 1
+            while os.path.exists(path) and os.path.normpath(path) not in self._sub_ext:
+                path = os.path.join(CONFIG_DIR, f"{base}_created_{n}.ass"); n += 1
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(ass_text)
+        except Exception as e:
+            msgbox_warning(self, "Субтитры", f"Не удалось сохранить: {e}")
+            return
+        self._add_external_sub(os.path.normpath(path))
 
     def _add_external_audio(self, path):
         target = ('ext', path)
@@ -6075,6 +2461,12 @@ class EditTab(QWidget):
 
     def on_sub_track_changed(self, idx):
         if self._loading_tracks:
+            return
+        # Пункт «Показать другие файлы…» — не дорожка, а команда: досыпать
+        # отфильтрованные файлы в список и остаться на прежнем выборе (см.
+        # _expand_external_subs / _populate_track_combos_subs_only).
+        if 0 < idx <= len(self._sub_entries) and self._sub_entries[idx - 1][0] == 'more':
+            self._expand_external_subs()
             return
         self._stop_sub_extractor()
         self._stop_ass()
@@ -6339,6 +2731,16 @@ class EditTab(QWidget):
             except Exception:
                 pass
             self.audio_worker = None
+        # Воркер быстрого предпросмотра волны выделения (см. _start_waveform).
+        if self._audio_partial_worker and self._audio_partial_worker.isRunning():
+            self._audio_partial_worker.stop(); self._audio_partial_worker.wait()
+        if self._audio_partial_worker:
+            try:
+                if self._audio_partial_worker.tmp_wav and os.path.exists(self._audio_partial_worker.tmp_wav):
+                    os.remove(self._audio_partial_worker.tmp_wav)
+            except Exception:
+                pass
+            self._audio_partial_worker = None
         # Proxy-воркер + его временный файл.
         if self.proxy_thread and self.proxy_thread.isRunning():
             self.proxy_thread.stop(); self.proxy_thread.wait()
@@ -6466,6 +2868,15 @@ class EditTab(QWidget):
             except Exception:
                 pass
             self.audio_worker = None
+        if self._audio_partial_worker and self._audio_partial_worker.isRunning():
+            self._audio_partial_worker.stop(); self._audio_partial_worker.wait()
+        if self._audio_partial_worker:
+            try:
+                if self._audio_partial_worker.tmp_wav and os.path.exists(self._audio_partial_worker.tmp_wav):
+                    os.remove(self._audio_partial_worker.tmp_wav)
+            except Exception:
+                pass
+            self._audio_partial_worker = None
 
         # Останавливаем фоновый proxy-воркер ДО удаления его файла (баг #2).
         if self.proxy_thread and self.proxy_thread.isRunning():
@@ -7015,35 +3426,77 @@ class EditTab(QWidget):
         except OSError:
             return None
 
-    def _start_waveform(self, filepath, audio_index):
+    def _start_waveform(self, filepath, audio_index, prioritize_selection=False):
         """Запускает (или перезапускает) построение аудиоволны для конкретного
         файла и индекса дорожки. Используется и при загрузке файла, и при смене
-        озвучки — тогда волна перестраивается под новую дорожку."""
+        озвучки — тогда волна перестраивается под новую дорожку.
+        prioritize_selection=True (смена аудиодорожки) — сперва запускает
+        быстрый проход ТОЛЬКО по текущему выделению IN/OUT (обычно секунды),
+        чтобы сразу показать/дать проверить нужный кусок, не дожидаясь полного
+        прохода по всему файлу; полный проход всё равно идёт следом и
+        подменяет собой предпросмотр, когда досчитается."""
         if not filepath:
             return
+        self._waveform_gen = getattr(self, "_waveform_gen", 0) + 1
+        gen = self._waveform_gen
         stamp = self._file_cache_stamp(filepath)
         cache_key = (str(filepath), audio_index, stamp) if stamp else None
         cached = self._waveform_cache.get(cache_key) if cache_key else None
-        if cached is not None:
-            self._waveform_cache_key = None
-            self.on_waveform_ready(*cached)
-            return
-        # Снимаем предыдущий воркер, чтобы две волны не гонялись наперегонки
-        # (иначе в виджет прилетела бы волна старой дорожки последней).
+        # Снимаем предыдущие воркеры (полный + быстрый предпросмотр выделения),
+        # чтобы устаревшая волна старой дорожки не прилетела последней.
         if self.audio_worker and self.audio_worker.isRunning():
             try:
                 self.audio_worker.stop(); self.audio_worker.wait()
             except Exception:
                 pass
+        if self._audio_partial_worker and self._audio_partial_worker.isRunning():
+            try:
+                self._audio_partial_worker.stop(); self._audio_partial_worker.wait()
+            except Exception:
+                pass
+        if cached is not None:
+            self._waveform_cache_key = None
+            self.on_waveform_ready(gen, *cached)
+            return
         self.waveform.set_loading("Загрузка волны...")
         self._waveform_cache_key = cache_key
+        seg_in, seg_out = self.current_in, self.current_out
+        if (prioritize_selection and self.duration > 0
+                and 0 <= seg_in < seg_out <= self.duration
+                and (seg_out - seg_in) < self.duration - 0.5):
+            seg_worker = AudioSegmentWaveformLoader(str(filepath), audio_index,
+                                                     seg_in, seg_out, self.duration)
+            seg_worker.finished.connect(
+                lambda samples, s_in, s_out, l, r, g=gen:
+                    self.on_waveform_partial_ready(g, samples, s_in, s_out, l, r))
+            self._audio_partial_worker = seg_worker
+            seg_worker.start()
         self.audio_worker = AudioWaveformLoader(str(filepath), audio_index,
                                                 self.duration)
-        self.audio_worker.finished.connect(self.on_waveform_ready)
-        self.audio_worker.progress.connect(self.waveform.set_loading)
+        self.audio_worker.finished.connect(
+            lambda samples, dur, l, r, g=gen: self.on_waveform_ready(g, samples, dur, l, r))
+        self.audio_worker.progress.connect(self._on_waveform_progress)
         self.audio_worker.start()
 
-    def on_waveform_ready(self, samples, duration, left=None, right=None):
+    def _on_waveform_progress(self, text):
+        # Если волна уже частично заполнена (быстрый предпросмотр выделения —
+        # см. prioritize_selection), set_loading() её бы стёр; тогда прогресс
+        # полного прохода пишем в строку лога вместо полосы волны.
+        if self.waveform.samples:
+            self.log_label.setText(text)
+        else:
+            self.waveform.set_loading(text)
+
+    def on_waveform_partial_ready(self, gen, samples, seg_in, seg_out, left=None, right=None):
+        if gen != getattr(self, "_waveform_gen", gen):
+            return
+        if not samples or self.duration <= 0:
+            return
+        self.waveform.set_partial_data(samples, seg_in, seg_out, self.duration, left, right)
+
+    def on_waveform_ready(self, gen, samples, duration, left=None, right=None):
+        if gen != getattr(self, "_waveform_gen", gen):
+            return
         cache_key = getattr(self, "_waveform_cache_key", None)
         if cache_key is not None:
             self._waveform_cache_key = None
@@ -7213,15 +3666,17 @@ class EditTab(QWidget):
             f"{icon_html('fa5s.stopwatch', 13, C['text'])}  Итог: {s_to_time(dur)}")
 
     def _resize_montage_side_btns(self, col_h):
-        """Высота кнопок боковой панели монтажа = высота колонки на ровно 8 значков."""
+        """Кнопки боковой панели монтажа — квадратные, в две колонки по 4 (место
+        под 8 штук); сторона квадрата = высота колонки на ровно 4 ряда."""
         btns = getattr(self, "_montage_side_btns", None)
         if not btns or col_h <= 0:
             return
-        avail = max(0, int(col_h) - self._MSIDE_GAP * (self._MSIDE_COUNT - 1))
-        bh = max(24, min(40, avail // self._MSIDE_COUNT))
+        rows = self._MSIDE_COUNT // 2
+        avail = max(0, int(col_h) - self._MSIDE_GAP * (rows - 1))
+        bh = max(24, min(40, avail // rows))
         isz = max(14, min(22, bh - 12))
         for b in btns:
-            b.setFixedHeight(bh)
+            b.setFixedSize(bh, bh)
             b.setIconSize(QSize(isz, isz))
 
     @staticmethod
@@ -7407,6 +3862,13 @@ class EditTab(QWidget):
         возвращаем сглаженную отрисовку кадра в VideoCanvas."""
         if isinstance(self.video_widget, VideoCanvas):
             self.video_widget.set_scrub_active(False)
+        # Прогреваем аудио-декодер в новой позиции, пока на паузе — иначе
+        # следующее «Воспроизвести» после перемотки/скраба волной (не только
+        # после кнопки «Стоп», для которой прогрев уже был) ловит ту же
+        # «холодную» задержку звука на пару секунд (см. _preroll_at) — из-за
+        # неё было не докрутить покадровую обрезку по слуху.
+        if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            self._preroll_at(self.player.position() / 1000.0)
 
     def toggle_play(self):
         self._scrubbing = False   # явное play/pause не должно гаситься скрабом
@@ -7585,7 +4047,7 @@ class EditTab(QWidget):
         _fsb = getattr(self, "btn_fullscreen", None)
         if _fsb is not None:
             _fsb.setEnabled(has_video)
-        for name in ("btn_save_frame", "btn_crop_frame", "btn_pixelize"):
+        for name in ("btn_save_frame", "btn_crop_frame", "btn_pixelize", "btn_create_subs"):
             b = getattr(self, name, None)
             if b is not None:
                 b.setEnabled(has_visual)
@@ -8055,6 +4517,61 @@ class EditTab(QWidget):
                 "Удалить объект с видео (водяной знак, эмодзи, логотип): закрасьте "
                 "его кистью на кадре — нейросеть LaMa уберёт его со всех кадров")
 
+    def _set_cut_btn_cancel(self, cancel_mode, cancel_handler=None):
+        """Переключает btn_cut («Обрезать») между обычным видом и «Отмена» на
+        время перекодировки/обрезки — тот же приём, что _set_remove_btn_cancel
+        для «Удалить объект», но с сохранением исходных текста/иконки/стиля:
+        у btn_cut они меняются по режиму («Обрезать» / «Создать видео» для
+        картинки), и вернуть нужно РОВНО то, что было до переключения."""
+        b = self.btn_cut
+        try:
+            b.clicked.disconnect()
+        except Exception:
+            pass
+        if cancel_mode:
+            self._cut_btn_saved = (b.text(), b.icon(), b.styleSheet())
+            b.setText("Отмена")
+            b.setIcon(get_icon('fa5s.times', color='#1e1e2e'))
+            b.setStyleSheet(f"""
+                QPushButton {{
+                    background: {C['red']};
+                    color: #1e1e2e;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 9px 24px;
+                    font-weight: 700;
+                    font-size: 13px;
+                    letter-spacing: 0.3px;
+                }}
+                QPushButton:hover {{ background: {C['red2']}; }}
+                QPushButton:pressed {{ background: {C['red2']}; }}
+                QPushButton:disabled {{ background: {C['surface3']}; color: {C['text3']}; }}
+            """)
+            b.setEnabled(True)
+            b.clicked.connect(cancel_handler or self._cancel_cut)
+        else:
+            saved = getattr(self, '_cut_btn_saved', None)
+            if saved:
+                b.setText(saved[0]); b.setIcon(saved[1]); b.setStyleSheet(saved[2])
+            b.setEnabled(True)
+            b.clicked.connect(self.start_cut)
+
+    def _cancel_cut(self):
+        """Отменяет текущую обрезку/перекодировку/Smart Cut (self.ffmpeg_thread)."""
+        th = getattr(self, "ffmpeg_thread", None)
+        if th is not None and th.isRunning():
+            self._set_cut_status("Отмена…", icon='fa5s.hourglass-half')
+            self.btn_cut.setEnabled(False)
+            th.stop()
+
+    def _cancel_cut_and_process(self, tab_media):
+        """Отменяет «Обрезать и обработать» (worker вкладки «Обработка»)."""
+        w = getattr(tab_media, 'worker', None)
+        if w is not None and w.isRunning():
+            self._set_cut_status("Отмена…", icon='fa5s.hourglass-half')
+            self.btn_cut.setEnabled(False)
+            w.stop()
+
     def _cancel_video_inpaint(self):
         """Просит фоновый воркер прерваться (временные файлы он уберёт сам)."""
         w = getattr(self, "_vinp_worker", None)
@@ -8400,12 +4917,28 @@ class EditTab(QWidget):
                 QTimer.singleShot(0, lambda d=old: self._close_play_device(d))
         return self._scrub_audio_player
 
+    _SCRUB_READY_STATUSES = None   # заполняется лениво в _scrub_audio_blip (нужен QMediaPlayer)
+
     def _scrub_audio_blip(self, painted):
-        """Короткий звуковой блип (~150 мс) в текущей целевой позиции шага. Видео
+        """Короткий звуковой блип (~400 мс) в текущей целевой позиции шага. Видео
         не трогаем. Источник звука:
           • выбрана внешняя озвучка → её отдельный плеер (звук видео заглушён);
           • painted-режим → отдельный скраб-плеер по оригиналу;
-          • overlay-режим → ничего (там звук даст основной player.play() ниже)."""
+          • overlay-режим → ничего (там звук даст основной player.play() ниже).
+        Между шагами плеер НЕ ставится на паузу: pause()/play() у QMediaPlayer
+        заново открывает аудиоустройство (на Windows это заметная задержка).
+        Вместо паузы — mute/unmute вывода, это мгновенно. Настоящая пауза
+        (отпустить устройство) — только после долгого простоя, см.
+        _hard_pause_scrub_audio. Если скраб-плеер только что создан/сменил
+        источник (первый шаг после смены файла), setSourceDevice/setSource
+        асинхронны — setPosition/play() сразу может тихо ничего не дать; тогда
+        откладываем реальный старт до mediaStatusChanged (см. _on_scrub_media_ready)
+        вместо того, чтобы просто промолчать (была жалоба «нет звука вообще»)."""
+        if self._SCRUB_READY_STATUSES is None:
+            self._SCRUB_READY_STATUSES = (
+                QMediaPlayer.MediaStatus.LoadedMedia,
+                QMediaPlayer.MediaStatus.BufferedMedia,
+                QMediaPlayer.MediaStatus.EndOfMedia)
         if not getattr(self, "_scrub_audio_enabled", True):
             return
         tgt = self._scrub_target
@@ -8414,29 +4947,81 @@ class EditTab(QWidget):
                 tgt = self.player.position()
             except Exception:
                 return
+        tgt_ms = int(max(0, tgt))
         if getattr(self, "_ext_audio_active", False) and self._ext_audio_player is not None:
-            player = self._ext_audio_player
-        elif painted:
-            player = self._ensure_scrub_audio_player()
-        else:
+            # Внешняя озвучка синхронно следует за основным плеером — уже
+            # загружена и играет, риска «холодного» источника тут нет.
+            self._start_scrub_blip_playback(self._ext_audio_player, self._ext_audio_output, tgt_ms)
             return
+        if not painted:
+            return
+        player = self._ensure_scrub_audio_player()
         if player is None:
             return
+        out = self._scrub_audio_output
+        self._scrub_pending = (player, out, tgt_ms)
         try:
-            player.setPosition(int(max(0, tgt)))
-            player.play()
+            status = player.mediaStatus()
+        except Exception:
+            status = None
+        if status is not None and status not in self._SCRUB_READY_STATUSES:
+            if not getattr(self, "_scrub_media_status_wired", False):
+                self._scrub_media_status_wired = True
+                player.mediaStatusChanged.connect(self._on_scrub_media_ready)
+            return
+        self._start_scrub_blip_playback(player, out, tgt_ms)
+
+    def _on_scrub_media_ready(self, status):
+        if status not in self._SCRUB_READY_STATUSES:
+            return
+        pending = getattr(self, "_scrub_pending", None)
+        if pending is None:
+            return
+        self._scrub_pending = None
+        self._start_scrub_blip_playback(*pending)
+
+    def _start_scrub_blip_playback(self, player, out, tgt_ms):
+        try:
+            if out is not None:
+                out.setMuted(False)
+            player.setPosition(tgt_ms)
+            if player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                player.play()
         except Exception:
             return
         self._scrub_blip_player = player
-        # Один таймер, перезапускаемый на каждом шаге: при удержании ←/→ звук
-        # идёт непрерывно, а после отпускания глохнет.
+        self._scrub_blip_output = out
+        # Таймер mute: перезапускается на каждом шаге — при удержании ←/→ звук
+        # идёт непрерывно, а после отпускания глохнет (но плеер продолжает
+        # тихо играть — см. docstring). 400мс — запас на то, что сиик по
+        # сжатому потоку сам по себе может занять заметное время: слишком
+        # короткое окно душило звук ДО того, как он вообще успевал начаться.
         if self._scrub_blip_timer is None:
             self._scrub_blip_timer = QTimer(self)
             self._scrub_blip_timer.setSingleShot(True)
             self._scrub_blip_timer.timeout.connect(self._stop_scrub_audio_blip)
-        self._scrub_blip_timer.start(150)
+        self._scrub_blip_timer.start(400)
+        # Таймер жёсткой паузы: куда дольше — реально отпускаем аудиоустройство,
+        # только когда пользователь давно не шагает по кадрам.
+        if self._scrub_hard_pause_timer is None:
+            self._scrub_hard_pause_timer = QTimer(self)
+            self._scrub_hard_pause_timer.setSingleShot(True)
+            self._scrub_hard_pause_timer.timeout.connect(self._hard_pause_scrub_audio)
+        self._scrub_hard_pause_timer.start(1200)
 
     def _stop_scrub_audio_blip(self):
+        out = getattr(self, "_scrub_blip_output", None)
+        if out is not None:
+            try:
+                out.setMuted(True)
+            except Exception:
+                pass
+
+    def _hard_pause_scrub_audio(self):
+        """Реально ставит скраб-плеер на паузу (отпускает аудиоустройство) —
+        вызывается только после долгого простоя между шагами, см.
+        _scrub_audio_blip. Звук уже приглушён _stop_scrub_audio_blip, так что
+        сама пауза не даёт слышимого щелчка."""
         p = getattr(self, "_scrub_blip_player", None)
         if p is not None:
             try:
@@ -8449,6 +5034,7 @@ class EditTab(QWidget):
         self._scrub_audio_enabled = bool(enabled)
         if not enabled:
             self._stop_scrub_audio_blip()
+            self._hard_pause_scrub_audio()
         if save:
             try:
                 self.save_settings()
@@ -8712,7 +5298,7 @@ class EditTab(QWidget):
         self._report_progress(0, "Создание видео…")
         self.log_label.setText("Создание видео из картинки…")
         self._set_cut_status("Пикселизация… подготовка", icon='fa5s.hourglass-half')
-        self.btn_cut.setEnabled(False)
+        self._set_cut_btn_cancel(True)
         self._cut_t0 = time.time(); self._cut_lastp = 0.0
         if getattr(self, "_cut_ticker", None) is None:
             self._cut_ticker = QTimer(self); self._cut_ticker.setInterval(500)
@@ -8728,7 +5314,7 @@ class EditTab(QWidget):
                     self._cut_ticker.stop()
             except Exception:
                 pass
-            self.btn_cut.setEnabled(True)
+            self._set_cut_btn_cancel(False)
             if success and os.path.exists(_final):
                 try:
                     if self.main is not None and hasattr(self.main, "log"):
@@ -9015,7 +5601,7 @@ class EditTab(QWidget):
         self._report_progress(0, "Обрезка…")
         self.log_label.setText("Обрезка...")
         self._set_cut_status("Обрезка… подготовка", icon='fa5s.hourglass-half')
-        self.btn_cut.setEnabled(False)
+        self._set_cut_btn_cancel(True)
 
         # Прогресс с ETA. Тикер раз в 0.5с обновляет «прошло/ETA», чтобы строка
         # не выглядела зависшей, даже если ffmpeg редко шлёт time= (короткие
@@ -9039,7 +5625,7 @@ class EditTab(QWidget):
                     self._cut_ticker.stop()
             except Exception:
                 pass
-            self.btn_cut.setEnabled(True)
+            self._set_cut_btn_cancel(False)
             # Папка извлечённых шрифтов больше не удаляется сразу — она в
             # _subtitle_fonts_cache и живёт до закрытия вкладки (см. shutdown()),
             # чтобы повторный экспорт того же источника не гонял ffmpeg заново.
@@ -9177,7 +5763,7 @@ class EditTab(QWidget):
         self._report_progress(0, "Smart Cut…")
         self.log_label.setText("Smart Cut…")
         self._set_cut_status("Smart Cut… подготовка", icon='fa5s.hourglass-half')
-        self.btn_cut.setEnabled(False)
+        self._set_cut_btn_cancel(True)
         self._cut_t0 = time.time(); self._cut_lastp = 0.0
         if getattr(self, "_cut_ticker", None) is None:
             self._cut_ticker = QTimer(self); self._cut_ticker.setInterval(500)
@@ -9200,7 +5786,7 @@ class EditTab(QWidget):
                     self._cut_ticker.stop()
             except Exception:
                 pass
-            self.btn_cut.setEnabled(True)
+            self._set_cut_btn_cancel(False)
             if success and _temp and os.path.exists(_temp) and os.path.getsize(_temp) > 0:
                 try:
                     is_loaded = (os.path.normpath(str(self.actual_source_file)) ==
@@ -9288,7 +5874,7 @@ class EditTab(QWidget):
         self._report_progress(0, "Обработка…")
         self.log_label.setText("Отправлено в «Обработку»…")
         self._set_cut_status("Обработка… подготовка", icon='fa5s.hourglass-half')
-        self.btn_cut.setEnabled(False)
+        self._set_cut_btn_cancel(True, cancel_handler=lambda: self._cancel_cut_and_process(tm))
         self._cut_t0 = time.time(); self._cut_lastp = 0.0
         if getattr(self, "_cut_ticker", None) is None:
             self._cut_ticker = QTimer(self); self._cut_ticker.setInterval(500)
@@ -9296,15 +5882,21 @@ class EditTab(QWidget):
         self._cut_ticker.start()
 
         iid = uuid.uuid4().hex
+        # Выбранная аудиодорожка (если в контейнере их несколько) — иначе
+        # process_media брал первую по умолчанию, игнорируя выбор в Монтаже.
+        sel_a = (self.selected_audio_abs_index
+                 if (self.selected_audio_abs_index is not None
+                     and len(self._audio_streams) > 1) else None)
         item = {'iid': iid, 'path': str(src), 'type': 'MEDIA',
                 'dur': max(0.0, out_s - in_s), 'is_done': False,
-                'trim': (in_s, out_s)}
+                'trim': (in_s, out_s), 'audio_index': sel_a}
         # _run_items сама собирает настройки со всех виджетов «Обработки» и
         # запускает ProcessWorker (тот же путь, что кнопка «НАЧАТЬ»); в очереди —
         # только наш синтетический элемент, чужие файлы не затрагиваются.
         tm._run_items([item])
         proc_worker = getattr(tm, 'worker', None)
         if proc_worker is None:
+            self._set_cut_btn_cancel(False)
             self.on_ffmpeg_finished(False, "Не удалось запустить «Обработку»")
             return
 
@@ -9327,7 +5919,7 @@ class EditTab(QWidget):
                     self._cut_ticker.stop()
             except Exception:
                 pass
-            self.btn_cut.setEnabled(True)
+            self._set_cut_btn_cancel(False)
             temp_out = _item.get('out_path')
             if not _item.get('is_done') or not temp_out or not os.path.exists(temp_out):
                 self.on_ffmpeg_finished(
@@ -9639,17 +6231,15 @@ class EditTab(QWidget):
 
         try:
             add_shortcut(Qt.Key.Key_Space, self.toggle_play)
-            add_shortcut("F", self.toggle_fullscreen)
-            add_shortcut("I", self.set_in_point)
-            add_shortcut("O", self.set_out_point)
             add_shortcut(Qt.Key.Key_Left,  partial(self.step_frame_scrub, -1))
             add_shortcut(Qt.Key.Key_Right, partial(self.step_frame_scrub,  1))
-            # WASD дублируют стрелки покадрового шага: A/S — кадр назад, D/W — вперёд.
-            add_shortcut("A", partial(self.step_frame_scrub, -1))
-            add_shortcut("S", partial(self.step_frame_scrub, -1))
-            add_shortcut("D", partial(self.step_frame_scrub,  1))
-            add_shortcut("W", partial(self.step_frame_scrub,  1))
-            add_shortcut("Ctrl+S", self.start_cut)
+            # F/I/O/WASD/Ctrl+S НЕ регистрируем через QKeySequence-строку — на
+            # кириллической раскладке физическая клавиша шлёт Qt переведённый
+            # код кириллической буквы (Ф/Ш/Щ/Ц/Ы/В/Ы), а не Key_F/I/O/A/S/D/W,
+            # и такой QShortcut на ней молча не срабатывает вовсе (та же
+            # природа бага, что и с Ctrl+Z/Ctrl+Y — см. keyPressEvent ниже и
+            # _pan_dir_from_event в tabs.py). Обрабатываем их там же, через
+            # nativeVirtualKey — независимо от раскладки.
             # Обрезка до точки воспроизведения (настраиваемые сочетания) —
             # храним QShortcut, чтобы можно было переназначить в Настройках.
             self._sc_trim_start = QShortcut(QKeySequence(self.trim_start_seq), self)
@@ -9664,37 +6254,122 @@ class EditTab(QWidget):
             # StandardKey.Redo == Ctrl+Y) — Qt считал это «неоднозначным
             # сочетанием» и не срабатывал НИ ОДИН из них: Ctrl+Z работал, а
             # Ctrl+Y — нет. Один QAction с несколькими сочетаниями неоднозначности
-            # не создаёт. Раскладочные дубли (рус. Я = Z, Н = Y) — тут же.
+            # не создаёт (после дедупликации ниже).
+            #
+            # РАСКЛАДОЧНЫЕ ЛИТЕРАЛЫ "Ctrl+Я"/"Ctrl+Н" (рус. Я=Z, Н=Y по месту
+            # клавиши) СЮДА НЕ ДОБАВЛЯЕМ — повторный баг-репорт ("Ambiguous
+            # shortcut overload: Ctrl+Z"/"Ctrl+?") показал, что именно они и
+            # ЛОМАЮТ act_undo/act_redo: физическое нажатие Ctrl+Z на кириллице
+            # Qt внутренне сопоставляет С ОБОИМИ кандидатами сразу (и с
+            # "Ctrl+Z" через ASCII-фолбэк Windows для Ctrl+буква, и с
+            # "Ctrl+Я"/"Ctrl+Н" через переведённый раскладкой символ) — два
+            # разных QKeySequence в списке ОДНОГО QAction, оба совпавшие с
+            # одним и тем же событием, Qt тоже считает неоднозначностью и не
+            # срабатывает вообще. Кириллицу целиком закрывает keyPressEvent
+            # ниже через nativeVirtualKey (не зависит от раскладки в принципе).
+            def _dedup_seqs(seqs):
+                seen = set(); out = []
+                for s in seqs:
+                    key = s.toString()
+                    if key and key not in seen:
+                        seen.add(key); out.append(s)
+                return out
+
             act_undo = QAction(self)
-            act_undo.setShortcuts([QKeySequence(QKeySequence.StandardKey.Undo),
-                                   QKeySequence("Ctrl+Z"), QKeySequence("Ctrl+Я")])
+            act_undo.setShortcuts(_dedup_seqs([QKeySequence(QKeySequence.StandardKey.Undo),
+                                   QKeySequence("Ctrl+Z")]))
             act_undo.setShortcutContext(ctx)
             act_undo.triggered.connect(self.undo)
             self.addAction(act_undo)
             act_redo = QAction(self)
-            act_redo.setShortcuts([QKeySequence(QKeySequence.StandardKey.Redo),
-                                   QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z"),
-                                   QKeySequence("Ctrl+Н")])
+            act_redo.setShortcuts(_dedup_seqs([QKeySequence(QKeySequence.StandardKey.Redo),
+                                   QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")]))
             act_redo.setShortcutContext(ctx)
             act_redo.triggered.connect(self.redo)
             self.addAction(act_redo)
-            # Доп. подстраховка ПРЯМО на волне: после перетаскивания маркеров
-            # IN/OUT фокус остаётся на self.waveform (см. её mousePressEvent), но
-            # пользователи жаловались, что Ctrl+Z/Ctrl+Y там «не работает нихуя» —
-            # вешаем те же сочетания WidgetShortcut'ом прямо на виджет волны, чтобы
-            # они точно срабатывали независимо от того, как разрешится
-            # WidgetWithChildrenShortcut выше по дереву.
-            self._sc_wave_undo = QShortcut(QKeySequence("Ctrl+Z"), self.waveform)
-            self._sc_wave_undo.setContext(Qt.ShortcutContext.WidgetShortcut)
-            self._sc_wave_undo.activated.connect(self.undo)
-            self._sc_wave_redo = QShortcut(QKeySequence("Ctrl+Y"), self.waveform)
-            self._sc_wave_redo.setContext(Qt.ShortcutContext.WidgetShortcut)
-            self._sc_wave_redo.activated.connect(self.redo)
-            self._sc_wave_redo2 = QShortcut(QKeySequence("Ctrl+Shift+Z"), self.waveform)
-            self._sc_wave_redo2.setContext(Qt.ShortcutContext.WidgetShortcut)
-            self._sc_wave_redo2.activated.connect(self.redo)
+            # Раньше тут ещё висела «подстраховка» — те же Ctrl+Z/Ctrl+Y вторым
+            # QShortcut'ом WidgetShortcut прямо на self.waveform (на случай, если
+            # после перетаскивания маркеров IN/OUT фокус остаётся на волне, а
+            # WidgetWithChildrenShortcut выше по дереву почему-то не срабатывает).
+            # На самом деле причиной был дубль сочетания ВНУТРИ act_undo/act_redo
+            # (см. выше) — Qt считал его неоднозначным и не срабатывал act_undo/
+            # act_redo вообще, независимо от фокуса. После дедупликации
+            # WidgetWithChildrenShortcut сам покрывает фокус на волне (она —
+            # дочерний виджет self), а второй QShortcut с тем же сочетанием на
+            # самой волне лишь СОЗДАВАЛ неоднозначность — убран.
         except Exception as e:
             self.main.log(f"shortcuts error: {e}")
+
+    # Кириллица: QKeySequence-строкой ("Ctrl+Я"/"Ctrl+Н") её ловить нельзя —
+    # QShortcut сопоставляет события по УЖЕ переведённому раскладкой Qt-коду
+    # клавиши, а не по физической клавише, и вдобавок такая строка сама
+    # ломала act_undo/act_redo неоднозначностью (см. комментарий выше). Единый
+    # надёжный способ — как WASD-пан в фоторедакторе (tabs.py,
+    # _pan_dir_from_event): читать ФИЗИЧЕСКУЮ клавишу через nativeVirtualKey
+    # (Windows VK_Z=0x5A, VK_Y=0x59) — не зависит от раскладки. Событие сюда
+    # доходит только если ни один QAction/QShortcut/дочерний виджет его не
+    # поглотил раньше — для латиницы Ctrl+Z уже работает через act_undo выше,
+    # это лишь докрывает случай, когда переведённый код клавиши не совпал.
+    _VK_Z = 0x5A
+    _VK_Y = 0x59
+    _VK_W = 0x57
+    _VK_A = 0x41
+    _VK_S = 0x53
+    _VK_D = 0x44
+    _VK_F = 0x46
+    _VK_I = 0x49
+    _VK_O = 0x4F
+
+    def keyPressEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            try:
+                vk = event.nativeVirtualKey()
+            except Exception:
+                vk = 0
+            if vk == self._VK_Z:
+                self.redo() if (event.modifiers() & Qt.KeyboardModifier.ShiftModifier) else self.undo()
+                event.accept()
+                return
+            if vk == self._VK_Y:
+                self.redo()
+                event.accept()
+                return
+            # Ctrl+S («Обрезать») — тот же баг, что и Ctrl+Z/Y на кириллице:
+            # QShortcut("Ctrl+S") на переведённом коде клавиши не срабатывает.
+            if vk == self._VK_S or event.key() == Qt.Key.Key_S:
+                self.start_cut()
+                event.accept()
+                return
+        elif not (event.modifiers() & (Qt.KeyboardModifier.AltModifier
+                                        | Qt.KeyboardModifier.ShiftModifier)):
+            # WASD покадрового шага + F/I/O — по физической клавише
+            # (nativeVirtualKey), с фолбэком на event.key() для латиницы (см.
+            # register_shortcuts выше и _pan_dir_from_event в tabs.py — тот же приём).
+            try:
+                vk = event.nativeVirtualKey()
+            except Exception:
+                vk = 0
+            if vk in (self._VK_A, self._VK_S) or event.key() in (Qt.Key.Key_A, Qt.Key.Key_S):
+                self.step_frame_scrub(-1)
+                event.accept()
+                return
+            if vk in (self._VK_D, self._VK_W) or event.key() in (Qt.Key.Key_D, Qt.Key.Key_W):
+                self.step_frame_scrub(1)
+                event.accept()
+                return
+            if vk == self._VK_F or event.key() == Qt.Key.Key_F:
+                self.toggle_fullscreen()
+                event.accept()
+                return
+            if vk == self._VK_I or event.key() == Qt.Key.Key_I:
+                self.set_in_point()
+                event.accept()
+                return
+            if vk == self._VK_O or event.key() == Qt.Key.Key_O:
+                self.set_out_point()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def compute_step(self, fast=False):
         step = 1.0 / self.fps if (self.fps and self.fps > 0) else 0.04
@@ -9866,6 +6541,7 @@ class EditTab(QWidget):
                     if hasattr(self, 'cmb_pb_quality') else 0,
                 'proxy_min': int(self.spin_proxy_min.value())
                     if hasattr(self, 'spin_proxy_min') else 0,
+                'subtitle_style': dict(getattr(self, '_last_subtitle_style', None) or {}) or None,
             }
             with open(EDITOR_SETTINGS_PATH, "w", encoding="utf-8") as f:
                 json.dump(settings, f, ensure_ascii=False, indent=2)
@@ -9905,6 +6581,9 @@ class EditTab(QWidget):
             self._update_export_dir_label()
             # Покадровый скраб-звук теперь всегда включён (настройка убрана из UI).
             self._scrub_audio_enabled = True
+            # Последние настройки стиля «Создать субтитры» (шрифт/размер/цвет/…) —
+            # см. create_subtitles/SubtitleCreatorDialog.default_style.
+            self._last_subtitle_style = settings.get('subtitle_style') or None
         except Exception:
             pass
 
@@ -9928,6 +6607,8 @@ class EditTab(QWidget):
         try:
             if self._scrub_blip_timer is not None:
                 self._scrub_blip_timer.stop()
+            if self._scrub_hard_pause_timer is not None:
+                self._scrub_hard_pause_timer.stop()
         except Exception:
             pass
         try:

@@ -33,7 +33,9 @@ GRAPH_REPORT.md
 /sigstats.db
 /author_blacklist.json
 /package_blacklist.json
+/package_blacklist_added_at.json
 /played_packages.json
+/played_packages_added_at.json
 /search_page_cache.json
 /ui_settings.json
 

@@ -684,29 +684,39 @@ class MainWindow(QMainWindow):
                 elif isinstance(fw, QLineEdit):
                     is_editable = not fw.isReadOnly()
             ctrl = event.modifiers() == Qt.KeyboardModifier.ControlModifier
-            if ctrl and event.key() == Qt.Key.Key_S and not is_editable:
+            # nativeVirtualKey — фолбэк для НЕ-латинских раскладок: физическая
+            # S/Z/Y/O/F на кириллице шлёт Qt-код кириллической буквы, а не
+            # Key_S/Z/Y/O/F, и одна только проверка event.key() молча не
+            # срабатывает (тот же баг и приём, что и в edit_tab.py/tabs.py —
+            # WASD-навигация чуть ниже свою кириллицу уже покрывает через
+            # _WASD_MAP, но там же то не годится для Ctrl-сочетаний).
+            try:
+                vk = event.nativeVirtualKey()
+            except Exception:
+                vk = 0
+            if ctrl and (event.key() == Qt.Key.Key_S or vk == 0x53) and not is_editable:
                 idx = self.sidebar.current_real_idx()
                 if 0 <= idx < len(self.datasets):
                     w = self.datasets[idx]["widget"]
                     if hasattr(w, '_save_siq_inplace'):
                         w._save_siq_inplace()
                 return True
-            if ctrl and event.key() == Qt.Key.Key_Z and not is_editable:
+            if ctrl and (event.key() == Qt.Key.Key_Z or vk == 0x5A) and not is_editable:
                 idx = self.sidebar.current_real_idx()
                 if 0 <= idx < len(self.datasets):
                     self.datasets[idx]["widget"].do_undo()
                 return True
-            if ctrl and event.key() == Qt.Key.Key_Y and not is_editable:
+            if ctrl and (event.key() == Qt.Key.Key_Y or vk == 0x59) and not is_editable:
                 idx = self.sidebar.current_real_idx()
                 if 0 <= idx < len(self.datasets):
                     self.datasets[idx]["widget"].do_redo()
                 return True
-            if ctrl and event.key() == Qt.Key.Key_O and not is_editable:
+            if ctrl and (event.key() == Qt.Key.Key_O or vk == 0x4F) and not is_editable:
                 path, _ = QFileDialog.getOpenFileName(
                     self, "Открыть .siq", "", "SIGame Package (*.siq);;All (*)")
                 if path: self._open_siq_file(path)
                 return True
-            if ctrl and event.key() == Qt.Key.Key_F:
+            if ctrl and (event.key() == Qt.Key.Key_F or vk == 0x46):
                 if self._search_panel.isVisible():
                     self._hide_search()
                 else:

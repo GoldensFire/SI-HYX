@@ -9,7 +9,7 @@ from conftest import FakeResponse, FakeSession
 
 def _card_html(pid="123", name="Аниме пак", authors=("Автор",), downloads="1 234",
                questions=150, size="12,5 МБ", date="2026-01-15",
-               themes_html=None, category=True):
+               themes_html=None, category=True, description=None):
     authors_html = "".join(
         f'<span itemprop="author"><span itemprop="name">{a}</span></span>'
         for a in authors)
@@ -23,6 +23,7 @@ def _card_html(pid="123", name="Аниме пак", authors=("Автор",), dow
     if category:
         cat_html = ('<a rel="category" href="/categories/anime">'
                     "<span>Аниме</span><span>80%</span></a>")
+    desc_html = f'<p itemprop="description">{description}</p>' if description else ""
     return f"""
 <article itemprop="itemListElement">
   <a href="/packages/{pid}"><h1>{name}</h1></a>
@@ -40,6 +41,7 @@ def _card_html(pid="123", name="Аниме пак", authors=("Автор",), dow
   <a rel="tag" href="/tags/anime">аниме</a>
   <a rel="tag" href="/tags/music">музыка</a>
   {cat_html}
+  {desc_html}
   <div>{themes_html}</div>
 </article>
 """
@@ -114,6 +116,14 @@ class TestParseCard:
         c = sb.parse_list(_page_html(_card_html()))[0]
         assert c.categories == [{"name": "Аниме", "pct": 80, "slug": "anime"}]
 
+    def test_description_parsed(self):
+        c = sb.parse_list(_page_html(_card_html(description="Старался над паком")))[0]
+        assert c.description == "Старался над паком"
+
+    def test_description_missing(self):
+        c = sb.parse_list(_page_html(_card_html()))[0]
+        assert c.description is None
+
     def test_themes_parsed(self):
         c = sb.parse_list(_page_html(_card_html()))[0]
         names = [t["name"] for t in c.themes]
@@ -155,6 +165,44 @@ class TestParseCard:
         assert c.size_mb is None
         assert c.themes == []
         assert c.round_count is None
+
+    def test_author_page_generic_title_falls_back_to_alternate_name(self):
+        """Некоторые авторы оставляют внутреннее название пакета (<h1>, оно
+        же <package name> в content.xml) одинаковым для всех своих паков,
+        различая их только именем .siq-файла — без фолбэка на
+        itemprop=alternateName такие паки получали одинаковый name_norm и
+        затирали друг друга при upsert (см.
+        sibrowser.py::_AUTHOR_PAGE_GENERIC_TITLE)."""
+        html = """
+<article itemprop="itemListElement">
+  <h1 itemprop="name headline"><a href="/packages/1">Вопросы SIGame</a></h1>
+  <a href="/packages/1">
+    <span itemprop="alternateName">Тридцать четвёртый аниме пак.siq</span>
+  </a>
+</article>
+<article itemprop="itemListElement">
+  <h1 itemprop="name headline"><a href="/packages/2">Вопросы SIGame</a></h1>
+  <a href="/packages/2">
+    <span itemprop="alternateName">Тридцать третий аниме пак.siq</span>
+  </a>
+</article>"""
+        cards = sb.parse_list(_page_html(html))
+        assert [c.name for c in cards] == [
+            "Тридцать четвёртый аниме пак", "Тридцать третий аниме пак"]
+        assert len({c.name_norm for c in cards}) == 2
+
+    def test_normal_h1_not_overridden_by_alternate_name(self):
+        """На обычных страницах каталога <h1> — настоящее (отличное от
+        alternateName/имени файла) название, его подменять не нужно."""
+        html = """
+<article itemprop="itemListElement">
+  <h1 itemprop="name headline"><a href="/packages/1">Плей Топ 2026 №1</a></h1>
+  <a href="/packages/1">
+    <span itemprop="alternateName">Плей ТОП By Автор клуб.siq</span>
+  </a>
+</article>"""
+        c = sb.parse_list(_page_html(html))[0]
+        assert c.name == "Плей Топ 2026 №1"
 
 
 # ── _category_pct ────────────────────────────────────────────────────────────

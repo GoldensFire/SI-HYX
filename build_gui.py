@@ -10,11 +10,12 @@ import os
 import re
 import subprocess
 import sys
+import time
 
-from PyQt6.QtCore import QProcess, QProcessEnvironment
+from PyQt6.QtCore import QProcess, QProcessEnvironment, QTimer
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
 from config import STYLESHEET, get_icon
@@ -26,6 +27,26 @@ README_MD = os.path.join(ROOT, "README.md")
 BUILD_BAT = os.path.join(ROOT, "build.bat")
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
+STEP_RE = re.compile(r"^\[STEP (\d+)/8\]")
+
+# Вес каждого шага build.bat в общем времени сборки (сумма = 100). PyInstaller
+# (шаг 2) доминирует по времени — компиляция всех зависимостей. Веса —
+# приблизительные (нет телеметрии по факту), но дают вменяемый ETA, а не
+# просто «крутилку». CUM_BEFORE[n] — прогресс (%), достигнутый к МОМЕНТУ
+# появления метки "[STEP n/8]" в выводе (т.е. все шаги 1..n-1 уже завершены).
+STEP_WEIGHTS = {1: 3, 2: 55, 3: 2, 4: 5, 5: 10, 6: 5, 7: 15, 8: 5}
+CUM_BEFORE = {}
+_acc = 0
+for _n in range(1, 9):
+    CUM_BEFORE[_n] = _acc
+    _acc += STEP_WEIGHTS[_n]
+del _acc, _n
+
+
+def _fmt_seconds(sec: float) -> str:
+    sec = max(0, int(sec))
+    m, s = divmod(sec, 60)
+    return f"{m}м {s:02d}с" if m else f"{s}с"
 
 
 def _read(path: str) -> str:
@@ -115,6 +136,16 @@ class BuildWindow(QMainWindow):
         btn_row.addStretch()
         root.addLayout(btn_row)
 
+        prog_row = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        prog_row.addWidget(self.progress_bar, stretch=1)
+        self.eta_lbl = QLabel("")
+        self.eta_lbl.setStyleSheet("color:#6c7086;")
+        prog_row.addWidget(self.eta_lbl)
+        root.addLayout(prog_row)
+
         self.status_lbl = QLabel("")
         root.addWidget(self.status_lbl)
 
@@ -122,12 +153,17 @@ class BuildWindow(QMainWindow):
         self.log.setReadOnly(True)
         root.addWidget(self.log, stretch=1)
 
-        version, silent = read_current()
+        version, _saved_silent = read_current()
         self.version_edit.setText(version)
-        self.silent_chk.setChecked(silent)
+        self.silent_chk.setChecked(False)  # всегда выключен по умолчанию — не унаследовать True с прошлого раза
 
         self.proc = None
         self._stopped = False
+        self._progress = 0
+        self._build_start_ts = 0.0
+        self._eta_timer = QTimer(self)
+        self._eta_timer.setInterval(1000)
+        self._eta_timer.timeout.connect(self._update_eta)
 
     # -- логирование --------------------------------------------------
     def _log(self, line: str) -> None:
@@ -147,6 +183,11 @@ class BuildWindow(QMainWindow):
             return
 
         self._stopped = False
+        self._progress = 0
+        self._build_start_ts = time.monotonic()
+        self.progress_bar.setValue(0)
+        self.eta_lbl.setText("Оценка появится после первого шага…")
+        self._eta_timer.start()
         self.build_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status_lbl.setText(
@@ -167,6 +208,19 @@ class BuildWindow(QMainWindow):
         data = bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
         for line in data.splitlines():
             self._log(line)
+            m = STEP_RE.match(line)
+            if m:
+                self._progress = CUM_BEFORE.get(int(m.group(1)), self._progress)
+                self.progress_bar.setValue(self._progress)
+
+    def _update_eta(self):
+        elapsed = time.monotonic() - self._build_start_ts
+        if self._progress <= 0:
+            self.eta_lbl.setText(f"Прошло {_fmt_seconds(elapsed)} · оценка появится после первого шага…")
+            return
+        total_est = elapsed / (self._progress / 100.0)
+        remaining = max(0.0, total_est - elapsed)
+        self.eta_lbl.setText(f"Прошло {_fmt_seconds(elapsed)} · осталось ~{_fmt_seconds(remaining)}")
 
     def _on_stop(self):
         if self.proc is None or self.proc.state() == QProcess.ProcessState.NotRunning:
@@ -186,18 +240,24 @@ class BuildWindow(QMainWindow):
             self.proc.kill()
 
     def _on_build_done(self, exit_code: int, _exit_status):
+        self._eta_timer.stop()
         self.build_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         if self._stopped:
             self.status_lbl.setText("Остановлено.")
+            self.eta_lbl.setText("")
             return
         if exit_code == 0:
+            self._progress = 100
+            self.progress_bar.setValue(100)
+            self.eta_lbl.setText(f"Готово за {_fmt_seconds(time.monotonic() - self._build_start_ts)}")
             self.status_lbl.setText("Готово.")
             QMessageBox.information(
                 self, "SI-HYX",
                 "Сборка завершена. Архивы и manifest.json — в dist\\ "
                 "(список файлов для релиза — в конце лога).")
         else:
+            self.eta_lbl.setText("")
             self.status_lbl.setText(f"Сборка упала (код {exit_code}).")
             QMessageBox.critical(self, "SI-HYX", f"Сборка завершилась с ошибкой (код {exit_code}). Смотри лог.")
 

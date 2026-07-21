@@ -7,8 +7,29 @@
 # License v3 (или новее) от Free Software Foundation. БЕЗ ВСЯКИХ ГАРАНТИЙ.
 # Полный текст — в файле LICENSE (https://www.gnu.org/licenses/gpl-3.0.txt).
 # workers.py — фоновые потоки: загрузка (yt-dlp) и обработка (ffmpeg)
-from config import *
-from utils import *
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+from collections import deque
+from config import (
+    COOKIE_PATHS, CREATE_NO_WINDOW, FFMPEG, FFMPEG7_DIR, FFPROBE, IS_WIN,
+    Image, ImageOps, QRunnable, QThread, QThreadPool, TEMP_DIR,
+    USER_AGENT, cpu_thread_count, deno_available, pyqtSignal,
+    subprocess_env, ytdlp_base_cmd
+)
+from utils import (
+    clean_ansi, clean_url, detect_ffmpeg_encoders, download_cdn_direct,
+    fmt_bitrate_with_codec, get_cookies_path, get_fps_float,
+    get_media_info, get_video_codec, get_video_codec_label, host_matches,
+    human_size, is_animego_site, is_direct_cdn_video, is_embed_candidate,
+    measure_loudness, require_svt, resolve_kodik
+)
 from utils import _cookie_matches_domain, _RE_DIGITS
 import re as _re_eta
 import math
@@ -16,6 +37,12 @@ import math
 
 # Регэксп кадра из stderr ffmpeg ("frame=  123 fps= 45 ...").
 _RE_FFMPEG_FRAME = _re_eta.compile(r"frame=\s*(\d+)")
+
+# Нормализация раскладки каналов перед libopus: кодер отвергает «боковые»/
+# нестандартные раскладки (5.1(side) у AC3-дорожек) с "Invalid channel
+# layout … (exit -22)". На stereo/mono — no-op, downmix не делается.
+# Ставится последним фильтром КАЖДОГО кодирования в libopus (см. _af_arg).
+OPUS_LAYOUT_FIX = "aformat=channel_layouts=mono|stereo|3.0|4.0|quad|5.0|5.1|6.1|7.1"
 
 
 class RealETACalculator:
@@ -1668,6 +1695,271 @@ class ProcessWorker(QThread):
                     PRESEEK)
         return ([], ["-ss", f"{in_s / sf:.6f}", "-t", f"{out_dur:.6f}"], in_s)
 
+    @staticmethod
+    def _out_suffix(is_video, video_enabled, metric, crf, speed_percent,
+                    remove_audio, norm, fade):
+        """Суффикс имени выходного файла (напр. «_crf45_speed100_norm_fade»).
+
+        Чистая функция (вынесена из process_media для читаемости/тестируемости).
+        При авто-подборе CRF (metric=='xpsnr') пишет 'autocrf' вместо числа —
+        реальный CRF на этот момент ещё неизвестен, подбирается для каждого файла
+        свой, и врать цифрой, взятой ДО подбора, нельзя. Порядок частей сохранён
+        1:1 с прежним инлайн-кодом."""
+        suffix = ""
+        if is_video and video_enabled:
+            crf_tag = "autocrf" if metric == 'xpsnr' else f"crf{crf}"
+            suffix += f"_{crf_tag}_speed{speed_percent}"
+        if remove_audio:
+            suffix += "_noaudio"
+        elif norm:
+            suffix += "_norm"
+        if not remove_audio and fade:
+            suffix += "_fade"
+        return suffix
+
+    @staticmethod
+    def _build_audio_filters(sa, t0, fade_out_dur, speed_factor):
+        """Цепочка аудиофильтров для ffmpeg `-af` из настроек звука.
+
+        Порядок (сохранён 1:1 с прежним инлайн-кодом process_media): loudnorm →
+        fade-in → fade-out → «деградация» (lowpass/highpass/u8/volume) → atempo
+        (смена скорости, через _build_atempo_chain). Чистая функция: t0 (начало
+        клипа в шкале фильтров) и fade_out_dur (длительность отрезка/файла, нужна
+        только ветке fade-out) передаются уже вычисленными — ffprobe тут не
+        вызывается, поэтому логику легко покрыть тестами. Вызывать только когда
+        звук сохраняется (не remove_audio) — как и раньше."""
+        filters = []
+        if sa.get('norm'):
+            tgt_i = float(sa.get('tgt', -20.0))
+            lra = float(sa.get('lra', 11.0))
+            tp = float(sa.get('tp', -1.5))
+            filters.append(f"loudnorm=I={tgt_i}:LRA={lra}:TP={tp}")
+        if sa.get('fade_in'):
+            fade_in_d = sa.get('fade_in_d', 1.0)
+            # st=t0: при обрезке (trim) seek не обнуляет PTS — фильтр видит
+            # исходное время клипа, поэтому фейд-ин начинается от t0, а не 0.
+            filters.append(f"afade=t=in:st={t0:.3f}:d={fade_in_d}")
+        if sa.get('fade'):
+            fade_d = sa.get('fade_d', 1.0)
+            filters.append(
+                f"afade=t=out:st={max(0.0, t0 + (fade_out_dur or 0.0) - fade_d):.3f}:d={fade_d}")
+        if sa.get('deg'):
+            filters.append(f"lowpass=f={sa.get('lp', 3000)}")
+            filters.append(f"highpass=f={sa.get('hp', 200)}")
+            hz = int(sa.get('hz', 44100))
+            if sa.get('u8'):
+                filters.append(f"aformat=sample_fmts=u8:sample_rates={hz}")
+            gain_db = float(sa.get('deg_gain_db', 0.0))
+            if abs(gain_db) > 0.01:
+                filters.append(f"volume={gain_db}dB")
+        if abs(speed_factor - 1.0) > 0.01:
+            filters.extend(_build_atempo_chain(speed_factor))
+        return filters
+
+    @staticmethod
+    def _scale_vf(res_sel):
+        """Фильтр `scale` по выбранному разрешению или None (исходное/не задано).
+
+        '1280x720' → вписать в рамку без искажения пропорций
+        (force_original_aspect_ratio=decrease), стороны чётные (SVT-AV1 требует).
+        Некорректная строка «WxH» откатывается на прямой `scale=<res>`. Чистая
+        функция — строит ровно ту же строку, что раньше инлайн в process_media."""
+        if not (isinstance(res_sel, str) and res_sel and res_sel != "Исходное"):
+            return None
+        if 'x' in res_sel:
+            try:
+                w_str, h_str = res_sel.split('x', 1)
+                w = int(w_str); h = int(h_str)
+                return (f"scale=w='min(iw,{w})':h='min(ih,{h})'"
+                        f":force_original_aspect_ratio=decrease"
+                        f":force_divisible_by=2")
+            except Exception:
+                return f"scale={res_sel}:force_divisible_by=2"
+        return f"scale={res_sel}:force_divisible_by=2"
+
+    @staticmethod
+    def _af_arg(filters, trim_tail=False):
+        """Готовая строка для ffmpeg `-af`: фильтры + фикс раскладки под libopus.
+
+        OPUS_LAYOUT_FIX добавляется ВСЕГДА (в т.ч. когда своих фильтров нет) —
+        libopus отвергает «боковые»/нестандартные раскладки каналов (5.1(side)
+        у AC3-дорожек) с "Invalid channel layout … (exit -22)"; на stereo/mono
+        это no-op и downmix не делается.
+
+        trim_tail=True добавляет aresample=async=1 ПЕРЕД фиксом раскладки —
+        выравнивает длину аудио к входной дорожке, срезая «хвост» от latency
+        loudnorm и добивки opus-кадров (иначе контейнер длиннее источника).
+        Включать только при нормальной скорости: при смене скорости длину
+        задаёт atempo, и async лишь помешал бы.
+
+        Чистая функция (вынесена из process_media — раньше эти же две цепочки
+        собирались инлайн в четырёх местах)."""
+        chain = list(filters)
+        if trim_tail:
+            chain.append("aresample=async=1")
+        chain.append(OPUS_LAYOUT_FIX)
+        return ",".join(chain)
+
+    @staticmethod
+    def _map_av_args(remove_audio, a_map_sel):
+        """`-map`-аргументы: только настоящее видео + (опционально) аудио.
+
+        0:V? исключает обложки/attached_pic. Субтитры/вложения/данные не
+        маппим сознательно: их кодеки несовместимы с целевым контейнером →
+        ffmpeg падает. a_map_sel — либо конкретная дорожка, выбранная в
+        Монтаже ("0:3"), либо "0:a?". Чистая функция."""
+        if remove_audio:
+            return ["-map", "0:V?"]
+        return ["-map", "0:V?", "-map", a_map_sel]
+
+    @staticmethod
+    def _fps_args(fps_sel, src_path):
+        """`-r`-аргументы по выбранному в настройках fps (или [] — не менять).
+
+        «Исходный (max 30)» ставит -r 30 только если источник реально быстрее
+        (иначе кодер бессмысленно растянул бы VFR до CFR). Нечисловые значения
+        игнорируются. Единственная нечистота — чтение fps источника."""
+        if fps_sel == "Исходный (max 30)":
+            try:
+                if get_fps_float(src_path) > 30.5:
+                    return ["-r", "30"]
+            except Exception:
+                pass
+            return []
+        if isinstance(fps_sel, str) and fps_sel != "Исходный":
+            try:
+                float(fps_sel)
+                return ["-r", fps_sel]
+            except Exception:
+                pass
+        return []
+
+    def _build_video_filters(self, sv, item, current_input, trim, t0, t0_video,
+                             speed_factor):
+        """Цепочка видеофильтров для `-vf` (порядок сохранён 1:1 с прежним
+        инлайн-кодом process_media): crop чёрных полос → setpts (скорость) →
+        scale → fade-in → fade-out.
+
+        Порядок значим: crop идёт ПЕРВЫМ, чтобы масштаб и фейды считались уже
+        от обрезанного кадра, а setpts — ДО fade, поэтому к моменту fade PTS
+        уже поделены на speed_factor.
+
+        Не чистая: определение чёрных полос и длительность/fps источника
+        требуют чтения файла."""
+        vf_list = []
+
+        if sv.get('crop_black'):
+            crop = self._detect_crop(current_input, item.get('dur') or 0.0,
+                                      start=(trim[0] if trim else 0.0))
+            if crop:
+                vf_list.append(f"crop={crop}")
+                self.log.emit(f"✂ Обрезка чёрных полос: crop={crop}")
+            else:
+                self.log.emit("✂ Чёрные полосы не обнаружены — обрезка пропущена")
+
+        if abs(speed_factor - 1.0) > 0.01:
+            vf_list.append(f"setpts={1.0/speed_factor}*PTS")
+
+        scale_vf = self._scale_vf(sv.get('res', 'Исходное') or 'Исходное')
+        if scale_vf:
+            vf_list.append(scale_vf)
+
+        # Видео fade in / out (через чёрный).
+        # st фейд-ИНА берём в ИСХОДНОЙ (до-setpts) шкале — сырой t0, НЕ
+        # поделённый на скорость. Проверено эмпирически: fade-фильтр
+        # сопоставляет st по времени кадров ДО setpts, поэтому при обрезке
+        # со сменой скорости fade-in ловится ровно на st=t0 (=значение
+        # output-seek), а t0_video (t0/speed) промахивается и первый кадр
+        # остаётся не затемнённым. При нормальной скорости t0==t0_video,
+        # так что обычный (частый) случай не меняется.
+        if sv.get('vfade_in'):
+            vfi = float(sv.get('vfade_in_d', 1.0))
+            if vfi > 0:
+                vf_list.append(f"fade=t=in:st={t0:.3f}:d={vfi}")
+        if sv.get('vfade_out'):
+            vfo = float(sv.get('vfade_out_d', 1.0))
+            if vfo > 0:
+                src_dur = item.get('dur') or 0.0
+                if src_dur <= 0.0:
+                    try: src_dur, *_ = get_media_info(current_input)
+                    except Exception: src_dur = 0.0
+                out_dur = (src_dur / speed_factor) if speed_factor else src_dur
+                out_dur += t0_video
+                # Фейд должен ЗАВЕРШИТЬСЯ до последнего кадра, иначе кадр
+                # окажется на ~96% затемнения, а не на 100%. Сдвигаем фейд
+                # на запас (≥1.5 кадра) — фильтр держит чёрный после конца.
+                try: _fps = get_fps_float(current_input) or 25.0
+                except Exception: _fps = 25.0
+                if _fps <= 0: _fps = 25.0
+                margin = max(0.08, 1.5 / _fps)
+                st = max(0.0, out_dur - vfo - margin)
+                vf_list.append(f"fade=t=out:st={st:.3f}:d={vfo}")
+
+        return vf_list
+
+    def _make_metric_sample(self, current_input, trim_pre, trim_post):
+        """Вход для пробных замеров качества → (путь, временный_файл_или_None).
+
+        При обрезке (trim) вырезает copy-копию ровно того диапазона, который
+        пойдёт в финальный энкод: без этого замер (подбор CRF ИЛИ разовая
+        оценка XPSNR) мог бы попасть на кадры вне отрезка. Без trim и при
+        любой ошибке нарезки возвращает исходный вход и None — замер просто
+        идёт по всему файлу, как раньше. Удаление временного файла — на
+        вызывающем (он переживает и подбор CRF, и последующую оценку)."""
+        if not trim_pre and not trim_post:
+            return current_input, None
+        tmp = os.path.join(
+            TEMP_DIR, f"metricsample_{uuid.uuid4().hex}"
+                      f"{os.path.splitext(current_input)[1] or '.mkv'}")
+        try:
+            cmd_cut = [FFMPEG, "-y"] + trim_pre + ["-i", current_input] + trim_post + ["-c", "copy", tmp]
+            subprocess.run(cmd_cut, capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=120)
+            if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+                return tmp, tmp
+        except Exception:
+            pass
+        return current_input, tmp
+
+    def _resolve_crf(self, item, sv, crf, sample_input, preset_for_search,
+                     search_pix_fmt, video_tune, vf_list, cb):
+        """Итоговый CRF для этого файла + эмит оценки XPSNR в таблицу.
+
+        metric=='xpsnr' → CRF подбирается под целевую метрику (_metric_crf_search,
+        без внешних инструментов); ручной CRF из настроек остаётся фолбэком,
+        если подбор не удался. Когда подбора не было (или он не удался),
+        оценку даёт одно пробное кодирование сэмпла на итоговом CRF — это
+        дешевле полного повторного прохода."""
+        xpsnr_score = None
+        vmetric = sv.get('metric', 'none')
+        if vmetric == 'xpsnr':
+            target_metric = float(sv.get('target_metric', 40.0))
+            metric_label = vmetric.upper()
+            self.log.emit(f"🔍 подбор CRF под {metric_label} ≥{target_metric:.2f}…")
+            cb(2, f"Подбор CRF под {metric_label} {target_metric:.2f}")
+            found_crf, info = self._metric_crf_search(
+                sample_input, preset_for_search, search_pix_fmt,
+                vmetric, target_metric, vf_list, tune=video_tune,
+                cancel_check=lambda: item["iid"] in self.removed_ids,
+                on_tick=lambda el: cb(min(9, 2 + int(el // 3)),
+                                      f"Подбор CRF под {metric_label} {target_metric:.2f} ({int(el)}с)"))
+            if found_crf is not None:
+                crf = found_crf
+                self.log.emit(f"✅ подобран CRF {crf} ({metric_label} ≈{info})")
+                # info — уже измеренная оценка НА ЭТОМ ЖЕ crf (подбор
+                # останавливается на первом подходящем значении), повторно
+                # мерить не нужно.
+                try: xpsnr_score = float(info)
+                except (TypeError, ValueError): xpsnr_score = None
+            else:
+                self.log.emit(f"⚠ подбор CRF не удался: {info} → использован ручной CRF {crf}")
+
+        if xpsnr_score is None:
+            xpsnr_score = self._measure_at_crf(
+                sample_input, crf, preset_for_search, search_pix_fmt,
+                video_tune, vf_list, cancel_check=lambda: item["iid"] in self.removed_ids)
+        self.xpsnr_sig.emit(item['iid'], xpsnr_score)
+        return crf
+
     def process_media(self, item, cb):
         path = item['path']
         base, ext = os.path.splitext(path)
@@ -1693,6 +1985,11 @@ class ProcessWorker(QThread):
             trim_pre, trim_post, t0 = self._trim_seek_args(trim[0], trim[1], speed_factor)
         else:
             trim_pre, trim_post, t0 = [], [], 0.0
+        # Выбранная в Монтаже аудиодорожка (кнопка «Обрезать и обработать» на
+        # многодорожечном источнике) — иначе -map "0:a?" всегда брал первую
+        # дорожку контейнера, игнорируя выбор пользователя.
+        audio_index = item.get('audio_index')
+        a_map_sel = f"0:{audio_index}" if audio_index is not None else "0:a?"
         # t0 сдвинут видеофильтрам через setpts (он стоит РАНЬШЕ fade в vf_list —
         # к моменту fade PTS уже поделены на speed_factor), а аудиофильтрам —
         # БЕЗ деления (atempo в audio_filters добавляется В КОНЦЕ списка, после
@@ -1715,16 +2012,9 @@ class ProcessWorker(QThread):
         # вырезать звук из чистого аудио значило бы получить пустой файл.
         remove_audio = bool(sa.get('remove')) and is_video
 
-        suffix = ""
-        if is_video and video_enabled:
-            # При авто-подборе (xpsnr) фактический CRF станет известен только
-            # позже, для каждого файла свой — в имя пишем маркер режима
-            # вместо ручного crf, чтобы не соврать цифрой, взятой ДО подбора.
-            crf_tag = "autocrf" if sv.get('metric') == 'xpsnr' else f"crf{crf}"
-            suffix += f"_{crf_tag}_speed{speed_percent}"
-        if remove_audio: suffix += "_noaudio"
-        elif sa.get('norm'): suffix += "_norm"
-        if not remove_audio and sa.get('fade'): suffix += "_fade"
+        suffix = self._out_suffix(is_video, video_enabled, sv.get('metric'), crf,
+                                  speed_percent, remove_audio,
+                                  sa.get('norm'), sa.get('fade'))
         out_name = out_name + suffix + out_ext
         out = os.path.join(out_dir, out_name)
 
@@ -1747,39 +2037,19 @@ class ProcessWorker(QThread):
 
         audio_filters = []
         if not remove_audio:
-            if sa.get('norm'):
-                tgt_i = float(sa.get('tgt', -20.0))
-                lra = float(sa.get('lra', 11.0))
-                tp = float(sa.get('tp', -1.5))
-                audio_filters.append(f"loudnorm=I={tgt_i}:LRA={lra}:TP={tp}")
-            if sa.get('fade_in'):
-                fade_in_d = sa.get('fade_in_d', 1.0)
-                # st=t0: при обрезке (trim) seek не обнуляет PTS — фильтр видит
-                # исходное время клипа, поэтому фейд-ин должен начинаться от t0, а не 0.
-                audio_filters.append(f"afade=t=in:st={t0:.3f}:d={fade_in_d}")
+            # Длительность нужна только ветке fade-out — считаем её лениво (и
+            # только когда fade включён), чтобы не дёргать ffprobe зря. dur мог не
+            # посчитаться при добавлении (кириллица в пути, ffprobe упал) — тогда
+            # читаем сейчас, когда файл точно доступен.
+            fade_out_dur = 0.0
             if sa.get('fade'):
-                fade_d = sa.get('fade_d', 1.0)
-                item_dur = item.get('dur') or 0.0
-                if item_dur <= 0.0:
-                    # dur мог не считаться при добавлении (кириллика в пути, ffprobe упал) —
-                    # читаем прямо сейчас, когда файл точно доступен
+                fade_out_dur = item.get('dur') or 0.0
+                if fade_out_dur <= 0.0:
                     try:
-                        item_dur, *_ = get_media_info(path)
+                        fade_out_dur, *_ = get_media_info(path)
                     except Exception:
-                        item_dur = 0.0
-                audio_filters.append(f"afade=t=out:st={max(0.0, t0 + item_dur - fade_d):.3f}:d={fade_d}")
-            if sa.get('deg'):
-                audio_filters.append(f"lowpass=f={sa.get('lp', 3000)}")
-                audio_filters.append(f"highpass=f={sa.get('hp', 200)}")
-                hz = int(sa.get('hz', 44100))
-                if sa.get('u8'):
-                    audio_filters.append(f"aformat=sample_fmts=u8:sample_rates={hz}")
-                gain_db = float(sa.get('deg_gain_db', 0.0))
-                if abs(gain_db) > 0.01:
-                    audio_filters.append(f"volume={gain_db}dB")
-
-            if abs(speed_factor - 1.0) > 0.01:
-                audio_filters.extend(_build_atempo_chain(speed_factor))
+                        fade_out_dur = 0.0
+            audio_filters = self._build_audio_filters(sa, t0, fade_out_dur, speed_factor)
 
         temp_files = []
         attempted_out = out
@@ -1787,15 +2057,6 @@ class ProcessWorker(QThread):
         try:
             current_input = path
             audio_codec = "libopus"  # opus в mp4
-            # libopus отвергает «боковые»/нестандартные раскладки каналов
-            # (например 5.1(side) у AC3-дорожек) с mapping family по умолчанию →
-            # "Invalid channel layout … (exit -22)". Нормализуем раскладку к
-            # стандартной (5.1(side)→5.1) фильтром aformat перед кодером: на
-            # stereo/mono это no-op, downmix не делается. Применяем на КАЖДОМ
-            # кодировании в libopus (в т.ч. когда других аудиофильтров нет).
-            opus_layout_fix = "aformat=channel_layouts=mono|stereo|3.0|4.0|quad|5.0|5.1|6.1|7.1"
-            def _opus_af(filters):
-                return ",".join(list(filters) + [opus_layout_fix])
             is_hevc = (vcodec and ('hevc' in vcodec or 'h265' in vcodec))
             # Когда видео ВСЁ РАВНО перекодируется (step2), отдельный Pass-1 (аудио +
             # copy видео в .mkv) ВРЕДЕН: круговой проход через .mkv ломает тайминги —
@@ -1856,13 +2117,10 @@ class ProcessWorker(QThread):
                 temp_intermediate = os.path.join(TEMP_DIR, f"inter_{uuid.uuid4().hex}{temp_ext}")
                 temp_files.append(temp_intermediate)
 
-                # Берём только НАСТОЯЩЕЕ видео+аудио (0:V? исключает обложки/
-                # attached_pic, 0:a? — аудио). Субтитры/вложения/данные не маппим:
-                # их кодеки несовместимы с контейнером → иначе ffmpeg падает.
                 # current_input здесь всегда == path (Pass-1 — первый читатель
                 # оригинала), поэтому trim_pre/trim_post режут именно исходник.
                 cmd_step1 = [FFMPEG, "-y"] + trim_pre + ["-i", current_input] + trim_post \
-                            + ["-map", "0:V?"] + ([] if remove_audio else ["-map", "0:a?"]) \
+                            + self._map_av_args(remove_audio, a_map_sel) \
                             + ["-map_metadata", "-1"]
                 if remove_audio:
                     cmd_step1 += ["-an"]
@@ -1872,12 +2130,9 @@ class ProcessWorker(QThread):
                     # от latency loudnorm надо срезать ЗДЕСЬ, иначе итог длиннее
                     # источника (без -t → 16.47→16.92). aresample=async=1 правит
                     # старт/склейку, реальный кап длины даёт -t (ниже).
-                    if (not is_video) and normal_speed and audio_filters:
-                        af1 = ",".join(list(audio_filters)
-                                       + ["aresample=async=1", opus_layout_fix])
-                    else:
-                        af1 = _opus_af(audio_filters)
-                    cmd_step1 += ["-af", af1]
+                    cmd_step1 += ["-af", self._af_arg(
+                        audio_filters,
+                        trim_tail=bool((not is_video) and normal_speed and audio_filters))]
                     cmd_step1 += ["-c:a", audio_codec, "-b:a", audio_bitrate]
                 if is_video: cmd_step1 += ["-c:v", "copy"]
                 else:
@@ -1915,102 +2170,24 @@ class ProcessWorker(QThread):
                 if remove_audio:
                     step2_audio = ["-an"]
                 elif single_pass_video and audio_filters:
-                    af_chain = list(audio_filters)
-                    if abs(speed_factor - 1.0) <= 0.01:
-                        # Выравниваем длину аудио к длине входной дорожки — убирает
-                        # «хвост» от latency loudnorm + добивки opus-кадров (иначе
-                        # audio.end > video.end и контейнер растёт: 12.55→12.62).
-                        # ВАЖНО: завязка только на скорость, НЕ на keep_timing/fps —
-                        # тримминг хвоста нужен и когда сменили fps. При смене скорости
-                        # НЕ трогаем: длину задаёт atempo, async лишь помешал бы.
-                        af_chain.append("aresample=async=1")
-                    af_chain.append(opus_layout_fix)
-                    step2_audio = ["-af", ",".join(af_chain),
+                    # trim_tail завязан ТОЛЬКО на скорость, не на keep_timing/fps:
+                    # подрезка хвоста нужна и когда сменили fps (см. _af_arg).
+                    step2_audio = ["-af", self._af_arg(audio_filters, trim_tail=normal_speed),
                                    "-c:a", audio_codec, "-b:a", audio_bitrate]
                 else:
                     step2_audio = ["-c:a", "copy"]
                 timing_args = ["-fps_mode", "passthrough"] if keep_timing else []
-                # Только видео+аудио (см. step1): субтитры/вложения не маппим,
-                # чтобы не падать на контейнерах, которые их не поддерживают.
                 # current_input здесь всегда == path: step1_needed исключает
                 # single_pass_video (см. выше), поэтому trim ещё не применён.
                 cmd_step2 = [FFMPEG, "-y"] + trim_pre + ["-i", current_input] + trim_post \
-                            + ["-map", "0:V?"] + ([] if remove_audio else ["-map", "0:a?"]) + timing_args \
+                            + self._map_av_args(remove_audio, a_map_sel) + timing_args \
                             + ["-map_metadata", "-1", "-map_chapters", "-1"]
 
-                res_sel = sv.get('res', 'Исходное') or 'Исходное'
-                vf_list = []
+                vf_list = self._build_video_filters(sv, item, current_input, trim,
+                                                    t0, t0_video, speed_factor)
 
-                # Обрезка чёрных полос — ПЕРВЫМ фильтром (до scale/fade), чтобы
-                # масштаб и фейды считались уже от обрезанного кадра.
-                if sv.get('crop_black'):
-                    crop = self._detect_crop(current_input, item.get('dur') or 0.0,
-                                              start=(trim[0] if trim else 0.0))
-                    if crop:
-                        vf_list.append(f"crop={crop}")
-                        self.log.emit(f"✂ Обрезка чёрных полос: crop={crop}")
-                    else:
-                        self.log.emit("✂ Чёрные полосы не обнаружены — обрезка пропущена")
-
-                if abs(speed_factor - 1.0) > 0.01:
-                    vf_list.append(f"setpts={1.0/speed_factor}*PTS")
-
-                if isinstance(res_sel, str) and res_sel != "Исходное":
-                    if 'x' in res_sel:
-                        try:
-                            w_str, h_str = res_sel.split('x', 1)
-                            w = int(w_str); h = int(h_str)
-                            vf_list.append(
-                                f"scale=w='min(iw,{w})':h='min(ih,{h})'"
-                                f":force_original_aspect_ratio=decrease"
-                                f":force_divisible_by=2"   # SVT-AV1 требует чётные размеры
-                            )
-                        except Exception:
-                            vf_list.append(f"scale={res_sel}:force_divisible_by=2")
-                    else: vf_list.append(f"scale={res_sel}:force_divisible_by=2")
-
-                # Видео fade in / out (через чёрный).
-                # st фейд-ИНА берём в ИСХОДНОЙ (до-setpts) шкале — сырой t0, НЕ
-                # поделённый на скорость. Проверено эмпирически: fade-фильтр
-                # сопоставляет st по времени кадров ДО setpts, поэтому при обрезке
-                # со сменой скорости fade-in ловится ровно на st=t0 (=значение
-                # output-seek), а t0_video (t0/speed) промахивается и первый кадр
-                # остаётся не затемнённым. При нормальной скорости t0==t0_video,
-                # так что обычный (частый) случай не меняется.
-                if sv.get('vfade_in'):
-                    vfi = float(sv.get('vfade_in_d', 1.0))
-                    if vfi > 0:
-                        vf_list.append(f"fade=t=in:st={t0:.3f}:d={vfi}")
-                if sv.get('vfade_out'):
-                    vfo = float(sv.get('vfade_out_d', 1.0))
-                    if vfo > 0:
-                        src_dur = item.get('dur') or 0.0
-                        if src_dur <= 0.0:
-                            try: src_dur, *_ = get_media_info(current_input)
-                            except Exception: src_dur = 0.0
-                        out_dur = (src_dur / speed_factor) if speed_factor else src_dur
-                        out_dur += t0_video
-                        # Фейд должен ЗАВЕРШИТЬСЯ до последнего кадра, иначе кадр
-                        # окажется на ~96% затемнения, а не на 100%. Сдвигаем фейд
-                        # на запас (≥1.5 кадра) — фильтр держит чёрный после конца.
-                        try: _fps = get_fps_float(current_input) or 25.0
-                        except Exception: _fps = 25.0
-                        if _fps <= 0: _fps = 25.0
-                        margin = max(0.08, 1.5 / _fps)
-                        st = max(0.0, out_dur - vfo - margin)
-                        vf_list.append(f"fade=t=out:st={st:.3f}:d={vfo}")
-
-                fps_sel = sv.get('fps', 'Исходный') or 'Исходный'
-                if fps_sel == "Исходный (max 30)":
-                    try:
-                        src_fps = get_fps_float(current_input)
-                        if src_fps > 30.5: cmd_step2 += ["-r", "30"]
-                    except Exception: pass
-                elif isinstance(fps_sel, str) and fps_sel != "Исходный":
-                    try:
-                        float(fps_sel)
-                        cmd_step2 += ["-r", fps_sel]
-                    except Exception: pass
+                cmd_step2 += self._fps_args(sv.get('fps', 'Исходный') or 'Исходный',
+                                            current_input)
 
                 preset_mode = sv.get('preset_mode', 'std')
                 is_dark_scenes = (preset_mode == "dark")
@@ -2023,72 +2200,25 @@ class ProcessWorker(QThread):
                 # внешних инструментов) под целевое значение метрики (кодек
                 # всегда SVT-AV1, тюнинг энкодера — video_tune выше, тот же,
                 # что и в финальном кодировании — см. _av1_encoder_args).
-                vmetric = sv.get('metric', 'none')
 
                 # preset/pix_fmt для пробных кодирований (поиск CRF и/или разовый
-                # замер итоговой оценки XPSNR ниже) — те же, что пойдут в реальный
+                # замер итоговой оценки XPSNR) — те же, что пойдут в реальный
                 # финальный энкод этого профиля (см. is_dark_scenes/else дальше).
                 preset_for_search = sv.get('pre', 0) if is_dark_scenes else sv.get('pre', 8)
                 search_pix_fmt = self._choose_pix_fmt(self._source_has_alpha(current_input))
-                # Сэмпл для пробных замеров — вырезанный по тому же диапазону
-                # (trim_pre/trim_post), что реально пойдёт в финальный энкод: без
-                # этого замер (поиск CRF ИЛИ разовая оценка XPSNR) мог бы попасть
-                # на кадры вне вырезанного отрезка. Строится ОДИН раз и переживает
-                # и подбор CRF, и последующий разовый замер оценки — см. ниже.
-                metric_sample_input = current_input
-                metric_sample_tmp = None
-                if trim:
-                    metric_sample_tmp = os.path.join(
-                        TEMP_DIR, f"metricsample_{uuid.uuid4().hex}"
-                                  f"{os.path.splitext(current_input)[1] or '.mkv'}")
-                    try:
-                        cmd_cut = [FFMPEG, "-y"] + trim_pre + ["-i", current_input] + trim_post + ["-c", "copy", metric_sample_tmp]
-                        subprocess.run(cmd_cut, capture_output=True, creationflags=CREATE_NO_WINDOW, timeout=120)
-                        if os.path.exists(metric_sample_tmp) and os.path.getsize(metric_sample_tmp) > 0:
-                            metric_sample_input = metric_sample_tmp
-                    except Exception:
-                        pass
-
-                # Авто-подбор CRF под целевую метрику (только когда метрика —
-                # XPSNR; ручной CRF из настроек остаётся фолбэком, если подбор
-                # не удался).
-                xpsnr_score = None   # для колонки «Оценка XPSNR» — заполняется ниже
-                if vmetric == 'xpsnr':
-                    target_metric = float(sv.get('target_metric', 40.0))
-                    search_target = target_metric
-                    metric_label = vmetric.upper()
-                    self.log.emit(f"🔍 подбор CRF под {metric_label} ≥{target_metric:.2f}…")
-                    cb(2, f"Подбор CRF под {metric_label} {target_metric:.2f}")
-                    found_crf, info = self._metric_crf_search(
-                        metric_sample_input, preset_for_search, search_pix_fmt,
-                        vmetric, search_target, vf_list, tune=video_tune,
-                        cancel_check=lambda: item["iid"] in self.removed_ids,
-                        on_tick=lambda el: cb(min(9, 2 + int(el // 3)),
-                                              f"Подбор CRF под {metric_label} {target_metric:.2f} ({int(el)}с)"))
-                    if found_crf is not None:
-                        crf = found_crf
-                        self.log.emit(f"✅ подобран CRF {crf} ({metric_label} ≈{info})")
-                        # info — уже измеренная оценка НА ЭТОМ ЖЕ crf (подбор
-                        # останавливается на первом подходящем значении), повторно
-                        # мерить не нужно.
-                        try: xpsnr_score = float(info)
-                        except (TypeError, ValueError): xpsnr_score = None
-                    else:
-                        self.log.emit(f"⚠ подбор CRF не удался: {info} → использован ручной CRF {crf}")
-
-                if xpsnr_score is None:
-                    # Ручной CRF (или неудавшийся подбор) — отдельного замера ещё не
-                    # было; разовое пробное кодирование сэмпла на итоговом crf даёт
-                    # представительную оценку без цены полного повторного прохода.
-                    xpsnr_score = self._measure_at_crf(
-                        metric_sample_input, crf, preset_for_search, search_pix_fmt,
-                        video_tune, vf_list, cancel_check=lambda: item["iid"] in self.removed_ids)
-                self.xpsnr_sig.emit(item['iid'], xpsnr_score)
-
-                if metric_sample_tmp:
-                    try:
-                        if os.path.exists(metric_sample_tmp): os.remove(metric_sample_tmp)
-                    except Exception: pass
+                # Сэмпл строится ОДИН раз и переживает и подбор CRF, и
+                # последующий разовый замер оценки — поэтому убираем его здесь.
+                metric_sample_input, metric_sample_tmp = self._make_metric_sample(
+                    current_input, trim_pre, trim_post)
+                try:
+                    crf = self._resolve_crf(item, sv, crf, metric_sample_input,
+                                            preset_for_search, search_pix_fmt,
+                                            video_tune, vf_list, cb)
+                finally:
+                    if metric_sample_tmp:
+                        try:
+                            if os.path.exists(metric_sample_tmp): os.remove(metric_sample_tmp)
+                        except Exception: pass
 
                 if is_dark_scenes:
                     # Профиль «Тёмные сцены»: 10-бит, одно-проходный CRF AV1.
@@ -2104,9 +2234,8 @@ class ProcessWorker(QThread):
 
                     cmd_dark = [
                         FFMPEG, "-y",
-                    ] + trim_pre + ["-i", current_input] + trim_post + (
-                        ["-map", "0:V?"] if remove_audio else ["-map", "0:V?", "-map", "0:a?"]
-                    ) + timing_args + ["-map_metadata", "-1", "-map_chapters", "-1"] \
+                    ] + trim_pre + ["-i", current_input] + trim_post \
+                      + self._map_av_args(remove_audio, a_map_sel) + timing_args + ["-map_metadata", "-1", "-map_chapters", "-1"] \
                       + self._bt709_color_args(current_input) \
                       + self._av1_encoder_args(crf, preset_val, pix_fmt, video_tune)
                     if vf_list:
@@ -2183,17 +2312,15 @@ class ProcessWorker(QThread):
                     # Для видео-копии (single_pass_copy): passthrough сохраняет VFR-
                     # тайминг при `-c:v copy`, а aresample=async=1 убирает хвост
                     # loudnorm/опус-сдвиг — итог точно равен длине источника.
-                    if is_video and normal_speed and audio_filters:
-                        af_direct = ",".join(list(audio_filters)
-                                             + ["aresample=async=1", opus_layout_fix])
-                    else:
-                        af_direct = _opus_af(audio_filters)
+                    af_direct = self._af_arg(
+                        audio_filters,
+                        trim_tail=bool(is_video and normal_speed and audio_filters))
                     # Видео тут НЕ перекодируется (-c:v copy) — при заданном trim
                     # рез всё равно останется привязан к ближайшему ключевому
                     # кадру (как обычная copy-обрезка), кадровая точность здесь
                     # принципиально недостижима без реэнкода видео.
                     cmd_direct = [FFMPEG, "-y"] + trim_pre + ["-i", path] + trim_post \
-                                 + (["-map", "0:V?"] if remove_audio else ["-map", "0:V?", "-map", "0:a?"])
+                                 + self._map_av_args(remove_audio, a_map_sel)
                     if is_video and keep_timing:
                         cmd_direct += ["-fps_mode", "passthrough"]
                     if remove_audio:
@@ -2376,6 +2503,103 @@ class ProcessWorker(QThread):
             pass
         return out_path
 
+    @staticmethod
+    def _avif_encode_cmd(src, tmp_out, crf_val, scale_vf, has_alpha, pix_fmt, aspd):
+        """Команда ffmpeg для одного кодирования картинки в AVIF (libaom-av1).
+
+        tune=iq («Image Quality») — режим тюнинга libaom именно под неподвижные
+        изображения; передаётся через -aom-params, т.к. ffmpeg-обёртка -tune
+        знает только psnr/ssim. Проверено: -aom-params валидирует ключи по-
+        настоящему (bogus-значение роняет открытие энкодера), так что принятый
+        tune=iq — реально применяемый режим, не тихая заглушка.
+
+        has_alpha=True: цвет (yuva420p10le) и извлечённая альфа (gray10le) идут
+        двумя av1-потоками, avif-муксер сшивает их в файл с прозрачностью.
+        ВАЖНО: split ДО scale — если масштабировать перед split, ffmpeg при
+        согласовании форматов роняет альфу (alphaextract «could not choose
+        format»). Поэтому делим из yuva420p10le, затем масштабируем каждую
+        ветку отдельно (цвет и альфа одного размера).
+
+        Чистая функция (вынесена из process_avif для тестируемости)."""
+        aom_common = ["-cpu-used", str(max(0, min(8, aspd))),
+                      "-aom-params", "tune=iq",
+                      "-tile-columns", "1", "-tile-rows", "1", "-row-mt", "1"]
+        if has_alpha:
+            if scale_vf:
+                fc = (f"[0:v]format=yuva420p10le,split[c][a];"
+                      f"[c]{scale_vf}[main];[a]alphaextract,{scale_vf}[alf]")
+            else:
+                fc = "[0:v]format=yuva420p10le,split[main][a];[a]alphaextract[alf]"
+            return [FFMPEG, "-y", "-i", src, "-filter_complex", fc,
+                    "-map", "[main]", "-map", "[alf]", "-map_metadata", "-1",
+                    "-c:v", "libaom-av1", "-crf", str(crf_val)] + aom_common + \
+                   ["-still-picture", "1", "-threads", "0", tmp_out]
+        cmd = [FFMPEG, "-y", "-i", src]
+        if scale_vf:
+            cmd += ["-vf", scale_vf]
+        return cmd + ["-frames:v", "1", "-map_metadata", "-1", "-c:v", "libaom-av1",
+                      "-crf", str(crf_val)] + aom_common + \
+                     ["-pix_fmt", pix_fmt, "-threads", "0", tmp_out]
+
+    def _avif_prepare_input(self, path):
+        """Готовит вход для AVIF-конвейера → (path, rot_tmp_file, ширина, высота).
+
+        Авто-поворот по EXIF делается ЗАРАНЕЕ, отдельным .png: ffmpeg сам EXIF-
+        ориентацию картинок не применяет, и без этого повёрнутые снимки с
+        телефона выходили боком. rot_tmp_file (или None) — временный файл,
+        который вызывающий обязан удалить, но только когда ffmpeg уже точно не
+        будет читать path. Размеры нужны для расчёта ужимания; если Pillow не
+        справился — добираем их ffprobe, а если и это не вышло, вернутся нули
+        (вызывающий тогда падает на scale-выражение по макс. стороне)."""
+        rot_tmp_file = None
+        orig_w, orig_h = 0, 0
+        try:
+            if Image and ImageOps:
+                with Image.open(path) as im:
+                    im_t = ImageOps.exif_transpose(im)
+                    orig_w, orig_h = im_t.size
+                    if im_t is not im:
+                        tmp_rot = os.path.join(TEMP_DIR, f"rot_{uuid.uuid4().hex}.png")
+                        im_t.save(tmp_rot)
+                        path = tmp_rot
+                        rot_tmp_file = tmp_rot
+        except Exception as e:
+            self.log.emit(f"EXIF rotation notice: {e}")
+
+        if not orig_w:
+            try:
+                p = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, creationflags=CREATE_NO_WINDOW)
+                parts = p.stdout.strip().split('x')
+                if len(parts) == 2: orig_w, orig_h = int(parts[0]), int(parts[1])
+            except Exception: pass
+
+        return path, rot_tmp_file, orig_w, orig_h
+
+    @staticmethod
+    def _avif_downscale_side(orig_w, orig_h, baseline_kb, limit_kb):
+        """Макс. сторона для первой попытки даунскейла, когда ни один CQ не влез.
+
+        Оценка от известной точки (размер на CQ=63): считаем, что размер файла
+        примерно пропорционален числу пикселей, берём нужную долю площади и
+        переводим её в сторону (корень), с запасом 2% вниз. Клампим долю к 1.0
+        и дополнительно требуем реального уменьшения (иначе следующая проба
+        была бы точной копией предыдущей и проход терялся бы впустую).
+
+        Чистая функция (вынесена из process_avif — арифметику легко покрыть
+        тестами, а раньше её нельзя было проверить без запуска ffmpeg)."""
+        baseline_bytes = baseline_kb * 1024
+        target_bytes = limit_kb * 1024
+        orig_pixels = orig_w * orig_h
+        approx_ratio = float(target_bytes) / float(baseline_bytes) if baseline_bytes > 0 else 0.5
+        approx_ratio = max(0.01, min(1.0, approx_ratio))
+        target_pixels = max(1, int(orig_pixels * approx_ratio * 0.98))
+        scale_factor = (target_pixels / orig_pixels) ** 0.5
+        new_max_side = max(1, int(max(orig_w, orig_h) * scale_factor))
+        if new_max_side >= max(orig_w, orig_h):
+            new_max_side = max(1, int(max(orig_w, orig_h) * 0.9))
+        return new_max_side
+
     def process_avif(self, item, cb):
         path = item['path']
         base, ext = os.path.splitext(path)
@@ -2404,30 +2628,10 @@ class ProcessWorker(QThread):
             self.log.emit(f"Формат изображения: {img_fmt.upper()}")
             return self._convert_simple_image(item, path, out_dir, sanitized, adim, av, img_fmt, cb)
 
-        orig_w, orig_h = 0, 0
         tried_tmp_files = []
-
-        # Фикс: Авто-поворот изображения согласно EXIF-метаданным перед отправкой в FFmpeg
-        try:
-            if Image and ImageOps:
-                with Image.open(path) as im:
-                    im_t = ImageOps.exif_transpose(im)
-                    orig_w, orig_h = im_t.size
-                    if im_t is not im:
-                        tmp_rot = os.path.join(TEMP_DIR, f"rot_{uuid.uuid4().hex}.png")
-                        im_t.save(tmp_rot)
-                        path = tmp_rot
-                        tried_tmp_files.append(tmp_rot)
-        except Exception as e:
-            self.log.emit(f"EXIF rotation notice: {e}")
-            
-        if not orig_w:
-            try:
-                p = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
-                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, creationflags=CREATE_NO_WINDOW)
-                parts = p.stdout.strip().split('x')
-                if len(parts) == 2: orig_w, orig_h = int(parts[0]), int(parts[1])
-            except Exception: pass
+        # rot_tmp_file — входной файл после EXIF-поворота, не проба: чистится
+        # только когда он точно больше не понадобится как -i для ffmpeg.
+        path, rot_tmp_file, orig_w, orig_h = self._avif_prepare_input(path)
 
         if orig_w * orig_h > 8500000:
             if aspd < 6: aspd = 6
@@ -2456,6 +2660,15 @@ class ProcessWorker(QThread):
             for t in list(files):
                 try:
                     if os.path.exists(t): os.remove(t)
+                except Exception: pass
+
+        def _cleanup_final(files):
+            """Как _cleanup, но также удаляет входной rot_*.png — вызывать
+            только там, где ffmpeg больше не будет читать path (конец функции)."""
+            _cleanup(files)
+            if rot_tmp_file:
+                try:
+                    if os.path.exists(rot_tmp_file): os.remove(rot_tmp_file)
                 except Exception: pass
 
         # Прозрачность теперь идёт в AVIF (а не принудительно в WebP, как раньше):
@@ -2497,20 +2710,12 @@ class ProcessWorker(QThread):
             cb(100, "Конвертация картинки")
             size_new = os.path.getsize(out_webp)
             self.update_item_sig.emit(item['iid'], human_size(size_new), "-")
-            _cleanup(tried_tmp_files)
+            _cleanup_final(tried_tmp_files)
             if os.path.exists(out) and out != out_webp:
                 try: os.remove(out)
                 except Exception: pass
             return out_webp
 
-        # tune=iq («Image Quality») — режим тюнинга libaom-av1 именно под
-        # неподвижные изображения; передаётся напрямую через -aom-params, т.к.
-        # ffmpeg-обёртка -tune знает только psnr/ssim, а полный список тюнов
-        # (включая iq) доступен лишь через прямой проброс параметров в aom.
-        # Проверено: -aom-params валидирует ключи/значения по-настоящему
-        # (bogus-значение тут же роняет открытие энкодера с "Invalid value"),
-        # так что принятый без ошибки tune=iq — не тихая заглушка, а реально
-        # применяемый режим (подтверждено и разным размером файла на выходе).
         if 'libaom-av1' not in detect_ffmpeg_encoders():
             raise Exception("libaom-av1 не доступен в вашей сборке ffmpeg — AVIF перекодирование настроено работать ТОЛЬКО через libaom (libaom-av1).")
         limit_kb = int(av.get('limit', 0) or 0)
@@ -2539,33 +2744,10 @@ class ProcessWorker(QThread):
 
         def _encode_to(tmp_out, crf_val, vf_override=None):
             pass_state['n'] += 1
-            scale_vf = vf_override if vf_override is not None else vf
-            aom_common = ["-cpu-used", str(max(0, min(8, aspd))),
-                          "-aom-params", "tune=iq",
-                          "-tile-columns", "1", "-tile-rows", "1", "-row-mt", "1"]
-            if has_alpha:
-                # AVIF с альфой: цвет (yuva420p10le) и извлечённая альфа
-                # (gray10le) — два av1-потока, avif-муксер сшивает их в файл
-                # с прозрачностью. ВАЖНО: split ДО scale — если масштабировать
-                # перед split, ffmpeg при согласовании форматов роняет альфу
-                # (alphaextract «could not choose format»). Поэтому делим из
-                # yuva420p10le, затем масштабируем каждую ветку отдельно
-                # (цвет и альфа имеют одинаковые размеры).
-                if scale_vf:
-                    fc = (f"[0:v]format=yuva420p10le,split[c][a];"
-                          f"[c]{scale_vf}[main];[a]alphaextract,{scale_vf}[alf]")
-                else:
-                    fc = "[0:v]format=yuva420p10le,split[main][a];[a]alphaextract[alf]"
-                cmd = [FFMPEG, "-y", "-i", path, "-filter_complex", fc,
-                       "-map", "[main]", "-map", "[alf]", "-map_metadata", "-1",
-                       "-c:v", "libaom-av1", "-crf", str(crf_val)] + aom_common + \
-                      ["-still-picture", "1", "-threads", "0", tmp_out]
-            else:
-                cmd = [FFMPEG, "-y", "-i", path]
-                if scale_vf: cmd += ["-vf", scale_vf]
-                cmd += ["-frames:v", "1", "-map_metadata", "-1", "-c:v", "libaom-av1",
-                        "-crf", str(crf_val)] + aom_common + \
-                       ["-pix_fmt", pix_fmt_avif, "-threads", "0", tmp_out]
+            cmd = self._avif_encode_cmd(
+                path, tmp_out, crf_val,
+                vf_override if vf_override is not None else vf,
+                has_alpha, pix_fmt_avif, aspd)
             try:
                 orig_size = os.path.getsize(path) if os.path.exists(path) else 1
                 est_seconds = max(1, int(orig_size / 400_000))
@@ -2596,67 +2778,95 @@ class ProcessWorker(QThread):
                 if os.path.exists(tmp):
                     try: os.remove(tmp)
                     except Exception: pass
-                for t in tried_tmp_files:
-                    try:
-                        if os.path.exists(t): os.remove(t)
-                    except Exception: pass
+                _cleanup_final(tried_tmp_files)
 
-        low_crf = 0
-        high_crf = 63
         best_tmp = None
         best_size_kb = -1
+        size63_kb = None  # база для оценки даунскейла, если ни один CQ не влезет
 
         try:
             iterations = 0
             max_iterations = max(1, min(8, int(av.get('fit_passes', 4))))
-            tmp63 = os.path.join(TEMP_DIR, f"avif_{uuid.uuid4().hex}_63.avif")
-            tried_tmp_files.append(tmp63)
-            ok, err = _encode_to(tmp63, 63)
-            if not ok:
-                if os.path.exists(tmp63):
-                    try: os.remove(tmp63)
-                    except Exception: pass
-                raise Exception(f"AVIF conversion failed: {err}")
-            size63_kb = max(1, os.path.getsize(tmp63) // 1024)
-            if size63_kb <= limit_kb:
-                best_tmp = tmp63
-                best_size_kb = size63_kb
-                low_crf = 0
-                high_crf = 62
 
-            while low_crf <= high_crf and iterations < max_iterations:
-                mid = (low_crf + high_crf) // 2
-                tmpf = os.path.join(TEMP_DIR, f"avif_{uuid.uuid4().hex}_{mid}.avif")
-                tried_tmp_files.append(tmpf)
-                ok, err = _encode_to(tmpf, mid)
+            def _probe(crf_val):
+                t = os.path.join(TEMP_DIR, f"avif_{uuid.uuid4().hex}_{crf_val}.avif")
+                tried_tmp_files.append(t)
+                ok, err = _encode_to(t, crf_val)
                 if not ok:
-                    if os.path.exists(tmpf):
-                        try: os.remove(tmpf)
+                    if os.path.exists(t):
+                        try: os.remove(t)
                         except Exception: pass
                     raise Exception(f"AVIF conversion failed: {err}")
-                size_kb = max(1, os.path.getsize(tmpf) // 1024)
-                if size_kb <= limit_kb:
-                    if size_kb > best_size_kb:
-                        if best_tmp and best_tmp != tmpf and os.path.exists(best_tmp):
-                            try: os.remove(best_tmp)
-                            except Exception: pass
-                        best_tmp = tmpf
-                        best_size_kb = size_kb
-                    else:
-                        try:
-                            if os.path.exists(tmpf):
-                                os.remove(tmpf)
-                                tried_tmp_files.remove(tmpf)
+                return t, max(1, os.path.getsize(t) // 1024)
+
+            def _discard(t):
+                try:
+                    if os.path.exists(t):
+                        os.remove(t)
+                        tried_tmp_files.remove(t)
+                except Exception: pass
+
+            def _consider(t, s):
+                nonlocal best_tmp, best_size_kb
+                if s > best_size_kb:
+                    if best_tmp and best_tmp != t and os.path.exists(best_tmp):
+                        try: os.remove(best_tmp)
                         except Exception: pass
-                    high_crf = mid - 1
+                    best_tmp, best_size_kb = t, s
                 else:
-                    try:
-                        if os.path.exists(tmpf):
-                            os.remove(tmpf)
-                            tried_tmp_files.remove(tmpf)
-                    except Exception: pass
-                    low_crf = mid + 1
-                iterations += 1
+                    _discard(t)
+
+            # Разведка: сразу пробуем оба полюса диапазона — CQ=0 (макс.
+            # качество) и CQ=63 (мин.) — вместо удвоения шага от 0. Обрыв
+            # размера у AV1 (tune=iq) не всегда у самых низких CQ (для
+            # мультяшных/плоских картинок — да, но для детальных фото может
+            # лежать и в середине-верху диапазона, см. в памяти
+            # avif-fit-passes-binary-search-depth) — раньше удвоение шага
+            # (0→1→3→7→…) в таких случаях за отведённый бюджет ни разу не
+            # приближалось к реальному обрыву и скатывалось на CQ=63 почти
+            # без разбора. Зная оба конца сразу, дальше сужаем вилку
+            # log-интерполяцией (log(size) у AV1 примерно линеен по CQ) с
+            # небольшим смещением цели НИЖЕ реального лимита — на гладкой
+            # кривой (без резкого обрыва) интерполяция к самому лимиту почти
+            # всегда чуть промахивается ВЫШЕ него, и проход теряется впустую;
+            # смещение забирает этот запас заранее.
+            tmp0, size0_kb = _probe(0)
+            iterations += 1
+            if size0_kb <= limit_kb:
+                _consider(tmp0, size0_kb)
+            else:
+                bad_crf, bad_size = 0, size0_kb
+                good_crf, good_size = None, None
+                if iterations < max_iterations:
+                    t63, s63 = _probe(63)
+                    iterations += 1
+                    size63_kb = s63
+                    if s63 <= limit_kb:
+                        good_crf, good_size = 63, s63
+                        _consider(t63, s63)
+                    else:
+                        _discard(t63)
+                        bad_crf, bad_size = 63, s63
+
+                if good_crf is not None:
+                    _TARGET_BIAS = 0.9
+                    while good_crf - bad_crf > 1 and iterations < max_iterations:
+                        if bad_size == good_size:
+                            mid = (bad_crf + good_crf) // 2
+                        else:
+                            lt = math.log(max(1, limit_kb * _TARGET_BIAS))
+                            lo, hi = math.log(bad_size), math.log(good_size)
+                            frac = max(0.0, min(1.0, (lo - lt) / (lo - hi)))
+                            mid = int(round(bad_crf + frac * (good_crf - bad_crf)))
+                            mid = max(bad_crf + 1, min(good_crf - 1, mid))
+                        t, s = _probe(mid)
+                        iterations += 1
+                        if s <= limit_kb:
+                            good_crf, good_size = mid, s
+                            _consider(t, s)
+                        else:
+                            _discard(t)
+                            bad_crf, bad_size = mid, s
 
             if best_tmp and os.path.exists(best_tmp):
                 if os.path.exists(out):
@@ -2664,7 +2874,7 @@ class ProcessWorker(QThread):
                     except Exception: pass
                 shutil.move(best_tmp, out)
                 size_new = os.path.getsize(out)
-                _cleanup(tried_tmp_files)
+                _cleanup_final(tried_tmp_files)
                 self.update_item_sig.emit(item['iid'], human_size(size_new), "-")
                 return out
 
@@ -2674,24 +2884,35 @@ class ProcessWorker(QThread):
                         with Image.open(path) as im: orig_w, orig_h = im.size
                 except Exception: pass
 
-            if not os.path.exists(tmp63): raise Exception("Не удалось получить базовый AVIF.")
+            if size63_kb is None:
+                # Разведка не успела дойти до CQ=63 в рамках бюджета проходов
+                # (шаг удвоения обогнал бюджет) — добираем эту пробу отдельно.
+                # Если CQ=63 САМ укладывается в лимит — это и есть готовый
+                # ответ в полном разрешении: раньше этот результат выбрасывали
+                # и всё равно шли на даунскейл (который не был нужен и терял
+                # разрешение без причины — approx_ratio клампится к 1.0, но
+                # target_pixels всё равно * 0.98 срезает ~1% стороны).
+                t63, size63_kb = _probe(63)
+                if size63_kb <= limit_kb:
+                    _consider(t63, size63_kb)
+                else:
+                    _discard(t63)
 
-            baseline_bytes = os.path.getsize(tmp63)
-            target_bytes = limit_kb * 1024
+            if best_tmp and os.path.exists(best_tmp):
+                if os.path.exists(out):
+                    try: os.remove(out)
+                    except Exception: pass
+                shutil.move(best_tmp, out)
+                size_new = os.path.getsize(out)
+                _cleanup_final(tried_tmp_files)
+                self.update_item_sig.emit(item['iid'], human_size(size_new), "-")
+                return out
 
             if not orig_w or not orig_h:
                 _cleanup(tried_tmp_files)
                 raise Exception("Не удалось получить размеры изображения для downscale.")
 
-            orig_pixels = orig_w * orig_h
-            approx_ratio = float(target_bytes) / float(baseline_bytes) if baseline_bytes > 0 else 0.5
-            approx_ratio = max(0.01, min(1.0, approx_ratio))
-            target_pixels = max(1, int(orig_pixels * approx_ratio * 0.98))
-            scale_factor = (target_pixels / orig_pixels) ** 0.5
-            new_max_side = max(1, int(max(orig_w, orig_h) * scale_factor))
-
-            if new_max_side >= max(orig_w, orig_h):
-                new_max_side = max(1, int(max(orig_w, orig_h) * 0.9))
+            new_max_side = self._avif_downscale_side(orig_w, orig_h, size63_kb, limit_kb)
 
             down_attempt = 0
             max_down_attempts = 5
@@ -2713,7 +2934,7 @@ class ProcessWorker(QThread):
                         except Exception: pass
                     shutil.move(tmp_down, out)
                     size_new = os.path.getsize(out)
-                    _cleanup(tried_tmp_files)
+                    _cleanup_final(tried_tmp_files)
                     self.update_item_sig.emit(item['iid'], human_size(size_new), "-")
                     return out
                 else:
@@ -2738,6 +2959,10 @@ class ProcessWorker(QThread):
                 except Exception: pass
             if has_alpha and Image:
                 return _alpha_webp_fallback()
+            if rot_tmp_file:
+                try:
+                    if os.path.exists(rot_tmp_file): os.remove(rot_tmp_file)
+                except Exception: pass
             raise Exception(f"AVIF conversion failed: {stderr_tail[:4000]}")
         except Exception:
             _cleanup(tried_tmp_files)
@@ -2748,6 +2973,10 @@ class ProcessWorker(QThread):
                 except Exception: pass
             if has_alpha and Image:
                 return _alpha_webp_fallback()
+            if rot_tmp_file:
+                try:
+                    if os.path.exists(rot_tmp_file): os.remove(rot_tmp_file)
+                except Exception: pass
             raise
 
     def _fmt_eta(self, fraction, start):

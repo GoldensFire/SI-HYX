@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Callable
 
-from . import config, db, sibrowser, stats_api, siq
+from . import config, db, sibrowser, stats_api, siq, steam_workshop
 
 ProgressCB = Callable[[int, int, str], None]
 
@@ -101,7 +101,8 @@ def collect(
             # .siq (опционально)
             if download_siq and card.sibrowser_id:
                 cb(done, max_new, f"Скачиваю .siq: {card.name}")
-                path = siq.download_siq(session, card.sibrowser_id, card.name)
+                path = siq.download_siq(session, card.sibrowser_id, card.name,
+                                        should_stop=stop)
                 if path:
                     try:
                         themes_siq, questions = siq.parse_siq(path, pid)
@@ -154,20 +155,24 @@ def collect(
 
 
 def collect_author(author: str, download_siq: bool = False,
-                   author_blacklist: set[str] | None = None,
                    on_new_package: Callable[[int], None] | None = None,
                    progress_cb: ProgressCB | None = None,
                    should_stop: Callable[[], bool] | None = None) -> dict:
     """Собирает ВСЕ паки указанного автора со страницы /authors/<author>.
 
     Обновляет уже собранные (upsert по названию), добавляет новые.
+
+    БЕЗ author_blacklist: вызов этой функции — явный, целевой запрос «собери
+    мне паки конкретно этого автора», и чёрный список (нужен, чтобы ФОНОВЫЙ
+    автосбор — collect()/collect_steam_workshop() — сам пропускал неугодных
+    авторов) тут же его вместо этого молча блокировал бы — весь результат
+    уходил в отсеянные, а «новых: 0» выглядело как будто сбор вообще не работает.
     """
     cb = progress_cb or _noop
     stop = should_stop or _never_stop
     db.init_db()
     session = sibrowser.make_session()
-    summary = {"new": 0, "with_stats": 0, "with_siq": 0, "no_stats": 0,
-               "skipped_blacklisted": 0}
+    summary = {"new": 0, "with_stats": 0, "with_siq": 0, "no_stats": 0}
     cards = list(sibrowser.iter_author_cards(
         session, author, progress_cb=lambda m: cb(0, 1, m), should_stop=stop))
     total = len(cards) or 1
@@ -175,14 +180,12 @@ def collect_author(author: str, download_siq: bool = False,
         for i, card in enumerate(cards, 1):
             if stop():
                 break
-            if _is_blacklisted(card.authors, author_blacklist):
-                summary["skipped_blacklisted"] += 1
-                continue
             stats = stats_api.get_package_stats(session, card.name, card.authors)
             pid = db.upsert_package(conn, card.as_package())
             db.replace_themes(conn, pid, card.themes)
             if download_siq and card.sibrowser_id:
-                path = siq.download_siq(session, card.sibrowser_id, card.name)
+                path = siq.download_siq(session, card.sibrowser_id, card.name,
+                                        should_stop=stop)
                 if path:
                     try:
                         themes_siq, questions = siq.parse_siq(path, pid)
@@ -207,13 +210,77 @@ def collect_author(author: str, download_siq: bool = False,
     return summary
 
 
+def collect_steam_workshop(
+    api_key: str,
+    max_new: int = 50,
+    min_subscriptions: int = 0,
+    author_blacklist: set[str] | None = None,
+    on_new_package: Callable[[int], None] | None = None,
+    progress_cb: ProgressCB | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict:
+    """Импортирует метаданные паков из Steam Workshop SIGame (app 3553500) через
+    Steam Web API (steam_workshop.py). ТОЛЬКО метаданные — depot-файлы воркшопа
+    не скачиваются (для этого нужен SteamCMD, отдельная задача). Импортированные
+    паки помечаются source='steam' (sibrowser_id=None), кнопка «Скачать .siq» их
+    автоматически пропускает (см. sigstats_tab.py::_bulk_download).
+
+    Дедупликация — как и у sibrowser, по name_norm: пак с уже известным названием
+    (собранный откуда угодно) не дублируется.
+    """
+    cb = progress_cb or _noop
+    stop = should_stop or _never_stop
+    db.init_db()
+    session = steam_workshop.make_session()
+    summary = {"new": 0, "with_stats": 0, "no_stats": 0, "skipped_existing": 0,
+               "skipped_low_subs": 0, "skipped_blacklisted": 0}
+    with db.connect() as conn:
+        skip_norms = db.existing_name_norms(conn)
+        before = len(skip_norms)
+        done = 0
+        for item in steam_workshop.iter_items(
+            session, api_key, skip_norms=skip_norms,
+            progress_cb=lambda m: cb(done, max_new, m), should_stop=stop,
+        ):
+            if stop():
+                break
+            if min_subscriptions > 0 and (item.subscriptions or 0) < min_subscriptions:
+                summary["skipped_low_subs"] += 1
+                continue
+            if _is_blacklisted(item.authors, author_blacklist):
+                summary["skipped_blacklisted"] += 1
+                continue
+            stats = stats_api.get_package_stats(session, item.name, item.authors)
+            pid = db.upsert_package(conn, item.as_package())
+            db.replace_themes(conn, pid, [])
+            db.set_stats(conn, pid, stats)
+            if stats:
+                summary["with_stats"] += 1
+            else:
+                summary["no_stats"] += 1
+            conn.commit()
+            if on_new_package:
+                try:
+                    on_new_package(pid)
+                except Exception:
+                    pass
+            summary["new"] += 1
+            done += 1
+            cb(done, max_new, f"[{done}/{max_new}] {item.name}")
+            stats_api.throttle()
+            if done >= max_new:
+                break
+        summary["skipped_existing"] = before
+    return summary
+
+
 def refresh_stats(only_missing: bool = True,
                   progress_cb: ProgressCB | None = None,
                   should_stop: Callable[[], bool] | None = None) -> dict:
     """Перезапрашивает статистику игр для УЖЕ собранных паков (без перескрейпа).
 
-    Нужно, чтобы заполнить новые метрики (% попыток/правильных, индекс баланса)
-    у паков, собранных до их появления.
+    Нужно, чтобы заполнить новые метрики (% попыток/правильных) у паков,
+    собранных до их появления.
     only_missing=True — только те, где этих метрик ещё нет.
     """
     cb = progress_cb or _noop
@@ -276,14 +343,16 @@ def recompute_durations(progress_cb: ProgressCB | None = None,
 
 
 def download_one(package_id: int, sibrowser_id: str, name: str,
-                 progress_cb=None) -> bool:
+                 progress_cb=None, should_stop=None) -> bool:
     """Скачивает и разбирает .siq одного уже собранного пакета (для кнопки в UI).
 
     progress_cb(done_bytes, total_bytes) — прогресс именно СКАЧИВАНИЯ файла
     (разбор/статистика после него не покрываются), пробрасывается в download_siq.
+    should_stop() — пробрасывается в download_siq, проверяется между чанками.
     """
     session = sibrowser.make_session()
-    path = siq.download_siq(session, sibrowser_id, name, progress_cb=progress_cb)
+    path = siq.download_siq(session, sibrowser_id, name, progress_cb=progress_cb,
+                            should_stop=should_stop)
     if not path:
         return False
     with db.connect() as conn:

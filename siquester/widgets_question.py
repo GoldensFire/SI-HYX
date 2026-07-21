@@ -1,5 +1,7 @@
 """QuestionViewer — the main question display/edit surface."""
 
+from PyQt6.QtGui import QDesktopServices
+
 from .qt import *
 from .constants import *
 from .util import *
@@ -1499,6 +1501,38 @@ class QuestionViewer(QWidget):
                 w = QWidget(); w.setStyleSheet("background:#1e1e2e; border-radius:6px;")
                 QVBoxLayout(w).addWidget(_lbl(f"⚠  Файл не найден: {text}", "color:#f38ba8; font-size:11px;"))
                 return w
+
+        # HTML-мини-игра
+        if itype == "html" and is_ref:
+            fname_html = text.split("/")[-1] + simul_tag
+            path = self.siq.extract_media(text)
+            w = QWidget(); w.setStyleSheet("background:#1e1e2e; border-radius:6px;")
+            wl = QHBoxLayout(w); wl.setContentsMargins(10, 8, 10, 8); wl.setSpacing(8)
+            icon = QLabel("🌐"); icon.setStyleSheet("font-size:18px;background:transparent;")
+            wl.addWidget(icon, 0, _AlignVC)
+
+            info_col = QVBoxLayout(); info_col.setSpacing(1)
+            name_lbl = QLabel(fname_html); name_lbl.setWordWrap(True)
+            name_lbl.setStyleSheet("color:#cdd6f4;font-size:12px;")
+            info_col.addWidget(name_lbl)
+            sub = "HTML-мини-игра"
+            if dur_sec_xml is not None:
+                sub += f"  ⏱ {fmt_dur(dur_sec_xml)}"
+            sub_lbl = QLabel(sub); sub_lbl.setStyleSheet("color:#6c7086;font-size:10px;")
+            info_col.addWidget(sub_lbl)
+            wl.addLayout(info_col, 1)
+
+            if path and os.path.exists(path):
+                open_btn = QPushButton("▶ Открыть")
+                open_btn.setObjectName(_ON_BTN_COMPARE); open_btn.setFixedHeight(26)
+                open_btn.clicked.connect(
+                    lambda _, p=path: QDesktopServices.openUrl(QUrl.fromLocalFile(p)))
+                wl.addWidget(open_btn, 0, _AlignVC)
+            else:
+                warn = QLabel("⚠ файл не найден")
+                warn.setStyleSheet("color:#f38ba8;font-size:11px;")
+                wl.addWidget(warn, 0, _AlignVC)
+            return w
 
 
     def _open_propagate_wrong_dialog(self, wrong_text: str, datasets: list):

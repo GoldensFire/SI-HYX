@@ -174,11 +174,21 @@ class _AnsEdit(QTextEdit):
             self.enter_pressed.emit()
         elif e.key() == Qt.Key.Key_Backspace and not self.toPlainText():
             self.backspace_empty.emit()
-        elif ctrl and e.key() == Qt.Key.Key_A:
-            # Select all text in THIS row only (not propagate to parent)
+        elif ctrl and (e.key() == Qt.Key.Key_A or self._is_native_vk_a(e)):
+            # Select all text in THIS row only (not propagate to parent).
+            # e.key()==Key_A alone misses кириллицу (физическая A шлёт код
+            # буквы Ф) — фолбэк по nativeVirtualKey (VK_A=0x41), не зависящий
+            # от раскладки (тот же приём, что и Ctrl+Z/Y в edit_tab.py/tabs.py).
             self.selectAll()
         else:
             super().keyPressEvent(e)
+
+    @staticmethod
+    def _is_native_vk_a(e):
+        try:
+            return e.nativeVirtualKey() == 0x41
+        except Exception:
+            return False
 
     def dragEnterEvent(self, e):
         # Accept media-file drops; let plain text / row-reorder MIME through normally
@@ -538,7 +548,7 @@ class QuestionEditorDialog(QDialog):
                 qvl.addWidget(te); self._text_edits.append(te)
         if media_items:
             for it in media_items:
-                icon = {"image": "🖼", "audio": "🎵", "video": "🎥"}.get(it["type"], "📎")
+                icon = {"image": "🖼", "audio": "🎵", "video": "🎥", "html": "🌐"}.get(it["type"], "📎")
                 lbl = _lbl(f"{icon} {it['text']}", "color:#a6adc8;font-size:10px;padding:2px 4px;"
                            "background:#1e1e2e;border-radius:3px;")
                 qvl.addWidget(lbl); self._media_labels.append(lbl)
@@ -554,6 +564,7 @@ class QuestionEditorDialog(QDialog):
             ("🖼", "Изображение", "Images (*.jpg *.jpeg *.png *.gif *.bmp *.webp *.avif)", "image"),
             ("🎵", "Аудио",       "Audio (*.mp3 *.ogg *.wav *.aac *.flac *.m4a)",   "audio"),
             ("🎥", "Видео",       "Video (*.mp4 *.avi *.mkv *.mov *.wmv *.webm)",   "video"),
+            ("🌐", "HTML-игра",   "HTML (*.html *.htm)",                             "html"),
         ]:
             mb = QPushButton(f"{icon} {label}")
             mb.setObjectName(_ON_BTN_COMPARE); mb.setFixedHeight(24)
@@ -678,7 +689,7 @@ class QuestionEditorDialog(QDialog):
         ok = self.siq.add_media_to_question(
             self.rnd_idx, self.theme_idx, self.q_idx, path, param_name)
         if ok:
-            icon = {"image": "🖼", "audio": "🎵", "video": "🎥"}.get(itype, "📎")
+            icon = {"image": "🖼", "audio": "🎵", "video": "🎥", "html": "🌐"}.get(itype, "📎")
             fname = os.path.basename(path)
             lbl = _lbl(f"{icon} {fname}", "color:#a6adc8;font-size:10px;padding:2px 4px;"
                        "background:#1e1e2e;border-radius:3px;")

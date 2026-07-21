@@ -19,6 +19,7 @@ import requests
 
 from . import config
 from .normalize import normalize_theme, display_theme
+import siq_duration
 
 # тип атома → папка медиа в архиве
 _MEDIA_FOLDER = {"image": "Images", "voice": "Audio", "audio": "Audio",
@@ -26,9 +27,9 @@ _MEDIA_FOLDER = {"image": "Images", "voice": "Audio", "audio": "Audio",
 _MEDIA_TYPES = set(_MEDIA_FOLDER)
 _CONTENT_CANDIDATES = ("content.xml", "Content.xml")
 
-# ── Оценка длительности пакета ────────────────────────────────────────────────
-_CHARS_PER_SEC = 20.0     # скорость чтения текста вопроса/ответа
-_IMAGE_SEC = 5.0          # показ одной картинки
+# ── Оценка длительности пакета (правила группировки — см. siq_duration.py) ────
+_CHARS_PER_SEC = siq_duration.CHARS_PER_SEC     # скорость чтения текста
+_IMAGE_SEC = siq_duration.IMAGE_SEC             # показ одной картинки
 _FFPROBE_CACHED: str | None = None
 
 
@@ -76,7 +77,7 @@ def _probe_duration(path: Path | str) -> float | None:
     return dur
 
 
-_ANSWER_TEXT_SEC = 3.0     # фиксированная длительность обычного текстового ответа
+_ANSWER_TEXT_SEC = siq_duration.ANSWER_TEXT_SEC  # обычный текстовый ответ
 # Современные («тяжёлые») кодеки — за них небольшой бонус
 _MODERN_CODECS = {"hevc", "h265", "av1", "vvc", "h266"}
 
@@ -161,27 +162,37 @@ def _child(el, name: str):
 
 
 def download_siq(session: requests.Session, sibrowser_id: str, name_hint: str,
-                 progress_cb=None) -> Path | None:
+                 progress_cb=None, should_stop=None) -> Path | None:
     """Качает .siq через direct_download (следует за редиректом на хранилище).
 
     progress_cb(done_bytes, total_bytes) — необязательный колбэк прогресса
     скачивания (для показа процента в интерфейсе). total_bytes == 0, если сервер
     не прислал Content-Length.
+
+    should_stop() — необязательная проверка отмены, вызывается между чанками
+    (не только между паками, как у остальных collector-функций): без неё
+    отмена скачивания срабатывала только ПОСЛЕ полного докачивания текущего
+    файла — на большом .siq это выглядело как «отмена не работает».
     """
     config.ensure_dirs()
+    stop = should_stop or (lambda: False)
     safe = re.sub(r"[^\w\-. ]+", "_", name_hint)[:80].strip() or sibrowser_id
     dest = config.PACKAGES_DIR / f"{sibrowser_id}_{safe}.siq"
     if dest.exists() and dest.stat().st_size > 0:
         return dest
     url = f"{config.SIBROWSER_BASE}/packages/{sibrowser_id}/direct_download"
+    tmp = dest.with_suffix(".part")
     try:
         with session.get(url, timeout=config.REQUEST_TIMEOUT, stream=True) as r:
             r.raise_for_status()
             total = int(r.headers.get("Content-Length") or 0)
             done = 0
-            tmp = dest.with_suffix(".part")
+            cancelled = False
             with open(tmp, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1 << 16):
+                    if stop():
+                        cancelled = True
+                        break
                     if chunk:
                         f.write(chunk)
                         done += len(chunk)
@@ -190,8 +201,12 @@ def download_siq(session: requests.Session, sibrowser_id: str, name_hint: str,
                                 progress_cb(done, total)
                             except Exception:
                                 pass
+            if cancelled:
+                tmp.unlink(missing_ok=True)
+                return None
             tmp.replace(dest)
     except Exception:
+        tmp.unlink(missing_ok=True)
         return None
     return dest
 
@@ -235,19 +250,7 @@ def _extract_atom(zf: zipfile.ZipFile, atype: str, raw: str,
 
 def _parse_dur_attr(s: str | None) -> float | None:
     """Разбирает атрибут duration: «5», «5.0», «mm:ss», «hh:mm:ss»."""
-    if not s:
-        return None
-    s = s.strip()
-    try:
-        if ":" in s:
-            parts = [float(p) for p in s.split(":")]
-            sec = 0.0
-            for p in parts:
-                sec = sec * 60 + p
-            return sec
-        return float(s)
-    except ValueError:
-        return None
+    return siq_duration.parse_dur_attr(s)
 
 
 def _item_info(item_el) -> dict:
@@ -277,6 +280,10 @@ def _item_seconds(info: dict, zf, media_dir) -> float:
     t = info["type"]
     if t == "image":
         return _IMAGE_SEC
+    if t == "html":
+        # No reliable way to know how long an interactive minigame runs —
+        # treat it like a static image unless an explicit timer is set.
+        return _IMAGE_SEC
     if t in ("audio", "video"):
         m = _extract_atom(zf, t, ("@" + info["raw"]) if info["is_ref"] else info["raw"],
                           media_dir)
@@ -288,37 +295,11 @@ def _item_seconds(info: dict, zf, media_dir) -> float:
 
 
 def _content_duration(items: list[dict], zf, media_dir) -> float:
-    """Длительность последовательности элементов с учётом одновременного показа.
-
-    waitForFinish=False → элемент показывается одновременно со следующим (они в
-    одной «группе»). placement=background (фоновая музыка) идёт параллельно всему.
-    В группе с медиа устный текст не считается; «2 фото разом» = 5 сек (берём
-    максимум по группе). Последовательные группы складываются.
-    """
-    fg = [it for it in items if it["placement"] != "background"]
-    bg = [it for it in items if it["placement"] == "background"]
-
-    groups: list[list[dict]] = []
-    cur: list[dict] = []
-    for it in fg:
-        cur.append(it)
-        if it["wait_false"]:
-            continue
-        groups.append(cur)
-        cur = []
-    if cur:
-        groups.append(cur)
-
-    fg_total = 0.0
-    for g in groups:
-        media = [it for it in g if it["type"] in ("image", "audio", "video")]
-        if media:                       # текст при одновременном медиа не считаем
-            fg_total += max(_item_seconds(it, zf, media_dir) for it in media)
-        else:
-            fg_total += max((_item_seconds(it, zf, media_dir) for it in g),
-                            default=0.0)
-    bg_total = sum(_item_seconds(it, zf, media_dir) for it in bg)
-    return max(fg_total, bg_total)
+    """Длительность последовательности элементов с учётом одновременного показа
+    (группировка — см. siq_duration.content_duration; тут только пробрасываем
+    ffprobe-специфичный способ измерить один элемент)."""
+    return siq_duration.content_duration(
+        items, lambda it: _item_seconds(it, zf, media_dir))
 
 
 def _scenario_items(scenario, half: str) -> list[dict]:
@@ -394,18 +375,13 @@ def _parse_question(q_el, zf, media_dir) -> tuple[str, list[dict], list[dict], f
                 if answer_time is None:
                     answer_time = _parse_dur_attr(param.get("duration"))
 
-    q_dur = _content_duration(q_items, zf, media_dir)
     # есть ли «сложный ответ» (контент-ответ с текстом/медиа)
     has_answer_content = any(it.get("raw") or it.get("type") in _MEDIA_TYPES
                              for it in a_items)
-    if answer_time is not None:
-        # «время на ответ» задаёт ответную часть: время на ответ − 5 секунд
-        a_dur = max(0.0, answer_time - 5.0)
-    else:
-        a_dur = _content_duration(a_items, zf, media_dir)
-        if not has_answer_content and _answer_texts(q_el):
-            a_dur += _ANSWER_TEXT_SEC      # обычный текстовый ответ = 3 сек
-    return (" ".join(texts).strip(), media, answer_media, round(q_dur + a_dur, 2))
+    dur = siq_duration.question_duration(
+        q_items, a_items, answer_time, has_answer_content,
+        bool(_answer_texts(q_el)), lambda it: _item_seconds(it, zf, media_dir))
+    return (" ".join(texts).strip(), media, answer_media, round(dur, 2))
 
 
 def _answer_texts(q_el) -> list[str]:

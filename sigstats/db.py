@@ -86,7 +86,10 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
     """Лёгкая миграция: добавляет недостающие колонки в существующую БД."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(packages)")}
     for col, decl in (("answer_rate", "REAL"), ("correct_rate", "REAL"),
-                      ("duration_sec", "REAL"), ("modern_codec_share", "REAL")):
+                      ("duration_sec", "REAL"), ("modern_codec_share", "REAL"),
+                      ("description", "TEXT"),
+                      ("source", "TEXT DEFAULT 'sibrowser'"), ("steam_id", "TEXT"),
+                      ("description_full", "TEXT")):
         if col not in cols:
             conn.execute(f"ALTER TABLE packages ADD COLUMN {col} {decl}")
     qcols = {r[1] for r in conn.execute("PRAGMA table_info(questions)")}
@@ -135,6 +138,9 @@ def upsert_package(conn: sqlite3.Connection, pkg: dict[str, Any]) -> int:
         pct_photo=pkg.get("pct_photo"),
         pct_audio=pkg.get("pct_audio"),
         pct_video=pkg.get("pct_video"),
+        description=pkg.get("description"),
+        source=pkg.get("source") or "sibrowser",
+        steam_id=pkg.get("steam_id"),
         collected_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
     if row:
@@ -265,6 +271,13 @@ def set_durations(conn: sqlite3.Connection, package_id: int,
     share = _modern_codec_share(questions)
     conn.execute("UPDATE packages SET duration_sec=?, modern_codec_share=? WHERE id=?",
                  (total, share, package_id))
+
+
+def set_description_full(conn: sqlite3.Connection, package_id: int, text: str) -> None:
+    """Кэширует полное описание пака (см. sibrowser.fetch_full_description) в
+    ОТДЕЛЬНОЙ колонке, а не в description — ту при каждом сборе перезаписывает
+    upsert_package урезанным текстом из карточки списка (см. пояснение там)."""
+    conn.execute("UPDATE packages SET description_full=? WHERE id=?", (text, package_id))
 
 
 def mark_siq(conn: sqlite3.Connection, package_id: int, path: str | None) -> None:

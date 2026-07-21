@@ -14,12 +14,6 @@ def load_packages(conn: sqlite3.Connection) -> pd.DataFrame:
     if df.empty:
         return df
     df["completion_pct"] = df["completion_rate"] * 100
-    # перцентиль завершённости ВНУТРИ группы по длине — снимает смещение
-    # «короткие пакеты всегда заканчивают чаще».
-    df["completion_rank_in_group"] = (
-        df.groupby("length_group")["completion_rate"]
-        .rank(pct=True) * 100
-    )
     df["authors"] = df["authors_json"].apply(
         lambda s: json.loads(s) if s else [])
     df["tags"] = df["tags_json"].apply(lambda s: json.loads(s) if s else [])
@@ -42,9 +36,6 @@ def load_packages(conn: sqlite3.Connection) -> pd.DataFrame:
     df["duration_str"] = df["duration_sec"].apply(_fmt_duration)
     if "modern_codec_share" not in df.columns:
         df["modern_codec_share"] = pd.NA
-    df["balance_index"] = _balance_index(
-        df["completion_rate"], df["answer_rate"], df["correct_rate"],
-        df["duration_min"], df["modern_codec_share"])
     return df
 
 
@@ -67,40 +58,6 @@ def _fmt_duration(sec) -> str:
     h, rem = divmod(sec, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-def _balance_index(completion_rate: pd.Series, answer_rate: pd.Series,
-                   correct_rate: pd.Series,
-                   duration_min: pd.Series | None = None,
-                   modern_codec_share: pd.Series | None = None) -> pd.Series:
-    """Индекс баланса 0–100.
-
-    Это % завершения, скорректированный на сложность. Пак тем «ценнее», чем он
-    сложнее при той же завершаемости: низкий % попыток ответа и низкий %
-    правильных дают бонус, высокие — штраф. За высокий % попыток ответа штраф
-    чуть строже, чем за высокий % правильных (вес 0.8 против 0.5): если по
-    вопросам много жмут — они «дешёвые», это сильнее обесценивает пак, чем то,
-    что нажавшие угадали. Привязка к завершаемости не даёт паку с низким
-    завершением стать «лучшим». Множитель ограничен диапазоном 0.4…1.6.
-
-    Длинные паки поощряются (если длительность известна из .siq): бонус до +20 %
-    линейно от 20 до 50 минут. Короче 20 мин или без данных — без бонуса.
-
-    Современные кодеки видео (hevc/av1/vvc) дают супер-небольшой бонус — до +5 %,
-    пропорционально доле вопросов с таким видео.
-    """
-    a_term = (0.8 * (0.5 - answer_rate)).fillna(0.0)
-    c_term = (0.5 * (0.5 - correct_rate)).fillna(0.0)
-    mult = (1 + a_term + c_term).clip(lower=0.4, upper=1.6)
-    base = completion_rate * 100 * mult
-    if duration_min is not None:
-        dur_bonus = (1 + (((duration_min - 20) / 30) * 0.20)
-                     .clip(lower=0.0, upper=0.20)).fillna(1.0)
-        base = base * dur_bonus
-    if modern_codec_share is not None:
-        share = pd.to_numeric(modern_codec_share, errors="coerce").clip(lower=0.0, upper=1.0)
-        base = base * (1 + 0.05 * share).fillna(1.0)
-    return base.clip(lower=0, upper=100).round(0)
 
 
 def category_names(df: pd.DataFrame) -> list[str]:
@@ -143,7 +100,7 @@ def theme_table(conn: sqlite3.Connection) -> pd.DataFrame:
     """Сводка по темам (по нормализованному ключу).
 
     Колонки: тема (для показа), в скольких пакетах, доля, средняя завершённость,
-    средний перцентиль завершённости в группе (с поправкой на длину), редкость.
+    редкость.
     """
     total_packages = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
     if not total_packages:
@@ -168,13 +125,6 @@ def theme_table(conn: sqlite3.Connection) -> pd.DataFrame:
     # ключ группировки пересчитываем из имени — отражает актуальную нормализацию
     rows["name_norm"] = rows["variant"].map(normalize_theme)
 
-    # перцентиль завершённости пакета внутри группы (тот же, что в load_packages)
-    pkg = rows.drop_duplicates("package_id")[
-        ["package_id", "completion_rate", "length_group"]].copy()
-    pkg["pct_in_group"] = (
-        pkg.groupby("length_group")["completion_rate"].rank(pct=True) * 100)
-    rows = rows.merge(pkg[["package_id", "pct_in_group"]], on="package_id", how="left")
-
     # уникальные пары (тема, пакет)
     uniq = rows.drop_duplicates(["name_norm", "package_id"])
 
@@ -182,7 +132,6 @@ def theme_table(conn: sqlite3.Connection) -> pd.DataFrame:
         n_packages=("package_id", "nunique"),
         n_with_stats=("has_stats", "sum"),
         avg_completion=("completion_rate", "mean"),
-        avg_pct_in_group=("pct_in_group", "mean"),
     ).reset_index()
 
     # отображаемое написание темы: вариант с эмодзи / самый длинный
@@ -208,18 +157,15 @@ def theme_table(conn: sqlite3.Connection) -> pd.DataFrame:
 
 
 def author_table(conn: sqlite3.Connection) -> pd.DataFrame:
-    """Топ авторов по качеству их паков.
+    """Топ авторов по средней завершённости их паков.
 
-    Качество = средний перцентиль завершённости их паков (с поправкой на длину) +
-    средняя сырая завершённость. Учитываются только паки со статистикой.
+    Учитываются только паки со статистикой.
     """
     df = pd.read_sql_query(
         "SELECT id, authors_json, completion_rate, has_stats, length_group, "
         "started_games FROM packages", conn)
     if df.empty:
         return pd.DataFrame()
-    df["pct_in_group"] = (
-        df.groupby("length_group")["completion_rate"].rank(pct=True) * 100)
 
     rows = []
     for _, r in df.iterrows():
@@ -228,7 +174,6 @@ def author_table(conn: sqlite3.Connection) -> pd.DataFrame:
                 "author": a,
                 "completion_rate": r["completion_rate"],
                 "has_stats": r["has_stats"],
-                "pct_in_group": r["pct_in_group"],
                 "started": r["started_games"] or 0,
             })
     a = pd.DataFrame(rows)
@@ -239,11 +184,10 @@ def author_table(conn: sqlite3.Connection) -> pd.DataFrame:
         packages=("author", "size"),
         with_stats=("has_stats", "sum"),
         avg_completion=("completion_rate", "mean"),
-        avg_pct_in_group=("pct_in_group", "mean"),
         total_started=("started", "sum"),
     ).reset_index()
     g["avg_completion_pct"] = g["avg_completion"] * 100
-    g = g.sort_values(["avg_pct_in_group", "packages"],
+    g = g.sort_values(["avg_completion_pct", "packages"],
                       ascending=[False, False], na_position="last").reset_index(drop=True)
     return g
 

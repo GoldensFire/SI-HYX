@@ -77,23 +77,10 @@ class TestLoadPackages:
         assert row["duration_min"] == pytest.approx(1.0)
         assert row["duration_str"] == "1:00"
 
-    def test_rank_in_group(self, populated):
-        conn, _ = populated
-        df = analysis.load_packages(conn)
-        good = df[df["name"] == "Хороший пак"].iloc[0]
-        mid = df[df["name"] == "Средний пак"].iloc[0]
-        assert good["completion_rank_in_group"] > mid["completion_rank_in_group"]
-
     def test_difficulty_label_applied(self, populated):
         conn, _ = populated
         df = analysis.load_packages(conn)
         assert df[df["name"] == "Хороший пак"].iloc[0]["difficulty"] == "средне"
-
-    def test_balance_index_range(self, populated):
-        conn, _ = populated
-        df = analysis.load_packages(conn)
-        vals = df["balance_index"].dropna()
-        assert ((vals >= 0) & (vals <= 100)).all()
 
 
 class TestDifficultyLabel:
@@ -124,50 +111,6 @@ class TestFmtDuration:
 
     def test_zero(self):
         assert analysis._fmt_duration(0) == "0:00"
-
-
-class TestBalanceIndex:
-    def _series(self, **kw):
-        base = dict(completion=[0.5], answer=[0.5], correct=[0.5],
-                    duration=[None], codec=[None])
-        base.update(kw)
-        return analysis._balance_index(
-            pd.Series(base["completion"]), pd.Series(base["answer"]),
-            pd.Series(base["correct"]),
-            pd.Series(base["duration"], dtype="float64"),
-            pd.Series(base["codec"], dtype="float64"))
-
-    def test_neutral(self):
-        # answer=correct=0.5 → множитель 1 → 50
-        assert self._series().iloc[0] == pytest.approx(50.0)
-
-    def test_hard_pack_bonus(self):
-        # реже отвечают → бонус
-        hard = self._series(answer=[0.2], correct=[0.3])
-        assert hard.iloc[0] > 50.0
-
-    def test_easy_pack_penalty(self):
-        easy = self._series(answer=[0.9], correct=[0.9])
-        assert easy.iloc[0] < 50.0
-
-    def test_duration_bonus(self):
-        long_pack = self._series(duration=[50.0])
-        assert long_pack.iloc[0] > self._series(duration=[10.0]).iloc[0]
-
-    def test_codec_bonus(self):
-        modern = self._series(codec=[1.0])
-        # 50*1.05 = 52.5, округляется до целого банковским округлением
-        assert modern.iloc[0] > self._series().iloc[0]
-        assert modern.iloc[0] == pytest.approx(52.0)
-
-    def test_clipped_at_100(self):
-        v = self._series(completion=[1.0], answer=[0.0], correct=[0.0],
-                         duration=[60.0], codec=[1.0])
-        assert v.iloc[0] == 100.0
-
-    def test_nan_tolerated(self):
-        v = self._series(answer=[float("nan")], correct=[float("nan")])
-        assert v.iloc[0] == pytest.approx(50.0)
 
 
 class TestThemeTable:
