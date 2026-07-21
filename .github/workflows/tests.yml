@@ -1,0 +1,72 @@
+# Прогон тестового набора SI-HYX.
+#
+# Windows выбран не для галочки: приложение живёт только под Windows, а часть
+# кода (пути %APPDATA%, taskbar, SHFileOperation, кодировки консоли) на других
+# ОС ведёт себя иначе — зелёный прогон на Linux ничего бы не гарантировал.
+#
+# QT_QPA_PLATFORM=offscreen — тесты создают настоящий QApplication, но у
+# раннера нет рабочего стола.
+name: Тесты
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Новый пуш в ту же ветку отменяет предыдущий незавершённый прогон.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Версия, на которой проект разрабатывается и собирается релиз.
+          python-version: '3.14'
+          cache: pip
+
+      - name: Установить зависимости
+        # Ставим весь requirements.txt целиком, а не урезанный список: заодно
+        # проверяется, что файл вообще устанавливается на чистой машине.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pyflakes
+
+      - name: Тесты
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONIOENCODING: utf-8
+        run: python -m pytest
+
+      - name: Гигиена импортов
+        # Страхует результат разбора star-импортов: пока в модуле есть
+        # `from X import *`, pyflakes не может проверить НИ ОДНОГО имени в нём,
+        # и опечатка в редко вызываемой ветке доедет до пользователя. Падаем
+        # только на неопределённых именах и звёздочках; предупреждения про
+        # неиспользуемые локальные переменные прогон не валят.
+        shell: python
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          import glob, subprocess, sys
+
+          files = sorted(set(glob.glob("*.py") + glob.glob("sigstats/*.py")
+                             + glob.glob("siquester/*.py") + glob.glob("tests/*.py")))
+          out = subprocess.run([sys.executable, "-m", "pyflakes", *files],
+                               capture_output=True, text=True, encoding="utf-8").stdout
+          bad = [ln for ln in out.splitlines()
+                 if "undefined name" in ln or "star imports" in ln
+                 or "unable to detect undefined names" in ln]
+          if bad:
+              print("Найдены неопределённые имена или star-импорты:")
+              print("\n".join(bad))
+              sys.exit(1)
+          print(f"OK: {len(files)} файлов, неопределённых имён и star-импортов нет")
