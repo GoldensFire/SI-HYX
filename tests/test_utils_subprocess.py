@@ -331,7 +331,7 @@ class TestMoveToTrash:
     @pytest.mark.skipif(os.name == "nt", reason="ветка не-Windows")
     def test_posix_removes(self, tmp_path):
         f = tmp_path / "f.txt"
-        f.write_text("x")
+        f.write_text("x", encoding="utf-8")
         assert utils.move_to_trash(str(f)) is True
         assert not f.exists()
 

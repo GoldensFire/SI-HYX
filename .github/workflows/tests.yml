@@ -46,27 +46,10 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python -m pytest
 
-      - name: Гигиена импортов
-        # Страхует результат разбора star-импортов: пока в модуле есть
-        # `from X import *`, pyflakes не может проверить НИ ОДНОГО имени в нём,
-        # и опечатка в редко вызываемой ветке доедет до пользователя. Падаем
-        # только на неопределённых именах и звёздочках; предупреждения про
-        # неиспользуемые локальные переменные прогон не валят.
-        shell: python
+      - name: Гигиена кода
+        # Star-импорты, неявная кодировка, голые except — всё, что тесты
+        # поймать не могут. Тот же скрипт запускается локально:
+        #   python tools/check_hygiene.py
         env:
           PYTHONIOENCODING: utf-8
-        run: |
-          import glob, subprocess, sys
-
-          files = sorted(set(glob.glob("*.py") + glob.glob("sigstats/*.py")
-                             + glob.glob("siquester/*.py") + glob.glob("tests/*.py")))
-          out = subprocess.run([sys.executable, "-m", "pyflakes", *files],
-                               capture_output=True, text=True, encoding="utf-8").stdout
-          bad = [ln for ln in out.splitlines()
-                 if "undefined name" in ln or "star imports" in ln
-                 or "unable to detect undefined names" in ln]
-          if bad:
-              print("Найдены неопределённые имена или star-импорты:")
-              print("\n".join(bad))
-              sys.exit(1)
-          print(f"OK: {len(files)} файлов, неопределённых имён и star-импортов нет")
+        run: python tools/check_hygiene.py

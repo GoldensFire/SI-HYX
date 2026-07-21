@@ -1681,10 +1681,18 @@ class UnifiedWindow(QMainWindow):
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         # 1) Планировщик задач (register.cmd сам делает /Create и /Run)
         try:
+            # encoding задан явно, как и везде в проекте: без него Python берёт
+            # кодировку системной локали (cp1251 на русской Windows, cp1252 на
+            # английской) — поведение зависело бы от языка системы пользователя.
+            # Вывод здесь не разбирается, важен только returncode; если он всё
+            # же понадобится — учесть, что cmd/schtasks пишут в OEM-кодировку
+            # консоли, и errors="replace" превратит кириллицу в «?».
             subprocess.run(["cmd", "/c", register_cmd], creationflags=flags,
-                           capture_output=True, text=True, errors="replace", timeout=30)
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=30)
             chk = subprocess.run(["schtasks", "/Query", "/TN", task_name],
-                                 creationflags=flags, capture_output=True, text=True, errors="replace", timeout=15)
+                                 creationflags=flags, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=15)
             if chk.returncode == 0:
                 self.log("Апдейтер запущен через Планировщик задач (вне job-объекта).")
                 return True
