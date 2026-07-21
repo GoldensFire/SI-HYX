@@ -17,9 +17,11 @@
 # ВАЖНО: edit_tab_base стоит первым в цепочке — он выставляет env-переменные
 # Qt-бэкенда (QSG_RHI_BACKEND/QT_MEDIA_BACKEND) ДО создания QApplication, что
 # критично для видео, и определяет флаги _HAS_MULTIMEDIA / LIBASS_AVAILABLE.
+import errno
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1338,6 +1340,49 @@ class EditTab(QWidget):
             pass
 
     @staticmethod
+    def _make_temp_out(final_out, suffix=None):
+        """Создаёт временный файл для результата РЯДОМ с финальным путём, а не в
+        системном %TEMP%. Две причины: (1) os.replace не умеет переносить файл
+        между дисками (WinError 17 «cannot move the file to a different disk
+        drive»), а сохранять на D:\\ при temp на C:\\ — обычный сценарий;
+        (2) не гоняем гигабайты между дисками. Если каталог назначения недоступен
+        на запись — откатываемся в системный temp (перенос вытянет _move_tolerant).
+        Возвращает путь к пустому файлу."""
+        if suffix is None:
+            suffix = Path(final_out).suffix
+        out_dir = os.path.dirname(os.path.abspath(final_out))
+        try:
+            tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix,
+                                             prefix=".sihyx_tmp_", dir=out_dir)
+            tf.close()
+            return tf.name
+        except OSError:
+            tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            tf.close()
+            return tf.name
+
+    @staticmethod
+    def _move_tolerant(temp, final):
+        """os.replace, но с откатом на копирование, если temp и final лежат на
+        РАЗНЫХ дисках: os.replace тогда падает с WinError 17 / EXDEV. shutil.move
+        в этом случае копирует и удаляет источник. Все прочие ошибки (в т.ч.
+        WinError 32 «занят») пробрасываются наверх — их разбирает
+        _replace_tolerant."""
+        try:
+            os.replace(temp, final)
+        except OSError as e:
+            cross = (getattr(e, "winerror", None) == 17
+                     or e.errno == getattr(errno, "EXDEV", 18))
+            if not cross:
+                raise
+            # Цель может уже существовать — shutil.move на непустой файл ругается,
+            # поэтому убираем её сами (занятую цель отловит WinError 32 выше).
+            if os.path.exists(final):
+                os.remove(final)
+            shutil.move(temp, final)
+        return final
+
+    @staticmethod
     def _replace_tolerant(temp, final):
         """Переносит temp → final атомарным os.replace. Если файл назначения занят
         ДРУГИМ процессом (например, его прямо сейчас читает вкладка «Обработка»,
@@ -1345,13 +1390,14 @@ class EditTab(QWidget):
         WinError 32 и os.replace падает. Раньше это роняло всю обрезку с ошибкой
         «не может получить доступ к файлу». Теперь в таком случае сохраняем
         готовый результат под соседним свободным именем (foo_обрез_1.mkv, _2…),
-        а не теряем работу. Возвращает фактический путь сохранения."""
+        а не теряем работу. Перенос между дисками (temp в %TEMP% на C:, результат
+        на D:) идёт копированием — см. _move_tolerant. Возвращает фактический путь
+        сохранения."""
         candidate = final
         last_err = None
         for _ in range(128):
             try:
-                os.replace(temp, candidate)
-                return candidate
+                return EditTab._move_tolerant(temp, candidate)
             except OSError as e:
                 # WinError 32 (sharing violation) приходит как PermissionError или
                 # OSError с winerror==32 — цель занята, пробуем соседнее имя.
@@ -5370,8 +5416,7 @@ class EditTab(QWidget):
             if not (self.chk_overwrite.isChecked() and in_place):
                 final_out = _unique_output(final_out)
 
-        tf = tempfile.NamedTemporaryFile(delete=False, suffix=Path(final_out).suffix)
-        tf.close(); temp_out = tf.name
+        temp_out = self._make_temp_out(final_out)
 
         dur_cut = out_s - in_s
         in_str  = s_to_time(in_s)
@@ -5757,8 +5802,7 @@ class EditTab(QWidget):
             in_place = bool(loaded) and os.path.normpath(loaded) == os.path.normpath(final_out)
             if not (replace_original and in_place):
                 final_out = _unique_output(final_out)
-        tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        tf.close(); temp_out = tf.name
+        temp_out = self._make_temp_out(final_out, suffix)
 
         self._report_progress(0, "Smart Cut…")
         self.log_label.setText("Smart Cut…")
