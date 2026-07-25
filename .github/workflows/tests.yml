@@ -14,6 +14,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# GITHUB_TOKEN по умолчанию выдаётся с широкими правами на запись. Этому
+# прогону нужно ровно одно — прочитать код (actions/checkout); ничего не
+# публикуется, не комментируется и не пишется обратно в репозиторий. Явный
+# минимум означает, что скомпрометированная зависимость или action не сможет
+# этим токеном что-то записать (алерт CodeQL actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
 # Новый пуш в ту же ветку отменяет предыдущий незавершённый прогон.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
