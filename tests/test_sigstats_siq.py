@@ -92,6 +92,18 @@ def _siq(tmp_path, xml, media=None, name="p.siq"):
     return p
 
 
+def _zip_bytes(entries: dict[str, bytes] | None = None) -> bytes:
+    """Байты валидного zip (эмулирует настоящий .siq на проводе) — для
+    FakeResponse(content=...) в тестах download_siq: с недавних пор
+    download_siq проверяет сигнатуру zip и отбрасывает не-zip содержимое."""
+    import io
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for arc, data in (entries or {"content.xml": b"<package/>"}).items():
+            zf.writestr(arc, data)
+    return buf.getvalue()
+
+
 # ── низкоуровневые хелперы ───────────────────────────────────────────────────
 class TestXmlHelpers:
     def test_local_strips_ns(self):
@@ -387,23 +399,23 @@ class TestAnswerTime:
 # ── download_siq ─────────────────────────────────────────────────────────────
 class TestDownloadSiq:
     def test_downloads(self, tmp_path):
-        s = FakeSession(routes=[("direct_download",
-                                 FakeResponse(content=b"SIQZIPDATA"))])
+        data = _zip_bytes()
+        s = FakeSession(routes=[("direct_download", FakeResponse(content=data))])
         out = siq.download_siq(s, "42", "Мой пак")
         assert out is not None
-        assert out.read_bytes() == b"SIQZIPDATA"
+        assert out.read_bytes() == data
         assert out.name.startswith("42_")
         assert out.suffix == ".siq"
 
     def test_name_sanitized(self, tmp_path):
-        s = FakeSession(routes=[("direct_download", FakeResponse(content=b"x"))])
+        s = FakeSession(routes=[("direct_download", FakeResponse(content=_zip_bytes()))])
         out = siq.download_siq(s, "1", 'Пак<>:"/\\|?*!')
         assert out is not None
         for ch in '<>:"/\\|?*':
             assert ch not in out.name
 
     def test_cached_no_refetch(self, tmp_path):
-        s = FakeSession(routes=[("direct_download", FakeResponse(content=b"data"))])
+        s = FakeSession(routes=[("direct_download", FakeResponse(content=_zip_bytes()))])
         out1 = siq.download_siq(s, "9", "Пак")
         n_calls = len(s.calls)
         out2 = siq.download_siq(s, "9", "Пак")
@@ -419,6 +431,18 @@ class TestDownloadSiq:
             def get(self, url, **kw):
                 raise OSError("сеть")
         assert siq.download_siq(Boom(), "5", "Пак") is None
+
+    def test_removed_package_html_stub_rejected(self, tmp_path):
+        """Пак сняли с sibrowser — direct_download отдаёт HTTP 200 с HTML-
+        заглушкой вместо архива. Раньше это тихо сохранялось КАК .siq (битый
+        файл на диске, siq_downloaded так и не выставлялся, но и повторная
+        попытка ничего не перекачивала — dest.exists() коротило качание)."""
+        html = b"<html><body>404 - Package not found</body></html>"
+        s = FakeSession(routes=[("direct_download", FakeResponse(content=html))])
+        assert siq.download_siq(s, "77", "Удалённый пак") is None
+        # И на диске ничего не осталось — ни .siq, ни .part.
+        left = list(scfg.PACKAGES_DIR.glob("77_*")) if scfg.PACKAGES_DIR.exists() else []
+        assert left == []
 
 
 # ── ffprobe-обвязка ──────────────────────────────────────────────────────────

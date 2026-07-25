@@ -238,6 +238,64 @@ def save_ui_settings(data: dict) -> None:
     UI_SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# Тир-лист сыгранных паков — раскладка по уровням + комментарии + пользователь-
+# ские теги. Открывается кнопкой «Тир-лист» в группе «Сыгранные пакеты».
+# Формат: {"tiers": [имена уровней], "placements": {pid: имя уровня},
+# "comments": {pid: текст}, "tags": {pid: [теги]}, "all_tags": [палитра тегов]}.
+# Хранится рядом с БД (см. BASE_DIR), как и остальные пользовательские списки.
+TIER_LIST_PATH = BASE_DIR / "tier_list.json"
+
+_DEFAULT_TIERS = ["S", "A", "B", "C", "D"]
+
+
+def load_tier_list() -> dict:
+    import json
+    data = {}
+    try:
+        if TIER_LIST_PATH.exists():
+            data = json.loads(TIER_LIST_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    tiers = data.get("tiers")
+    if not isinstance(tiers, list) or not tiers:
+        tiers = list(_DEFAULT_TIERS)
+    placements = data.get("placements") if isinstance(data.get("placements"), dict) else {}
+    comments = data.get("comments") if isinstance(data.get("comments"), dict) else {}
+    tags = data.get("tags") if isinstance(data.get("tags"), dict) else {}
+    all_tags = data.get("all_tags") if isinstance(data.get("all_tags"), list) else []
+    # Полярность тега: "good" (зелёный) / "bad" (красный) — задаётся вручную
+    # пользователем в тир-листе (см. _TierListDialog._tag_kind / ._set_tag_kind).
+    tag_kinds = data.get("tag_kinds") if isinstance(data.get("tag_kinds"), dict) else {}
+    # publish_id / edit_token — постоянный публичный id страницы тир-листа и
+    # секретный токен на её перезапись (см. tier_worker.js). Заводятся при первой
+    # публикации и переиспользуются, чтобы ссылка не менялась.
+    return {
+        "tiers": [str(t) for t in tiers],
+        "placements": {str(k): str(v) for k, v in placements.items()},
+        "comments": {str(k): str(v) for k, v in comments.items()},
+        "tags": {str(k): [str(x) for x in v] for k, v in tags.items() if isinstance(v, list)},
+        "all_tags": [str(t) for t in all_tags],
+        "tag_kinds": {str(k): ("bad" if str(v) == "bad" else "good") for k, v in tag_kinds.items()},
+        "publish_id": str(data.get("publish_id") or ""),
+        "edit_token": str(data.get("edit_token") or ""),
+        # Адрес личного Cloudflare Worker пользователя (вводится в окне
+        # публикации). Хранится тут, а не в config.py — нельзя зашивать чужой.
+        "publish_url": str(data.get("publish_url") or ""),
+        # Оценка сложности пака самим пользователем (pid -> уровень из
+        # _DIFF_LEVELS), отдельная от «сложности» с сайта.
+        "difficulty": {str(k): str(v) for k, v in (
+            data.get("difficulty") if isinstance(data.get("difficulty"), dict) else {}).items()},
+    }
+
+
+def save_tier_list(data: dict) -> None:
+    import json
+    ensure_dirs()
+    TIER_LIST_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 # Категории sibrowser (отображаемое имя → слаг для /categories/<слаг>).
 # Каждая карточка несёт максимум одну категорию с процентом (доминирующая
 # тема пака), слаг берётся из ссылки rel="category" при парсинге.

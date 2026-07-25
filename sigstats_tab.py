@@ -30,8 +30,8 @@ import webbrowser
 import datetime as _dt
 
 from PyQt6.QtCore import (Qt, QObject, QRunnable, QThreadPool, pyqtSignal, QUrl,
-                          QTimer, QEvent, QDate, QRect, QSize)
-from PyQt6.QtGui import QDesktopServices, QColor, QFontMetrics, QPalette
+                          QTimer, QEvent, QDate, QRect, QSize, QPoint)
+from PyQt6.QtGui import QDesktopServices, QColor, QFontMetrics, QPalette, QIcon
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QTabWidget, QGroupBox,
     QRadioButton, QButtonGroup, QLabel, QLineEdit, QPushButton, QComboBox,
@@ -40,6 +40,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QFileDialog, QMessageBox, QScrollArea, QTextEdit,
     QDialogButtonBox, QFrame, QListWidget, QListWidgetItem,
     QStyledItemDelegate, QStyle, QStyleOptionViewItem, QApplication, QMenu,
+    QSizePolicy, QLayout,
 )
 from msgbox import msgbox_critical, msgbox_warning, msgbox_information, msgbox_question
 
@@ -54,12 +55,18 @@ except Exception:  # pragma: no cover
     CONFIG_DIR = None
     FFPROBE = None
 
-    def get_icon(name, color="#cdd6f4"):
+    def get_icon(name, color="#cdd6f4", **_kw):
         from PyQt6.QtGui import QIcon as _QIcon
         return _QIcon()
 
     def icon_html(name, size=16, color="#cdd6f4"):
         return ""
+
+try:
+    from config import TIER_LIST_PUBLISH_URL, APP_VERSION
+except Exception:  # pragma: no cover
+    TIER_LIST_PUBLISH_URL = ""
+    APP_VERSION = "?"
 
 # Переменная окружения ДОЛЖНА быть выставлена ДО первого импорта sigstats.config
 # (он читает её один раз при импорте) — поэтому это идёт перед `from sigstats
@@ -103,9 +110,9 @@ _CATEGORY_ACCENT = {"Аниме": "#f38ba8", "Музыка": "#cba6f7"}
 # пак обычно скрыт. Порядок приоритета при нескольких причинах сразу —
 # чёрный список пакета > чёрный список автора > уже сыграно.
 _ROW_STATUS_TINT = {
-    "pkg_bl": QColor(243, 139, 168, 40),      # красноватый — чёрный список пакетов
-    "author_bl": QColor(249, 226, 175, 40),   # желтоватый — чёрный список авторов
-    "played": QColor(137, 180, 250, 35),      # голубоватый — уже сыграно
+    "pkg_bl": QColor(243, 139, 168, 55),      # красноватый — чёрный список пакетов
+    "author_bl": QColor(249, 226, 175, 55),   # желтоватый — чёрный список авторов
+    "played": QColor(137, 180, 250, 50),      # голубоватый — уже сыграно
 }
 
 
@@ -115,6 +122,16 @@ def _fmt_pct(v, digits=0) -> str:
         if v is None or (isinstance(v, float) and math.isnan(v)):
             return "—"
         return f"{v:.{digits}f}%"
+    except Exception:
+        return "—"
+
+
+def _fmt_int(v) -> str:
+    try:
+        import math
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return "—"
+        return str(int(v))
     except Exception:
         return "—"
 
@@ -153,7 +170,33 @@ def _fmt_date(v) -> str:
         return s or "—"
 
 
-class _PkgNameDelegate(QStyledItemDelegate):
+class _RowTintDelegate(QStyledItemDelegate):
+    """Базовый делегат таблицы паков: поверх штатной отрисовки ячейки кладёт
+    лёгкую заливку (см. _ROW_STATUS_TINT) — ею помечаются паки, попавшие в
+    список только из-за включённого «игнорировать» чекбокса.
+
+    Почему делегат, а не QTableWidgetItem.setBackground: в глобальном
+    STYLESHEET есть правило `QTableWidget::item` — при его наличии
+    QStyleSheetStyle рисует фон ячейки сам и Qt.BackgroundRole из модели
+    ПОЛНОСТЬЮ игнорирует, так что setBackground не давал вообще никакого
+    эффекта (проверено замером пикселей отрисованной таблицы)."""
+
+    TintRole = Qt.ItemDataRole.UserRole + 25
+
+    def _paint_tint(self, painter, option, index):
+        tint = index.data(self.TintRole)
+        if not tint:
+            return
+        painter.save()
+        painter.fillRect(option.rect, QColor(tint))
+        painter.restore()
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        self._paint_tint(painter, option, index)
+
+
+class _PkgNameDelegate(_RowTintDelegate):
     """Ячейка «Название»: текст с переносом по словам + индикатор скачивания
     справа — зелёная галочка (пак скачан) или «NN%» во время скачивания. Заменяет
     прежнюю отдельную колонку «.siq». Данные берёт из ролей элемента:
@@ -177,6 +220,9 @@ class _PkgNameDelegate(QStyledItemDelegate):
         style = opt.widget.style() if opt.widget else QApplication.style()
         # Фон / выделение / чередование / рамку фокуса рисует штатный стиль.
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+        # Тут этот делегат сам рисует текст ниже, поэтому заливку статуса
+        # кладём сразу после фона — так она не «моет» название пака.
+        self._paint_tint(painter, option, index)
 
         prog = index.data(self.ProgressRole)
         downloaded = bool(index.data(self.DownloadedRole))
@@ -225,8 +271,8 @@ class _PkgNameDelegate(QStyledItemDelegate):
         return QSize(w if w > 0 else 200, max(br.height() + 8, 26))
 
 
-class _AccentBarDelegate(QStyledItemDelegate):
-    """Ячейка чекбокса (колонка 0): рисует обычный чекбокс + узкую цветную
+class _AccentBarDelegate(_RowTintDelegate):
+    """Ячейка «места» (колонка 0): рисует номер строки + узкую цветную
     полоску у самого левого края строки (см. _CATEGORY_ACCENT) — для паков с
     преобладающей темой. Полоска вместо покраски всего фона строки: заметно,
     но не мешает читать текст остальных колонок."""
@@ -236,12 +282,24 @@ class _AccentBarDelegate(QStyledItemDelegate):
 
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
-        color = index.data(self.AccentRole)
-        if not color:
-            return
         painter.save()
-        bar = QRect(option.rect.left(), option.rect.top(), self._BAR_W, option.rect.height())
-        painter.fillRect(bar, QColor(color))
+        # Номер места берём из index.row(), а НЕ из текста ячейки: QTableWidget
+        # при сортировке физически переставляет строки модели, так что
+        # index.row() — это и есть текущее «место» пака сверху вниз, и оно
+        # автоматически верно после любой сортировки по заголовку. Хранить
+        # номер в самой ячейке нельзя: setText при включённой сортировке
+        # заставляет таблицу пересортироваться прямо во время пересчёта.
+        rect = QRect(option.rect)
+        rect.setLeft(rect.left() + self._BAR_W + 2)
+        rect.setRight(rect.right() - 3)
+        painter.setPen(QColor("#7f849c"))
+        painter.drawText(rect, int(Qt.AlignmentFlag.AlignRight
+                                   | Qt.AlignmentFlag.AlignVCenter),
+                         str(index.row() + 1))
+        color = index.data(self.AccentRole)
+        if color:
+            bar = QRect(option.rect.left(), option.rect.top(), self._BAR_W, option.rect.height())
+            painter.fillRect(bar, QColor(color))
         painter.restore()
 
 
@@ -275,6 +333,22 @@ class _NumItem(QTableWidgetItem):
             return a < b
         except Exception:
             return super().__lt__(other)
+
+
+class _NoHScrollTable(QTableWidget):
+    """Таблица, автопрокрутка которой работает ТОЛЬКО по вертикали.
+
+    Qt при выборе ячейки зовёт scrollTo(index) — и если кликнуть по значению в
+    правой колонке широкой таблицы, вся таблица уезжает вправо («прыгает»).
+    Выключать autoScroll целиком нельзя: тогда потеряется вертикальная
+    доводка (стрелки клавиатуры, восстановление выделения после
+    перефильтровки), поэтому просто возвращаем горизонтальную позицию на
+    место после базовой реализации."""
+
+    def scrollTo(self, index, hint=QAbstractItemView.ScrollHint.EnsureVisible):
+        h = self.horizontalScrollBar().value()
+        super().scrollTo(index, hint)
+        self.horizontalScrollBar().setValue(h)
 
 
 class _FullscreenHost(QWidget):
@@ -363,12 +437,19 @@ class _DownloadSignals(QObject):
     finished = pyqtSignal(int)   # сколько успешно скачано
 
 
-class _BulkDownloadTask(QRunnable):
-    """Скачивает .siq нескольких отмеченных паков последовательно, отдавая
-    прогресс скачивания КАЖДОГО пака (item_progress) — чтобы у его строки в
-    таблице бежал процент, а по завершении встала галочка.
+# Сколько паков качаются ОДНОВРЕМЕННО из общей очереди (см. _BulkDownloadTask).
+# Небольшое число — не DDOS-ить sibrowser.ru, но и не качать строго по одному.
+_MAX_PARALLEL_DOWNLOADS = 3
 
-    Очередь (queue.Queue), а не статичный список: пока пакет качается, можно
+
+class _BulkDownloadTask(QRunnable):
+    """Скачивает .siq нескольких отмеченных паков — до _MAX_PARALLEL_DOWNLOADS
+    одновременно (несколько потоков разбирают общую очередь), отдавая прогресс
+    скачивания КАЖДОГО пака (item_progress) — чтобы у его строки в таблице (и у
+    карточки в тир-листе, см. SigstatsTab.download_progress) бежал процент, а
+    по завершении встала галочка.
+
+    Очередь (queue.Queue), а не статичный список: пока пакеты качаются, можно
     дозаписать в неё ещё паков через add_items — раньше выбор нового пака для
     скачивания, пока идёт другое, либо блокировался, либо (кнопка временно
     превращена в «Отмена») реально отменял уже идущее скачивание вместо того
@@ -378,9 +459,12 @@ class _BulkDownloadTask(QRunnable):
         super().__init__()
         self.setAutoDelete(False)
         import queue
+        import threading
         self._queue = queue.Queue()
         self._total = 0
         self._done_count = 0
+        self._ok_count = 0
+        self._lock = threading.Lock()
         self.signals = _DownloadSignals()
         self._stop = False
         self.add_items(items)
@@ -393,16 +477,17 @@ class _BulkDownloadTask(QRunnable):
     def stop(self):
         self._stop = True
 
-    def run(self):
+    def _worker(self):
         import queue
-        ok = 0
         while not self._stop:
             try:
                 pid, sib_id, name = self._queue.get_nowait()
             except queue.Empty:
                 break
-            self._done_count += 1
-            self.signals.progress.emit(self._done_count, self._total, name)
+            with self._lock:
+                self._done_count += 1
+                done_snap, total_snap = self._done_count, self._total
+            self.signals.progress.emit(done_snap, total_snap, name)
             self.signals.item_progress.emit(pid, 0)
 
             def _pcb(done, tot, _pid=pid):
@@ -411,11 +496,22 @@ class _BulkDownloadTask(QRunnable):
             try:
                 if sg_collector.download_one(pid, sib_id, name, progress_cb=_pcb,
                                              should_stop=lambda: self._stop):
-                    ok += 1
+                    with self._lock:
+                        self._ok_count += 1
                     self.signals.item_progress.emit(pid, 100)
             except Exception:
                 pass
-        self.signals.finished.emit(ok)
+
+    def run(self):
+        import threading
+        helpers = [threading.Thread(target=self._worker, daemon=True)
+                   for _ in range(_MAX_PARALLEL_DOWNLOADS - 1)]
+        for w in helpers:
+            w.start()
+        self._worker()   # пуловый поток тоже качает, а не только раздаёт работу
+        for w in helpers:
+            w.join()
+        self.signals.finished.emit(self._ok_count)
 
 
 class _DeleteSiqSignals(QObject):
@@ -476,8 +572,49 @@ class _DescFetchTask(QRunnable):
             self.signals.failed.emit(self.package_id)
 
 
+class _SteamOneSignals(QObject):
+    finished = pyqtSignal(dict)   # см. sg_collector.collect_steam_one
+
+
+class _SteamOneTask(QRunnable):
+    """Точечное добавление ОДНОГО пака Steam Workshop по прямой ссылке/id —
+    ровно один сетевой запрос, поэтому отдельный лёгкий раннер, а не очередь
+    через _JobTask (та рассчитана на постраничный обход каталога)."""
+
+    def __init__(self, id_or_url: str, api_key: str, author_blacklist):
+        super().__init__()
+        self.setAutoDelete(True)
+        self.id_or_url = id_or_url
+        self.api_key = api_key
+        self.author_blacklist = author_blacklist
+        self.signals = _SteamOneSignals()
+
+    def run(self):
+        result = sg_collector.collect_steam_one(
+            self.id_or_url, self.api_key, author_blacklist=self.author_blacklist)
+        self.signals.finished.emit(result)
+
+
 class SigstatsTab(QWidget):
     """Вкладка «Поиск пакетов»: сбор и анализ статистики паков «Своя игра»."""
+
+    # Первая загрузка БД идёт в фоновом потоке (иначе окно вкладки виснет на
+    # несколько секунд). Поток эмитит этот сигнал с результатом; применение
+    # данных в таблицы — уже в GUI-потоке (см. _on_db_loaded).
+    _db_loaded_sig = pyqtSignal(object)
+
+    # (package_id, процент 0..100) скачивания .siq — эмитится независимо от
+    # того, ОТКУДА запущено скачивание (таблица паков или тир-лист), чтобы
+    # открытое окно тир-листа тоже могло показать бегущий процент у карточки
+    # (см. _TierListDialog._on_download_progress).
+    download_progress = pyqtSignal(int, int)
+
+    # Датафрейм паков перезагружен (скачивание завершилось, .siq удалён и
+    # т.п.) — эмитится из _apply_db_data. Открытый тир-лист по нему
+    # перерисовывает галочки «скачан» у карточек в «Не распределено» (см.
+    # _TierListDialog._refresh_all_card_icons); без этого сигнала галочка
+    # оставалась висеть даже после удаления .siq через основную таблицу.
+    library_changed = pyqtSignal()
 
     def __init__(self, main):
         super().__init__()
@@ -485,6 +622,8 @@ class SigstatsTab(QWidget):
         self._pool = QThreadPool.globalInstance()
         self._active_job = None
         self._loaded = False
+        self._loading_db = False
+        self._db_loaded_sig.connect(self._on_db_loaded)
 
         self._pkgs_df = None
         self._themes_df = None
@@ -575,7 +714,7 @@ class SigstatsTab(QWidget):
         super().showEvent(e)
         if not self._loaded and _HAS_BACKEND:
             self._loaded = True
-            self._reload_data()
+            self._reload_data_async()   # первая загрузка — в фоне, без фриза
         # Карточка была открыта до ухода со вкладки — возвращаем фильтр «клик вне
         # панели закрывает её» (на скрытой вкладке он не нужен, см. hideEvent).
         if getattr(self, "pkg_detail", None) is not None and self.pkg_detail.isVisible():
@@ -589,28 +728,83 @@ class SigstatsTab(QWidget):
         except Exception:
             pass
 
-    def _reload_data(self):
-        try:
-            sg_db.init_db()
-            with sg_db.connect() as conn:
-                self._pkgs_df = sg_analysis.load_packages(conn)
-                self._themes_df = sg_analysis.theme_table(conn)
-                self._authors_df = sg_analysis.author_table(conn)
-                summary = sg_db.stats(conn)
+    @staticmethod
+    def _load_db_data():
+        """Тяжёлая часть загрузки БД (init_db + чтение датафреймов + summary).
+        Не трогает GUI — можно звать из фонового потока. Возвращает dict или
+        бросает исключение при ошибке."""
+        sg_db.init_db()
+        with sg_db.connect() as conn:
+            pkgs = sg_analysis.load_packages(conn)
+            themes = sg_analysis.theme_table(conn)
+            authors = sg_analysis.author_table(conn)
+            summary = sg_db.stats(conn)
+        return {"pkgs": pkgs, "themes": themes, "authors": authors, "summary": summary}
+
+    def _apply_db_data(self, result):
+        """Ставит загруженные датафреймы и обновляет таблицы (GUI-поток).
+        result=None → загрузка упала, оставляем прежние/пустые данные."""
+        import pandas as pd
+        if result is not None:
+            self._pkgs_df = result["pkgs"]
+            self._themes_df = result["themes"]
+            self._authors_df = result["authors"]
+            summary = result["summary"]
             self.lbl_summary.setText(
                 f"Пакетов: {summary['packages']} · со статистикой: {summary['with_stats']} · "
                 f"скачано .siq: {summary['with_siq']} · уник. тем: {summary['themes']} · "
                 f"вопросов: {summary['questions']}")
-        except Exception as e:
-            self._pkgs_df = self._pkgs_df if self._pkgs_df is not None else __import__("pandas").DataFrame()
-            self._themes_df = self._themes_df if self._themes_df is not None else __import__("pandas").DataFrame()
-            self._authors_df = self._authors_df if self._authors_df is not None else __import__("pandas").DataFrame()
-            self._log(f"Поиск пакетов: ошибка загрузки БД: {e}")
+        else:
+            self._pkgs_df = self._pkgs_df if self._pkgs_df is not None else pd.DataFrame()
+            self._themes_df = self._themes_df if self._themes_df is not None else pd.DataFrame()
+            self._authors_df = self._authors_df if self._authors_df is not None else pd.DataFrame()
         self._refresh_played_list()
         self._refresh_pkg_blacklist_list()
         self._refresh_packages_table()
         self._refresh_themes_table()
         self._refresh_authors_table()
+        self.library_changed.emit()
+
+    def _reload_data(self):
+        """Синхронная перезагрузка (используется после действий пользователя —
+        пометка «сыграно», ЧС и т.п., где данные нужны сразу)."""
+        try:
+            result = self._load_db_data()
+        except Exception as e:
+            result = None
+            self._log(f"Поиск пакетов: ошибка загрузки БД: {e}")
+        self._apply_db_data(result)
+
+    def _reload_data_async(self):
+        """Первая загрузка — в фоновом потоке, чтобы не морозить окно вкладки.
+        Пока идёт — показываем «Загрузка…». Результат применяем в GUI-потоке
+        через сигнал _db_loaded_sig."""
+        if self._loading_db:
+            return
+        self._loading_db = True
+        try:
+            self.lbl_summary.setText("Загрузка базы пакетов…")
+        except Exception:
+            pass
+        import threading
+
+        def _work():
+            # В фоновом потоке НЕ трогаем GUI (в т.ч. _log) — только считаем.
+            # Успех → dict, ошибка → строка с текстом (обработаем в GUI-потоке).
+            try:
+                res = self._load_db_data()
+            except Exception as e:
+                res = f"__error__:{e}"
+            self._db_loaded_sig.emit(res)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _on_db_loaded(self, result):
+        self._loading_db = False
+        if isinstance(result, str) and result.startswith("__error__:"):
+            self._log(f"Поиск пакетов: ошибка загрузки БД: {result[len('__error__:'):]}")
+            result = None
+        self._apply_db_data(result)
 
     def _log(self, msg):
         try:
@@ -779,24 +973,28 @@ class SigstatsTab(QWidget):
         self._pkg_fullscreen_host = None
 
         split = QSplitter(Qt.Orientation.Horizontal)
-        # Колонки: чек · Название (с индикатором скачивания) · Авторы · Дата
-        # выхода · Вопр. · Вес · Сложность · Скач. · % завершения · % попыток ·
-        # % правильных · Игр начато · Тема · Длит. · Группа.
+        # Колонки: № (место в текущем порядке) · Название (с индикатором
+        # скачивания) · Авторы · Дата выхода · Вопр. · Вес · Сложность · Скач. ·
+        # % завершения · % попыток · % правильных · Игр начато · Тема · Длит. ·
+        # Группа.
         # «.siq» убрана (её роль — галочка/процент прямо в колонке «Название»,
         # см. _PkgNameDelegate). «Длит.» — предпоследняя колонка (перед «Группа»).
         # «Вес» — отдельная колонка (раньше дописывался в скобках к «Вопр.»).
-        self.tbl_pkgs = QTableWidget(0, 15)
+        self.tbl_pkgs = _NoHScrollTable(0, 15)
         self.tbl_pkgs.setHorizontalHeaderLabels([
-            "", "Название", "Авторы", "Дата", "Вопр.", "Вес", "Сложность",
+            "№", "Название", "Авторы", "Дата", "Вопр.", "Вес", "Сложность",
             "Скач.", "% завершения", "% попыток", "% правильных", "Игр начато",
             "Тема", "Длит.", "Группа",
         ])
         self._COL_NAME = 1
         self._COL_THEME = 12
-        self.tbl_pkgs.horizontalHeaderItem(0).setIcon(get_icon('fa5s.check-square'))
         self.tbl_pkgs.setSortingEnabled(True)
         self.tbl_pkgs.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.tbl_pkgs.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # ExtendedSelection — Ctrl+ЛКМ точечно, Shift+ЛКМ диапазоном (как в
+        # проводнике). Раньше был SingleSelection и «скачать несколько» делалось
+        # галочками в колонке 0; галочки заменены на номер места, а массовые
+        # действия (скачать/сыграно/чёрный список) работают по выделению.
+        self.tbl_pkgs.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.tbl_pkgs.setAlternatingRowColors(True)
         self.tbl_pkgs.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         # Перенос по словам делает ТОЛЬКО делегат «Название»; остальные колонки
@@ -804,11 +1002,14 @@ class SigstatsTab(QWidget):
         # разрастались по высоте из-за длинных авторов/тем.
         self.tbl_pkgs.setWordWrap(False)
         self.tbl_pkgs.verticalHeader().setVisible(False)
+        # Делегат по умолчанию (все «обычные» колонки) — только заливка статуса
+        # строки; у «Названия» и «№» она встроена в их собственные делегаты.
+        self.tbl_pkgs.setItemDelegate(_RowTintDelegate(self.tbl_pkgs))
         # Название рисует свой делегат: перенос длинного имени по словам +
         # индикатор скачивания (процент/галочка) справа.
         self._name_delegate = _PkgNameDelegate(self.tbl_pkgs)
         self.tbl_pkgs.setItemDelegateForColumn(self._COL_NAME, self._name_delegate)
-        # Колонка 0 (чекбокс) заодно рисует цветную полоску слева от строки —
+        # Колонка 0 (номер места) заодно рисует цветную полоску слева от строки —
         # см. _AccentBarDelegate/_CATEGORY_ACCENT.
         self._accent_delegate = _AccentBarDelegate(self.tbl_pkgs)
         self.tbl_pkgs.setItemDelegateForColumn(0, self._accent_delegate)
@@ -825,7 +1026,7 @@ class SigstatsTab(QWidget):
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)         # Авторы
         hdr.setSectionResizeMode(self._COL_THEME, QHeaderView.ResizeMode.Interactive)  # Тема
         hdr.setStretchLastSection(False)
-        self.tbl_pkgs.setColumnWidth(0, 28)
+        self.tbl_pkgs.setColumnWidth(0, 42)   # место: до 4 цифр + полоска темы
         self.tbl_pkgs.setColumnWidth(self._COL_NAME, 320)
         self.tbl_pkgs.setColumnWidth(2, 140)
         self.tbl_pkgs.setColumnWidth(self._COL_THEME, 90)
@@ -897,9 +1098,10 @@ class SigstatsTab(QWidget):
         self.btn_mark_played.setIcon(get_icon('fa5s.check-circle'))
         self.btn_mark_played.setFixedWidth(36)
         self.btn_mark_played.setToolTip(
-            "Уже сыграно — убрать из списка\n\n"
+            "Добавить в сыграно\n\n"
             "Скрыть пак из основного списка — он попадёт в «Сыгранные пакеты» "
-            "в фильтрах справа, откуда его можно вернуть обратно.")
+            "в фильтрах справа, откуда его можно вернуть обратно. Работает "
+            "сразу для всех выделенных паков (Ctrl/Shift+ЛКМ).")
         self.btn_mark_played.clicked.connect(self._mark_selected_played)
         self.btn_mark_played.setEnabled(False)
         det_btns.addWidget(self.btn_mark_played)
@@ -908,9 +1110,10 @@ class SigstatsTab(QWidget):
         self.btn_add_pkg_blacklist.setFixedWidth(36)
         self.btn_add_pkg_blacklist.setToolTip(
             "Добавить в чёрный список\n\n"
-            "Скрыть пак из списка совсем (в отличие от «Уже сыграно» — попадает "
+            "Скрыть пак из списка совсем (в отличие от «Добавить в сыграно» — попадает "
             "в «Чёрный список пакетов» в фильтрах справа, откуда его можно "
-            "вернуть обратно).")
+            "вернуть обратно). Работает сразу для всех выделенных паков "
+            "(Ctrl/Shift+ЛКМ).")
         self.btn_add_pkg_blacklist.clicked.connect(self._blacklist_selected_package)
         self.btn_add_pkg_blacklist.setEnabled(False)
         det_btns.addWidget(self.btn_add_pkg_blacklist)
@@ -943,13 +1146,26 @@ class SigstatsTab(QWidget):
         self.btn_delete_siq.clicked.connect(self._delete_selected_siq)
         self.btn_delete_siq.setEnabled(False)
         det_btns.addWidget(self.btn_delete_siq)
+        # Открыть в Проводнике скачанный .siq (файл выделяется) или, если
+        # скачано только медиа без самого .siq, папку медиа. Активна только для
+        # реально скачанных паков — как «Удалить пак» рядом.
+        self.btn_open_folder = QPushButton()
+        self.btn_open_folder.setIcon(get_icon('fa5s.folder-open', color='#f9e2af'))
+        self.btn_open_folder.setFixedWidth(36)
+        self.btn_open_folder.setToolTip(
+            "Открыть в проводнике\n\n"
+            "Открыть Проводник на скачанном .siq (файл выделится) выбранного "
+            "пака. Доступно для скачанных паков.")
+        self.btn_open_folder.clicked.connect(self._open_selected_folder)
+        self.btn_open_folder.setEnabled(False)
+        det_btns.addWidget(self.btn_open_folder)
         self.btn_bulk_dl = QPushButton()
         self.btn_bulk_dl.setIcon(get_icon('fa5s.download'))
         self.btn_bulk_dl.setFixedWidth(36)
         self.btn_bulk_dl.setToolTip(
             "Скачать .siq\n\n"
-            "Скачать .siq всех отмеченных галочками паков. Если ни одна галочка "
-            "не стоит — скачивает просто выбранный (кликом) пак.")
+            "Скачать .siq всех выделенных паков. Несколько сразу выделяются "
+            "как в проводнике: Ctrl+ЛКМ — по одному, Shift+ЛКМ — диапазоном.")
         self.btn_bulk_dl.clicked.connect(self._bulk_download)
         det_btns.addWidget(self.btn_bulk_dl)
         # Папка, куда сохраняются скачиваемые .siq — по умолчанию обычная папка
@@ -1104,6 +1320,8 @@ class SigstatsTab(QWidget):
         self.lst_blacklist = QListWidget()
         self.lst_blacklist.addItems(self._author_blacklist)
         self.lst_blacklist.setMaximumHeight(110)
+        self.lst_blacklist.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.lst_blacklist.customContextMenuRequested.connect(self._on_author_blacklist_context_menu)
         v.addWidget(self.lst_blacklist)
         self._update_author_blacklist_title()
 
@@ -1162,18 +1380,28 @@ class SigstatsTab(QWidget):
         self._box_played = QGroupBox()
         box = self._box_played
         v = QVBoxLayout(box)
-        lbl = QLabel("Паки, отмеченные кнопкой «Уже сыграно» у выбранного пака, "
+        lbl = QLabel("Паки, отмеченные кнопкой «Добавить в сыграно» у выбранного пака, "
                      "скрыты из основного списка (см. чекбокс «Показывать "
                      "сыгранные» в фильтрах).")
         lbl.setWordWrap(True)
         v.addWidget(lbl)
         self.lst_played = QListWidget()
         self.lst_played.setMaximumHeight(110)
+        self.lst_played.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.lst_played.customContextMenuRequested.connect(self._on_played_context_menu)
         v.addWidget(self.lst_played)
+        row = QHBoxLayout()
         btn_unplay = QPushButton("Вернуть в список")
         btn_unplay.setIcon(get_icon('fa5s.undo'))
         btn_unplay.clicked.connect(self._unmark_played)
-        v.addWidget(btn_unplay)
+        row.addWidget(btn_unplay)
+        btn_tier = QPushButton("Тир-лист")
+        btn_tier.setIcon(get_icon('fa5s.trophy', color='#f9e2af'))
+        btn_tier.setToolTip("Открыть тир-лист: разложить сыгранные паки по "
+                            "уровням, добавить комментарии и свои теги.")
+        btn_tier.clicked.connect(self._open_tier_list)
+        row.addWidget(btn_tier)
+        v.addLayout(row)
         self._update_played_title()
         return box
 
@@ -1197,22 +1425,34 @@ class SigstatsTab(QWidget):
             self.lst_played.addItem(item)
 
     def _mark_selected_played(self):
-        r = self._selected_pkg_row()
+        """Кнопка «Добавить в сыграно» — сразу для ВСЕХ выделенных паков
+        (Ctrl/Shift+ЛКМ)."""
+        self._mark_played_ids([int(r["id"]) for r in self._selected_pkg_rows()])
+
+    def _mark_played_for_row(self, r):
         if r is None:
             return
-        pid = int(r["id"])
-        if pid not in self._played_ids:
-            self._played_ids.insert(0, pid)
-        self._played_added_at[pid] = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+        self._mark_played_ids([int(r["id"])])
+
+    def _mark_played_ids(self, pids):
+        """Один общий save+refresh на всю пачку — при пометке десятка паков
+        по одному перезапись файлов и перестроение таблицы на каждый id заметно
+        подтормаживали."""
+        if not pids:
+            return
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+        for pid in pids:
+            if pid not in self._played_ids:
+                self._played_ids.insert(0, pid)
+            self._played_added_at[pid] = now
         sg_config.save_played_packages(self._played_ids)
         sg_config.save_played_added_at(self._played_added_at)
         self._refresh_played_list()
         self._refresh_packages_table()
 
-    def _unmark_played(self):
+    def _unmark_played_ids(self, pids):
         changed = False
-        for item in self.lst_played.selectedItems():
-            pid = item.data(Qt.ItemDataRole.UserRole)
+        for pid in pids:
             if pid in self._played_ids:
                 self._played_ids.remove(pid)
                 self._played_added_at.pop(pid, None)
@@ -1222,6 +1462,54 @@ class SigstatsTab(QWidget):
             sg_config.save_played_added_at(self._played_added_at)
             self._refresh_played_list()
             self._refresh_packages_table()
+        return changed
+
+    def _unmark_played(self):
+        pids = [item.data(Qt.ItemDataRole.UserRole) for item in self.lst_played.selectedItems()]
+        self._unmark_played_ids(pids)
+
+    def _unmark_played_for_row(self, r):
+        if r is None:
+            return
+        self._unmark_played_ids([int(r["id"])])
+
+    def _open_tier_list(self):
+        """Отдельное окно тир-листа: разложить сыгранные паки по уровням, у
+        каждого — комментарий и пользовательские теги (см. _TierListDialog).
+        Окно одно на приложение — повторный клик поднимает уже открытое, а не
+        плодит вторую копию (закрытие крестиком только прячет окно, см.
+        QDialog.closeEvent по умолчанию, поэтому isVisible() тут надёжен)."""
+        existing = getattr(self, "_tier_dialog", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        import pandas as pd
+        state = sg_config.load_tier_list()
+        placed = [int(k) for k in state.get("placements", {})]
+        # Паки для тир-листа: все сыгранные + уже размещённые ранее (даже если
+        # их успели убрать из «сыгранных») — порядок сохраняем, дубли убираем.
+        pids = list(dict.fromkeys(list(self._played_ids) + placed))
+        if not pids:
+            msgbox_information(
+                self, "Тир-лист",
+                "Пока нечего раскладывать: отметьте паки кнопкой «Добавить в сыграно» — "
+                "они появятся здесь.")
+            return
+        names = None
+        if self._pkgs_df is not None and not self._pkgs_df.empty:
+            names = self._pkgs_df.set_index("id")["name"]
+        pkg_info = {}
+        for pid in pids:
+            nm = names.get(pid) if names is not None else None
+            pkg_info[int(pid)] = str(nm) if (nm is not None and not pd.isna(nm)) else f"#{pid}"
+        # Немодально (show, не exec) + ссылка на себя, чтобы окно не удалилось
+        # сборщиком мусора. Иначе (модальный exec) у окна нет своей кнопки в
+        # панели задач и клик по иконке проги его не сворачивает.
+        self._tier_dialog = _TierListDialog(pkg_info, self)
+        self._tier_dialog.show()
+        self._tier_dialog.raise_()
+        self._tier_dialog.activateWindow()
 
     def _build_pkg_blacklist_group(self) -> QGroupBox:
         self._box_pkg_blacklist = QGroupBox()
@@ -1234,6 +1522,8 @@ class SigstatsTab(QWidget):
         v.addWidget(lbl)
         self.lst_pkg_blacklist = QListWidget()
         self.lst_pkg_blacklist.setMaximumHeight(110)
+        self.lst_pkg_blacklist.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.lst_pkg_blacklist.customContextMenuRequested.connect(self._on_pkg_blacklist_context_menu)
         v.addWidget(self.lst_pkg_blacklist)
         btn_unblacklist = QPushButton("Убрать из чёрного списка")
         btn_unblacklist.setIcon(get_icon('fa5s.undo'))
@@ -1263,23 +1553,28 @@ class SigstatsTab(QWidget):
             self.lst_pkg_blacklist.addItem(item)
 
     def _blacklist_package(self, package_id: int):
-        pid = int(package_id)
-        if pid not in self._pkg_blacklist:
-            self._pkg_blacklist.insert(0, pid)
-        self._pkg_blacklist_added_at[pid] = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+        self._blacklist_packages([int(package_id)])
+
+    def _blacklist_packages(self, pids):
+        """Пачкой — один save+refresh на всё выделение (см. _mark_played_ids)."""
+        if not pids:
+            return
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+        for pid in pids:
+            pid = int(pid)
+            if pid not in self._pkg_blacklist:
+                self._pkg_blacklist.insert(0, pid)
+            self._pkg_blacklist_added_at[pid] = now
         sg_config.save_package_blacklist(self._pkg_blacklist)
         sg_config.save_package_blacklist_added_at(self._pkg_blacklist_added_at)
         self._refresh_pkg_blacklist_list()
         self._refresh_packages_table()
 
     def _blacklist_selected_package(self):
-        """Кнопка «Добавить в чёрный список» рядом с «Уже сыграно» — та же
-        логика, что и пункт ПКМ-меню (_on_pkg_context_menu), для выбранного
-        кликом пака."""
-        r = self._selected_pkg_row()
-        if r is None:
-            return
-        self._blacklist_package(int(r["id"]))
+        """Кнопка «Добавить в чёрный список» рядом с «Добавить в сыграно» — та же
+        логика, что и пункт ПКМ-меню (_on_pkg_context_menu), сразу для ВСЕХ
+        выделенных паков (Ctrl/Shift+ЛКМ)."""
+        self._blacklist_packages([int(r["id"]) for r in self._selected_pkg_rows()])
 
     def _unblacklist_selected_packages(self):
         changed = False
@@ -1464,6 +1759,21 @@ class SigstatsTab(QWidget):
         self.btn_collect_steam.setIcon(get_icon('fa5b.steam', color='#66c0f4'))
         self.btn_collect_steam.clicked.connect(self._start_collect_steam)
         v.addWidget(self.btn_collect_steam)
+
+        # Точечное добавление ОДНОГО пака по прямой ссылке/id — без обхода
+        # всего каталога (по просьбе; использует тот же ключ выше).
+        v.addWidget(QLabel("Добавить один пак по ссылке/id:"))
+        steam_link_row = QHBoxLayout()
+        self.ed_steam_link = QLineEdit()
+        self.ed_steam_link.setPlaceholderText(
+            "https://steamcommunity.com/sharedfiles/filedetails/?id=... или голый id")
+        self.ed_steam_link.returnPressed.connect(self._add_steam_by_link)
+        steam_link_row.addWidget(self.ed_steam_link, 1)
+        self.btn_add_steam_link = QPushButton("Добавить")
+        self.btn_add_steam_link.setIcon(get_icon('fa5s.plus', color='#66c0f4'))
+        self.btn_add_steam_link.clicked.connect(self._add_steam_by_link)
+        steam_link_row.addWidget(self.btn_add_steam_link)
+        v.addLayout(steam_link_row)
 
         return box
 
@@ -1687,6 +1997,42 @@ class SigstatsTab(QWidget):
         self._log(f"Поиск пакетов: {msg}")
         self._reload_data()
 
+    def _add_steam_by_link(self):
+        """Точечно добавляет один Steam-пак по прямой ссылке/id — без обхода
+        всего каталога, как «Импортировать из Steam Workshop» выше (по
+        просьбе: не всегда нужного пака дожидаешься массовым импортом)."""
+        if self._job_running():
+            return
+        api_key = self.ed_steam_api_key.text().strip()
+        if not api_key:
+            msgbox_warning(
+                self, "Нужен ключ Steam Web API",
+                "Получите бесплатный ключ на steamcommunity.com/dev/apikey и "
+                "вставьте его в поле выше.")
+            return
+        link = self.ed_steam_link.text().strip()
+        if not link:
+            return
+        self.btn_add_steam_link.setEnabled(False)
+        self.ed_steam_link.setEnabled(False)
+        self.lbl_status.setText("Добавляю пак Steam Workshop по ссылке…")
+        task = _SteamOneTask(link, api_key, self._blacklist_set())
+
+        def _done(result):
+            self.btn_add_steam_link.setEnabled(True)
+            self.ed_steam_link.setEnabled(True)
+            if result.get("ok"):
+                self.ed_steam_link.clear()
+                self.lbl_status.setText(f"Добавлен пак «{result['name']}».")
+                self._log(f"Поиск пакетов: добавлен по ссылке пак Steam «{result['name']}»")
+                self._reload_data()
+            else:
+                self.lbl_status.setText("Не удалось добавить пак по ссылке.")
+                msgbox_warning(self, "Не удалось добавить пак",
+                               result.get("error") or "Неизвестная ошибка.")
+        task.signals.finished.connect(_done)
+        self._pool.start(task)
+
     # ── Фильтрация и таблица паков ───────────────────────────────────────────
     def _filtered_packages_df(self):
         import pandas as pd
@@ -1739,10 +2085,17 @@ class SigstatsTab(QWidget):
             mask = (view["name"].str.lower().str.contains(needle, na=False)
                     | view["authors_display"].str.lower().str.contains(needle, na=False))
             try:
+                # SQLite'шный lower()/LIKE регистронезависимы ТОЛЬКО для ASCII —
+                # для кириллицы lower('Музыка') возвращает строку без изменений,
+                # так что WHERE lower(name) LIKE ? никогда не совпадал ни с одной
+                # темой, где есть заглавная буква (то есть почти никогда).
+                # Фильтруем в Python — str.lower() тут корректно работает с юникодом.
                 with sg_db.connect() as conn:
-                    ids = pd.read_sql_query(
-                        "SELECT DISTINCT package_id FROM themes WHERE lower(name) LIKE ?",
-                        conn, params=(f"%{needle}%",))["package_id"].tolist()
+                    themes_df = pd.read_sql_query(
+                        "SELECT DISTINCT package_id, name FROM themes", conn)
+                ids = themes_df.loc[
+                    themes_df["name"].fillna("").str.lower().str.contains(needle, na=False),
+                    "package_id"].tolist()
             except Exception:
                 ids = []
             view = view[mask | view["id"].isin(ids)]
@@ -1790,9 +2143,13 @@ class SigstatsTab(QWidget):
             row = t.rowCount()
             t.insertRow(row)
 
+            # Колонка 0 — «место» пака в текущем порядке. Сам номер рисует
+            # _AccentBarDelegate по index.row(), в ячейке его нет (иначе setText
+            # при включённой сортировке пересортировывал бы таблицу). Раньше тут
+            # был чекбокс для массового скачивания — его роль перешла к обычному
+            # выделению строк (Ctrl/Shift+ЛКМ, см. ExtendedSelection).
             chk_item = QTableWidgetItem()
-            chk_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            chk_item.setCheckState(Qt.CheckState.Unchecked)
+            chk_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             chk_item.setData(Qt.ItemDataRole.UserRole, int(r["id"]))
             t.setItem(row, 0, chk_item)
 
@@ -1863,10 +2220,14 @@ class SigstatsTab(QWidget):
             elif pid in self._played_ids:
                 tint = _ROW_STATUS_TINT["played"]
             if tint is not None:
+                # Роль, а НЕ setBackground: фон ячейки в этой таблице рисует
+                # QStyleSheetStyle (правило QTableWidget::item в глобальном
+                # STYLESHEET) и BackgroundRole из модели не смотрит — заливку
+                # кладёт делегат, см. _RowTintDelegate.
                 for col in range(t.columnCount()):
                     cell = t.item(row, col)
                     if cell is not None:
-                        cell.setBackground(tint)
+                        cell.setData(_RowTintDelegate.TintRole, tint)
         t.setSortingEnabled(True)
         t.resizeRowsToContents()
         self.lbl_pkg_count.setText(f"Найдено пакетов: {len(view)}")
@@ -1936,36 +2297,28 @@ class SigstatsTab(QWidget):
         index = self.tbl_pkgs.indexAt(pos)
         if not index.isValid():
             return
-        # Выделяем кликнутую строку (не обязательно совпадает с уже выбранной) —
-        # даёт и корректный _selected_pkg_row() ниже, и открывает карточку пака,
-        # как при обычном ЛКМ-клике.
-        self.tbl_pkgs.selectRow(index.row())
+        # ПКМ по строке ВНЕ текущего выделения работает как обычный клик —
+        # выделяет её одну. ПКМ по строке, которая уже входит в выделение,
+        # выделение НЕ сбрасывает (иначе Ctrl/Shift-набор из нескольких паков
+        # разваливался бы ровно в тот момент, когда по нему хотят вызвать меню).
+        sel_rows = {i.row() for i in self.tbl_pkgs.selectionModel().selectedRows()}
+        if index.row() not in sel_rows:
+            self.tbl_pkgs.selectRow(index.row())
+        rows = self._selected_pkg_rows()
+        if len(rows) > 1:
+            self._pkg_multi_menu(rows, pos)
+            return
         r = self._selected_pkg_row()
         if r is None:
             return
-        import pandas as pd
         pid = int(r["id"])
         name = str(r["name"])
         authors = r["authors"] if isinstance(r.get("authors"), list) else []
-        is_steam = r.get("source") == "steam"
 
         menu = QMenu(self)
-        act_open = menu.addAction(
-            get_icon('fa5b.steam', color='#66c0f4') if is_steam else get_icon('fa5s.external-link-alt'),
-            "Открыть в Steam Workshop" if is_steam else "Открыть на sibrowser.ru")
-        act_open.triggered.connect(self._open_selected_link)
-        act_questions = menu.addAction(get_icon('fa5s.book-open'), "Показать вопросы и ответы")
-        act_questions.triggered.connect(self._show_selected_questions)
-        if pd.notna(r.get("sibrowser_id")):
-            act_play = menu.addAction(get_icon('fa5s.play-circle', color='#a6e3a1'), "Играть")
-            act_play.triggered.connect(self._play_selected_package)
-        act_played = menu.addAction(get_icon('fa5s.check-circle'), "Уже сыграно — убрать из списка")
-        act_played.triggered.connect(self._mark_selected_played)
-        act_dl = menu.addAction(get_icon('fa5s.download'), "Скачать .siq")
-        act_dl.triggered.connect(self._bulk_download)
-        if r.get("siq_downloaded") == 1:
-            act_del = menu.addAction(get_icon('fa5s.trash', color='#f38ba8'), "Удалить пак")
-            act_del.triggered.connect(self._delete_selected_siq)
+        # Первые действия (открыть/вопросы/играть/сыграно/скачать/удалить) —
+        # общие с контекстными меню списков справа (см. _add_pkg_context_actions).
+        self._add_pkg_context_actions(menu, r)
 
         menu.addSeparator()
         act_pkg = menu.addAction(get_icon('fa5s.ban'), f"Добавить «{name}» в чёрный список")
@@ -2008,6 +2361,156 @@ class SigstatsTab(QWidget):
         if match.empty:
             return None
         return match.iloc[0]
+
+    def _pkg_multi_menu(self, rows, pos):
+        """ПКМ, когда в таблице выделено НЕСКОЛЬКО паков (Ctrl/Shift+ЛКМ):
+        действия применяются сразу ко всему выделению. Меню на один пак — в
+        _on_pkg_context_menu/_add_pkg_context_actions."""
+        import pandas as pd
+        pids = [int(r["id"]) for r in rows]
+        names = [str(r["name"]) for r in rows]
+        menu = QMenu(self)
+        act_copy = menu.addAction(get_icon('fa5s.copy'), f"Скопировать названия ({len(names)})")
+        act_copy.triggered.connect(lambda checked=False, ns=names:
+                                   QApplication.clipboard().setText("\n".join(ns)))
+
+        dl_rows = [r for r in rows
+                   if pd.notna(r.get("sibrowser_id")) and r.get("siq_downloaded") != 1]
+        if dl_rows:
+            menu.addSeparator()
+            act_dl = menu.addAction(get_icon('fa5s.download'), f"Скачать .siq ({len(dl_rows)})")
+            act_dl.triggered.connect(lambda checked=False, rs=dl_rows: self._download_for_rows(rs))
+
+        menu.addSeparator()
+        not_played = [p for p in pids if p not in self._played_ids]
+        if not_played:
+            act_played = menu.addAction(get_icon('fa5s.check-circle'),
+                                        f"Добавить в сыграно ({len(not_played)})")
+            act_played.triggered.connect(lambda checked=False, ps=not_played: self._mark_played_ids(ps))
+        played = [p for p in pids if p in self._played_ids]
+        if played:
+            act_unplayed = menu.addAction(get_icon('fa5s.undo'),
+                                          f"Убрать из сыгранных ({len(played)})")
+            act_unplayed.triggered.connect(lambda checked=False, ps=played: self._unmark_played_ids(ps))
+        not_bl = [p for p in pids if p not in self._pkg_blacklist]
+        if not_bl:
+            act_bl = menu.addAction(get_icon('fa5s.ban', color='#f38ba8'),
+                                    f"Добавить в чёрный список ({len(not_bl)})")
+            act_bl.triggered.connect(lambda checked=False, ps=not_bl: self._blacklist_packages(ps))
+        menu.exec(self.tbl_pkgs.viewport().mapToGlobal(pos))
+
+    def _selected_pkg_rows(self):
+        """ВСЕ выделенные строки (Ctrl/Shift+ЛКМ) как список pandas Series — в
+        порядке, в котором они идут в таблице. Массовые действия (скачать,
+        «уже сыграно», чёрный список) работают именно по этому списку: раньше
+        для этого была колонка галочек, теперь — обычное выделение."""
+        sel = self.tbl_pkgs.selectionModel()
+        if sel is None or self._pkg_view_df is None:
+            return []
+        out = []
+        for idx in sorted(sel.selectedRows(), key=lambda i: i.row()):
+            item = self.tbl_pkgs.item(idx.row(), 0)
+            if item is None:
+                continue
+            match = self._pkg_view_df[self._pkg_view_df["id"] == item.data(Qt.ItemDataRole.UserRole)]
+            if not match.empty:
+                out.append(match.iloc[0])
+        return out
+
+    def _pkg_row_by_id(self, pid):
+        """Строка пакета по id из ПОЛНОГО _pkgs_df (а не _pkg_view_df) — нужна
+        для контекстных меню списков «Сыгранные»/«Чёрные списки», где пак может
+        быть отфильтрован из видимой таблицы, но действия над ним всё равно
+        должны работать."""
+        if pid is None or self._pkgs_df is None or self._pkgs_df.empty:
+            return None
+        match = self._pkgs_df[self._pkgs_df["id"] == int(pid)]
+        if match.empty:
+            return None
+        return match.iloc[0]
+
+    def _add_pkg_context_actions(self, menu, r):
+        """Добавляет в меню те же действия над паком, что и ПКМ на строке
+        таблицы, КРОМЕ последних трёх (ЧС пака / ЧС авторов / выбор папки).
+        Используется и самим ПКМ таблицы (_on_pkg_context_menu), и контекстными
+        меню списков «Сыгранные»/«Чёрный список пакетов». `r` — строка пака
+        (pandas Series)."""
+        import pandas as pd
+        is_steam = r.get("source") == "steam"
+        act_open = menu.addAction(
+            get_icon('fa5b.steam', color='#66c0f4') if is_steam else get_icon('fa5s.external-link-alt'),
+            "Открыть в Steam Workshop" if is_steam else "Открыть на sibrowser.ru")
+        act_open.triggered.connect(lambda checked=False, r=r: self._open_link_for_row(r))
+        act_questions = menu.addAction(get_icon('fa5s.book-open'), "Показать вопросы и ответы")
+        act_questions.triggered.connect(lambda checked=False, r=r: self._show_questions_for_row(r))
+        if pd.notna(r.get("sibrowser_id")):
+            act_play = menu.addAction(get_icon('fa5s.play-circle', color='#a6e3a1'), "Играть")
+            act_play.triggered.connect(lambda checked=False, r=r: self._play_package_for_row(r))
+        if int(r["id"]) in self._played_ids:
+            act_played = menu.addAction(get_icon('fa5s.undo'), "Убрать из сыгранных")
+            act_played.triggered.connect(lambda checked=False, r=r: self._unmark_played_for_row(r))
+        else:
+            act_played = menu.addAction(get_icon('fa5s.check-circle'), "Добавить в сыграно")
+            act_played.triggered.connect(lambda checked=False, r=r: self._mark_played_for_row(r))
+        if pd.notna(r.get("sibrowser_id")) and r.get("siq_downloaded") != 1:
+            # Без sibrowser_id (например, Steam-пак) .siq скачать нечем — раньше
+            # пункт всё равно показывался и молча ничего не делал по клику
+            # (выглядело как «скачивание не работает»). Уже скачанные тоже не
+            # показываем — для них ниже есть «Удалить пак».
+            act_dl = menu.addAction(get_icon('fa5s.download'), "Скачать .siq")
+            act_dl.triggered.connect(lambda checked=False, r=r: self._download_for_row(r))
+        if r.get("siq_downloaded") == 1:
+            act_folder = menu.addAction(get_icon('fa5s.folder-open', color='#f9e2af'), "Открыть в проводнике")
+            act_folder.triggered.connect(lambda checked=False, r=r: self._open_folder_for_row(r))
+            act_del = menu.addAction(get_icon('fa5s.trash', color='#f38ba8'), "Удалить пак")
+            act_del.triggered.connect(lambda checked=False, r=r: self._delete_siq_for_row(r))
+
+    def _pkg_list_context_menu(self, lst, pos):
+        """Общее ПКМ-меню для списков «Сыгранные»/«Чёрный список пакетов» (в
+        обоих id пака лежит в UserRole элемента): скопировать название + те же
+        действия над паком, что и ПКМ на строке таблицы (кроме ЧС/папки)."""
+        item = lst.itemAt(pos)
+        if item is None:
+            return
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        r = self._pkg_row_by_id(pid)
+        if r is None:
+            return
+        name = str(r["name"])
+        menu = QMenu(self)
+        act_copy = menu.addAction(get_icon('fa5s.copy'), "Скопировать название")
+        act_copy.triggered.connect(lambda checked=False, n=name: QApplication.clipboard().setText(n))
+        menu.addSeparator()
+        self._add_pkg_context_actions(menu, r)
+        menu.exec(lst.viewport().mapToGlobal(pos))
+
+    def _on_played_context_menu(self, pos):
+        self._pkg_list_context_menu(self.lst_played, pos)
+
+    def _on_pkg_blacklist_context_menu(self, pos):
+        self._pkg_list_context_menu(self.lst_pkg_blacklist, pos)
+
+    def _on_author_blacklist_context_menu(self, pos):
+        """ПКМ в списке чёрного списка авторов: скопировать ник и открыть
+        страницу автора на sibrowser.ru."""
+        item = self.lst_blacklist.itemAt(pos)
+        if item is None:
+            return
+        author = item.text()
+        menu = QMenu(self)
+        act_copy = menu.addAction(get_icon('fa5s.copy'), "Скопировать имя автора")
+        act_copy.triggered.connect(lambda checked=False, a=author: QApplication.clipboard().setText(a))
+        act_open = menu.addAction(get_icon('fa5s.external-link-alt'), "Открыть страницу автора на sibrowser.ru")
+        act_open.triggered.connect(lambda checked=False, a=author: self._open_author_page(a))
+        menu.exec(self.lst_blacklist.viewport().mapToGlobal(pos))
+
+    def _open_author_page(self, author: str):
+        import urllib.parse
+        author = (author or "").strip()
+        if not author:
+            return
+        url = f"{sg_config.SIBROWSER_BASE}/authors/{urllib.parse.quote(author, safe='')}"
+        webbrowser.open(url)
 
     def eventFilter(self, obj, event):
         # Колесо мыши не должно менять значения спинбоксов/комбобоксов/
@@ -2052,8 +2555,8 @@ class SigstatsTab(QWidget):
         над выбранным паком — их нажатие не должно закрывать карточку."""
         protected = (self.pkg_detail, self.btn_open_link, self.btn_show_questions,
                      self.btn_mark_played, self.btn_add_pkg_blacklist,
-                     self.btn_play, self.btn_delete_siq, self.btn_bulk_dl,
-                     self.btn_pkgs_fullscreen)
+                     self.btn_play, self.btn_delete_siq, self.btn_open_folder,
+                     self.btn_bulk_dl, self.btn_pkgs_fullscreen)
         node = w
         while node is not None:
             if node in protected:
@@ -2078,6 +2581,13 @@ class SigstatsTab(QWidget):
     def _on_pkg_selection_changed(self):
         import pandas as pd
         self._pkg_selection_just_changed = True
+        # Открытие карточки справа сужает таблицу (setSizes ниже) — Qt при этом
+        # автоскроллит по горизонтали к текущей (последней кликнутой) ячейке,
+        # из-за чего вся таблица иногда «прыгала» вправо, если кликнули по
+        # правой колонке. Запоминаем позицию горизонтального скролла и
+        # возвращаем её после того, как layout пересчитается.
+        _hbar = self.tbl_pkgs.horizontalScrollBar()
+        _prev_h = _hbar.value()
         r = self._selected_pkg_row()
         has = r is not None
         if has:
@@ -2092,8 +2602,10 @@ class SigstatsTab(QWidget):
         self.btn_mark_played.setEnabled(has)
         self.btn_add_pkg_blacklist.setEnabled(has)
         self.btn_play.setEnabled(bool(has and pd.notna(r.get("sibrowser_id"))))
-        # «Удалить пак» — только когда выбран реально скачанный .siq.
+        # «Удалить пак»/«Открыть в проводнике» — только когда выбран реально
+        # скачанный .siq.
         self.btn_delete_siq.setEnabled(bool(has and r.get("siq_downloaded") == 1))
+        self.btn_open_folder.setEnabled(bool(has and r.get("siq_downloaded") == 1))
         if not has:
             self._current_detail_pid = None
             self.pkg_detail.setHtml("")
@@ -2107,6 +2619,7 @@ class SigstatsTab(QWidget):
         self.pkg_detail.setHtml(self._render_package_detail_html(r))
         self._set_app_click_filter(True)
         self._maybe_fetch_full_description(r)
+        QTimer.singleShot(0, lambda h=_prev_h: _hbar.setValue(h))
 
     def _maybe_fetch_full_description(self, r):
         """Полное описание пака урезано на карточке списка (см. sibrowser.
@@ -2169,17 +2682,38 @@ class SigstatsTab(QWidget):
         if pid is not None and pid == self._current_detail_pid and not just_changed:
             self.tbl_pkgs.clearSelection()
 
-    def _render_package_detail_html(self, r) -> str:
+    @staticmethod
+    def _copy_link_html(field: str, what: str, copied: bool) -> str:
+        """Маленький значок «копировать» прямо в строке текста (не отдельной
+        кнопкой на всю ширину панели, см. _on_pkg_detail_anchor_clicked).
+        Текст ссылки внутри <a> — не реальный URL, а внутренний маркер, который
+        отлавливает anchorClicked. После клика значок на 1.5 с превращается в
+        зелёную галочку (copied=True) — визуальное подтверждение копирования
+        (см. _show_copy_feedback)."""
+        if copied:
+            return (f'<a href="sigstats-copy-{field}" style="text-decoration:none;" '
+                    'title="Скопировано">'
+                    f'{icon_html("fa5s.check", size=13, color="#a6e3a1")}</a>')
+        return (f'<a href="sigstats-copy-{field}" style="text-decoration:none;" '
+                f'title="Копировать {what}">'
+                f'{icon_html("fa5s.copy", size=13, color="#a6adc8")}</a>')
+
+    def _render_package_detail_html(self, r, copied: str | None = None) -> str:
+        """`copied` — какая именно строка только что скопирована ("name" или
+        "authors"): у неё вместо значка копирования на 1.5 с показывается
+        зелёная галочка."""
         import pandas as pd
         is_steam = r.get("source") == "steam"
-        # Значок «копировать название» — прямо в строке заголовка, справа от
-        # текста (не отдельной кнопкой на всю ширину панели, см.
-        # _on_pkg_detail_anchor_clicked); текст ссылки внутри <a> — не реальный
-        # URL, а внутренний маркер, который отлавливает anchorClicked.
-        copy_link = (f'<a href="sigstats-copy-name" style="text-decoration:none;" '
-                     f'title="Копировать название">'
-                     f'{icon_html("fa5s.copy", size=13, color="#a6adc8")}</a>')
-        parts = [f"<h3>{_esc(r['name'])} {copy_link}</h3>"]
+        parts = [f"<h3>{_esc(r['name'])} "
+                 f"{self._copy_link_html('name', 'название', copied == 'name')}</h3>"]
+        # Авторы — сразу под названием (по просьбе), а не в середине карточки
+        # среди статистики: это второе, что о паке хотят знать, и такая же
+        # кнопка копирования, как у названия.
+        authors = r["authors"] if isinstance(r.get("authors"), list) else []
+        if authors:
+            parts.append(
+                f"<p><b>Авторы:</b> {_esc(', '.join(authors))} "
+                f"{self._copy_link_html('authors', 'авторов', copied == 'authors')}</p>")
         if is_steam and pd.notna(r.get("steam_id")):
             parts.append(f"<p><b>Steam Workshop id:</b> {_esc(str(r['steam_id']))}</p>")
         qc = r.get("question_count")
@@ -2212,9 +2746,6 @@ class SigstatsTab(QWidget):
             # Каждый показатель — отдельной строкой (по просьбе).
             parts.append(f"<p>Средний % попыток: {_fmt_pct(ap, 0)}</p>")
             parts.append(f"<p>Средний % правильных: {_fmt_pct(cp, 0)}</p>")
-        authors = r["authors"] if isinstance(r.get("authors"), list) else []
-        if authors:
-            parts.append(f"<p><b>Авторы:</b> {_esc(', '.join(authors))}</p>")
         cats = r.get("categories") if isinstance(r.get("categories"), list) else []
         if cats:
             parts.append("<p><b>Категории:</b> " +
@@ -2261,15 +2792,46 @@ class SigstatsTab(QWidget):
             self._update_pkg_dir_tooltip()
 
     def _on_pkg_detail_anchor_clicked(self, url: QUrl):
-        """Единственная псевдо-ссылка в карточке пака сейчас — значок
-        «копировать» рядом с названием (см. _render_package_detail_html)."""
-        if url.toString() == "sigstats-copy-name":
+        """Псевдо-ссылки в карточке пака — значки «копировать» у названия и у
+        строки авторов (см. _render_package_detail_html)."""
+        field = {"sigstats-copy-name": "name",
+                 "sigstats-copy-authors": "authors"}.get(url.toString())
+        if field is None:
+            return
+        r = self._selected_pkg_row()
+        if r is None:
+            return
+        if field == "name":
+            text = str(r["name"])
+        else:
+            authors = r["authors"] if isinstance(r.get("authors"), list) else []
+            text = ", ".join(authors)
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        self._show_copy_feedback(int(r["id"]), field)
+
+    def _show_copy_feedback(self, pid: int, field: str):
+        """Значок «копировать» у нужной строки → зелёная галочка на 1.5 с, затем
+        обратно. Перерисовываем карточку с сохранением позиции скролла (setHtml
+        иначе сбросил бы её в начало)."""
+        def _render(copied):
+            if self._current_detail_pid != pid:
+                return
             r = self._selected_pkg_row()
-            if r is not None:
-                QApplication.clipboard().setText(str(r["name"]))
+            if r is None or int(r["id"]) != pid:
+                return
+            sb = self.pkg_detail.verticalScrollBar()
+            pos = sb.value()
+            self.pkg_detail.setHtml(self._render_package_detail_html(r, copied=copied))
+            sb.setValue(pos)
+        _render(field)
+        QTimer.singleShot(1500, lambda: _render(None))
 
     def _open_selected_link(self):
-        r = self._selected_pkg_row()
+        self._open_link_for_row(self._selected_pkg_row())
+
+    def _open_link_for_row(self, r):
         if r is None:
             return
         import pandas as pd
@@ -2280,6 +2842,9 @@ class SigstatsTab(QWidget):
             webbrowser.open(url)
 
     def _play_selected_package(self):
+        self._play_package_for_row(self._selected_pkg_row())
+
+    def _play_package_for_row(self, r):
         """Открывает пак сразу в SIGame, без скачивания .siq — как кнопка
         «Играть» на sibrowser.ru. Штатный способ передать пак в SIGame — это
         параметр packageUri в URL самого sigame.vladimirkhil.com (см.
@@ -2290,7 +2855,6 @@ class SigstatsTab(QWidget):
         стандартного API для адресации конкретной вкладки чужого браузера без
         remote-debugging протокола), новая вкладка/переиспользование окна
         браузера — уже поведение самой ОС/браузера по умолчанию."""
-        r = self._selected_pkg_row()
         if r is None:
             return
         import pandas as pd
@@ -2299,8 +2863,31 @@ class SigstatsTab(QWidget):
         url = sg_sibrowser.play_url(str(int(r["sibrowser_id"])), str(r["name"]))
         webbrowser.open(url)
 
+    def _open_selected_folder(self):
+        self._open_folder_for_row(self._selected_pkg_row())
+
+    def _open_folder_for_row(self, r):
+        """Открывает Проводник на скачанном .siq пака (файл выделяется); если
+        .siq нет на диске, но есть распакованная папка медиа — открывает её."""
+        if r is None:
+            return
+        from pathlib import Path
+        import subprocess
+        siq_path = r.get("siq_path")
+        if isinstance(siq_path, str) and siq_path and Path(siq_path).exists():
+            subprocess.Popen(["explorer", "/select," + str(Path(siq_path))])
+            return
+        media_dir = sg_config.MEDIA_DIR / str(int(r["id"]))
+        if media_dir.exists():
+            os.startfile(str(media_dir))
+            return
+        msgbox_information(self, "Открыть в проводнике",
+                           "Пак ещё не скачан локально — открывать нечего.")
+
     def _show_selected_questions(self):
-        r = self._selected_pkg_row()
+        self._show_questions_for_row(self._selected_pkg_row())
+
+    def _show_questions_for_row(self, r):
         if r is None:
             return
         try:
@@ -2321,10 +2908,11 @@ class SigstatsTab(QWidget):
                     self, "Скачать .siq",
                     "Вопросы ещё не скачаны. Скачать и разобрать .siq сейчас?"
             ) == QMessageBox.StandardButton.Yes:
-                ok = sg_collector.download_one(int(r["id"]), str(r["sibrowser_id"]), r["name"])
+                pid = int(r["id"])
+                ok = sg_collector.download_one(pid, str(r["sibrowser_id"]), r["name"])
                 if ok:
                     self._reload_data()
-                    self._show_selected_questions()
+                    self._show_questions_for_row(self._pkg_row_by_id(pid))
                 else:
                     msgbox_warning(self, "Ошибка", "Не удалось скачать/разобрать .siq.")
             return
@@ -2346,34 +2934,49 @@ class SigstatsTab(QWidget):
         dlg.exec()
 
     def _bulk_download(self):
+        """Скачать .siq всех ВЫДЕЛЕННЫХ паков (Ctrl/Shift+ЛКМ в таблице).
+        Раньше набор задавался галочками в первой колонке — их заменил номер
+        места, а массовый выбор делается обычным выделением строк."""
         import pandas as pd
-        t = self.tbl_pkgs
         items = []
-        for row in range(t.rowCount()):
-            chk = t.item(row, 0)
-            if chk is None or chk.checkState() != Qt.CheckState.Checked:
-                continue
-            pid = chk.data(Qt.ItemDataRole.UserRole)
-            match = self._pkg_view_df[self._pkg_view_df["id"] == pid]
-            if match.empty:
-                continue
-            r = match.iloc[0]
+        for r in self._selected_pkg_rows():
             if r.get("siq_downloaded") == 1 or pd.isna(r.get("sibrowser_id")):
                 continue
-            items.append((int(pid), str(r["sibrowser_id"]), r["name"]))
-        if not items:
-            # Ни одной галочки не стоит — скачиваем просто выбранный (ЛКМ) пак,
-            # галочка не обязательна (по просьбе).
-            r = self._selected_pkg_row()
-            if r is not None and r.get("siq_downloaded") != 1 and pd.notna(r.get("sibrowser_id")):
-                items.append((int(r["id"]), str(r["sibrowser_id"]), r["name"]))
+            items.append((int(r["id"]), str(r["sibrowser_id"]), r["name"]))
         if not items:
             msgbox_information(self, "Нечего скачивать",
-                                    "Отметьте паки галочками в первой колонке или выберите "
-                                    "один пак кликом — уже скачанные паки пропускаются "
-                                    "автоматически.")
+                                    "Выделите паки в таблице (Ctrl+ЛКМ — по одному, "
+                                    "Shift+ЛКМ — диапазоном) — уже скачанные паки и "
+                                    "паки без ссылки на .siq пропускаются автоматически.")
             return
+        self._enqueue_downloads(items)
 
+    def _download_for_row(self, r):
+        """Скачать .siq одного конкретного пака (из контекстного меню списков
+        «Сыгранные»/«Чёрный список пакетов», где пак не обязательно есть в
+        видимой таблице). Уже скачанные / без sibrowser_id молча пропускаются."""
+        import pandas as pd
+        if r is None or r.get("siq_downloaded") == 1 or not pd.notna(r.get("sibrowser_id")):
+            return
+        self._enqueue_downloads([(int(r["id"]), str(r["sibrowser_id"]), r["name"])])
+
+    def _download_for_rows(self, rows):
+        """Пакетная версия _download_for_row — для мультивыбора карточек в
+        тир-листе (см. _TierListDialog._card_multi_menu). Качаются параллельно
+        (см. _MAX_PARALLEL_DOWNLOADS), не по одному."""
+        import pandas as pd
+        items = []
+        for r in rows:
+            if r is None or r.get("siq_downloaded") == 1 or not pd.notna(r.get("sibrowser_id")):
+                continue
+            items.append((int(r["id"]), str(r["sibrowser_id"]), r["name"]))
+        if not items:
+            return
+        self._enqueue_downloads(items)
+
+    def _enqueue_downloads(self, items):
+        if not items:
+            return
         if isinstance(self._active_job, _BulkDownloadTask):
             # Скачивание уже идёт — дозаписываем в его очередь вместо того чтобы
             # блокировать выбор нового пака (кнопка временно в режиме «Отмена» —
@@ -2439,22 +3042,26 @@ class SigstatsTab(QWidget):
 
     def _on_item_download_progress(self, pid, pct):
         """Бегущий процент скачивания у строки пака: пишем в роль ячейки имени,
-        по достижении 100% ставим галочку (её отрисует _PkgNameDelegate)."""
+        по достижении 100% ставим галочку (её отрисует _PkgNameDelegate).
+        Пак может не быть в видимой таблице (отфильтрован, либо скачивание
+        запущено из тир-листа) — в этом случае просто отдаём сигнал дальше,
+        его подхватит открытое окно тир-листа (см. download_progress)."""
         row = self._row_for_pid(pid)
-        if row is None:
-            return
-        name_item = self.tbl_pkgs.item(row, self._COL_NAME)
-        if name_item is None:
-            return
-        if pct >= 100:
-            name_item.setData(_PkgNameDelegate.ProgressRole, None)
-            name_item.setData(_PkgNameDelegate.DownloadedRole, True)
-        else:
-            name_item.setData(_PkgNameDelegate.ProgressRole, int(pct))
-        self.tbl_pkgs.viewport().update()
+        if row is not None:
+            name_item = self.tbl_pkgs.item(row, self._COL_NAME)
+            if name_item is not None:
+                if pct >= 100:
+                    name_item.setData(_PkgNameDelegate.ProgressRole, None)
+                    name_item.setData(_PkgNameDelegate.DownloadedRole, True)
+                else:
+                    name_item.setData(_PkgNameDelegate.ProgressRole, int(pct))
+                self.tbl_pkgs.viewport().update()
+        self.download_progress.emit(pid, pct)
 
     def _delete_selected_siq(self):
-        r = self._selected_pkg_row()
+        self._delete_siq_for_row(self._selected_pkg_row())
+
+    def _delete_siq_for_row(self, r):
         if r is None or r.get("siq_downloaded") != 1:
             return
         if msgbox_question(
@@ -2976,3 +3583,1278 @@ def _render_media_html(media_json) -> str:
 
 def _open_media_link(url: QUrl):
     QDesktopServices.openUrl(url)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Тир-лист сыгранных паков (окно из группы «Сыгранные пакеты»)
+# ══════════════════════════════════════════════════════════════════════════════
+# Цвет названия уровня (S/A/B/C/D и любых пользовательских) — по позиции, с
+# зацикливанием (catppuccin, как остальная вкладка). Это только цвет ТЕКСТА
+# заголовка, никакой цветной вертикальной полосы у строки нет (по просьбе).
+_TIER_COLORS = ["#f38ba8", "#fab387", "#f9e2af", "#a6e3a1", "#89b4fa", "#cba6f7", "#94e2d5"]
+
+# Полярность тега (хороший/нейтральный/плохой) задаётся вручную пользователем
+# (ПКМ на чипе тега) и хранится per-tag в tier_list.json → tag_kinds. Новый тег
+# по умолчанию «хороший». См. _TierListDialog._tag_kind / ._set_tag_kind.
+_TAG_GOOD = "#a6e3a1"
+_TAG_BAD = "#f38ba8"
+_TAG_NEUTRAL = "#ffffff"
+_TAG_KIND_COLORS = {"good": _TAG_GOOD, "neutral": _TAG_NEUTRAL, "bad": _TAG_BAD}
+# Порядок для сортировки редактора тегов: хорошие сверху, плохие снизу (по просьбе).
+_TAG_KIND_ORDER = {"good": 0, "neutral": 1, "bad": 2}
+
+# Карточка пака = видимый блок с рамкой и полным названием (по просьбе — не
+# обрезанное имя, а «блок названия»). Общий стиль для всех списков тир-листа.
+_CARD_QSS = """
+QListWidget { background: transparent; border: 1px solid #313244; border-radius: 6px; }
+QListWidget::item {
+    border: 1px solid #45475a;
+    border-radius: 6px;
+    background: #313244;
+    color: #cdd6f4;
+    padding: 6px 10px;
+    margin: 3px;
+}
+QListWidget::item:selected {
+    border: 1px solid #89b4fa;
+    background: #45475a;
+    color: #ffffff;
+}
+"""
+
+
+class _TagChip(QLabel):
+    """Чип тега: кликабельный «бейджик» с переносом текста по словам (в отличие
+    от QPushButton, который не переносит и вылезал бы за окно). Клик переключает
+    (toggled), ПКМ отдаётся наружу через customContextMenuRequested. Цвет — по
+    полярности тега (good/bad); заливка — если тег присвоен текущему паку."""
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, text: str, color: str, checked: bool, parent=None):
+        super().__init__(parent)
+        self._color = color
+        self._checked = checked
+        self._text = text
+        self.setWordWrap(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+        self._apply()
+
+    def set_color(self, color: str):
+        self._color = color
+        self._apply()
+
+    def set_checked(self, checked: bool):
+        self._checked = checked
+        self._apply()
+
+    def _apply(self):
+        self.setText(("✓ " if self._checked else "") + self._text)
+        if self._checked:
+            self.setStyleSheet(
+                f"QLabel{{background:{self._color};color:#11111b;"
+                f"border:1px solid {self._color};border-radius:11px;"
+                f"padding:4px 12px;font-weight:bold;}}")
+        else:
+            self.setStyleSheet(
+                f"QLabel{{background:transparent;color:{self._color};"
+                f"border:1px solid {self._color};border-radius:11px;"
+                f"padding:4px 12px;}}")
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._checked = not self._checked
+            self._apply()
+            self.toggled.emit(self._checked)
+        super().mousePressEvent(e)
+
+
+class _FlowLayout(QLayout):
+    """Раскладка чипов тегов слева направо с переносом на новую строку, когда
+    не хватает ширины (как обычный текст) — вместо одного тега на всю ширину
+    в ряд (по просьбе: теги должны умещаться по горизонтали, а не съедать
+    вертикаль по одному в ряд). Чип не может быть шире доступной ширины —
+    длинный текст переносится внутри чипа (никакого горизонтального скролла)."""
+
+    def __init__(self, parent=None, margin=0, h_spacing=6, v_spacing=6):
+        super().__init__(parent)
+        self._h_spacing = h_spacing
+        self._v_spacing = v_spacing
+        self._items = []
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        left, top, right, bottom = self.getContentsMargins()
+        return size + QSize(left + right, top + bottom)
+
+    def _do_layout(self, rect, test_only):
+        left, top, right, bottom = self.getContentsMargins()
+        effective = rect.adjusted(left, top, -right, -bottom)
+        avail = max(1, effective.width())
+        x, y = effective.x(), effective.y()
+        line_height = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            w = min(hint.width(), avail)   # чип не шире области → без гор. скролла
+            wid = item.widget()
+            if wid is not None and wid.hasHeightForWidth():
+                h = wid.heightForWidth(w)   # длинный текст переносится → выше
+            else:
+                h = hint.height()
+            next_x = x + w + self._h_spacing
+            if next_x - self._h_spacing > effective.right() and line_height > 0:
+                x = effective.x()
+                y = y + line_height + self._v_spacing
+                next_x = x + w + self._h_spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(x, y, w, h))
+            x = next_x
+            line_height = max(line_height, h)
+        return y + line_height - rect.y() + bottom
+
+
+class _TierPublishEmitter(QObject):
+    """Мостик из фонового потока публикации тир-листа обратно в GUI-поток
+    (как error_report._Emitter). done(ok, url_или_ошибка)."""
+    done = pyqtSignal(bool, str)
+
+
+def _post_tier(url: str, payload: dict, token: str, emitter: "_TierPublishEmitter"):
+    """Шлёт модель тир-листа POST-ом на worker (см. tier_worker.js) в фоновом
+    потоке. При успехе возвращает постоянную ссылку на страницу, иначе — текст
+    ошибки. Запускается только из _TierListDialog._publish_online."""
+    import json
+    import urllib.request
+    import urllib.error
+    ok, result = False, ""
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"Content-Type": "application/json",
+                     "X-Edit-Token": token,
+                     "User-Agent": f"SI-HYX/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            ok = 200 <= getattr(resp, "status", 200) < 300
+            if ok:
+                try:
+                    result = json.loads(body).get("url", "")
+                except Exception:
+                    result = ""
+    except urllib.error.HTTPError as e:
+        result = f"HTTP {e.code}"
+    except Exception as e:
+        result = str(e)
+    emitter.done.emit(ok, result)
+
+
+class _TierCardList(QListWidget):
+    """Список карточек-паков с drag&drop между уровнями и «пулом». Карточки
+    переносятся на следующую строку, когда кончается ширина (setWrapping), а не
+    уходят бесконечно вправо. Перетаскивание между разными QListWidget работает
+    «из коробки» через стандартный mime-формат Qt (роли элемента, в т.ч. id пака
+    в UserRole, переносятся). Эмитит `dropped` после перемещения.
+
+    auto_height=True (полосы уровней): виджет сам подгоняет высоту под
+    содержимое (сколько получилось перенесённых строк) — без внутреннего
+    скролла. auto_height=False (пул «Не распределено»): фиксированной высоты со
+    своим вертикальным скроллом. Эмитит `emptyClicked` при клике мимо карточек,
+    чтобы диалог мог снять «текущий» пак (свою переменную, не только Qt-выделение)."""
+    dropped = pyqtSignal()
+    emptyClicked = pyqtSignal()
+
+    def __init__(self, auto_height: bool, parent=None):
+        super().__init__(parent)
+        self._auto_height = auto_height
+        self.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.setSpacing(3)
+        self.setUniformItemSizes(False)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        # ExtendedSelection — можно выделить сразу несколько карточек (Ctrl/Shift,
+        # как в проводнике) и применить действие сразу ко всем (см. _on_card_menu/
+        # _card_multi_menu), а заодно перетащить всю группу между уровнями разом.
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setStyleSheet(_CARD_QSS)
+        self._empty_h = 46
+        if auto_height:
+            # Полосы уровней: карточки текут слева направо с переносом строк.
+            self.setFlow(QListWidget.Flow.LeftToRight)
+            self.setWrapping(True)
+            self.setWordWrap(False)
+            self.setTextElideMode(Qt.TextElideMode.ElideNone)
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self.setFixedHeight(self._empty_h)
+        else:
+            # Пул «Не распределено» — узкий, поэтому карточки идут вертикально
+            # (одна под другой) на всю ширину, а длинные названия ПЕРЕНОСЯТСЯ
+            # по словам (без горизонтального скролла, текст виден целиком).
+            self.setFlow(QListWidget.Flow.TopToBottom)
+            self.setWrapping(False)
+            self.setWordWrap(True)
+            self.setTextElideMode(Qt.TextElideMode.ElideNone)
+            self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            self.setMinimumHeight(120)
+
+    def mousePressEvent(self, e):
+        super().mousePressEvent(e)
+        if self.itemAt(e.pos()) is None:
+            self.emptyClicked.emit()
+
+    def startDrag(self, supportedActions):
+        # Держа Alt (иногда и Ctrl) во время перетаскивания, Qt/Windows может
+        # предложить CopyAction вместо MoveAction — карточка пака при этом
+        # дублировалась (оставалась в источнике И появлялась в цели). Разрешаем
+        # ТОЛЬКО перемещение, вне зависимости от того, какой модификатор зажат.
+        super().startDrag(Qt.DropAction.MoveAction)
+        # super().startDrag() блокируется на время всего D&D (внутренний
+        # nested event loop QDrag.exec) и возвращается ТОЛЬКО ПОСЛЕ того, как
+        # исходный список уже лишился перетащенной карточки (Qt удаляет её из
+        # источника сама, если результат — MoveAction). А вот dropEvent() ЦЕЛИ
+        # срабатывает РАНЬШЕ этого — ещё ВНУТРИ nested loop, когда карточка уже
+        # добавлена в цель, но ещё не убрана из источника. Раньше сохранение
+        # состояния (_on_drop → _save_state) шло только по dropEvent цели —
+        # ловило этот промежуточный момент, когда карточка сидела сразу в ДВУХ
+        # списках, и _sync_placements_from_widgets записывала пак ещё и в
+        # старый уровень. При закрытии/открытии тир-листа пак «возвращался»
+        # туда же. Эмит здесь (после реального завершения перемещения)
+        # гарантированно перезаписывает состояние уже корректными данными.
+        self.dropped.emit()
+
+    def dropEvent(self, e):
+        super().dropEvent(e)
+        self.dropped.emit()
+        if self._auto_height:
+            QTimer.singleShot(0, self.update_height)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._auto_height:
+            self.update_height()
+
+    def update_height(self):
+        """Подгоняет высоту под фактически разложенные (с переносом) карточки —
+        по нижней границе самой нижней карточки."""
+        if not self._auto_height:
+            return
+        if self.count() == 0:
+            self.setFixedHeight(self._empty_h)
+            return
+        bottom = 0
+        for i in range(self.count()):
+            bottom = max(bottom, self.visualItemRect(self.item(i)).bottom())
+        self.setFixedHeight(max(self._empty_h, bottom + self.spacing() + 2 * self.frameWidth() + 4))
+
+
+class _TierListDialog(QDialog):
+    """Окно тир-листа: сыгранные паки раскладываются по уровням (drag&drop), у
+    каждого пака — свой комментарий и пользовательские теги (хорошие/плохие).
+    Всё сохраняется в tier_list.json (см. sg_config.load/save_tier_list) при
+    каждом изменении. Отдельной кнопки «Закрыть» нет — окно закрывается крестиком
+    (данные и так сохранены)."""
+
+    def __init__(self, pkg_info: dict, parent=None):
+        # Без Qt-родителя: на Windows top-level окно с реальным родителем
+        # (даже вложенным Window-флагом) получает нативного "owner", из-за
+        # чего сворачивание анимируется не в панель задач, а в левый нижний
+        # угол экрана (Windows не может для него посчитать iconic-позицию).
+        # `parent` всё равно нужен для _tab/размера — держим отдельно.
+        super().__init__(None)
+        self.setWindowTitle("Тир-лист сыгранных паков")
+        # Полноценное окно с кнопкой сворачивания и своей кнопкой в панели задач
+        # (иначе клик по иконке проги не сворачивал тир-лист).
+        self.setWindowFlags(Qt.WindowType.Window
+                            | Qt.WindowType.WindowMinimizeButtonHint
+                            | Qt.WindowType.WindowMaximizeButtonHint
+                            | Qt.WindowType.WindowCloseButtonHint)
+        # Окно должно быть чуть меньше основного окна SI-HYX (по просьбе), а не
+        # фиксированного размера — подгоняем под текущий размер главного окна.
+        top = parent.window() if parent is not None else None
+        if top is not None and top.width() > 200 and top.height() > 200:
+            self.resize(max(900, top.width() - 60), max(600, top.height() - 60))
+        else:
+            self.resize(1200, 820)
+        self._tab = parent   # SigstatsTab — для ПКМ-действий над паком
+        if self._tab is not None:
+            # Бегущий процент скачивания у карточки — независимо от того, где
+            # запущено скачивание (эта кнопка или таблица на вкладке); см.
+            # SigstatsTab.download_progress / _on_download_progress ниже.
+            self._tab.download_progress.connect(self._on_download_progress)
+            # Библиотека паков перечиталась (скачивание завершилось, .siq
+            # удалён и т.п.) — перерисовываем галочки «скачан» в пуле.
+            self._tab.library_changed.connect(self._refresh_all_card_icons)
+        self._info = {int(k): str(v) for k, v in pkg_info.items()}
+
+        st = sg_config.load_tier_list()
+        self._tiers = list(st["tiers"])
+        self._placements = {int(k): v for k, v in st["placements"].items()}
+        self._comments = {int(k): v for k, v in st["comments"].items()}
+        self._tags = {int(k): list(v) for k, v in st["tags"].items()}
+        self._all_tags = list(st["all_tags"])
+        # Полярность тега (good/bad) — задаётся вручную (ПКМ на чипе тега),
+        # хранится per-tag; тегов без записи (например, только что созданных
+        # в старом файле) считаем «хорошими» — см. _tag_kind.
+        self._tag_kinds = dict(st.get("tag_kinds", {}))
+        # Оценка сложности пака самим пользователем (pid -> уровень из _DIFF_LEVELS).
+        self._difficulty = {int(k): v for k, v in st.get("difficulty", {}).items()}
+        # Постоянная ссылка публикации: id страницы + секретный токен на её
+        # перезапись. Заводятся при первой публикации (см. _publish_online).
+        self._publish_id = st.get("publish_id", "")
+        self._edit_token = st.get("edit_token", "")
+        # Адрес личного воркера пользователя: приоритет — сохранённый в его
+        # tier_list.json; иначе то, что зашито в config (обычно пусто).
+        self._publish_url = st.get("publish_url", "") or (TIER_LIST_PUBLISH_URL or "")
+
+        self._current_pid = None
+        self._loading_editor = False
+        self._publishing = False
+        self._tier_lists = []   # список (header_edit, _TierCardList) в текущем порядке
+
+        outer = QVBoxLayout(self)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+
+        # ── Левая часть: уровни (в вертикальном скролле) + кнопка публикации
+        # снизу. Кнопка живёт именно тут (а не в общей нижней строке на всю
+        # ширину окна) — иначе под правой колонкой оставалась пустая полоса
+        # той строки (та самая «пустота под Добавить тег»).
+        left_col = QWidget()
+        left_col_v = QVBoxLayout(left_col)
+        left_col_v.setContentsMargins(0, 0, 0, 0)
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_host = QWidget()
+        self._board = QVBoxLayout(left_host)
+        self._board.setContentsMargins(4, 4, 4, 4)
+        self._tiers_host = QVBoxLayout()
+        self._board.addLayout(self._tiers_host)
+        self._board.addStretch(1)
+        left_scroll.setWidget(left_host)
+        left_col_v.addWidget(left_scroll, 1)
+        split.addWidget(left_col)
+
+        # ── Правая часть: «Не распределено» сверху + редактор снизу ──────────
+        # Обычный QVBoxLayout, а не QSplitter — растяжение через stretch-
+        # фактор тут надёжно применяется всегда (и на первом лэйауте, и при
+        # изменении размера), без сюрпризов от тем/шрифтов, в отличие от
+        # QSplitter (по факту ловили там пустоту, несмотря на maximumHeight).
+        right = QWidget()
+        right_v = QVBoxLayout(right)
+        right_v.setContentsMargins(0, 0, 0, 0)
+
+        pool_box = QGroupBox("Не распределено")
+        pv = QVBoxLayout(pool_box)
+        self._pool_list = _TierCardList(auto_height=False)
+        self._pool_list.dropped.connect(self._on_drop)
+        self._pool_list.itemClicked.connect(self._on_card_clicked)
+        self._pool_list.emptyClicked.connect(self._on_empty_clicked)
+        self._pool_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._pool_list.customContextMenuRequested.connect(
+            lambda pos: self._on_card_menu(self._pool_list, pos))
+        pv.addWidget(self._pool_list)
+        # «Не распределено» получает МАЛЕНЬКУЮ долю (1), редактор с тегами ниже —
+        # всё остальное (4). Раньше было 2:3 — пул занимал вдвое больше высоты,
+        # чем сейчас, и освободившееся место ушло области тегов (по просьбе).
+        right_v.addWidget(pool_box, 1)
+
+        editor = QWidget()
+        ev = QVBoxLayout(editor)
+        self._ed_name = QLabel("Выберите пак")
+        self._ed_name.setWordWrap(True)
+        self._ed_name.setStyleSheet("font-weight:bold;")
+        ev.addWidget(self._ed_name)
+        ev.addWidget(QLabel("Комментарий:"))
+        self._ed_comment = QTextEdit()
+        self._ed_comment.setPlaceholderText("Заметки об этом паке…")
+        self._ed_comment.setFixedHeight(50)
+        self._ed_comment.textChanged.connect(self._on_comment_changed)
+        ev.addWidget(self._ed_comment)
+
+        # ── Блок «Сложность пакета» ──────────────────────────────────────────
+        diff_box = QGroupBox("Сложность пакета")
+        dv = QVBoxLayout(diff_box)
+        # Статистика из данных пакета (с сайта): кол-во законченных игр,
+        # % попыток и % правильных.
+        self._lbl_finished_games = QLabel("Законченных игр: —")
+        self._lbl_answer_pct = QLabel("% попыток ответа: —")
+        self._lbl_correct_pct = QLabel("% правильных ответов: —")
+        dv.addWidget(self._lbl_finished_games)
+        dv.addWidget(self._lbl_answer_pct)
+        dv.addWidget(self._lbl_correct_pct)
+        # Своя оценка сложности — одна из 4 (как на странице поиска паков).
+        dv.addWidget(QLabel("Моя оценка:"))
+        diff_row = QHBoxLayout()
+        diff_row.setSpacing(6)
+        self._diff_buttons = {}
+        for lvl in _DIFF_LEVELS:
+            b = QPushButton(lvl)
+            b.setCheckable(True)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(lambda _=False, l=lvl: self._set_difficulty(l))
+            diff_row.addWidget(b)
+            self._diff_buttons[lvl] = b
+        dv.addLayout(diff_row)
+        ev.addWidget(diff_box)
+
+        ev.addWidget(QLabel("Теги (зелёный — хороший, красный — плохой; "
+                            "ПКМ на теге — сменить цвет/переименовать):"))
+        tags_scroll = QScrollArea()
+        tags_scroll.setWidgetResizable(True)
+        tags_scroll.setMinimumHeight(120)
+        # По горизонтали скролла быть не должно — чипы всегда умещаются в ширину
+        # (длинные переносятся внутри чипа, см. _FlowLayout/_TagChip).
+        tags_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # Область тегов растягивается на всю доступную высоту редактора (без
+        # потолка) — теги должны получать максимум места (по просьбе).
+        tags_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._tags_scroll = tags_scroll
+        self._tag_chips = {}   # tag -> _TagChip (для точечного обновления вида)
+        self._tags_host_w = QWidget()
+        self._tags_host = _FlowLayout(self._tags_host_w, margin=0, h_spacing=6, v_spacing=6)
+        tags_scroll.setWidget(self._tags_host_w)
+        ev.addWidget(tags_scroll, 1)
+
+        new_tag_row = QHBoxLayout()
+        self._ed_new_tag = QLineEdit()
+        self._ed_new_tag.setPlaceholderText("Новый тег…")
+        self._ed_new_tag.returnPressed.connect(self._create_tag)
+        new_tag_row.addWidget(self._ed_new_tag, 1)
+        btn_add_tag = QPushButton("Добавить тег")
+        btn_add_tag.setIcon(get_icon('fa5s.tag'))
+        btn_add_tag.setToolTip("Добавить тег — по умолчанию хороший (зелёный), "
+                               "поменять цвет можно ПКМ на теге")
+        btn_add_tag.clicked.connect(self._create_tag)
+        new_tag_row.addWidget(btn_add_tag)
+        ev.addLayout(new_tag_row)
+
+        editor.setMinimumWidth(300)
+        # Редактор с тегами растягивается и получает БОЛЬШУЮ долю (4 против 1 у
+        # пула) — всё лишнее место внутри забирает область тегов.
+        right_v.addWidget(editor, 4)
+        split.addWidget(right)
+        split.setSizes([920, 380])
+        # Правая панель автономна от левого тир-листа: при изменении размера
+        # окна левая часть держит свою ширину, а вся свободная ширина уходит
+        # правой панели (по просьбе).
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        outer.addWidget(split, 1)
+
+        # Кнопки внизу левой колонки: «Добавить уровень» слева, «Опубликовать»
+        # правее (обе — в левом нижнем углу, а не в строке на всю ширину окна).
+        bottom_bar = QHBoxLayout()
+        btn_add_tier = QPushButton("Добавить уровень")
+        btn_add_tier.setIcon(get_icon('fa5s.plus', color='#a6e3a1'))
+        btn_add_tier.setToolTip("Добавить новый уровень (строку) в конец тир-листа")
+        btn_add_tier.clicked.connect(self._add_tier)
+        bottom_bar.addWidget(btn_add_tier)
+        self._btn_publish = QPushButton("Опубликовать")
+        self._btn_publish.setIcon(get_icon('fa5s.globe', color='#89b4fa'))
+        self._btn_publish.setToolTip("Опубликовать тир-лист как страницу-сайт по "
+                                     "постоянной ссылке на ВАШЕМ Cloudflare Worker "
+                                     "(адрес спросим при первой публикации).")
+        self._btn_publish.clicked.connect(self._publish_online)
+        bottom_bar.addWidget(self._btn_publish)
+        bottom_bar.addStretch(1)
+        left_col_v.addLayout(bottom_bar)
+
+        self._rebuild_tiers()
+        self._populate_cards()
+        self._refresh_tags_editor()
+        self._set_editor_enabled(False)
+        self._refresh_difficulty()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        # Ширины финализированы только после показа — пересчитываем высоту полос
+        # уровней (перенос карточек зависит от доступной ширины).
+        QTimer.singleShot(0, self._update_all_heights)
+
+    def _update_all_heights(self):
+        for _, lst in self._tier_lists:
+            lst.update_height()
+
+    # ── Построение уровней ────────────────────────────────────────────────────
+    def _rebuild_tiers(self):
+        """Пересобирает строки уровней из self._tiers (имена/порядок).
+        Раскладку паков не трогает — её восстанавливает _populate_cards."""
+        while self._tiers_host.count():
+            item = self._tiers_host.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        self._tier_lists = []
+        for idx, tname in enumerate(self._tiers):
+            self._tiers_host.addWidget(self._make_tier_row(idx, tname))
+
+    def _make_tier_row(self, idx: int, tname: str) -> QWidget:
+        color = _TIER_COLORS[idx % len(_TIER_COLORS)]
+        row = QFrame()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+
+        head = QWidget()
+        head.setFixedWidth(110)
+        hv = QVBoxLayout(head)
+        hv.setContentsMargins(2, 2, 4, 2)
+        name_edit = QLineEdit(tname)
+        name_edit.setToolTip("Название уровня")
+        name_edit.setStyleSheet(f"font-weight:bold;color:{color};")
+        name_edit.editingFinished.connect(self._save_state)
+        hv.addWidget(name_edit)
+        ctl = QHBoxLayout()
+        ctl.setContentsMargins(0, 0, 0, 0)
+        btn_up = QPushButton()
+        btn_up.setIcon(get_icon('fa5s.arrow-up'))
+        btn_up.setFixedWidth(30)
+        btn_up.setToolTip("Поднять уровень выше")
+        btn_up.clicked.connect(lambda _=False, i=idx: self._move_tier(i, -1))
+        ctl.addWidget(btn_up)
+        btn_down = QPushButton()
+        btn_down.setIcon(get_icon('fa5s.arrow-down'))
+        btn_down.setFixedWidth(30)
+        btn_down.setToolTip("Опустить уровень ниже")
+        btn_down.clicked.connect(lambda _=False, i=idx: self._move_tier(i, 1))
+        ctl.addWidget(btn_down)
+        btn_del = QPushButton()
+        btn_del.setIcon(get_icon('fa5s.trash', color='#f38ba8'))
+        btn_del.setFixedWidth(30)
+        btn_del.setToolTip("Удалить уровень (паки вернутся в «Не распределено»)")
+        btn_del.clicked.connect(lambda _=False, i=idx: self._delete_tier(i))
+        ctl.addWidget(btn_del)
+        hv.addLayout(ctl)
+        hv.addStretch(1)
+        h.addWidget(head)
+
+        lst = _TierCardList(auto_height=True)
+        lst.dropped.connect(self._on_drop)
+        lst.itemClicked.connect(self._on_card_clicked)
+        lst.emptyClicked.connect(self._on_empty_clicked)
+        lst.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        lst.customContextMenuRequested.connect(
+            lambda pos, l=lst: self._on_card_menu(l, pos))
+        h.addWidget(lst, 1)
+
+        self._tier_lists.append((name_edit, lst))
+        return row
+
+    def _iter_tier_lists(self):
+        """(текущее имя уровня, его список) в порядке отображения."""
+        for name_edit, lst in self._tier_lists:
+            yield name_edit.text().strip() or "—", lst
+
+    def _all_lists(self):
+        return [self._pool_list] + [l for _, l in self._tier_lists]
+
+    def _make_card(self, pid: int, in_pool: bool = False) -> QListWidgetItem:
+        it = QListWidgetItem(self._card_label(pid))
+        it.setData(Qt.ItemDataRole.UserRole, int(pid))
+        it.setFlags((it.flags() | Qt.ItemFlag.ItemIsDragEnabled
+                     | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
+                    & ~Qt.ItemFlag.ItemIsDropEnabled)
+        self._set_card_icon(it, pid, in_pool)
+        return it
+
+    def _pkg_downloaded(self, pid: int) -> bool:
+        if self._tab is None:
+            return False
+        r = self._tab._pkg_row_by_id(pid)
+        return r is not None and r.get("siq_downloaded") == 1
+
+    def _set_card_icon(self, it: QListWidgetItem, pid: int, in_pool: bool):
+        """Значок карточки: галочка (пак уже скачан) — только в «Не распределено»
+        (по просьбе, в остальных списках не нужна — там паки уже разложены по
+        уровням), плюс иконка комментария. Обе сразу — составной иконкой
+        (см. get_icon(overlay=...))."""
+        has_comment = bool((self._comments.get(pid) or "").strip())
+        downloaded = in_pool and self._pkg_downloaded(pid)
+        if has_comment and downloaded:
+            it.setIcon(get_icon('fa5s.comment-dots', color='#89b4fa',
+                                 overlay='fa5s.check', overlay_color='#a6e3a1'))
+        elif downloaded:
+            it.setIcon(get_icon('fa5s.check', color='#a6e3a1'))
+        elif has_comment:
+            it.setIcon(get_icon('fa5s.comment-dots', color='#89b4fa'))
+        else:
+            it.setIcon(QIcon())
+
+    def _refresh_all_card_icons(self):
+        """Перестраивает значки во ВСЕХ списках — вызывается после любого
+        перемещения карточки (drag&drop/контекстное меню), т.к. галочка
+        «скачан» зависит от того, в пуле карточка сейчас или нет."""
+        for i in range(self._pool_list.count()):
+            it = self._pool_list.item(i)
+            pid = it.data(Qt.ItemDataRole.UserRole)
+            if pid is not None:
+                self._set_card_icon(it, int(pid), True)
+        for _, lst in self._tier_lists:
+            for i in range(lst.count()):
+                it = lst.item(i)
+                pid = it.data(Qt.ItemDataRole.UserRole)
+                if pid is not None:
+                    self._set_card_icon(it, int(pid), False)
+
+    def _card_label(self, pid: int) -> str:
+        # Теги пака сознательно не выводятся рядом с названием в самом тир-листе
+        # (по просьбе) — они видны только в редакторе справа.
+        return self._info.get(pid, f"#{pid}")
+
+    def _populate_cards(self):
+        """Раскладывает карточки паков по уровням из self._placements; всё, что
+        не размещено (или чей уровень удалён), — в «Не распределено»."""
+        valid_tiers = {name for name, _ in self._iter_tier_lists()}
+        self._pool_list.clear()
+        lists_by_name = {name: lst for name, lst in self._iter_tier_lists()}
+        for name, lst in self._iter_tier_lists():
+            lst.clear()
+        for pid in self._info:
+            tier = self._placements.get(pid)
+            if tier in valid_tiers and tier in lists_by_name:
+                lists_by_name[tier].addItem(self._make_card(pid, in_pool=False))
+            else:
+                self._pool_list.addItem(self._make_card(pid, in_pool=True))
+        self._update_all_heights()
+
+    def _sync_placements_from_widgets(self):
+        placements = {}
+        for name, lst in self._iter_tier_lists():
+            for i in range(lst.count()):
+                pid = lst.item(i).data(Qt.ItemDataRole.UserRole)
+                if pid is not None:
+                    placements[int(pid)] = name
+        self._placements = placements
+
+    # ── Реакции ────────────────────────────────────────────────────────────
+    def _on_drop(self):
+        # Карточка переехала между списками — пересохраняем раскладку. Пул мог
+        # опустеть/пополниться, но сами элементы уже на месте, полный ребилд не
+        # нужен (он сбросил бы выделение/позиции). Высоты полос пересчитаем на
+        # следующей итерации event loop (элементы уже вставлены).
+        self._save_state()
+        # Галочка «скачан» зависит от того, в пуле карточка или нет —
+        # перестраиваем значки после любого перемещения.
+        self._refresh_all_card_icons()
+        QTimer.singleShot(0, self._update_all_heights)
+
+    def _on_card_clicked(self, item):
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        if pid is None:
+            return
+        pid = int(pid)
+        # Снимаем выделение во всех остальных списках, чтобы «текущий» пак был
+        # ровно один (QListWidget-ы независимы, общего выделения нет).
+        for lst in self._all_lists():
+            if lst is not item.listWidget():
+                lst.clearSelection()
+        self._current_pid = pid
+        self._load_editor(pid)
+
+    def _on_empty_clicked(self):
+        """Клик мимо карточек — снимаем «текущий» пак (по просьбе)."""
+        if self._current_pid is None:
+            return
+        for lst in self._all_lists():
+            lst.clearSelection()
+        self._current_pid = None
+        self._ed_name.setText("Выберите пак")
+        self._loading_editor = True
+        self._ed_comment.setPlainText("")
+        self._loading_editor = False
+        self._set_editor_enabled(False)
+        self._refresh_difficulty()
+        self._refresh_tags_editor()
+
+    def _on_card_menu(self, lst, pos):
+        """ПКМ на карточке пака: скопировать название + те же действия, что и в
+        основном окне (см. SigstatsTab._add_pkg_context_actions). Если выделено
+        сразу НЕСКОЛЬКО карточек (см. ExtendedSelection в _TierCardList) — меню
+        с батч-действиями над всем выделением (см. _card_multi_menu)."""
+        item = lst.itemAt(pos)
+        if item is None:
+            return
+        selected = lst.selectedItems()
+        if item not in selected:
+            # ПКМ по невыделенной карточке — переносим выделение на неё одну,
+            # как в проводнике, а не действуем над старым набором.
+            lst.setCurrentItem(item)
+            selected = [item]
+        if len(selected) > 1:
+            self._card_multi_menu(lst, pos, selected)
+            return
+        pid = item.data(Qt.ItemDataRole.UserRole)
+        if pid is None:
+            return
+        pid = int(pid)
+        name = self._info.get(pid, f"#{pid}")
+        menu = QMenu(self)
+        act_copy = menu.addAction(get_icon('fa5s.copy'), "Скопировать название")
+        act_copy.triggered.connect(lambda checked=False, n=name: QApplication.clipboard().setText(n))
+        if lst is not self._pool_list:
+            # Явная альтернатива drag&drop — перетаскивать карточку через весь
+            # сплиттер в узкий пул неудобно, особенно если уровень далеко внизу
+            # прокрутки (по просьбе).
+            act_unassign = menu.addAction(get_icon('fa5s.reply'), "Вернуть в «Не распределено»")
+            act_unassign.triggered.connect(lambda checked=False, p=pid: self._return_to_pool(p))
+        r = self._tab._pkg_row_by_id(pid) if self._tab is not None else None
+        if r is not None:
+            menu.addSeparator()
+            self._tab._add_pkg_context_actions(menu, r)
+        menu.exec(lst.viewport().mapToGlobal(pos))
+
+    def _card_multi_menu(self, lst, pos, items):
+        """Батч-меню для нескольких выделенных карточек разом: скачать .siq
+        (параллельно, см. SigstatsTab._download_for_rows) и скопировать все
+        названия списком."""
+        pids = [int(it.data(Qt.ItemDataRole.UserRole)) for it in items
+                if it.data(Qt.ItemDataRole.UserRole) is not None]
+        if not pids:
+            return
+        names = [self._info.get(pid, f"#{pid}") for pid in pids]
+        menu = QMenu(self)
+        act_copy = menu.addAction(get_icon('fa5s.copy'), f"Скопировать названия ({len(names)})")
+        act_copy.triggered.connect(lambda checked=False, ns=names:
+                                    QApplication.clipboard().setText("\n".join(ns)))
+        if lst is not self._pool_list:
+            act_unassign = menu.addAction(get_icon('fa5s.reply'), f"Вернуть в «Не распределено» ({len(pids)})")
+            act_unassign.triggered.connect(lambda checked=False, ps=pids: self._return_to_pool_many(ps))
+        if self._tab is not None:
+            import pandas as pd
+            rows = [self._tab._pkg_row_by_id(pid) for pid in pids]
+            rows = [r for r in rows if r is not None]
+            # Только реально скачиваемые (есть sibrowser_id, ещё не скачан) — иначе
+            # счётчик в пункте меню обещал бы больше, чем реально скачается.
+            rows = [r for r in rows if pd.notna(r.get("sibrowser_id")) and r.get("siq_downloaded") != 1]
+            if rows:
+                menu.addSeparator()
+                act_dl = menu.addAction(get_icon('fa5s.download'), f"Скачать .siq ({len(rows)})")
+                act_dl.triggered.connect(lambda checked=False, rs=rows: self._tab._download_for_rows(rs))
+        menu.exec(lst.viewport().mapToGlobal(pos))
+
+    def _on_download_progress(self, pid, pct):
+        """Бегущий процент скачивания у карточки пака (если он есть на этом
+        тир-листе, в любом из уровней/пуле) — ширина текста держится постоянной
+        (нулями слева), чтобы карточка не «прыгала» на каждый тик прогресса."""
+        base = self._card_label(pid)
+        suffix = f"  ·  {pct:02d}%" if 0 <= pct < 100 else ""
+        for lst in self._all_lists():
+            for i in range(lst.count()):
+                it = lst.item(i)
+                if it.data(Qt.ItemDataRole.UserRole) == pid:
+                    it.setText(base + suffix)
+                    return
+
+    def _move_tier(self, idx: int, delta: int):
+        self._sync_placements_from_widgets()
+        names = [n for n, _ in self._iter_tier_lists()]
+        j = idx + delta
+        if idx < 0 or idx >= len(names) or j < 0 or j >= len(names):
+            return
+        names[idx], names[j] = names[j], names[idx]
+        self._tiers = names
+        self._rebuild_tiers()
+        self._populate_cards()
+        self._save_state()
+
+    def _delete_tier(self, idx: int):
+        self._sync_placements_from_widgets()
+        names = [n for n, _ in self._iter_tier_lists()]
+        if idx < 0 or idx >= len(names):
+            return
+        removed = names[idx]
+        # Паки удаляемого уровня «разразмещаем» — уйдут в пул при _populate_cards.
+        self._placements = {p: t for p, t in self._placements.items() if t != removed}
+        del names[idx]
+        self._tiers = names
+        self._rebuild_tiers()
+        self._populate_cards()
+        self._save_state()
+
+    def _add_tier(self):
+        """Добавляет новый пустой уровень в конец тир-листа. Имя подбираем
+        уникальным («Новый», «Новый 2», …), чтобы не совпало с существующим."""
+        self._sync_placements_from_widgets()
+        names = [n for n, _ in self._iter_tier_lists()]
+        base = "Новый"
+        name = base
+        i = 2
+        while name in names:
+            name = f"{base} {i}"
+            i += 1
+        self._tiers = names + [name]
+        self._rebuild_tiers()
+        self._populate_cards()
+        self._save_state()
+        QTimer.singleShot(0, self._update_all_heights)
+
+    # ── Редактор комментария/тегов ────────────────────────────────────────────
+    def _set_editor_enabled(self, on: bool):
+        # Комментарий привязан к конкретному паку — без выбора недоступен.
+        # Палитра тегов (создание/удаление/хороший-плохой) — общая для всех
+        # паков, поэтому остаётся доступной даже без выбора (по просьбе).
+        self._ed_comment.setEnabled(on)
+        for b in self._diff_buttons.values():
+            b.setEnabled(on)
+
+    def _load_editor(self, pid: int):
+        self._loading_editor = True
+        self._ed_name.setText(self._info.get(pid, f"#{pid}"))
+        self._ed_comment.setPlainText(self._comments.get(pid, ""))
+        self._loading_editor = False
+        self._set_editor_enabled(True)
+        self._refresh_difficulty()
+        self._refresh_tags_editor()
+
+    # ── Блок сложности ────────────────────────────────────────────────────────
+    def _refresh_difficulty(self):
+        """Обновляет статистику (% попыток/правильных из данных пакета) и
+        подсветку кнопки выбранной оценки под текущий пак."""
+        pid = self._current_pid
+        ap = cp = finished = None
+        if pid is not None and self._tab is not None:
+            r = self._tab._pkg_row_by_id(pid)
+            if r is not None:
+                ap, cp = r.get("answer_pct"), r.get("correct_pct")
+                finished = r.get("completed_games")
+        self._lbl_finished_games.setText(f"Законченных игр: {_fmt_int(finished)}")
+        self._lbl_answer_pct.setText(f"% попыток ответа: {_fmt_pct(ap, 0)}")
+        self._lbl_correct_pct.setText(f"% правильных ответов: {_fmt_pct(cp, 0)}")
+        chosen = self._difficulty.get(pid) if pid is not None else None
+        for lvl, b in self._diff_buttons.items():
+            on = (lvl == chosen)
+            b.setChecked(on)
+            color = _DIFF_COLORS[lvl]
+            if on:
+                b.setStyleSheet(f"QPushButton{{background:{color};color:#11111b;"
+                                f"border:1px solid {color};border-radius:6px;"
+                                f"padding:4px 6px;font-weight:bold;}}")
+            else:
+                b.setStyleSheet(f"QPushButton{{background:transparent;color:{color};"
+                                f"border:1px solid {color};border-radius:6px;"
+                                f"padding:4px 6px;}}")
+
+    def _set_difficulty(self, lvl: str):
+        if self._current_pid is None:
+            self._refresh_difficulty()
+            return
+        # Повторный клик по выбранному уровню — снимает оценку.
+        if self._difficulty.get(self._current_pid) == lvl:
+            self._difficulty.pop(self._current_pid, None)
+        else:
+            self._difficulty[self._current_pid] = lvl
+        self._refresh_difficulty()
+        self._save_state()
+
+    def _on_comment_changed(self):
+        if self._loading_editor or self._current_pid is None:
+            return
+        self._comments[self._current_pid] = self._ed_comment.toPlainText()
+        self._refresh_card(self._current_pid)
+        self._save_state()
+
+    def _tag_kind(self, tag: str) -> str:
+        kind = self._tag_kinds.get(tag)
+        return kind if kind in _TAG_KIND_COLORS else "good"
+
+    def _set_tag_kind(self, tag: str, kind: str):
+        self._tag_kinds[tag] = kind if kind in _TAG_KIND_COLORS else "good"
+        # Полярность меняет порядок (хорошие сверху/плохие снизу) — приходится
+        # пересобрать список целиком, точечной перекраски тут недостаточно.
+        self._refresh_tags_editor()
+        self._save_state()
+
+    def _refresh_tags_editor(self):
+        # Очищаем прежние чипы.
+        self._tag_chips = {}
+        while self._tags_host.count():
+            item = self._tags_host.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        if not self._all_tags:
+            hint = QLabel("Тегов пока нет — создайте первый ниже.")
+            hint.setStyleSheet("color:#6c7086;")
+            hint.setWordWrap(True)
+            self._tags_host.addWidget(hint)
+            return
+        assigned = set(self._tags.get(self._current_pid, [])) if self._current_pid is not None else set()
+        # Хорошие сверху, нейтральные посередине, плохие снизу (по просьбе);
+        # порядок внутри группы — стабильный (как были созданы).
+        tags_sorted = sorted(self._all_tags, key=lambda t: _TAG_KIND_ORDER.get(self._tag_kind(t), 0))
+        for tag in tags_sorted:
+            color = _TAG_KIND_COLORS[self._tag_kind(tag)]
+            checked = tag in assigned
+            chip = _TagChip(tag, color, checked)
+            chip.toggled.connect(lambda on, t=tag: self._toggle_tag(t, on))
+            chip.customContextMenuRequested.connect(
+                lambda pos, t=tag: self._tag_context_menu(t))
+            self._tags_host.addWidget(chip)
+            self._tag_chips[tag] = chip
+
+    def _toggle_tag(self, tag: str, on: bool):
+        # Чип уже сам обновил свой вид (галочку/заливку) — список НЕ пересобираем,
+        # поэтому позиция скролла не прыгает (по просьбе).
+        if self._current_pid is None:
+            # Тег без выбранного пака нечему присваивать — откатываем галочку.
+            chip = self._tag_chips.get(tag)
+            if chip is not None:
+                chip.set_checked(False)
+            return
+        cur = list(self._tags.get(self._current_pid, []))
+        if on and tag not in cur:
+            cur.append(tag)
+        elif not on and tag in cur:
+            cur.remove(tag)
+        self._tags[self._current_pid] = cur
+        self._refresh_card(self._current_pid)
+        self._save_state()
+
+    def _create_tag(self):
+        tag = self._ed_new_tag.text().strip()
+        if not tag:
+            return
+        if tag not in self._all_tags:
+            self._all_tags.append(tag)
+        self._tag_kinds.setdefault(tag, "good")
+        # Новый тег сразу присваиваем текущему паку (если он выбран).
+        if self._current_pid is not None:
+            cur = list(self._tags.get(self._current_pid, []))
+            if tag not in cur:
+                cur.append(tag)
+            self._tags[self._current_pid] = cur
+            self._refresh_card(self._current_pid)
+        self._ed_new_tag.clear()
+        self._refresh_tags_editor()
+        self._save_state()
+
+    def _tag_context_menu(self, tag: str):
+        from PyQt6.QtGui import QCursor
+        menu = QMenu(self)
+        current = self._tag_kind(tag)
+        labels = {"good": "хорошим (зелёный)", "neutral": "нейтральным (белый)", "bad": "плохим (красный)"}
+        for kind in ("good", "neutral", "bad"):
+            if kind == current:
+                continue
+            act = menu.addAction(get_icon('fa5s.circle', color=_TAG_KIND_COLORS[kind]),
+                                 f"Сделать «{tag}» {labels[kind]}")
+            act.triggered.connect(lambda checked=False, t=tag, k=kind: self._set_tag_kind(t, k))
+        act_rename = menu.addAction(get_icon('fa5s.pen'), f"Переименовать тег «{tag}»")
+        act_rename.triggered.connect(lambda checked=False, t=tag: self._rename_tag(t))
+        act_del = menu.addAction(get_icon('fa5s.trash', color='#f38ba8'),
+                                 f"Удалить тег «{tag}» из палитры")
+        act_del.triggered.connect(lambda checked=False, t=tag: self._delete_tag(t))
+        menu.exec(QCursor.pos())
+
+    def _rename_tag(self, tag: str):
+        from PyQt6.QtWidgets import QInputDialog
+        new, ok = QInputDialog.getText(self, "Переименовать тег",
+                                       "Новое название тега:", text=tag)
+        if not ok:
+            return
+        new = new.strip()
+        if not new or new == tag:
+            return
+        if new in self._all_tags:
+            msgbox_information(self, "Переименовать тег",
+                              f"Тег «{new}» уже есть в палитре.")
+            return
+        # Переносим название в палитре (сохраняя порядок), полярность и все
+        # присвоения по пакам.
+        self._all_tags = [new if t == tag else t for t in self._all_tags]
+        if tag in self._tag_kinds:
+            self._tag_kinds[new] = self._tag_kinds.pop(tag)
+        for pid in list(self._tags):
+            if tag in self._tags[pid]:
+                self._tags[pid] = [new if t == tag else t for t in self._tags[pid]]
+        self._refresh_tags_editor()
+        self._save_state()
+
+    def _delete_tag(self, tag: str):
+        if msgbox_question(
+                self, "Удалить тег",
+                f"Удалить тег «{tag}» из палитры и снять его со всех паков?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._all_tags = [t for t in self._all_tags if t != tag]
+        self._tag_kinds.pop(tag, None)
+        for pid in list(self._tags):
+            if tag in self._tags[pid]:
+                self._tags[pid] = [t for t in self._tags[pid] if t != tag]
+                self._refresh_card(pid)
+        self._refresh_tags_editor()
+        self._save_state()
+
+    def _refresh_card(self, pid: int):
+        it = self._find_item(pid)
+        if it is None:
+            return
+        it.setText(self._card_label(pid))
+        self._set_card_icon(it, pid, it.listWidget() is self._pool_list)
+        self._update_all_heights()
+
+    def _return_to_pool(self, pid: int):
+        """Явный перенос карточки пака из уровня в «Не распределено» — то же,
+        что перетащить её мышью, но через контекстное меню (по просьбе)."""
+        it = self._find_item(pid)
+        if it is None:
+            return
+        lst = it.listWidget()
+        if lst is None or lst is self._pool_list:
+            return
+        self._pool_list.addItem(lst.takeItem(lst.row(it)))
+        self._set_card_icon(it, pid, True)
+        self._placements.pop(pid, None)
+        self._update_all_heights()
+        self._save_state()
+
+    def _return_to_pool_many(self, pids):
+        for pid in pids:
+            self._return_to_pool(pid)
+
+    def _find_item(self, pid: int):
+        for lst in self._all_lists():
+            for i in range(lst.count()):
+                it = lst.item(i)
+                if it.data(Qt.ItemDataRole.UserRole) == pid:
+                    return it
+        return None
+
+    # ── Ссылка на пак (для публикации) ──────────────────────────────────────
+    def _pkg_url(self, pid: int):
+        """Ссылка на пак (sibrowser.ru или Steam Workshop) для публикации — та же
+        логика, что и у SigstatsTab._open_link_for_row, но возвращает URL, а не
+        открывает браузер. None, если строка пака не нашлась (например, БД
+        сейчас пуста) или у пака нет ни sibrowser_id, ни steam_id."""
+        if self._tab is None:
+            return None
+        r = self._tab._pkg_row_by_id(pid)
+        if r is None:
+            return None
+        import pandas as pd
+        if r.get("source") == "steam" and pd.notna(r.get("steam_id")):
+            return sg_steam_workshop.workshop_url(str(r["steam_id"]))
+        if pd.notna(r.get("sibrowser_id")):
+            return f"{sg_config.SIBROWSER_BASE}/packages/{int(r['sibrowser_id'])}"
+        return None
+
+    def _pkg_author(self, pid: int) -> str:
+        """Автор(ы) пака для публикации — несколько через запятую. Пусто, если
+        строка пака не нашлась или авторов нет."""
+        if self._tab is None:
+            return ""
+        r = self._tab._pkg_row_by_id(pid)
+        if r is None:
+            return ""
+        authors = r.get("authors")
+        if isinstance(authors, list) and authors:
+            return ", ".join(str(a) for a in authors)
+        return ""
+
+    def _pkg_is_steam(self, pid: int) -> bool:
+        """Пак пришёл из Steam Workshop — на сайте у такого рисуется значок Steam
+        (см. tier_worker.js renderPack)."""
+        if self._tab is None:
+            return False
+        r = self._tab._pkg_row_by_id(pid)
+        return r is not None and r.get("source") == "steam"
+
+    # ── Публикация онлайн (Cloudflare Worker, см. tier_worker.js) ──────────────
+    def _build_publish_model(self) -> dict:
+        """Модель тир-листа для отправки на worker: уровни в порядке отображения
+        (с цветом), в каждом — паки с готовой ссылкой, автором, сложностью,
+        комментарием и тегами (с полярностью good/neutral/bad). «Не распределено»
+        не публикуется — оно не в _iter_tier_lists. Пустые уровни оставляем (на
+        странице рисуются «пусто»)."""
+        self._sync_placements_from_widgets()
+        tiers = []
+        for idx, (name, lst) in enumerate(self._iter_tier_lists()):
+            color = _TIER_COLORS[idx % len(_TIER_COLORS)]
+            packs = []
+            for i in range(lst.count()):
+                pid = lst.item(i).data(Qt.ItemDataRole.UserRole)
+                if pid is None:
+                    continue
+                pid = int(pid)
+                packs.append({
+                    "id": pid,
+                    "name": self._info.get(pid, f"#{pid}"),
+                    "url": self._pkg_url(pid) or "",
+                    "author": self._pkg_author(pid),
+                    "steam": self._pkg_is_steam(pid),
+                    "difficulty": self._difficulty.get(pid) or "",
+                    "comment": (self._comments.get(pid) or "").strip(),
+                    "tags": [{"text": t, "kind": self._tag_kind(t)}
+                             for t in (self._tags.get(pid) or [])],
+                })
+            tiers.append({"name": name, "color": color, "packs": packs})
+        return {"title": "Тир-лист от GoldensFire по аниме-пакам", "tiers": tiers}
+
+    def _configure_publish_url(self) -> bool:
+        """Спрашивает у пользователя адрес ЕГО Cloudflare Worker + даёт ссылку на
+        гайд. Возвращает True, если адрес задан (сохранён в self._publish_url)."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Настройка публикации")
+        v = QVBoxLayout(dlg)
+        info = QLabel(
+            "Публикация выкладывает тир-лист веб-страницей на <b>вашем личном</b> "
+            "бесплатном сервере Cloudflare Worker (поднимается один раз за ~5 минут).<br><br>"
+            "Вставьте адрес своего воркера — например "
+            "<code>https://si-hyx-tier.ВАШ-АккаунТ.workers.dev</code>")
+        info.setWordWrap(True)
+        info.setTextFormat(Qt.TextFormat.RichText)
+        v.addWidget(info)
+        ed = QLineEdit(self._publish_url)
+        ed.setPlaceholderText("https://<имя>.<аккаунт>.workers.dev")
+        v.addWidget(ed)
+        guide = QLabel('<a href="guide">Открыть пошаговый гайд (DEPLOY_TIER.md)</a>')
+        guide.setTextFormat(Qt.TextFormat.RichText)
+
+        def _open_guide(_=None):
+            import os
+            for base in (CONFIG_DIR, os.path.dirname(os.path.abspath(__file__))):
+                if not base:
+                    continue
+                p = os.path.join(base, "DEPLOY_TIER.md")
+                if os.path.exists(p):
+                    webbrowser.open("file:///" + p.replace("\\", "/"))
+                    return
+            webbrowser.open("https://dash.cloudflare.com/")
+        guide.linkActivated.connect(_open_guide)
+        v.addWidget(guide)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        v.addWidget(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        url = ed.text().strip()
+        if not url:
+            return False
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        self._publish_url = url
+        self._save_state()
+        return True
+
+    def _publish_online(self):
+        if self._publishing:
+            return
+        # Адрес воркера ещё не задан — просим ввести его (с ссылкой на гайд).
+        if not self._publish_url:
+            if not self._configure_publish_url():
+                return
+        model = self._build_publish_model()
+        if not any(t["packs"] for t in model["tiers"]):
+            msgbox_information(self, "Публикация",
+                               "Тир-лист пуст — разложите паки по уровням и попробуйте снова.")
+            return
+        import secrets
+        # id/токен заводим один раз и переиспользуем, чтобы ссылка не менялась.
+        if not self._publish_id:
+            self._publish_id = secrets.token_urlsafe(9)
+        if not self._edit_token:
+            self._edit_token = secrets.token_urlsafe(24)
+        base = self._publish_url.rstrip("/")
+        url = f"{base}/tier/{self._publish_id}"
+        payload = {
+            "title": model["title"],
+            "tiers": model["tiers"],
+            "updated": int(_dt.datetime.now().timestamp()),
+        }
+        self._publishing = True
+        self._btn_publish.setEnabled(False)
+        self._btn_publish.setText("Публикую…")
+        self._pub_emitter = _TierPublishEmitter()
+        self._pub_emitter.done.connect(self._on_published)
+        import threading
+        threading.Thread(
+            target=_post_tier, args=(url, payload, self._edit_token, self._pub_emitter),
+            daemon=True).start()
+
+    def _on_published(self, ok: bool, result: str):
+        self._publishing = False
+        self._btn_publish.setEnabled(True)
+        self._btn_publish.setText("Опубликовать")
+        if not ok:
+            hint = ""
+            if result == "HTTP 403":
+                hint = ("\n\nЭта ссылка занята другим токеном. Такое бывает, если "
+                        "tier_list.json переносили между устройствами. Можно сбросить "
+                        "ссылку кнопкой «Опубликовать» ещё раз после удаления полей "
+                        "publish_id/edit_token из tier_list.json.")
+            msgbox_warning(self, "Публикация",
+                           "Не удалось опубликовать тир-лист"
+                           + (f": {result}" if result else "")
+                           + ".\nПроверьте интернет и адрес вашего воркера." + hint)
+            return
+        page_url = result or f"{self._publish_url.rstrip('/')}/tier/{self._publish_id}"
+        # Ссылка теперь постоянная — сохраняем id/токен, чтобы переиспользовать.
+        self._save_state()
+        QApplication.clipboard().setText(page_url)
+        if msgbox_question(
+                self, "Опубликовано",
+                f"Тир-лист опубликован и ссылка скопирована в буфер обмена:\n\n{page_url}\n\n"
+                "Её можно вставить в Дискорд — страница откроется у любого. При "
+                "следующей публикации ссылка останется той же (обновится содержимое).\n\n"
+                "Открыть страницу в браузере сейчас?"
+        ) == QMessageBox.StandardButton.Yes:
+            webbrowser.open(page_url)
+
+    # ── Сохранение ────────────────────────────────────────────────────────────
+    def _save_state(self):
+        self._sync_placements_from_widgets()
+        data = {
+            "tiers": [n for n, _ in self._iter_tier_lists()],
+            "placements": {str(k): v for k, v in self._placements.items()},
+            "comments": {str(k): v for k, v in self._comments.items() if (v or "").strip()},
+            "tags": {str(k): v for k, v in self._tags.items() if v},
+            "all_tags": self._all_tags,
+            "tag_kinds": {t: self._tag_kind(t) for t in self._all_tags},
+            "difficulty": {str(k): v for k, v in self._difficulty.items() if v},
+            "publish_id": self._publish_id,
+            "edit_token": self._edit_token,
+            "publish_url": self._publish_url,
+        }
+        try:
+            sg_config.save_tier_list(data)
+        except Exception:
+            pass

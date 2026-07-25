@@ -109,12 +109,12 @@ class YtdlpTab(QWidget):
         h.addWidget(self.url_edit); h.addWidget(btn_v); h.addWidget(btn_a); h.addWidget(self.btn_stop)
         
         self.out = QLineEdit(default_download_dir())
-        btn_p = _icon_btn("", 'fa5s.folder-open'); btn_p.clicked.connect(self.ch_dir); btn_p.setFixedWidth(36)
+        btn_p = _icon_btn("", 'fa5s.folder-open'); btn_p.clicked.connect(self.ch_dir)
         ho = QHBoxLayout(); ho.addWidget(self.out); ho.addWidget(btn_p)
 
         self.cookie_edit = QLineEdit(); self.cookie_edit.setPlaceholderText("Путь к файлу cookies.txt (необязательно)")
         self.cookie_edit.setClearButtonEnabled(True)
-        btn_ck = _icon_btn("", 'fa5s.folder-open'); btn_ck.setFixedWidth(36)
+        btn_ck = _icon_btn("", 'fa5s.folder-open')
         btn_ck.clicked.connect(self._choose_cookie)
         ho_ck = QHBoxLayout(); ho_ck.addWidget(self.cookie_edit); ho_ck.addWidget(btn_ck)
 
@@ -134,9 +134,9 @@ class YtdlpTab(QWidget):
         # распирают правую панель (в выпадающем списке текст эллипсизируется).
         self.kodik_trans.setMinimumWidth(90)
         self.kodik_trans.setMaximumWidth(128)
-        # та же высота, что у строк выше — иначе ряд Kodik «выпадает» из ритма
-        # и отступ от Прокси выглядит неровным.
-        self.kodik_ep.setFixedHeight(26); self.kodik_trans.setFixedHeight(26)
+        # Высота ряда Kodik выставляется ниже, вместе с остальными строками
+        # (общая константа _ROW_H) — иначе ряд «выпадает» из ритма и отступ от
+        # Прокси выглядит неровным.
         ho_kd = QHBoxLayout(); ho_kd.setSpacing(4)
         ho_kd.addWidget(QLabel("Сер.:")); ho_kd.addWidget(self.kodik_ep)
         ho_kd.addWidget(QLabel("Озв.:")); ho_kd.addWidget(self.kodik_trans)
@@ -153,9 +153,32 @@ class YtdlpTab(QWidget):
         fl.addRow(label_with_info("Kodik:", "Для сайтов с плеером Kodik (animego и т.п.): номер серии и название озвучки. "
                                   "После вставки ссылки списки заполняются автоматически, в лог выводится число серий и доступные озвучки. "
                                   "Примечание: 1080p на таких сайтах обычно апскейл, реальный максимум — 720p."), ho_kd)
-        # Поля Папка/Cookies/Прокси — компактнее по высоте
-        for _w in (self.out, btn_p, self.cookie_edit, btn_ck, self.proxy_edit):
-            _w.setFixedHeight(26)
+        # Единая высота строк Папка/Cookies/Прокси/Kodik.
+        #
+        # Глобальный STYLESHEET задаёт QPushButton{min-height:24px;
+        # padding:5px 14px} → 36px, а QLineEdit{min-height:22px; padding:4px 7px}
+        # → 32px, из-за чего кнопки «папка» торчали выше строк ввода. Одного
+        # setFixedSize тут мало: QStyleSheetStyle при полировке виджета
+        # выставляет minimumSize из min-width/min-height таблицы стилей и
+        # затирает всё, что проставлено руками (кнопка сжималась до 20px по
+        # ширине — соседнее поле забирало место). Поэтому размер кнопок задаём
+        # ИМЕННО их собственным правилом; фон, рамка и hover при этом
+        # по-прежнему приходят каскадом из глобального листа.
+        # 30px содержимого + рамка 1px с каждой стороны = 32×32 — ровно высота
+        # строки, кнопка квадратная.
+        _ROW_H = 32
+        _BTN_QSS = ("QPushButton{padding:0px;"
+                    f"min-width:{_ROW_H - 2}px;max-width:{_ROW_H - 2}px;"
+                    f"min-height:{_ROW_H - 2}px;max-height:{_ROW_H - 2}px;}}")
+        for _b in (btn_p, btn_ck):
+            _b.setStyleSheet(_BTN_QSS)
+            # Значок 20×20 (умолчание _icon_btn) в такой кнопке занимал почти
+            # всю её высоту и выглядел крупнее строки ввода рядом.
+            _b.setIconSize(QSize(14, 14))
+        for _w in (self.out, self.cookie_edit, self.proxy_edit):
+            _w.setFixedHeight(_ROW_H)
+        self.kodik_ep.setFixedHeight(_ROW_H)
+        self.kodik_trans.setFixedHeight(_ROW_H)
         fl.setVerticalSpacing(4)
         grp.setLayout(fl); layout.addWidget(grp)
 

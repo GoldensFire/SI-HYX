@@ -9,6 +9,27 @@ from .qt import (
 from .constants import _AlignC, _C_BG3, _C_BG4, _C_BORDER, _Expand, _Fixed
 
 
+def _center_over_parent(box, parent):
+    # Qt не центрирует QDialog/QMessageBox над родителем сам по себе на Windows
+    # (иначе он всплывает там, где решит ОС — по факту в левом верхнем углу).
+    # activeWindow() приоритетнее parent.window() — общий на несколько окон
+    # action-метод мог получить в parent виджет НЕ того окна, что сейчас видит
+    # пользователь.
+    box.adjustSize()
+    active = QApplication.activeWindow()
+    top = active if (active is not None and active.isVisible()) \
+        else (parent.window() if parent is not None else None)
+    if top is not None and top.isVisible():
+        center = top.frameGeometry().center()
+    else:
+        screen = QApplication.primaryScreen()
+        center = screen.availableGeometry().center() if screen else None
+    if center is not None:
+        geo = box.frameGeometry()
+        geo.moveCenter(center)
+        box.move(geo.topLeft())
+
+
 def _selectable_box(icon, parent, title, text, buttons, default_button):
     """QMessageBox с выделяемым мышью и копируемым текстом (в отличие от
     статических QMessageBox.critical/warning/information/question)."""
@@ -20,6 +41,7 @@ def _selectable_box(icon, parent, title, text, buttons, default_button):
     box.setStandardButtons(buttons)
     if default_button is not None:
         box.setDefaultButton(default_button)
+    _center_over_parent(box, parent)
     return box.exec()
 
 

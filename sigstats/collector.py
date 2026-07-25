@@ -274,6 +274,36 @@ def collect_steam_workshop(
     return summary
 
 
+def collect_steam_one(id_or_url: str, api_key: str,
+                      author_blacklist: set[str] | None = None) -> dict:
+    """Точечно добавляет ОДИН пак Steam Workshop по прямой ссылке/id — без
+    обхода всего каталога (см. collect_steam_workshop для массового импорта).
+    Дедупликация та же — по name_norm. Возвращает {"ok": True, "id", "name"}
+    либо {"ok": False, "error"}."""
+    db.init_db()
+    steam_id = steam_workshop.parse_workshop_id(id_or_url)
+    if not steam_id:
+        return {"ok": False, "error": "Не удалось распознать ссылку или id Steam Workshop."}
+    session = steam_workshop.make_session()
+    try:
+        item = steam_workshop.get_item_by_id(session, api_key, steam_id)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if item is None:
+        return {"ok": False, "error": "Пак не найден — неверная ссылка/id, либо он удалён/приватный."}
+    if _is_blacklisted(item.authors, author_blacklist):
+        return {"ok": False, "error": f"Автор «{', '.join(item.authors)}» этого пака в чёрном списке."}
+    with db.connect() as conn:
+        if item.name_norm in db.existing_name_norms(conn):
+            return {"ok": False, "error": f"Пак «{item.name}» уже есть в списке (по названию)."}
+        stats = stats_api.get_package_stats(session, item.name, item.authors)
+        pid = db.upsert_package(conn, item.as_package())
+        db.replace_themes(conn, pid, [])
+        db.set_stats(conn, pid, stats)
+        conn.commit()
+    return {"ok": True, "id": pid, "name": item.name}
+
+
 def refresh_stats(only_missing: bool = True,
                   progress_cb: ProgressCB | None = None,
                   should_stop: Callable[[], bool] | None = None) -> dict:
@@ -374,6 +404,15 @@ def download_one(package_id: int, sibrowser_id: str, name: str,
             conn.commit()
             return True
         except Exception:
+            # Файл скачался, но не разобрался (битый/неполный архив) — не
+            # оставляем его на диске: иначе download_siq() при следующей
+            # попытке решил бы, что пак «уже скачан» (dest.exists()), и
+            # молча повторял бы этот же провал разбора бесконечно, ничего
+            # заново не скачивая.
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
             return False
 
 

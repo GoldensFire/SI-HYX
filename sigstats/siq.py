@@ -204,6 +204,16 @@ def download_siq(session: requests.Session, sibrowser_id: str, name_hint: str,
             if cancelled:
                 tmp.unlink(missing_ok=True)
                 return None
+            # Паки, снятые с sibrowser (удалены/скрыты автором), отдают на
+            # direct_download не 404, а HTTP 200 со страницей-заглушкой
+            # (HTML) вместо архива — raise_for_status() её пропускает.
+            # Без этой проверки такая заглушка сохранялась КАК БУДТО .siq
+            # (dest.exists() && size>0 выше потом считал её «уже скачанной»
+            # навсегда, парсинг молча падал при каждой новой попытке).
+            # .siq — это ZIP, проверяем сигнатуру перед тем как принять файл.
+            if not zipfile.is_zipfile(tmp):
+                tmp.unlink(missing_ok=True)
+                return None
             tmp.replace(dest)
     except Exception:
         tmp.unlink(missing_ok=True)

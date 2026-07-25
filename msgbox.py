@@ -10,7 +10,31 @@
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QGuiApplication
-from PyQt6.QtWidgets import QMessageBox
+from PyQt6.QtWidgets import QApplication, QMessageBox
+
+
+def _center_over_parent(box, parent):
+    # Qt НЕ центрирует QDialog/QMessageBox над родителем сам по себе на Windows —
+    # без этого диалог всплывал там, где ОС решит (по факту — в левом верхнем
+    # углу экрана), а не над окном, с которым реально работает пользователь.
+    # Берём activeWindow() (а не сразу parent.window()) — action-методы вроде
+    # «Удалить пак» общие для главного окна и отдельного окна тир-листа, и
+    # передают в качестве parent саму вкладку (часть ГЛАВНОГО окна) всегда;
+    # без этого предупреждение из тир-листа центрировалось бы над главным
+    # окном где-то позади, а не над окном, которое реально видит пользователь.
+    box.adjustSize()
+    active = QApplication.activeWindow()
+    top = active if (active is not None and active.isVisible()) \
+        else (parent.window() if parent is not None else None)
+    if top is not None and top.isVisible():
+        center = top.frameGeometry().center()
+    else:
+        screen = QGuiApplication.primaryScreen()
+        center = screen.availableGeometry().center() if screen else None
+    if center is not None:
+        geo = box.frameGeometry()
+        geo.moveCenter(center)
+        box.move(geo.topLeft())
 
 
 def _selectable_box(icon, parent, title, text, buttons, default_button, copyable=False):
@@ -28,6 +52,7 @@ def _selectable_box(icon, parent, title, text, buttons, default_button, copyable
         if default_button is not None:
             box.setDefaultButton(default_button)
         copy_btn = box.addButton("Копировать", QMessageBox.ButtonRole.ActionRole) if copyable else None
+        _center_over_parent(box, parent)
         box.exec()
         clicked = box.clickedButton()
         if copyable and clicked is copy_btn:

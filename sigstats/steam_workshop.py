@@ -11,6 +11,7 @@ ISteamUser/GetPlayerSummaries для имени автора по SteamID64). С
 """
 from __future__ import annotations
 import datetime
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Iterator
@@ -24,6 +25,8 @@ SIGAME_APP_ID = 3553500
 
 _QUERY_URL = "https://api.steampowered.com/IPublishedFileService/QueryFiles/v1/"
 _PLAYER_SUMMARIES_URL = "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+_FILE_DETAILS_URL = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
+_WORKSHOP_ID_RE = re.compile(r"[?&]id=(\d+)")
 
 # EPublishedFileQueryType (Steam Web API) — нужные нам значения из паблик-энума.
 QUERY_TYPE_SUBSCRIPTIONS = 9    # RankedByTotalUniqueSubscriptions — аналог «по скачиваниям»
@@ -199,3 +202,41 @@ def iter_items(
 
 def workshop_url(steam_id: str) -> str:
     return f"https://steamcommunity.com/sharedfiles/filedetails/?id={steam_id}"
+
+
+def parse_workshop_id(text: str) -> str | None:
+    """Достаёт id воркшоп-предмета из прямой ссылки
+    (steamcommunity.com/sharedfiles/filedetails/?id=123) или из голого
+    числового id, вписанного как есть."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    m = _WORKSHOP_ID_RE.search(text)
+    if m:
+        return m.group(1)
+    return text if text.isdigit() else None
+
+
+def get_item_by_id(session: requests.Session, api_key: str, steam_id: str) -> WorkshopItem | None:
+    """Метаданные ОДНОГО предмета воркшопа по его id (для точечного добавления
+    по прямой ссылке — см. collector.collect_steam_one) — без обхода всего
+    каталога, как в iter_items."""
+    resp = session.post(
+        _FILE_DETAILS_URL,
+        data={"key": api_key, "itemcount": 1, "publishedfileids[0]": steam_id},
+        timeout=config.REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    details = ((resp.json() or {}).get("response", {}) or {}).get("publishedfiledetails", [])
+    if not details or details[0].get("result") != 1:
+        return None
+    raw = details[0]
+    item = _parse_item(raw)
+    if item is None:
+        return None
+    creator_id = raw.get("creator")
+    if creator_id:
+        name = resolve_creator_names(session, api_key, [creator_id]).get(creator_id)
+        if name:
+            item.authors = [name]
+    return item

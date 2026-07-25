@@ -38,6 +38,11 @@ GRAPH_REPORT.md
 /played_packages_added_at.json
 /search_page_cache.json
 /ui_settings.json
+/tier_list.json
+
+# Локальный кэш wrangler (в т.ч. слепок cf-запроса с IP/геоданными) — деплой
+# воркеров идёт из CLI, в репозитории этому файлу делать нечего.
+.wrangler/
 
 # Временные файлы сторонних утилит (ab-av1 и т.п.)
 .ab-av1-*/

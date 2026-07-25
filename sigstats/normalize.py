@@ -4,6 +4,7 @@
 Эмодзи стрипаются только для ключа сравнения; для отображения хранится оригинал.
 """
 from __future__ import annotations
+import functools
 import re
 import emoji
 
@@ -49,6 +50,7 @@ def _stem_word(w: str) -> str:
     return w
 
 
+@functools.lru_cache(maxsize=None)
 def strip_emoji(text: str) -> str:
     """Убирает эмодзи и невидимые управляющие символы."""
     if not text:
@@ -65,6 +67,7 @@ def display_theme(name: str) -> str:
     return _WS.sub(" ", name).strip()
 
 
+@functools.lru_cache(maxsize=None)
 def normalize_theme(name: str) -> str:
     """Ключ группировки тем: без эмодзи, lower, ё→е, без декора, с алиасами и
     лёгким стеммингом.
