@@ -161,6 +161,44 @@ def _child(el, name: str):
     return None
 
 
+# Хранилища VK, на которые sibrowser редиректит скачивание .siq. Сертификат
+# этих хостов (CN=userapi.com) перечисляет в SAN только userapi.com и
+# www.userapi.com — БЕЗ wildcard, поэтому проверка имени для psvN.userapi.com
+# всегда падает «Hostname mismatch». Это ошибка конфигурации на стороне VK, а
+# не подмена: сертификат настоящий, выдан HARICA на домены VK. Только для этих
+# хостов допускается докачка без проверки имени (см. _download_stream) —
+# скачанное всё равно обязано быть ZIP-архивом, а разбор .siq защищён от XXE
+# и zip-slip (см. parse_siq).
+_TLS_BROKEN_HOSTS = (".userapi.com", ".vk-cdn.net", ".vkuserfile.ru")
+
+
+def _host_tls_broken(url: str) -> bool:
+    from urllib.parse import urlsplit
+    host = (urlsplit(url).hostname or "").lower()
+    return any(host.endswith(suffix) for suffix in _TLS_BROKEN_HOSTS)
+
+
+def _resolve_redirect_target(session: requests.Session, url: str, limit: int = 5) -> str:
+    """Идёт по цепочке редиректов вручную и возвращает последний URL. Нужен,
+    чтобы узнать КУДА ведёт direct_download, когда сам запрос к цели падает на
+    проверке сертификата: сюда мы доходим уже после SSLError, а Location'ы
+    отдаёт sibrowser, чей сертификат в порядке."""
+    from urllib.parse import urljoin
+    cur = url
+    for _ in range(limit):
+        try:
+            r = session.get(cur, timeout=config.REQUEST_TIMEOUT, stream=True,
+                            allow_redirects=False)
+        except requests.exceptions.SSLError:
+            return cur     # дошли до хоста с битым сертификатом — это и есть цель
+        with r:
+            loc = r.headers.get("Location") if r.is_redirect or r.is_permanent_redirect else None
+        if not loc:
+            return cur
+        cur = urljoin(cur, loc)
+    return cur
+
+
 def download_siq(session: requests.Session, sibrowser_id: str, name_hint: str,
                  progress_cb=None, should_stop=None) -> Path | None:
     """Качает .siq через direct_download (следует за редиректом на хранилище).
@@ -182,17 +220,18 @@ def download_siq(session: requests.Session, sibrowser_id: str, name_hint: str,
         return dest
     url = f"{config.SIBROWSER_BASE}/packages/{sibrowser_id}/direct_download"
     tmp = dest.with_suffix(".part")
-    try:
-        with session.get(url, timeout=config.REQUEST_TIMEOUT, stream=True) as r:
+
+    def _download_stream(target: str, verify: bool) -> bool:
+        """Скачивает target в tmp. True — файл готов и это ZIP."""
+        with session.get(target, timeout=config.REQUEST_TIMEOUT, stream=True,
+                         verify=verify) as r:
             r.raise_for_status()
             total = int(r.headers.get("Content-Length") or 0)
             done = 0
-            cancelled = False
             with open(tmp, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1 << 16):
                     if stop():
-                        cancelled = True
-                        break
+                        return False
                     if chunk:
                         f.write(chunk)
                         done += len(chunk)
@@ -201,20 +240,32 @@ def download_siq(session: requests.Session, sibrowser_id: str, name_hint: str,
                                 progress_cb(done, total)
                             except Exception:
                                 pass
-            if cancelled:
-                tmp.unlink(missing_ok=True)
-                return None
-            # Паки, снятые с sibrowser (удалены/скрыты автором), отдают на
-            # direct_download не 404, а HTTP 200 со страницей-заглушкой
-            # (HTML) вместо архива — raise_for_status() её пропускает.
-            # Без этой проверки такая заглушка сохранялась КАК БУДТО .siq
-            # (dest.exists() && size>0 выше потом считал её «уже скачанной»
-            # навсегда, парсинг молча падал при каждой новой попытке).
-            # .siq — это ZIP, проверяем сигнатуру перед тем как принять файл.
-            if not zipfile.is_zipfile(tmp):
-                tmp.unlink(missing_ok=True)
-                return None
-            tmp.replace(dest)
+        # Паки, снятые с sibrowser (удалены/скрыты автором), отдают на
+        # direct_download не 404, а HTTP 200 со страницей-заглушкой (HTML)
+        # вместо архива — raise_for_status() её пропускает. Без этой проверки
+        # заглушка сохранялась КАК БУДТО .siq (dest.exists() && size>0 выше
+        # потом считал её «уже скачанной» навсегда, парсинг молча падал при
+        # каждой новой попытке). .siq — это ZIP, проверяем сигнатуру.
+        return zipfile.is_zipfile(tmp)
+
+    try:
+        try:
+            ok = _download_stream(url, verify=True)
+        except requests.exceptions.SSLError:
+            # Единственный случай, когда проверка имени хоста отключается:
+            # цель редиректа — известное хранилище VK с некорректным SAN
+            # (см. _TLS_BROKEN_HOSTS). Для любого другого хоста ошибка
+            # сертификата остаётся ошибкой.
+            target = _resolve_redirect_target(session, url)
+            if not _host_tls_broken(target):
+                raise
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            ok = _download_stream(target, verify=False)
+        if not ok:
+            tmp.unlink(missing_ok=True)
+            return None
+        tmp.replace(dest)
     except Exception:
         tmp.unlink(missing_ok=True)
         return None

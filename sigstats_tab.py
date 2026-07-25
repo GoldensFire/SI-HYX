@@ -4088,8 +4088,8 @@ class _TierListDialog(QDialog):
         self._btn_publish = QPushButton("Опубликовать")
         self._btn_publish.setIcon(get_icon('fa5s.globe', color='#89b4fa'))
         self._btn_publish.setToolTip("Опубликовать тир-лист как страницу-сайт по "
-                                     "постоянной ссылке на ВАШЕМ Cloudflare Worker "
-                                     "(адрес спросим при первой публикации).")
+                                     "постоянной ссылке (адрес воркера спросим "
+                                     "при первой публикации).")
         self._btn_publish.clicked.connect(self._publish_online)
         bottom_bar.addWidget(self._btn_publish)
         bottom_bar.addStretch(1)
@@ -4735,9 +4735,8 @@ class _TierListDialog(QDialog):
         v = QVBoxLayout(dlg)
         info = QLabel(
             "Публикация выкладывает тир-лист веб-страницей на <b>вашем личном</b> "
-            "бесплатном сервере Cloudflare Worker (поднимается один раз за ~5 минут).<br><br>"
-            "Вставьте адрес своего воркера — например "
-            "<code>https://si-hyx-tier.ВАШ-АккаунТ.workers.dev</code>")
+            "бесплатном сервере Cloudflare Worker (поднимается один раз за ~5 минут)."
+            "<br><br>Вставьте адрес своего воркера:")
         info.setWordWrap(True)
         info.setTextFormat(Qt.TextFormat.RichText)
         v.addWidget(info)
