@@ -32,9 +32,12 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      # v7 у обоих action — первые версии на node24. Более старые (checkout@v4,
+      # setup-python@v5) объявляли node20, который GitHub объявил устаревшим:
+      # раннер запускал их на node24 принудительно и ругался в каждом прогоне.
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           # Версия, на которой проект разрабатывается и собирается релиз.
           python-version: '3.14'
