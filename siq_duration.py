@@ -8,10 +8,9 @@
 # siq_duration.py — общие ПРАВИЛА оценки длительности .siq-пака (группировка
 # одновременных элементов, длительность ответа), без единого байта IO.
 #
-# Используется и sigstats/siq.py (сбор статистики: ffprobe-проба медиа,
-# извлечённого на диск), и siquester/siq_package.py (редактор паков: быстрая
-# in-Python проба mp4/mp3 прямо из открытого zip-потока, без субпроцессов) —
-# формула одна и та же, разнится только item_seconds_fn (как измерить
+# Используется siquester/siq_package.py (редактор паков: быстрая in-Python проба
+# mp4/mp3 прямо из открытого zip-потока, без субпроцессов). Формула одна и та же
+# для любого потребителя, разнится только item_seconds_fn (как измерить
 # длительность ОДНОГО элемента) — это отдаётся вызывающему модулю.
 from __future__ import annotations
 from typing import Callable
@@ -57,8 +56,7 @@ def content_duration(items: list[dict], item_seconds_fn: ItemSecondsFn) -> float
     (итог = max(последовательность переднего плана, сумма фона)).
 
     item_seconds_fn(item) -> float — длительность ОДНОГО элемента; реализация
-    специфична для вызывающего модуля (ffprobe-проба у sigstats, пробование
-    zip-потока у siquester).
+    специфична для вызывающего модуля (пробование zip-потока у siquester).
     """
     fg = [it for it in items if it.get("placement") != "background"]
     bg = [it for it in items if it.get("placement") == "background"]

@@ -29,7 +29,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PATTERNS = ("*.py", "sigstats/*.py", "siquester/*.py", "tests/*.py", "tools/*.py")
+PATTERNS = ("*.py", "siquester/*.py", "tests/*.py", "tools/*.py")
 
 # Функции, у которых текстовый режим тянет кодировку из локали.
 _TEXT_CALLS = ("subprocess.run", "subprocess.Popen", "subprocess.check_output",

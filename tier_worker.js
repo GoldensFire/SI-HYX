@@ -1,10 +1,14 @@
-// tier_worker.js — Cloudflare Worker для публикации тир-листа сыгранных паков
-// из вкладки «Поиск пакетов» SI-HYX. Хранит модель тир-листа в KV и отдаёт
+// tier_worker.js — Cloudflare Worker для публикации тир-листа сыгранных паков.
+// Вкладка «Поиск пакетов», которая сюда публиковала, из SI-HYX вырезана; воркер
+// оставлен как есть — уже опубликованные страницы должны открываться и дальше.
+// Хранит модель тир-листа в KV и отдаёт
 // готовую HTML-страницу по постоянной ссылке (кликабельные ссылки на паки,
 // комментарии, теги — визуально как в приложении).
 //
 // ── Протокол ──────────────────────────────────────────────────────────────
-//   POST /tier/<id>   тело: {token, title, tiers:[...], updated}
+//   POST /tier/<id>   тело: {token, title, boards:[{name,tiers:[...]}], updated}
+//                     (старое поле tiers:[...] тоже принимается — это один
+//                     тир-лист без вкладок)
 //                     Заголовок X-Edit-Token тоже принимается вместо body.token.
 //                     Первый POST на свободный <id> «занимает» его вместе с
 //                     токеном; последующие требуют тот же токен (иначе 403).
@@ -181,14 +185,78 @@ function safeColor(c) {
   return /^#[0-9a-fA-F]{3,8}$/.test(s) ? s : "";
 }
 
-function renderPage(model, updated, pageId) {
-  const title = SITE_TITLE;
-  const tiers = Array.isArray(model && model.tiers) ? model.tiers : [];
-  const maxLen = tiers.reduce((m, t) => Math.max(m, ((t && t.name) || "").length), 0);
-  const dims = tierLabelDims(maxLen);
-  const tiersHtml = tiers.map((t) => renderTier(t, dims)).join("");
-  const totalPacks = tiers.reduce(
+// Cloudflare Web Analytics: маяк вставляется, только если задана переменная
+// окружения CF_BEACON_TOKEN (Settings → Variables). Без неё страница
+// отдаётся как раньше — ни одного лишнего запроса.
+function beaconTag(token) {
+  if (!token) return "";
+  const t = String(token).replace(/[^A-Za-z0-9]/g, "");
+  if (!t) return "";
+  return `<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js" ` +
+    `data-cf-beacon='{"token":"${t}"}'></script>`;
+}
+
+// Тир-листов на одной странице может быть несколько — они приходят в
+// model.boards и показываются вкладками. Старая модель (одно поле tiers)
+// читается как единственный тир-лист без вкладок.
+function modelBoards(model) {
+  const raw = Array.isArray(model && model.boards) ? model.boards : null;
+  if (raw && raw.length) {
+    return raw.map((b, i) => ({
+      name: String((b && b.name) || `Тир-лист ${i + 1}`),
+      tiers: Array.isArray(b && b.tiers) ? b.tiers : [],
+    }));
+  }
+  return [{
+    name: "Тир-лист",
+    tiers: Array.isArray(model && model.tiers) ? model.tiers : [],
+  }];
+}
+
+function countPacks(tiers) {
+  return tiers.reduce(
     (sum, t) => sum + (Array.isArray(t && t.packs) ? t.packs.length : 0), 0);
+}
+
+function renderBoardsNav(boards, counts) {
+  if (boards.length < 2) return "";
+  const items = boards.map((b, i) =>
+    `<button class="board-tab${i === 0 ? " active" : ""}" data-board="${i}" ` +
+    `data-count="${counts[i]}" type="button">${esc(b.name)}</button>`).join("");
+  return `<nav class="boards">${items}</nav>`;
+}
+
+function renderPage(model, updated, pageId, beaconToken) {
+  const title = SITE_TITLE;
+  const boards = modelBoards(model);
+  // Размер колонки с названием уровня подбираем ОДИН раз по всем доскам —
+  // иначе при переключении вкладок колонка прыгала бы в ширине.
+  const maxLen = boards.reduce((m, b) => b.tiers.reduce(
+    (mm, t) => Math.max(mm, ((t && t.name) || "").length), m), 0);
+  const dims = tierLabelDims(maxLen);
+  const counts = boards.map((b) => countPacks(b.tiers));
+  const boardsNav = renderBoardsNav(boards, counts);
+  const tiersHtml = boards.map((b, i) =>
+    `<div class="board" data-board="${i}"${i ? " hidden" : ""}>` +
+    (b.tiers.map((t) => renderTier(t, dims)).join("")
+      || `<p class="sub">Тир-лист пуст.</p>`) +
+    `</div>`).join("");
+  const totalPacks = counts[0] || 0;
+  const boardsScript = boards.length < 2 ? "" : `<script>
+(function(){
+  var tabs = document.querySelectorAll('.board-tab');
+  var boards = document.querySelectorAll('.board');
+  var count = document.querySelector('.pack-count');
+  tabs.forEach(function(tab){
+    tab.addEventListener('click', function(){
+      var idx = tab.getAttribute('data-board');
+      tabs.forEach(function(t){ t.classList.toggle('active', t === tab); });
+      boards.forEach(function(b){ b.hidden = b.getAttribute('data-board') !== idx; });
+      if (count) count.textContent = 'Пакетов: ' + tab.getAttribute('data-count');
+    });
+  });
+})();
+</script>`;
   // Серверный рендер не знает часовой пояс зрителя — отдаём UTC как запасной
   // вариант в тексте узла и настоящий timestamp в data-ts; скрипт ниже
   // переформатирует в локальное время браузера при загрузке страницы.
@@ -283,10 +351,17 @@ function renderPage(model, updated, pageId) {
   .pack.played{opacity:.5}
   .pack.played .pk-name{text-decoration:line-through}
   .empty{color:var(--dim);font-size:12px;padding:6px 2px}
+  .boards{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 14px}
+  .board-tab{background:var(--bg2);color:var(--muted);border:1px solid var(--card-bd);
+    border-radius:8px;padding:6px 14px;font:inherit;font-size:13px;cursor:pointer}
+  .board-tab:hover{color:var(--text);border-color:#89b4fa}
+  .board-tab.active{background:var(--card);color:#89b4fa;border-color:#89b4fa;
+    font-weight:600}
   @media (max-width:520px){
     .pack{max-width:none;flex:1 1 100%}
   }
 </style>
+${beaconTag(beaconToken)}
 </head>
 <body>
   <div class="wrap">
@@ -295,9 +370,11 @@ function renderPage(model, updated, pageId) {
       <span class="pack-count">Пакетов: ${totalPacks}</span>
     </div>
     ${updatedHtml}
+    ${boardsNav}
     ${tiersHtml || `<p class="sub">Тир-лист пуст.</p>`}
   </div>
   ${updatedScript}
+  ${boardsScript}
   ${playedScript}
 </body>
 </html>`;
@@ -329,7 +406,7 @@ export default {
       if (url.searchParams.get("format") === "json") {
         return json({ model: rec.model, updated: rec.updated });
       }
-      return new Response(renderPage(rec.model || {}, rec.updated, id), {
+      return new Response(renderPage(rec.model || {}, rec.updated, id, env.CF_BEACON_TOKEN), {
         headers: { "Content-Type": "text/html; charset=utf-8", ...CORS },
       });
     }
@@ -364,6 +441,9 @@ export default {
         title: String(body.title || "").slice(0, 200),
         tiers: Array.isArray(body.tiers) ? body.tiers : [],
       };
+      if (Array.isArray(body.boards)) {
+        model.boards = body.boards.slice(0, 32);
+      }
       const updated = Number(body.updated) || Math.floor(Date.now() / 1000);
       await env.TIER_KV.put(
         key,

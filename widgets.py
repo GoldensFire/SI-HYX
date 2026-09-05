@@ -7,14 +7,16 @@
 # License v3 (или новее) от Free Software Foundation. БЕЗ ВСЯКИХ ГАРАНТИЙ.
 # Полный текст — в файле LICENSE (https://www.gnu.org/licenses/gpl-3.0.txt).
 # widgets.py — кастомные виджеты, делегаты, превью, info-подсказки
+import hashlib
 import io
 import os
+import re
 import subprocess
 import uuid
 from pathlib import Path
 from config import (
     ALLOWED_AUDIO, ALLOWED_IMG, ALLOWED_MEDIA, COLOR_DONE, COLOR_ERR,
-    COLOR_PROC, CREATE_NO_WINDOW, DEFAULT_TAG, FFMPEG, FFPROBE,
+    COLOR_PROC, CONFIG_DIR, CREATE_NO_WINDOW, DEFAULT_TAG, FFMPEG, FFPROBE,
     ITEM_AUDIO_ROLE, ITEM_COMPARE_ROLE, ITEM_STATUS_ROLE, Image, ImageOps,
     QAbstractItemView, QAbstractSpinBox, QApplication, QBrush, QByteArray,
     QColor, QComboBox, QDialog, QEvent, QFileDialog, QFont, QFrame,
@@ -27,11 +29,12 @@ from config import (
     get_icon_pixmap, http_get, icon_html, pyqtSignal
 )
 from utils import (
-    default_download_dir, human_size, load_pixmap_any, load_settings,
+    csv_first, default_download_dir, human_size, load_pixmap_any, load_settings,
     move_to_trash, pil_to_qicon, rasterize_svg, save_settings
 )
 from msgbox import msgbox_warning
-from PyQt6.QtWidgets import QSizePolicy, QAbstractButton, QStyleOptionSlider
+from PyQt6.QtWidgets import (QAbstractScrollArea, QSizePolicy, QAbstractButton,
+                             QLineEdit, QScrollBar, QStyleOptionSlider)
 from PyQt6.QtCore import QUrl
 
 
@@ -373,43 +376,93 @@ class _InfoTipPopup(QLabel):
             "#infoTip{background:#1e1e2e;color:#cdd6f4;border:1px solid #585b70;"
             "border-radius:6px;padding:6px 8px;font-size:12px;}")
 
+    def _fit_size(self, text):
+        """Ставит текст и приводит попап к его настоящему размеру.
+
+        adjustSize() у QLabel со словопереносом даёт высоту для ЭВРИСТИЧЕСКОЙ
+        ширины, а не для той, до которой попап реально ужат maximumWidth: у
+        длинных подсказок (кнопки с абзацем пояснения) высота получалась
+        заниженной в разы. По ней же считался вылет за край экрана — поэтому
+        подсказка «не помещалась» и уезжала под панель задач, хотя сдвиг
+        рассчитывался. Досчитываем высоту через heightForWidth."""
+        self.setText(text)
+        self.adjustSize()
+        w = min(self.width(), self.maximumWidth())
+        h = self.height()
+        if self.wordWrap():
+            h = max(h, self.heightForWidth(w) or 0)
+        self.resize(w, h)
+
+    def _place(self, x, y, flip_top, screen_geo):
+        """Двигает попап в (x, y), не выпуская его за пределы экрана.
+
+        Не влезает снизу — уходит НАД точкой привязки (flip_top), а не просто
+        прижимается к нижнему краю: иначе попап накрыл бы то, к чему относится."""
+        try:
+            sg = screen_geo
+            if sg is not None:
+                if x + self.width() > sg.right(): x = sg.right() - self.width() - 4
+                if x < sg.left(): x = sg.left() + 4
+                if y + self.height() > sg.bottom():
+                    y = flip_top - self.height() - 4
+                if y < sg.top(): y = sg.top() + 4
+        except Exception:
+            pass
+        self.move(x, y); self.show(); self.raise_()
+
     def show_for(self, badge, text):
         # Уже показываем ровно эту подсказку — не дёргаем show()/move() повторно.
         # При перестроении виджетов под курсором (списки/плитки) ToolTip-события
         # повторяются с тем же текстом; без этой проверки попап моргал.
         if self.isVisible() and self.text() == text:
             return
-        self.setText(text)
-        self.adjustSize()
+        self._fit_size(text)
         # Ниже-правее значка — курсор на значке не попадёт на попап (иначе цикл).
         gp = badge.mapToGlobal(badge.rect().bottomLeft())
-        x, y = gp.x(), gp.y() + 4
         try:
-            scr = badge.screen().availableGeometry()
-            if x + self.width() > scr.right(): x = scr.right() - self.width() - 4
-            if x < scr.left(): x = scr.left() + 4
+            scr = badge.screen()
+            sg = scr.availableGeometry() if scr else None
         except Exception:
-            pass
-        self.move(x, y); self.show(); self.raise_()
+            sg = None
+        # Не влезло снизу — показываем над самим виджетом (его верхний край).
+        top = badge.mapToGlobal(badge.rect().topLeft()).y()
+        self._place(gp.x(), gp.y() + 4, top, sg)
 
     def show_at(self, global_point, text):
         """Показывает подсказку у заданной глобальной точки (напр. у курсора над
         ячейкой дерева). Тот же стабильный попап, что и у значков ⓘ."""
         if not text:
             return
-        self.setText(text)
-        self.adjustSize()
-        x, y = global_point.x() + 16, global_point.y() + 18
+        self._fit_size(text)
         try:
             scr = QApplication.screenAt(global_point)
             sg = scr.availableGeometry() if scr else None
-            if sg is not None:
-                if x + self.width() > sg.right(): x = sg.right() - self.width() - 4
-                if x < sg.left(): x = sg.left() + 4
-                if y + self.height() > sg.bottom(): y = global_point.y() - self.height() - 6
         except Exception:
-            pass
-        self.move(x, y); self.show(); self.raise_()
+            sg = None
+        self._place(global_point.x() + 16, global_point.y() + 18,
+                    global_point.y() - 2, sg)
+
+
+def _enable_clear_button(ed) -> None:
+    """Включает крестик «очистить» у поля ввода, если он там уместен.
+
+    Не трогаем: поля только для чтения (стирать нечего), пароли (крестик выдаёт
+    длину), внутренние строки счётчиков/выпадающих списков (там свои кнопки, и
+    крестик влезал бы в стрелку) и редакторы ячеек в таблицах (правку и так
+    завершают Enter/Esc).
+    """
+    try:
+        if ed.isReadOnly() or ed.echoMode() != QLineEdit.EchoMode.Normal:
+            return
+        parent = ed.parentWidget()
+        if isinstance(parent, (QAbstractSpinBox, QComboBox)):
+            return
+        # редактор ячейки живёт на viewport'е таблицы/списка
+        if parent is not None and isinstance(parent.parentWidget(), QAbstractItemView):
+            return
+        ed.setClearButtonEnabled(True)
+    except Exception:
+        pass
 
 
 class HoverTipManager(QObject):
@@ -432,6 +485,43 @@ class HoverTipManager(QObject):
                         and obj.cursor().shape() == Qt.CursorShape.ArrowCursor):
                     obj.setCursor(Qt.CursorShape.PointingHandCursor)
                 return False
+            # Крестик «очистить» в КАЖДОМ поле ввода: раньше его ставили руками
+            # и только части полей, из-за чего в одних текст стирался одним
+            # кликом, а в других приходилось выделять и удалять. Ставим по
+            # Polish — он приходит один раз, ещё до показа виджета.
+            if et == QEvent.Type.Polish and isinstance(obj, QLineEdit):
+                _enable_clear_button(obj)
+                return False
+            # Шаг значения у спинбокса выделяет весь его текст (Qt делает
+            # selectAll в stepBy) — и это выделение остаётся висеть синим, будто
+            # в поле что-то редактируют, хотя фокус там даже не побывал: колесо
+            # фокус спинбоксу НЕ отдаёт (проверено на живом окне — после колеса
+            # hasFocus=False, фокус остаётся на QScrollArea панели). Значит и
+            # снимать выделение надо не по уходу фокуса, а сразу: покрутили
+            # колесом над НЕсфокусированным полем — выделять там нечего.
+            if et == QEvent.Type.Wheel:
+                # Alt + колесо в Qt прокручивает область ПО ГОРИЗОНТАЛИ — и
+                # список/таблица уезжали вбок от случайно зажатого Alt. По всей
+                # программе такую прокрутку выключаем: событие съедаем, до
+                # области прокрутки оно не доходит (просьба пользователя).
+                # modifiers() есть у QWheelEvent, но не у голого QEvent — фильтр
+                # обязан пережить и такой (его шлют, например, тесты).
+                mods = (ev.modifiers() if hasattr(ev, "modifiers")
+                        else Qt.KeyboardModifier.NoModifier)
+                if (mods & Qt.KeyboardModifier.AltModifier
+                        and self._is_scroll_area(obj)):
+                    _InfoTipPopup.instance().hide()
+                    ev.accept()
+                    return True
+                self._drop_wheel_selection(obj)
+            # Второй случай: в поле реально работали (кликнули внутрь, набрали/
+            # покрутили) и оно сфокусировано. Клик по «пустому» месту окна фокус
+            # не забирает — под курсором нефокусируемый виджет (лейбл, фон
+            # формы), — и выделение опять залипает. Снимаем фокус: QLineEdit по
+            # focusOut сам убирает выделение, а спинбокс заодно дочитывает
+            # набранное (editingFinished), как при обычном уходе.
+            if et == QEvent.Type.MouseButtonPress:
+                self._release_spinbox_focus(obj)
             if et == QEvent.Type.ToolTip:
                 tip = obj.toolTip() if isinstance(obj, QWidget) else ""
                 if tip:
@@ -453,6 +543,65 @@ class HoverTipManager(QObject):
         except Exception:
             pass
         return False
+
+    @staticmethod
+    def _is_scroll_area(obj) -> bool:
+        """Прокручиваемая область, её viewport или сама полоса прокрутки —
+        то есть всё, что Qt двигает по Alt + колесо. Обычные виджеты со своей
+        обработкой колеса (холст с зумом) сюда не попадают."""
+        if isinstance(obj, (QScrollBar, QAbstractScrollArea)):
+            return True
+        parent = obj.parentWidget() if isinstance(obj, QWidget) else None
+        return (isinstance(parent, QAbstractScrollArea)
+                and parent.viewport() is obj)
+
+    @staticmethod
+    def _spinbox_under(obj):
+        """Спинбокс, которому адресовано событие: колесо/нажатие приходит и его
+        потомкам (поле ввода, стрелки), поэтому поднимаемся по родителям."""
+        node = obj if isinstance(obj, QWidget) else None
+        while node is not None:
+            if isinstance(node, QAbstractSpinBox):
+                return node
+            node = node.parentWidget()
+        return None
+
+    @classmethod
+    def _drop_wheel_selection(cls, obj):
+        """Снимает выделение, которое шаг колеса ставит в НЕсфокусированном
+        спинбоксе (см. вызов). Отложенно (singleShot 0): фильтр приложения видит
+        колесо ДО того, как спинбокс его обработает, — сначала пусть шагнёт
+        значение и выделит текст, потом убираем выделение. Сфокусированное поле
+        не трогаем: там выделение осмысленно (набор заменит значение)."""
+        spin = cls._spinbox_under(obj)
+        if spin is None or spin.hasFocus():
+            return
+
+        def _deselect():
+            try:
+                if not spin.hasFocus():
+                    ed = spin.lineEdit()
+                    if ed is not None:
+                        ed.deselect()
+            except RuntimeError:
+                pass    # виджет успели удалить, пока ждали таймер
+        QTimer.singleShot(0, _deselect)
+
+    @staticmethod
+    def _release_spinbox_focus(obj):
+        """Снимает фокус со спинбокса, если кликнули ВНЕ него (см. вызов).
+        Клик по самому спинбоксу или его потомку (поле ввода, стрелки) не
+        трогаем — иначе поле теряло бы фокус ровно в момент клика по нему."""
+        app = QApplication.instance()
+        fw = app.focusWidget() if app is not None else None
+        if not isinstance(fw, QAbstractSpinBox):
+            return
+        node = obj if isinstance(obj, QWidget) else None
+        while node is not None:
+            if node is fw:
+                return
+            node = node.parentWidget()
+        fw.clearFocus()
 
 
 def install_hover_tips(app):
@@ -509,18 +658,32 @@ def info_badge(tip: str) -> QLabel:
 
 
 class WheelBlocker(QObject):
-    """Глобальный фильтр событий: когда колёсико «выключено», прокрутка над
-    полями (спинбоксы, выпадающие списки, ползунки) НЕ меняет их значения,
-    а прокручивает ближайшую область прокрутки. Когда «включено» — обычное
-    поведение (колесо меняет значение).
-    `is_on` — функция без аргументов, возвращающая True, если колесо разрешено."""
+    """Глобальный фильтр событий: прокрутка над полями (спинбоксы, выпадающие
+    списки, ползунки) не меняет их значения, а прокручивает ближайшую область
+    прокрутки.
+
+    `is_on` — функция без аргументов: True, если настройка «колёсико меняет
+    значения в полях» включена.
+
+    Когда настройка ВЫКЛЮЧЕНА — колесо не меняет значения никогда.
+
+    Когда ВКЛЮЧЕНА — меняет, но не отбирая прокрутку у панели: поле должно быть
+    сфокусировано, то есть в него кликнули. Иначе получалось так, как жаловался
+    пользователь: правая панель настроек длинная, крутишь её колесом, а числа в
+    полях, над которыми проехал курсор, молча меняются. Фокус тут надёжный
+    признак «работаю именно с этим полем»: колесо фокус НЕ отдаёт (проверено на
+    живом окне, см. HoverTipManager), так что сам по себе он не появится.
+
+    Если прокручивать нечего (поле не внутри области прокрутки), колесо меняет
+    значение и без фокуса — отнимать у него единственную работу незачем.
+    """
     def __init__(self, parent, is_on):
         super().__init__(parent)
         self._is_on = is_on
 
     def eventFilter(self, obj, ev):
         try:
-            if ev.type() == QEvent.Type.Wheel and not self._is_on():
+            if ev.type() == QEvent.Type.Wheel:
                 # Поднимаемся к виджету-значению (событие может прийти в дочерний)
                 target = None
                 p = obj
@@ -531,17 +694,22 @@ class WheelBlocker(QObject):
                         break
                     p = p.parent() if hasattr(p, "parent") else None
                     depth += 1
+                if target is None:
+                    return False
                 # Виджеты с пометкой wheelAlways (напр. ползунок громкости) —
                 # колесо меняет значение ВСЕГДА, не блокируем.
-                if target is not None and target.property("wheelAlways"):
+                if target.property("wheelAlways"):
                     return False
-                if target is not None:
-                    sa = target.parent()
-                    while sa is not None and not isinstance(sa, QScrollArea):
-                        sa = sa.parent()
-                    if isinstance(sa, QScrollArea):
-                        QApplication.sendEvent(sa.viewport(), ev)
-                    return True  # блокируем изменение значения колесом
+                if self._is_on() and target.hasFocus():
+                    return False        # поле выбрано кликом — крутим значение
+                sa = target.parent()
+                while sa is not None and not isinstance(sa, QScrollArea):
+                    sa = sa.parent()
+                if isinstance(sa, QScrollArea):
+                    QApplication.sendEvent(sa.viewport(), ev)
+                    return True         # прокрутка панели важнее значения
+                # Прокручивать нечего: при включённой настройке пусть меняет.
+                return not self._is_on()
         except Exception:
             pass
         return False
@@ -655,6 +823,114 @@ class RemoteThumbnailRunnable(QRunnable):
         except Exception: pass
 
 
+# ── Кэш миниатюр ленты «последние файлы» ─────────────────────────────────────
+# Лента показывает до 30 карточек, и на КАЖДУЮ раньше запускалось два процесса
+# (ffmpeg за кадром + ffprobe за длительностью) — до 60 запусков 215-мегабайтных
+# бинарников при каждом старте программы. На SSD это фон, на жёстком диске —
+# главная причина, по которой окно долго «оживает»: десяток параллельных ffmpeg
+# рвёт головку между своими образами, исходными видео и Qt-библиотеками, которые
+# в это же время грузит главный поток.
+#
+# Со второго запуска этих процессов нет вовсе. Ключ записи включает mtime и
+# размер файла: изменённый (или подменённый другим) файл получает новый ключ и
+# пересчитывается, устаревшую картинку показать невозможно. Одна запись — один
+# файл: первая строка «длительность\n», дальше байты картинки. Любая ошибка
+# кэша означает лишь «считаем как раньше», поэтому здесь всё под try/except.
+_THUMB_CACHE_DIR = os.path.join(CONFIG_DIR, "thumb_cache")
+_THUMB_CACHE_LIMIT = 600       # записей; лишние (самые старые) удаляются
+_thumb_cache_trimmed = False   # уборку делаем один раз за запуск
+
+
+def _thumb_cache_key(path: str) -> str:
+    st = os.stat(path)
+    raw = f"{os.path.abspath(path)}|{int(st.st_mtime)}|{st.st_size}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _thumb_cache_read(path: str):
+    """(байты картинки, строка длительности) из кэша или (None, "")."""
+    try:
+        with open(os.path.join(_THUMB_CACHE_DIR, _thumb_cache_key(path)), "rb") as f:
+            blob = f.read()
+    except Exception:
+        return None, ""
+    head, sep, data = blob.partition(b"\n")
+    if not sep or not data:
+        return None, ""
+    try:
+        return data, head.decode("utf-8")
+    except Exception:
+        return data, ""
+
+
+def _thumb_cache_write(path: str, data: bytes, dur: str) -> None:
+    if not data:
+        return
+    tmp = ""
+    try:
+        os.makedirs(_THUMB_CACHE_DIR, exist_ok=True)
+        fp = os.path.join(_THUMB_CACHE_DIR, _thumb_cache_key(path))
+        tmp = f"{fp}.{uuid.uuid4().hex}.part"
+        with open(tmp, "wb") as f:
+            f.write((dur or "").encode("utf-8") + b"\n" + data)
+        os.replace(tmp, fp)    # атомарно: недописанную запись никто не прочтёт
+    except Exception:
+        if tmp:
+            try: os.remove(tmp)
+            except Exception: pass
+
+
+def _thumb_cache_trim() -> None:
+    """Оставляет в кэше только _THUMB_CACHE_LIMIT самых свежих записей."""
+    global _thumb_cache_trimmed
+    if _thumb_cache_trimmed:
+        return
+    _thumb_cache_trimmed = True
+    try:
+        entries = []
+        with os.scandir(_THUMB_CACHE_DIR) as it:
+            for e in it:
+                try:
+                    if e.is_file():
+                        entries.append((e.stat().st_mtime, e.path))
+                except Exception:
+                    pass
+        if len(entries) <= _THUMB_CACHE_LIMIT:
+            return
+        entries.sort()
+        for _, p in entries[:len(entries) - _THUMB_CACHE_LIMIT]:
+            try: os.remove(p)
+            except Exception: pass
+    except Exception:
+        pass
+
+
+_FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)")
+
+
+def _duration_from_ffmpeg_log(text: str) -> float:
+    """Секунды из строки «Duration: 00:03:21.44», которую ffmpeg сам печатает в
+    stderr, разбирая входной файл. Раньше этот вывод уходил в DEVNULL, а за той
+    же цифрой следом запускался отдельный ffprobe — то есть второй 215-МБ
+    процесс на тот же файл. 0.0 — в выводе длительности нет (поток без неё или
+    файл не открылся); тогда вызывающий код честно спрашивает ffprobe."""
+    m = _FFMPEG_DURATION_RE.search(text or "")
+    if not m:
+        return 0.0
+    try:
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    except Exception:
+        return 0.0
+
+
+def _fmt_duration(d: float) -> str:
+    """Секунды → «12:34» или «1:02:03» (подпись на карточке ленты)."""
+    if not d or d <= 0:
+        return ""
+    h = int(d // 3600); m = int((d % 3600) // 60); s = int(d % 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 class _RecentThumbWorker(QRunnable):
     """Готовит миниатюру в фоне (ffmpeg/ffprobe/PIL) и отдаёт БАЙТЫ изображения
     в GUI-поток через сигнал. QPixmap нельзя создавать вне главного потока, поэтому
@@ -667,6 +943,17 @@ class _RecentThumbWorker(QRunnable):
     def run(self):
         data = None
         dur_str = ""
+        # Готовое из кэша — и ни одного процесса (см. комментарий у кэша выше).
+        try:
+            data, dur_str = _thumb_cache_read(self.path)
+        except Exception:
+            data, dur_str = None, ""
+        if data:
+            try:
+                self.signal.emit(data, dur_str)
+            except Exception:
+                pass
+            return
         try:
             ext = os.path.splitext(self.path)[1].lower()
             if ext == '.svg':
@@ -692,13 +979,21 @@ class _RecentThumbWorker(QRunnable):
                     pass
             if data is None:
                 tmp = os.path.join(TEMP_DIR, f"rft_{uuid.uuid4().hex}.jpg")
+                dur = 0.0
                 # Пробуем несколько позиций: 1с → 0с (для коротких клипов)
                 for seek in ("00:00:01", "00:00:00"):
                     cmd = [FFMPEG, "-y", "-ss", seek, "-i", self.path,
                            "-vframes", "1", "-vf", "scale=96:-2", "-q:v", "3", tmp]
                     try:
-                        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       creationflags=CREATE_NO_WINDOW, timeout=8)
+                        # stderr забираем, а не выбрасываем: ffmpeg печатает туда
+                        # «Duration:» разбираемого файла, и этой цифры хватает —
+                        # отдельный ffprobe ниже остаётся только запасным путём.
+                        p = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.PIPE, text=True,
+                                           encoding="utf-8", errors="replace",
+                                           creationflags=CREATE_NO_WINDOW, timeout=8)
+                        if not dur:
+                            dur = _duration_from_ffmpeg_log(p.stderr)
                     except Exception:
                         pass
                     if os.path.exists(tmp) and os.path.getsize(tmp) > 0:
@@ -715,20 +1010,24 @@ class _RecentThumbWorker(QRunnable):
                         try:
                             if os.path.exists(tmp): os.remove(tmp)
                         except Exception: pass
-                try:
-                    probe = subprocess.run(
-                        [FFPROBE, "-v", "error", "-show_entries", "format=duration",
-                         "-of", "default=noprint_wrappers=1:nokey=1", self.path],
-                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                        text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW, timeout=4)
-                    d = float(probe.stdout.strip() or 0)
-                    if d > 0:
-                        h = int(d // 3600); m = int((d % 3600) // 60); s = int(d % 60)
-                        dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-                except Exception:
-                    pass
+                if dur <= 0:
+                    # Запасной путь: ffmpeg длительность не назвал (поток без неё
+                    # или файл не открылся) — спрашиваем ffprobe, как раньше.
+                    try:
+                        probe = subprocess.run(
+                            [FFPROBE, "-v", "error", "-show_entries", "format=duration",
+                             "-of", "default=noprint_wrappers=1:nokey=1", self.path],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, encoding="utf-8", errors="replace",
+                            creationflags=CREATE_NO_WINDOW, timeout=4)
+                        dur = float(probe.stdout.strip() or 0)
+                    except Exception:
+                        pass
+                dur_str = _fmt_duration(dur)
         except Exception:
             pass
+        _thumb_cache_write(self.path, data, dur_str)
+        _thumb_cache_trim()   # раз за запуск и только в этом фоновом потоке
         try:
             self.signal.emit(data, dur_str)
         except Exception:
@@ -905,34 +1204,41 @@ class RecentFileThumb(QWidget):
                 return
             pix = pix.scaled(96, 72, Qt.AspectRatioMode.KeepAspectRatio,
                              Qt.TransformationMode.SmoothTransformation)
+            # Бейджи (длительность/размер) рисуем на ПОЛНОМ холсте 96×72, а не
+            # поверх узкого pix — у портретных превью (высокий формат) pix
+            # масштабируется до узкой полоски по ширине, и подпись вроде
+            # "143.5KB" обрезалась бы клипом до "143". Холст даёт бейджам
+            # полную ширину карточки независимо от пропорций превью.
+            canvas = QPixmap(96, 72)
+            canvas.fill(Qt.GlobalColor.transparent)
+            cpaint = QPainter(canvas)
+            cpaint.setRenderHint(QPainter.RenderHint.Antialiasing)
+            cx = (96 - pix.width()) // 2
+            cy = (72 - pix.height()) // 2
+            cpaint.drawPixmap(cx, cy, pix)
             if dur_str:
-                painter = QPainter(pix)
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing)
                 font = QFont(); font.setPointSize(7); font.setBold(True)
-                painter.setFont(font)
-                fm = painter.fontMetrics()
+                cpaint.setFont(font)
+                fm = cpaint.fontMetrics()
                 tw = fm.horizontalAdvance(dur_str) + 6
                 th = fm.height() + 2
-                tx = pix.width() - tw - 2
-                ty = pix.height() - th - 2
-                painter.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 160))
-                painter.setPen(QPen(QColor(255, 255, 255)))
-                painter.drawText(tx + 3, ty + th - 3, dur_str)
-                painter.end()
+                tx = canvas.width() - tw - 2
+                ty = canvas.height() - th - 2
+                cpaint.fillRect(tx, ty, tw, th, QColor(0, 0, 0, 160))
+                cpaint.setPen(QPen(QColor(255, 255, 255)))
+                cpaint.drawText(tx + 3, ty + th - 3, dur_str)
             # Бейдж размера файла — верхний левый угол (минимум в КБ)
             if self._size_str:
-                p2 = QPainter(pix)
-                p2.setRenderHint(QPainter.RenderHint.Antialiasing)
-                f2 = QFont(); f2.setPointSize(7); f2.setBold(True); p2.setFont(f2)
-                fm2 = p2.fontMetrics()
-                sw = fm2.horizontalAdvance(self._size_str) + 6
+                f2 = QFont(); f2.setPointSize(7); f2.setBold(True); cpaint.setFont(f2)
+                fm2 = cpaint.fontMetrics()
+                sw = min(fm2.horizontalAdvance(self._size_str) + 6, canvas.width() - 4)
                 sh = fm2.height() + 1
-                p2.fillRect(2, 2, sw, sh, QColor(0, 0, 0, 160))
-                p2.setPen(QPen(QColor(255, 255, 255)))
-                p2.drawText(2 + 3, 2 + sh - 3, self._size_str)
-                p2.end()
+                cpaint.fillRect(2, 2, sw, sh, QColor(0, 0, 0, 160))
+                cpaint.setPen(QPen(QColor(255, 255, 255)))
+                cpaint.drawText(2 + 3, 2 + sh - 3, self._size_str)
+            cpaint.end()
             self._thumb_lbl.setText("")
-            self._thumb_lbl.setPixmap(pix)
+            self._thumb_lbl.setPixmap(canvas)
             self._has_thumb = True
             # Запоминаем, какому состоянию файла соответствует это превью —
             # чтобы заметить позднюю перезапись файла по тому же пути.
@@ -1113,13 +1419,8 @@ class RecentFileThumb(QWidget):
             pass
 
     def _action_show_in_folder(self):
-        try:
-            if os.name == 'nt':
-                subprocess.Popen(["explorer", "/select,", os.path.normpath(self.path)])
-            else:
-                subprocess.Popen(["xdg-open", os.path.dirname(self.path)])
-        except Exception:
-            pass
+        from utils import reveal_in_explorer
+        reveal_in_explorer(self.path)
 
     def _action_copy_file(self):
         """Кладёт сам файл (как URL) в буфер обмена — можно вставить в проводник."""
@@ -2290,7 +2591,9 @@ def _probe_video_codec(path):
             [FFPROBE, "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, creationflags=CREATE_NO_WINDOW)
-        return (r.stdout or "").strip().lower()
+        # csv_first, а не strip(): ffprobe оставляет хвостовой разделитель
+        # («h264,»), и сравнение с 'av1' переставало срабатывать.
+        return csv_first(r.stdout).lower()
     except Exception:
         return ""
 
@@ -2855,6 +3158,110 @@ def show_video_compare(src_path, out_path, parent=None, use_filenames=False):
 # Раньше жили в tabs.py, но нужны и «Обработке»/«Загрузчику», и «Редактированию
 # фото» (photo_tab.py). Держим здесь, чтобы tabs.py и photo_tab.py не зависели
 # друг от друга (иначе получался бы циклический импорт).
+
+class TabScrollArrows(QObject):
+    """Стрелки прокрутки вкладок «как в браузере».
+
+    Родной QTabBar рисует ОБЕ стрелки-прокрутки в одном блоке у правого края и
+    держит их там всегда (неактивную просто гасит). В браузере иначе: стрелка
+    «влево» стоит у ЛЕВОГО края и появляется, только если слева есть уехавшие
+    вкладки; стрелка «вправо» — у правого и исчезает, когда справа всё влезло.
+
+    Своей прокрутки у QTabBar нет (scrollOffset приватный), поэтому родные
+    кнопки остаются рабочим механизмом — мы только переставляем их: активную
+    кладём к нужному краю, неактивную уводим ЗА границу таббара (дети виджета
+    обрезаются его прямоугольником, поэтому она просто не видна). Прятать
+    через setVisible нельзя: QTabBar на каждой перекладке зовёт им show(), и
+    получается мигание.
+    """
+
+    OFF = 400   # насколько увести неактивную кнопку за край (лишь бы обрезалась)
+
+    def __init__(self, bar):
+        super().__init__(bar)
+        self.bar = bar
+        self.left = bar.findChild(QToolButton, "ScrollLeftButton")
+        self.right = bar.findChild(QToolButton, "ScrollRightButton")
+        if self.left is None or self.right is None:
+            # Порядок создания у Qt стабилен (сначала левая), но objectName —
+            # то, на что можно опереться; запасной путь на случай смены имён.
+            btns = bar.findChildren(QToolButton)
+            if len(btns) < 2:
+                self.left = self.right = None
+                return
+            self.left, self.right = btns[0], btns[-1]
+        self._busy = False
+        self._style_buttons()
+        for b in (self.left, self.right):
+            b.installEventFilter(self)
+        bar.installEventFilter(self)
+        self.apply()
+
+    def _style_buttons(self):
+        """QTabBar рисует прокрутку обычными QToolButton, а те у нас
+        стилизованы глобально (config.STYLESHEET) под целую кнопку с фоном и
+        рамкой — родная стрелка при этом не рисуется и получаются «два пустых
+        квадратика». Ставим свою стрелку-иконку и снимаем фон/рамку только у
+        этих двух кнопок. Фон непрозрачный НАРОЧНО: кнопки лежат ПОВЕРХ
+        вкладок, и сквозь прозрачную было бы видно вкладку под низом."""
+        flat = ("QToolButton{background:#1e1e2e;border:none;border-radius:0px;"
+                "padding:0px;margin:0px;min-width:18px;min-height:0px;}"
+                "QToolButton:hover{background:#313244;}"
+                "QToolButton:disabled{background:#1e1e2e;}")
+        for b, icon in ((self.left, 'fa5s.chevron-left'),
+                        (self.right, 'fa5s.chevron-right')):
+            try:
+                b.setIcon(get_icon(icon))
+                b.setText("")
+                b.setIconSize(QSize(11, 11))
+                b.setStyleSheet(flat)
+            except Exception:
+                pass
+
+    def buttons(self):
+        return (self.left, self.right)
+
+    def eventFilter(self, obj, ev):
+        if self._busy:
+            return False
+        if obj is self.bar:
+            if ev.type() == QEvent.Type.Resize:
+                self.apply()
+            return False
+        if obj not in (self.left, self.right):
+            return False
+        if ev.type() in (QEvent.Type.Move, QEvent.Type.Resize,
+                         QEvent.Type.Show, QEvent.Type.EnabledChange):
+            self.apply()
+        return False
+
+    def apply(self):
+        """Ставит каждую кнопку на своё место: активную — к краю, неактивную —
+        за границу таббара."""
+        if self.left is None or self.right is None:
+            return
+        self._busy = True
+        try:
+            bw = self.bar.width()
+            for b, active_x in ((self.left, 0),
+                                (self.right, bw - self.right.width())):
+                x = active_x if b.isEnabled() else -self.OFF
+                if b.x() != x:
+                    b.move(x, b.y())
+        except Exception:
+            pass
+        finally:
+            self._busy = False
+
+
+def install_tab_scroll_arrows(bar):
+    """Включает браузерное поведение стрелок прокрутки у QTabBar.
+    Возвращает объект-контроллер (его же можно спросить кнопки для колеса)."""
+    try:
+        return TabScrollArrows(bar)
+    except Exception:
+        return None
+
 
 def _icon_btn(text, icon, size=20, color=None):
     """QPushButton с векторной иконкой qtawesome (см. get_icon в config.py).

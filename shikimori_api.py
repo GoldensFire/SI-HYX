@@ -20,6 +20,8 @@
 #     пагинацией + локальная доводка под полный набор критериев.
 from __future__ import annotations
 
+import datetime
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -182,6 +184,146 @@ def index_components_from_card(card: dict) -> list[tuple[str, float, int]]:
     out = [(label, wv, cnt) for label, (wv, cnt) in agg.items()]
     out.sort(key=lambda x: x[1], reverse=True)
     return out
+
+
+def index_base_from_statuses_stats(stats) -> float:
+    """То же, что index_base_from_card, но для GraphQL-формы
+    `statusesStats { status count }` (там ключи английские, а не локализованные
+    подписи REST-карточки). Нужна генератору аниме-паков: он и так тянет
+    карточки через GraphQL пачками по 50 и не должен ради индекса ходить
+    в REST по одному тайтлу."""
+    total = 0.0
+    for s in (stats or []):
+        if not isinstance(s, dict):
+            continue
+        w = _INDEX_STATUS_WEIGHTS.get(str(s.get("status") or "").strip().lower())
+        if w:
+            try:
+                total += w * int(s.get("count") or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+# Параметры «индекса популярности». Половина узнаваемости теряется примерно за
+# 5 лет — подобрано так, чтобы свежий тайтл с заметно меньшими просмотрами
+# обходил старый «миллионник» (пример пользователя: тайтл 2025 г. с 8k узнают
+# лучше, чем 2012 г. с 41k). Пол (floor) не даёт классике обнулиться совсем.
+_INDEX_HALF_LIFE_YEARS = 5.0
+_INDEX_RECENCY_FLOOR = 0.12
+# Очень слабое влияние оценки тайтла на индекс (просьба «прям незначительно»):
+# отклонение оценки от ~7 баллов меняет индекс лишь на проценты.
+_INDEX_SCORE_INFLUENCE = 0.04
+_INDEX_SCORE_PIVOT = 7.0
+
+
+def age_years(when) -> Optional[float]:
+    """Возраст тайтла в годах (дробных) на сегодня. when — datetime.date (точно по
+    дню/месяцу), int-год (грубо по году) или None. None/ошибка → None («возраст
+    неизвестен»)."""
+    if when is None:
+        return None
+    try:
+        if isinstance(when, datetime.date):
+            return max(0.0, (datetime.date.today() - when).days / 365.25)
+        return max(0.0, float(datetime.date.today().year - int(when)))
+    except (TypeError, ValueError):
+        return None
+
+
+def index_factors(when, score: float = 0.0) -> tuple[float, float]:
+    """Множители индекса: (свежесть выхода, оценка). recency ∈ [floor, 1.0],
+    score_factor ∈ [0.6, 1.4]. when — дата выхода (точно по дню/месяцу) или год.
+    Вынесено, чтобы и считать индекс, и показывать в подсказке влияние года/оценки."""
+    age = age_years(when)
+    if age is None:
+        recency = _INDEX_RECENCY_FLOOR   # дата неизвестна — считаем «старым»
+    else:
+        recency = max(_INDEX_RECENCY_FLOOR,
+                      0.5 ** (age / _INDEX_HALF_LIFE_YEARS))
+    score_factor = 1.0 + _INDEX_SCORE_INFLUENCE * (float(score or 0.0) - _INDEX_SCORE_PIVOT)
+    score_factor = max(0.6, min(1.4, score_factor))
+    return recency, score_factor
+
+
+def popularity_index(base: float, when, score: float = 0.0) -> float:
+    """«Индекс популярности»: взвешенная по статусам база (index_base_from_card —
+    просмотрено=10, смотрю=8, брошено/отложено=6, запланировано=2), домноженная
+    на свежесть выхода тайтла (точно по дате) и СЛАБО — на его оценку. Чем свежее
+    тайтл и выше оценка, тем выше индекс при той же базе.
+
+    Единственное место, где живёт эта формула: ею пользуется и сортировка во
+    вкладке ShikimoriHYX, и цены вопросов в генераторе аниме-паков."""
+    if base <= 0:
+        return 0.0
+    recency, score_factor = index_factors(when, score)
+    return base * recency * score_factor
+
+
+# ── Узнаваемость франшизы ────────────────────────────────────────────────────
+# Сериал, у которого вышло несколько популярных сезонов, узнают лучше, чем
+# одиночный тайтл с тем же числом зрителей: франшиза дольше держится на слуху.
+# И штраф за возраст ему полагается не по году ПЕРВОГО сезона, а по году
+# последнего заметного продолжения (просьба пользователя: «первый сезон 2002-го,
+# продолжение 2007-го и тоже популярное — минус за год не должен быть большим»).
+#
+# «Заметной» считается часть, у которой база индекса хотя бы такая доля от базы
+# самой популярной части: иначе франшизу раздували бы спешлы и пятиминутные ONA,
+# которых никто не смотрел.
+FRANCHISE_PART_SHARE = 0.2
+# Надбавка за каждую заметную часть сверх первой и её потолок.
+FRANCHISE_SEASON_BONUS = 0.05
+FRANCHISE_SEASON_BONUS_MAX = 0.25
+
+
+def franchise_parts_index(parts) -> float:
+    """«Индекс популярности» франшизы по карточкам её частей.
+
+    parts — карточки в GraphQL-форме (`statusesStats`, `airedOn { year }`,
+    `score`), обычно самые популярные части одной франшизы. База берётся у самой
+    популярной части, а сверху две поправки:
+      • штраф за возраст смягчается, если у франшизы есть заметное продолжение:
+        свежесть считается СРЕДНИМ ГЕОМЕТРИЧЕСКИМ между свежестью самой
+        популярной части и свежестью последнего заметного продолжения. Не
+        подменяем год целиком нарочно — иначе «Наруто» 2002-го считался бы
+        ровесником «Боруто» 2017-го;
+      • за каждую заметную часть сверх первой идёт небольшая надбавка
+        (FRANCHISE_SEASON_BONUS, не больше FRANCHISE_SEASON_BONUS_MAX): сериал с
+        живыми сезонами узнают лучше одиночки с тем же числом зрителей.
+
+    Пустой список или части без статистики — ноль."""
+    rows = []
+    for part in (parts or []):
+        if not isinstance(part, dict):
+            continue
+        base = index_base_from_statuses_stats(part.get("statusesStats"))
+        if base <= 0:
+            continue
+        try:
+            year = int((part.get("airedOn") or {}).get("year") or 0) or None
+        except (TypeError, ValueError):
+            year = None
+        try:
+            score = float(part.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        rows.append((base, year, score))
+    if not rows:
+        return 0.0
+    rows.sort(key=lambda r: r[0], reverse=True)
+    top_base, top_year, top_score = rows[0]
+    notable = [r for r in rows if r[0] >= top_base * FRANCHISE_PART_SHARE]
+    years = [r[1] for r in notable if r[1]]
+    recency, score_factor = index_factors(top_year, top_score)
+    if years:
+        late, _ = index_factors(max(years), top_score)
+        # max — на случай, когда самая популярная часть и есть самая свежая
+        # («Стальной алхимик: Братство» 2009-го против частей 2003-го):
+        # приплюсовывать ей старость предшественников нельзя.
+        recency = max(recency, math.sqrt(recency * late))
+    bonus = 1.0 + min(FRANCHISE_SEASON_BONUS_MAX,
+                      FRANCHISE_SEASON_BONUS * (len(notable) - 1))
+    return top_base * recency * score_factor * bonus
 
 
 def kinds_for(content_type: str):

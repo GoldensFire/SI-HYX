@@ -8,6 +8,7 @@
 # прокси-превью, загрузка звуковой волны, извлечение субтитров, удаление объектов.
 # Слой поверх edit_tab_base.
 
+import math
 import os
 import subprocess
 import sys
@@ -16,6 +17,7 @@ import threading
 import wave
 from config import (CREATE_NO_WINDOW, FFMPEG, FFPROBE, QThread, pyqtSignal)
 from edit_tab_base import (_parse_srt, time_to_s)
+from utils import csv_first
 from PyQt6.QtCore import (QIODevice)
 from PyQt6.QtGui import (QImage)
 
@@ -323,7 +325,8 @@ class SmartCutWorker(QThread):
                  "-show_entries", "stream=codec_name", "-of", "csv=p=0", self.src],
                 capture_output=True, text=True, encoding="utf-8",
                 errors="replace", creationflags=CREATE_NO_WINDOW, timeout=30)
-            return (r.stdout or "").strip()
+            # csv_first: у ffprobe в конце строки остаётся разделитель («h264,»)
+            return csv_first(r.stdout)
         except Exception:
             return ""
 
@@ -363,7 +366,7 @@ class SmartCutWorker(QThread):
                  "-of", "csv=p=0", path], capture_output=True, text=True,
                 encoding="utf-8", errors="replace",
                 creationflags=CREATE_NO_WINDOW, timeout=30)
-            return float((r.stdout or "0").strip() or 0.0)
+            return float(csv_first(r.stdout) or 0.0)
         except Exception:
             return 0.0
 
@@ -822,6 +825,479 @@ class VideoInpaintWorker(QThread):
             try:
                 if self._tmp and os.path.isdir(self._tmp):
                     shutil.rmtree(self._tmp, ignore_errors=True)
+            except Exception:
+                pass
+
+
+def overlay_top_left(box, ovl_w, ovl_h, anchor="center", off_x=0, off_y=0):
+    """Левый верхний угол накладки относительно отслеженной рамки box=[x,y,w,h].
+
+    anchor: center — по центру области, top/bottom — над/под ней, left/right —
+    слева/справа. off_x/off_y — дополнительный сдвиг в пикселях кадра."""
+    bx, by, bw, bh = (float(v) for v in box)
+    cx, cy = bx + bw / 2.0, by + bh / 2.0
+    if anchor == "top":
+        x, y = cx - ovl_w / 2.0, by - ovl_h
+    elif anchor == "bottom":
+        x, y = cx - ovl_w / 2.0, by + bh
+    elif anchor == "left":
+        x, y = bx - ovl_w, cy - ovl_h / 2.0
+    elif anchor == "right":
+        x, y = bx + bw, cy - ovl_h / 2.0
+    else:                                    # center
+        x, y = cx - ovl_w / 2.0, cy - ovl_h / 2.0
+    return x + float(off_x), y + float(off_y)
+
+
+def blend_bgra(frame_bgr, ovl_bgra, x, y):
+    """Накладывает BGRA-картинку на BGR-кадр по альфе, ПРЯМО в кадр (in-place).
+    Часть накладки за границей кадра просто обрезается."""
+    import numpy as np
+    fh, fw = frame_bgr.shape[:2]
+    oh, ow = ovl_bgra.shape[:2]
+    x, y = int(round(x)), int(round(y))
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(fw, x + ow), min(fh, y + oh)
+    if x1 <= x0 or y1 <= y0:
+        return frame_bgr
+    src = ovl_bgra[y0 - y:y1 - y, x0 - x:x1 - x]
+    a = src[:, :, 3:4].astype(np.float32) / 255.0
+    roi = frame_bgr[y0:y1, x0:x1]
+    roi[:] = np.clip(src[:, :, :3].astype(np.float32) * a
+                     + roi.astype(np.float32) * (1.0 - a) + 0.5, 0, 255).astype(np.uint8)
+    return frame_bgr
+
+
+def track_box_at(boxes, t, start_s, fps):
+    """Рамка из посчитанной траектории на момент времени t (секунды).
+
+    Единая точка правды для предпросмотра (VideoCanvas) и рендера
+    (TrackOverlayWorker) — иначе накладка в готовом файле съезжает относительно
+    того, что человек видел в плеере."""
+    if not boxes:
+        return None
+    i = int(round((float(t) - float(start_s)) * float(fps)))
+    return list(boxes[max(0, min(len(boxes) - 1, i))])
+
+
+class TrackPathWorker(QThread):
+    """Первый (быстрый) этап привязки к объекту: считает ТРАЕКТОРИЮ рамки и
+    ничего не кодирует.
+
+    Сделано отдельно от рендера ради предпросмотра «как в Filmora»: сначала за
+    несколько секунд получаем путь объекта, показываем накладку прямо в плеере
+    Монтажа — и только если человек доволен, запускаем длинный экспорт
+    (TrackOverlayWorker, которому траектория уже отдаётся готовой).
+
+    Отслеживаем на УМЕНЬШЕННОМ кадре (длинная сторона до TRACK_MAX_SIDE): сеть
+    всё равно режет из кадра окно ×4 вокруг цели и жмёт его до 256², поэтому
+    точность практически не страдает, а декодирование и препроцессинг заметно
+    дешевле. Рамки возвращаются уже в координатах ИСХОДНОГО кадра."""
+
+    TRACK_MAX_SIDE = 720
+
+    progress = pyqtSignal(int, str)
+    done = pyqtSignal(object)            # список рамок [x, y, w, h] в px исходника
+    failed = pyqtSignal(str)
+
+    def __init__(self, src, fps, size, init_box, start_s, end_s,
+                 smooth=1.0, prefer="auto"):
+        super().__init__()
+        self._src = os.path.abspath(str(src))
+        self._fps = float(fps) if fps and fps > 0 else 25.0
+        self._w, self._h = int(size[0]), int(size[1])
+        self._box0 = [float(v) for v in init_box]
+        self._start = max(0.0, float(start_s))
+        self._end = float(end_s) if end_s and end_s > 0 else float('inf')
+        self._smooth = float(smooth)
+        self._prefer = prefer
+        self._cancel = False
+        self._procs = []
+
+    def cancel(self):
+        self._cancel = True
+        for p in list(self._procs):
+            try:
+                if p is not None and p.poll() is None:
+                    p.terminate()
+            except Exception:
+                pass
+
+    def stop(self):
+        self.cancel()
+
+    def _scale(self):
+        """Во сколько раз уменьшаем кадр для отслеживания (1.0 — не уменьшаем)."""
+        side = max(self._w, self._h)
+        if side <= self.TRACK_MAX_SIDE:
+            return 1.0, self._w, self._h
+        k = self.TRACK_MAX_SIDE / float(side)
+        # Чётные стороны: rawvideo-декодирование не любит нечётных размеров у
+        # yuv-исходников, а ffmpeg округляет сам — считаем так же, как он.
+        w = max(2, int(round(self._w * k / 2)) * 2)
+        h = max(2, int(round(self._h * k / 2)) * 2)
+        return w / float(self._w), w, h
+
+    def run(self):
+        import numpy as np
+        try:
+            from dyhit_tracker import create_tracker
+        except Exception as e:                       # pragma: no cover
+            self.failed.emit(f"Отслеживание недоступно: {e}")
+            return
+
+        k, tw, th = self._scale()
+        frame_bytes = tw * th * 3
+        span = (self._end - self._start) if self._end != float('inf') else 0.0
+        total = int(span * self._fps) if span > 0 else 0
+        dec = None
+        try:
+            self.progress.emit(-1, "Подготовка трекера…")
+            tracker = create_tracker(prefer=self._prefer, smooth=self._smooth,
+                                     fps=self._fps)
+            tracker.warmup()
+            if self._cancel:
+                raise RuntimeError("Отменено")
+
+            cmd = [FFMPEG, "-hide_banner", "-nostdin"]
+            if self._start > 0.05:
+                # Кадры до начала отрезка не нужны вообще — input-seek экономит
+                # всё время декодирования «хвоста» перед выбранным моментом.
+                cmd += ["-ss", f"{self._start:.6f}"]
+            cmd += ["-i", self._src, "-an", "-sn", "-dn"]
+            if k < 1.0:
+                cmd += ["-vf", f"scale={tw}:{th}"]
+            cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+            dec = self._popen(cmd)
+
+            box0 = [v * k for v in self._box0]
+            buf = bytearray(frame_bytes)
+            view = memoryview(buf)
+            boxes = []
+            self.progress.emit(0, "Отслеживание объекта…")
+            while True:
+                if self._cancel:
+                    raise RuntimeError("Отменено")
+                got = 0
+                while got < frame_bytes:
+                    n = dec.stdout.readinto(view[got:])
+                    if not n:
+                        break
+                    got += n
+                if got < frame_bytes:
+                    break
+                frame = np.frombuffer(buf, np.uint8).reshape(th, tw, 3).copy()
+
+                if not boxes:
+                    tracker.init(frame, box0)
+                    box = list(box0)
+                else:
+                    box, _score = tracker.update(frame)
+                boxes.append([v / k for v in box])
+
+                if total > 0 and len(boxes) >= total:
+                    break
+                if total > 0 and len(boxes) % 5 == 0:
+                    pct = max(0, min(99, int(99 * len(boxes) / total)))
+                    self.progress.emit(pct, f"Отслеживание объекта… "
+                                            f"кадр {len(boxes)}/{total}")
+
+            if self._cancel:
+                raise RuntimeError("Отменено")
+            if not boxes:
+                raise RuntimeError("В видео не найдено кадров")
+            self.done.emit(boxes)
+        except Exception as e:
+            msg = str(e)
+            self.failed.emit("Отменено" if (self._cancel or msg == "Отменено")
+                             else msg)
+        finally:
+            for p, close in ((dec, True),):
+                try:
+                    if p is not None:
+                        if close and p.stdout is not None:
+                            p.stdout.close()
+                        if p.poll() is None:
+                            p.terminate()
+                        p.wait(timeout=5)
+                except Exception:
+                    pass
+
+    def _popen(self, cmd):
+        kw = {"stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL}
+        if os.name == 'nt':
+            kw['creationflags'] = CREATE_NO_WINDOW
+        p = subprocess.Popen(cmd, **kw)
+        self._procs.append(p)
+        return p
+
+
+class TrackOverlayWorker(QThread):
+    """Привязка текста/картинки к движущемуся объекту.
+
+    Пользователь обводит объект рамкой на одном кадре (диалог _TrackAttachDialog),
+    а этот воркер:
+      1) гонит видео через ffmpeg сырыми кадрами (rawvideo bgr24) — без записи
+         PNG на диск, в отличие от VideoInpaintWorker: кадров тут столько же, но
+         менять их надо целиком и по одному разу;
+      2) на каждом кадре внутри выбранного отрезка спрашивает у трекера DyHiT
+         (dyhit_tracker.py, ONNX; запасной вариант — CSRT из OpenCV), где теперь
+         объект, и подмешивает накладку по альфе рядом с рамкой;
+      3) тут же отдаёт кадр второму ffmpeg, который кодирует результат и
+         подмешивает исходную аудиодорожку.
+
+    Оба ffmpeg живут одновременно (декодер → python → кодировщик), поэтому
+    промежуточных файлов нет вообще. stderr обоих уходит в DEVNULL: читать его
+    некому, а неопустошённый pipe на Windows вешает процесс (см. ProxyWorker).
+    """
+    progress = pyqtSignal(int, str)      # (процент 0..100; -1 = «busy», текст фазы)
+    done = pyqtSignal(str)               # путь готового файла
+    failed = pyqtSignal(str)             # текст ошибки ("Отменено" при отмене)
+
+    def __init__(self, src, out_path, venc, has_audio, fps, size, duration,
+                 init_box, start_s, end_s, overlay_bgra, anchor="center",
+                 off_x=0, off_y=0, scale_with_box=False, smooth=0.35,
+                 prefer="auto", boxes=None, trim_in=None, trim_out=None,
+                 static_overlays=None):
+        super().__init__()
+        self._src = os.path.abspath(str(src))
+        self._out = str(out_path)
+        self._venc = list(venc)
+        self._has_audio = bool(has_audio)
+        self._fps = float(fps) if fps and fps > 0 else 25.0
+        self._w, self._h = int(size[0]), int(size[1])
+        self._duration = float(duration or 0.0)
+        self._box0 = [float(v) for v in init_box]
+        self._start = max(0.0, float(start_s))
+        self._end = float(end_s) if end_s and end_s > 0 else float('inf')
+        self._ovl = overlay_bgra
+        self._anchor = anchor
+        self._off = (int(off_x), int(off_y))
+        self._scale_with_box = bool(scale_with_box)
+        self._smooth = float(smooth)
+        self._prefer = prefer
+        # Готовая траектория из TrackPathWorker: с ней рендер ровно повторяет то,
+        # что человек видел в предпросмотре, и не тратит время на отслеживание
+        # второй раз. None — считаем путь на ходу (старый одношаговый режим).
+        self._boxes = list(boxes) if boxes else None
+        # Выделенный в Монтаже отрезок: «Обрезать» с активной накладкой должна и
+        # резать, и вшивать. None — берём файл целиком.
+        self._trim_in = max(0.0, float(trim_in)) if trim_in else 0.0
+        self._trim_out = (float(trim_out) if trim_out and trim_out > 0
+                          else float('inf'))
+        # Неподвижные накладки Монтажа (логотип/водяной знак): [(BGRA, x, y)] в
+        # пикселях кадра. Обычный экспорт вшивает их фильтром overlay=…, но этот
+        # путь собирает кадры сам — подмешиваем их тем же blend_bgra.
+        self._static = list(static_overlays or [])
+        self._cancel = False
+        self._procs = []
+        self._tmp = None
+
+    def cancel(self):
+        """Просит прервать обработку и мгновенно валит оба ffmpeg."""
+        self._cancel = True
+        for p in list(self._procs):
+            try:
+                if p is not None and p.poll() is None:
+                    p.terminate()
+            except Exception:
+                pass
+
+    # Единообразная остановка в EditTab.shutdown (как у остальных воркеров).
+    def stop(self):
+        self.cancel()
+
+    def _popen(self, cmd, **kw):
+        if os.name == 'nt':
+            kw['creationflags'] = CREATE_NO_WINDOW
+        p = subprocess.Popen(cmd, **kw)
+        self._procs.append(p)
+        return p
+
+    def _scaled_overlay(self, cache, scale):
+        """Накладка, масштабированная под текущий размер рамки. Масштаб округляем
+        до 2% — иначе cv2.resize дёргается на каждом кадре без видимой разницы."""
+        import cv2
+        q = max(0.25, min(4.0, round(float(scale) / 0.02) * 0.02))
+        got = cache.get(q)
+        if got is not None:
+            return got
+        oh, ow = self._ovl.shape[:2]
+        nw, nh = max(1, int(round(ow * q))), max(1, int(round(oh * q)))
+        interp = cv2.INTER_AREA if q < 1.0 else cv2.INTER_LINEAR
+        img = self._ovl if q == 1.0 else cv2.resize(self._ovl, (nw, nh),
+                                                    interpolation=interp)
+        if len(cache) > 64:
+            cache.clear()
+        cache[q] = img
+        return img
+
+    def run(self):
+        import numpy as np
+        tracker = None
+        if self._boxes is None:
+            try:
+                from dyhit_tracker import create_tracker
+            except Exception as e:                   # pragma: no cover
+                self.failed.emit(f"Отслеживание недоступно: {e}")
+                return
+
+        frame_bytes = self._w * self._h * 3
+        span_total = (min(self._duration, self._trim_out) - self._trim_in
+                      if self._duration > 0 else 0.0)
+        total = int(span_total * self._fps) if span_total > 0 else 0
+        base_area = max(1.0, self._box0[2] * self._box0[3])
+        cache = {}
+        dec = enc = None
+        try:
+            if self._boxes is None:
+                self.progress.emit(-1, "Подготовка трекера…")
+                tracker = create_tracker(prefer=self._prefer,
+                                         smooth=self._smooth, fps=self._fps)
+                tracker.warmup()
+            else:
+                self.progress.emit(-1, "Подготовка…")
+            if self._cancel:
+                raise RuntimeError("Отменено")
+
+            out_tmp = os.path.join(tempfile.gettempdir(),
+                                   f"sihyx_track_{os.getpid()}_{id(self)}"
+                                   + os.path.splitext(self._out)[1])
+            self._tmp = out_tmp
+
+            # Обрезка: перемотка ДО -i (быстро) + длительность отрезка. Время
+            # кадра дальше считаем от trim_in, поэтому накладка встаёт на те же
+            # кадры, что и в предпросмотре.
+            trim_args = []
+            if self._trim_in > 0.001:
+                trim_args += ["-ss", f"{self._trim_in:.6f}"]
+            span = (self._trim_out - self._trim_in
+                    if self._trim_out != float('inf') else 0.0)
+            dur_args = ["-t", f"{span:.6f}"] if span > 0.001 else []
+            dec_cmd = ([FFMPEG, "-hide_banner", "-nostdin"] + trim_args
+                       + ["-i", self._src] + dur_args
+                       + ["-an", "-sn", "-dn", "-f", "rawvideo",
+                          "-pix_fmt", "bgr24", "-"])
+            enc_cmd = [FFMPEG, "-hide_banner", "-nostdin", "-y",
+                       "-f", "rawvideo", "-pixel_format", "bgr24",
+                       "-video_size", f"{self._w}x{self._h}",
+                       "-framerate", f"{self._fps:.6f}", "-i", "-"]
+            if self._w % 2 or self._h % 2:
+                # yuv420p требует чётных сторон — редкие нечётные размеры
+                # (кадрированные исходники) иначе роняют кодировщик.
+                enc_cmd += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+            if self._has_audio:
+                enc_cmd += (trim_args + ["-i", self._src] + dur_args
+                            + ["-map", "0:v:0", "-map", "1:a:0?",
+                               "-c:a", "aac", "-b:a", "192k"])
+            else:
+                enc_cmd += ["-map", "0:v:0"]
+            enc_cmd += self._venc + ["-pix_fmt", "yuv420p",
+                                     "-movflags", "+faststart", "-shortest", out_tmp]
+
+            dec = self._popen(dec_cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL)
+            enc = self._popen(enc_cmd, stdin=subprocess.PIPE,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            buf = bytearray(frame_bytes)
+            view = memoryview(buf)
+            idx = 0
+            started = False
+            phase = ("Наложение на кадры…" if self._boxes is not None
+                     else "Отслеживание объекта…")
+            self.progress.emit(0, phase)
+            while True:
+                if self._cancel:
+                    raise RuntimeError("Отменено")
+                # readinto по кускам: pipe отдаёт данные порциями, а кадр нам
+                # нужен целиком (иначе картинка «поедет» на полкадра).
+                got = 0
+                while got < frame_bytes:
+                    n = dec.stdout.readinto(view[got:])
+                    if not n:
+                        break
+                    got += n
+                if got < frame_bytes:
+                    break                      # видео кончилось
+                frame = np.frombuffer(buf, np.uint8).reshape(self._h, self._w, 3).copy()
+
+                t = self._trim_in + idx / self._fps
+                if self._start <= t <= self._end:
+                    if self._boxes is not None:
+                        box = track_box_at(self._boxes, t, self._start, self._fps)
+                        started = True
+                    elif not started:
+                        tracker.init(frame, self._box0)
+                        box = list(self._box0)
+                        started = True
+                    else:
+                        box, _score = tracker.update(frame)
+                    if self._scale_with_box:
+                        scale = math.sqrt(max(1.0, box[2] * box[3]) / base_area)
+                        ovl = self._scaled_overlay(cache, scale)
+                    else:
+                        ovl = self._ovl
+                    x, y = overlay_top_left(box, ovl.shape[1], ovl.shape[0],
+                                            self._anchor, *self._off)
+                    blend_bgra(frame, ovl, x, y)
+
+                for sovl, sx, sy in self._static:
+                    blend_bgra(frame, sovl, sx, sy)
+
+                try:
+                    enc.stdin.write(frame.tobytes())
+                except (BrokenPipeError, OSError):
+                    raise RuntimeError("Кодировщик неожиданно завершился")
+
+                idx += 1
+                if total > 0 and idx % 5 == 0:
+                    pct = max(0, min(97, int(97 * idx / total)))
+                    self.progress.emit(pct, f"{phase} кадр {idx}/{total}")
+
+            if self._cancel:
+                # Декодер убит отменой — поток кадров просто оборвался.
+                raise RuntimeError("Отменено")
+            if idx == 0:
+                raise RuntimeError("В видео не найдено кадров")
+
+            self.progress.emit(98, "Сборка видео…")
+            try:
+                enc.stdin.close()
+            except Exception:
+                pass
+            rc = enc.wait()
+            try:
+                dec.stdout.close()
+                dec.wait(timeout=10)
+            except Exception:
+                pass
+            if self._cancel:
+                raise RuntimeError("Отменено")
+            if rc != 0:
+                raise RuntimeError("Не удалось собрать видео")
+
+            # Ленивый импорт (edit_tab зависит от этого модуля — цикл разрывается
+            # тем, что импорт происходит уже во время работы воркера).
+            from edit_tab import EditTab
+            final = EditTab._replace_tolerant(out_tmp, self._out)
+            self._tmp = None
+            self.done.emit(final)
+        except Exception as e:
+            msg = str(e)
+            self.failed.emit("Отменено" if (self._cancel or msg == "Отменено") else msg)
+        finally:
+            for p in (dec, enc):
+                try:
+                    if p is not None and p.poll() is None:
+                        p.terminate()
+                        p.wait(timeout=5)
+                except Exception:
+                    pass
+            self._procs = []
+            try:
+                if self._tmp and os.path.exists(self._tmp):
+                    os.remove(self._tmp)
             except Exception:
                 pass
 

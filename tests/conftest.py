@@ -4,20 +4,16 @@
 КРИТИЧНО: тесты никогда не должны трогать реальные пользовательские файлы:
   • config.SETTINGS_FILE указывает на настоящий %APPDATA%\\unified_media_tool —
     во всех тестах он подменяется на файл во временной папке (autouse-фикстура);
-  • пакет sigstats хранит БД/кэши рядом с проектом — переменные окружения
-    SIGSTATS_HOME / SIGSTATS_DB выставляются во временную папку ДО первого
-    импорта sigstats.config (ниже, на уровне модуля);
   • siquester.persistence пишет в Path.home() — пути подменяются фикстурой.
+
+Сеть в тестах запрещена целиком (см. блок «Запрет реальной сети» ниже): HTTP
+везде мокается FakeSession, а фоновые QRunnable вкладок доходили до настоящего
+requests.post и роняли процесс целиком.
 """
 import os
+import socket
 import sys
-import tempfile
 import zipfile
-
-# ── Изоляция sigstats ДО любого импорта пакета ────────────────────────────────
-_SIGSTATS_TMP = tempfile.mkdtemp(prefix="sihyx_test_sigstats_")
-os.environ.setdefault("SIGSTATS_HOME", _SIGSTATS_TMP)
-os.environ.setdefault("SIGSTATS_DB", os.path.join(_SIGSTATS_TMP, "test_sigstats.db"))
 
 # Корень проекта в sys.path (тесты запускаются из корня, но подстрахуемся).
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -25,6 +21,84 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 import pytest
+
+
+# ── Запрет реальной сети ─────────────────────────────────────────────────────
+# Полный прогон падал не тестом, а «Windows fatal exception: access violation»:
+# вкладка «Генерация аниме-пака» через 1.5 с после создания запускала в
+# QThreadPool задачу за списком жанров Shikimori, и поток оставался висеть в
+# socket.getaddrinfo, пока Qt и интерпретатор сносили объекты вокруг него. Ловилось
+# не всегда — таймер успевал сработать, только если чей-то цикл событий крутился
+# достаточно долго, поэтому краш плавал от прогона к прогону.
+#
+# Затыкаем на уровне сокетов, а не отдельных клиентов: так запрет действует и на
+# requests, и на urllib, и на любую будущую библиотеку, и — что важнее — держится
+# между тестами, а не только внутри одного (фоновый поток стартует когда угодно).
+# Петля (127.0.0.1/::1) разрешена: на ней держится socket.socketpair, через
+# который asyncio на Windows будит свой цикл.
+NETWORK_ATTEMPTS: list = []          # (host, port) всех попыток — для проверок
+
+
+class NetworkBlocked(RuntimeError):
+    """Тест попытался выйти в интернет. Мокайте клиента (см. FakeSession)."""
+
+
+def _is_loopback(host) -> bool:
+    if host in (None, "", "localhost", "::1", "0.0.0.0", "::"):
+        return True
+    return isinstance(host, str) and host.startswith("127.")
+
+
+def _block(host, port=None):
+    NETWORK_ATTEMPTS.append((host, port))
+    raise NetworkBlocked(
+        f"Тесты не ходят в сеть, а этот пошёл: {host}:{port}. "
+        "Подмените HTTP-клиент (tests/conftest.py: FakeSession) или отмените "
+        "фоновую задачу вкладки."
+    )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def block_network():
+    """Рубит наружные соединения на всю сессию (в т.ч. в фоновых потоках)."""
+    real_getaddrinfo = socket.getaddrinfo
+    real_create_connection = socket.create_connection
+    real_connect = socket.socket.connect
+
+    def getaddrinfo(host, port, *a, **kw):
+        if not _is_loopback(host):
+            _block(host, port)
+        return real_getaddrinfo(host, port, *a, **kw)
+
+    def create_connection(address, *a, **kw):
+        if not _is_loopback(address[0] if address else None):
+            _block(*address[:2])
+        return real_create_connection(address, *a, **kw)
+
+    def connect(self, address, *a, **kw):
+        # Юникс-сокеты и прочие семейства адресуются не парой (host, port) —
+        # такие пропускаем, наружу они всё равно не ведут.
+        if isinstance(address, tuple) and address and not _is_loopback(address[0]):
+            _block(*address[:2])
+        return real_connect(self, address, *a, **kw)
+
+    socket.getaddrinfo = getaddrinfo
+    socket.create_connection = create_connection
+    socket.socket.connect = connect
+    try:
+        yield NETWORK_ATTEMPTS
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
+        socket.create_connection = real_create_connection
+        socket.socket.connect = real_connect
+
+
+@pytest.fixture
+def network_attempts(block_network):
+    """Попытки выйти в сеть за время теста (список пар host/port)."""
+    block_network.clear()
+    yield block_network
+    block_network.clear()
 
 
 # ── QApplication (одно на сессию) ─────────────────────────────────────────────
@@ -54,6 +128,28 @@ def isolate_settings(tmp_path, monkeypatch):
         mod = sys.modules.get(mod_name)
         if mod is not None and hasattr(mod, "SETTINGS_FILE"):
             monkeypatch.setattr(mod, "SETTINGS_FILE", fake, raising=True)
+    # Генератор аниме-паков держит рядом с настройками кэш каталога Shikimori и
+    # память о показанных кадрах — они тоже в настоящем %APPDATA%.
+    animepack = sys.modules.get("animepack")
+    if animepack is not None:
+        monkeypatch.setattr(animepack, "SHIKI_CACHE_FILE",
+                            str(tmp_path / "animepack_shikimori_db.json"),
+                            raising=True)
+        monkeypatch.setattr(animepack, "FRAMES_HISTORY_FILE",
+                            str(tmp_path / "animepack_frames_used.json"),
+                            raising=True)
+    # Общая кладовая обложек (генератор + апгрейд) тоже живёт рядом с
+    # настройками: без подмены тесты складывали бы туда свои фальшивые картинки,
+    # а следующий тест находил бы их и «скачивал» постер там, где его нет.
+    pcache = sys.modules.get("poster_cache")
+    if pcache is not None:
+        monkeypatch.setattr(pcache, "POSTER_CACHE_DIR",
+                            str(tmp_path / "animepack_posters"), raising=True)
+    # Кэш миниатюр ленты «последние файлы» — тоже рядом с настройками.
+    wdg = sys.modules.get("widgets")
+    if wdg is not None and hasattr(wdg, "_THUMB_CACHE_DIR"):
+        monkeypatch.setattr(wdg, "_THUMB_CACHE_DIR",
+                            str(tmp_path / "thumb_cache"), raising=True)
     yield
 
 
@@ -160,28 +256,6 @@ def make_siq(tmp_path):
         return str(path)
 
     return _make
-
-
-# ── Временная БД sigstats на тест ────────────────────────────────────────────
-@pytest.fixture
-def sigstats_db(tmp_path, monkeypatch):
-    """Свежая изолированная SQLite-БД sigstats + подмена всех путей пакета."""
-    from sigstats import config as scfg
-    from sigstats import db as sdb
-    from pathlib import Path
-
-    monkeypatch.setattr(scfg, "BASE_DIR", Path(tmp_path))
-    monkeypatch.setattr(scfg, "DB_PATH", Path(tmp_path / "sigstats.db"))
-    monkeypatch.setattr(scfg, "PACKAGES_DIR", Path(tmp_path / "packages"))
-    monkeypatch.setattr(scfg, "MEDIA_DIR", Path(tmp_path / "media"))
-    monkeypatch.setattr(scfg, "BLACKLIST_PATH", Path(tmp_path / "author_blacklist.json"))
-    monkeypatch.setattr(scfg, "PLAYED_PATH", Path(tmp_path / "played_packages.json"))
-    monkeypatch.setattr(scfg, "SEARCH_CACHE_PATH", Path(tmp_path / "search_page_cache.json"))
-    monkeypatch.setattr(scfg, "UI_SETTINGS_PATH", Path(tmp_path / "ui_settings.json"))
-    sdb.init_db()
-    conn = sdb.connect()
-    yield conn
-    conn.close()
 
 
 # ── Простейший фейковый HTTP-ответ/сессия ────────────────────────────────────

@@ -22,7 +22,7 @@ from PyQt6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QLineEdit, QCheckBox, QTreeWidget, QTreeWidgetItem, QFileDialog,
-    QMessageBox, QMenu, QAbstractItemView, QHeaderView,
+    QMessageBox, QMenu, QAbstractItemView, QHeaderView, QApplication,
 )
 from msgbox import msgbox_critical, msgbox_warning, msgbox_information, msgbox_question
 
@@ -78,6 +78,7 @@ class LeaderboardTab(QWidget):
         self._data = {}
         self._path = ""
         self._dirty = False          # есть несохранённые изменения
+        self._undo_stack = []        # стек убранных записей: [[(diff, rec_id, rec), ...], ...]
         self.setAcceptDrops(True)
 
         root = QVBoxLayout(self)
@@ -101,6 +102,12 @@ class LeaderboardTab(QWidget):
         flt = QHBoxLayout()
         flt.addWidget(QLabel("Сложность:"))
         self.cmb_diff = QComboBox()
+        # AdjustToContents (не дефолтный AdjustToContentsOnFirstShow) — иначе
+        # ширина считается один раз по «Все» ДО загрузки файла и не растёт под
+        # реальные имена сложностей ("easy"/"normal"/...), из-за чего текст
+        # обрезается в комбобоксе.
+        self.cmb_diff.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_diff.setMinimumContentsLength(8)
         self.cmb_diff.addItem(_ALL)
         self.cmb_diff.currentIndexChanged.connect(self._rebuild)
         flt.addWidget(self.cmb_diff)
@@ -147,7 +154,8 @@ class LeaderboardTab(QWidget):
         hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         root.addWidget(self.tree, 1)
 
-        # Delete — убрать выделенные строки из списка.
+        # Delete — убрать выделенные строки из списка. Key_Delete не буква,
+        # раскладку не переводит — обычный QShortcut годится.
         sc = QShortcut(QKeySequence(Qt.Key.Key_Delete), self.tree)
         sc.activated.connect(self._remove_selected)
 
@@ -160,7 +168,8 @@ class LeaderboardTab(QWidget):
 
         self.btn_remove = QPushButton("Убрать из списка")
         self.btn_remove.setIcon(get_icon('fa5s.user-slash'))
-        self.btn_remove.setToolTip("Удалить выделенные записи (клавиша Delete)")
+        self.btn_remove.setToolTip(
+            "Удалить выделенные записи (клавиша Delete, отмена — Ctrl+Z)")
         self.btn_remove.clicked.connect(self._remove_selected)
         bot.addWidget(self.btn_remove)
 
@@ -173,6 +182,37 @@ class LeaderboardTab(QWidget):
         root.addLayout(bot)
 
         self._refresh_enabled()
+
+    # Ctrl+C/Ctrl+Z/Ctrl+A — буквенные сочетания с Ctrl. QShortcut(QKeySequence(
+    # "Ctrl+..")) на кириллической (ЙЦУКЕН) раскладке не срабатывает: физическая
+    # клавиша шлёт Qt-код УЖЕ переведённой раскладкой буквы, а не Key_C/Z/A (см.
+    # тот же приём в edit_tab.py keyPressEvent, tabs.py MediaTab.keyPressEvent).
+    # Поэтому ловим по nativeVirtualKey (не зависит от раскладки) с фолбэком на
+    # event.key() для латиницы. QTreeWidget не обрабатывает эти сочетания сам —
+    # необработанное событие всплывает сюда, в keyPressEvent вкладки.
+    _VK_C = 0x43
+    _VK_Z = 0x5A
+    _VK_A = 0x41
+
+    def keyPressEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            try:
+                vk = event.nativeVirtualKey()
+            except Exception:
+                vk = 0
+            if vk == self._VK_C or event.key() == Qt.Key.Key_C:
+                self._copy_selected()
+                event.accept()
+                return
+            if vk == self._VK_Z or event.key() == Qt.Key.Key_Z:
+                self._undo_remove()
+                event.accept()
+                return
+            if vk == self._VK_A or event.key() == Qt.Key.Key_A:
+                self.tree.selectAll()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     # ──────────────────────────────────────────────────────────────────────
     # Загрузка
@@ -357,16 +397,36 @@ class LeaderboardTab(QWidget):
             return
 
         scores = self._data.get("scores", {})
-        removed = 0
+        removed_batch = []
         for diff, rec_id in refs:
             block = scores.get(diff)
             if isinstance(block, dict) and rec_id in block:
-                del block[rec_id]
-                removed += 1
-        if removed:
+                removed_batch.append((diff, rec_id, block.pop(rec_id)))
+        if removed_batch:
+            self._undo_stack.append(removed_batch)
             self._dirty = True
-            self._log(f"Убрано записей: {removed}")
+            self._log(f"Убрано записей: {len(removed_batch)}")
             self._rebuild()
+
+    def _undo_remove(self):
+        """Ctrl+Z — вернуть последнюю убранную группу записей."""
+        if not self._undo_stack or not self._data:
+            return
+        batch = self._undo_stack.pop()
+        scores = self._data.setdefault("scores", {})
+        for diff, rec_id, rec in batch:
+            scores.setdefault(diff, {})[rec_id] = rec
+        self._dirty = True
+        self._log(f"Отмена удаления: возвращено записей — {len(batch)}")
+        self._rebuild()
+
+    def _copy_selected(self):
+        """Ctrl+C — скопировать никнеймы выделенных строк в буфер обмена."""
+        items = self.tree.selectedItems()
+        if not items:
+            return
+        names = [it.text(1) for it in items]  # колонка 1 — «Никнейм»
+        QApplication.clipboard().setText("\n".join(names))
 
     # ──────────────────────────────────────────────────────────────────────
     # Сохранение

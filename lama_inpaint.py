@@ -406,6 +406,37 @@ def _worker_loop(conn):
             conn.send(("error", str(e)))
 
 
+def _child_death_reason(exitcode):
+    """Человеческая причина обрыва дочернего процесса по его коду выхода.
+
+    EOFError/BrokenPipeError сами по себе пустые (str(e) == ""), и сообщение
+    вида «Процесс прервался: » не говорило пользователю ничего. Коды Windows
+    известны: 0xC0000005 — обращение по неверному адресу (обычно сбой в
+    onnxruntime/OpenCV), 0xC0000409 — порча стека, 1 — необработанное
+    исключение в дочернем процессе (его traceback уже в консоли)."""
+    known = {
+        -1073741819: "сбой в библиотеке модели (0xC0000005)",
+        -1073741571: "переполнение стека (0xC00000FD)",
+        -1073740791: "порча стека (0xC0000409)",
+        -1073741801: "не хватило памяти (0xC0000017)",
+    }
+    if exitcode is None:
+        return "процесс не ответил"
+    if exitcode in known:
+        return known[exitcode]
+    if exitcode == 1:
+        return "ошибка внутри процесса (подробности в консоли)"
+    return f"код выхода {exitcode}"
+
+
+class ModelCancelled(RuntimeError):
+    """Работу прервал сам пользователь (кнопка «Отмена») — не ошибка.
+
+    Отличается от настоящего краха атрибутом `cancelled`: по нему воркеры
+    не печатают traceback в консоль и не показывают окно с ошибкой."""
+    cancelled = True
+
+
 class LaMaProcessInpainter:
     """Тот же интерфейс, что у LaMaInpainter (is_available/warmup/inpaint/
     device_label), но ONNX-сессия исполняется в дочернем процессе.
@@ -423,6 +454,7 @@ class LaMaProcessInpainter:
         self._device = "—"
         self._fallback = None            # LaMaInpainter, если процесс не поднялся
         self._lock = threading.Lock()
+        self._cancelled = False          # обрыв пайпа — наших рук дело («Отмена»)
 
     def is_available(self) -> bool:
         return cv2 is not None and os.path.exists(self.model_path)
@@ -473,6 +505,7 @@ class LaMaProcessInpainter:
     def inpaint(self, img_bgr, mask, pad: int = 32, dilate: int = 4,
                 feather: float = 2.0, progress=None):
         with self._lock:
+            self._cancelled = False
             if self._fallback is not None:
                 return self._fallback.inpaint(
                     img_bgr, mask, pad=pad, dilate=dilate,
@@ -498,9 +531,15 @@ class LaMaProcessInpainter:
                         return rec[1]
                     elif tag == "error":
                         raise RuntimeError(rec[1])
-            except (EOFError, BrokenPipeError, ConnectionResetError) as e:
+            except (EOFError, BrokenPipeError, ConnectionResetError):
+                # См. rmbg_bg: обрыв пайпа — это и штатная отмена тоже.
+                cancelled = self._cancelled
+                code = self._proc.exitcode if self._proc is not None else None
                 self._kill_proc()
-                raise RuntimeError(f"Процесс обработки прервался: {e}")
+                if cancelled:
+                    raise ModelCancelled("Обработка отменена")
+                raise RuntimeError("Процесс обработки прервался: "
+                                   + _child_death_reason(code))
 
     def unload(self):
         """Выгружает модель из ОЗУ: убивает дочерний процесс (или сбрасывает
@@ -515,6 +554,7 @@ class LaMaProcessInpainter:
         self._lock — в отличие от unload(), лок НЕ берём (иначе дедлок: поток
         обработки держит лок, пока не разблокируется чтением из закрытого
         пайпа). Закрытие пайпа/kill процесса безопасно вызывать конкурентно."""
+        self._cancelled = True
         self._kill_proc()
 
     def _kill_proc(self):

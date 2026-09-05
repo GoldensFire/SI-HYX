@@ -57,7 +57,7 @@ import random
 import functools
 
 
-import requests
+# requests подключается лениво — см. _requests() ниже
 
 
 from pathlib import Path
@@ -113,6 +113,7 @@ import qtawesome as qta
 # ║  использовать эмодзи. Все новые иконки добавлять строго через метод/       ║
 # ║  функцию get_icon() из библиотеки qtawesome!                              ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
+@functools.lru_cache(maxsize=512)
 def get_icon(name, color='#cdd6f4', overlay=None, overlay_color=None):
     """Единая точка создания иконок интерфейса. У приложения ТОЛЬКО тёмная тема,
     поэтому по умолчанию иконки светлые — но не «жёсткий» белый, а мягкий
@@ -121,7 +122,14 @@ def get_icon(name, color='#cdd6f4', overlay=None, overlay_color=None):
     scale_factor<1 даёт глифу поля внутри иконки — он не упирается в края кнопки.
     name — имя иконки из паков Font Awesome 5 Solid (fa5s.*) или Material Design (mdi6.*).
     overlay — доп. глиф маленьким значком в правом нижнем углу (составная иконка
-    для двух одновременных статусов, например «есть комментарий» + «скачан»)."""
+    для двух одновременных статусов, например «есть комментарий» + «скачан»).
+
+    Результат КЭШИРУЕТСЯ (lru_cache): на старте набегает ~300 вызовов всего на
+    ~70 разных значков — одну и ту же info-circle просили под 60 раз. QIcon в Qt
+    разделяемый и только для чтения (setIcon копирует его по значению), поэтому
+    отдавать один объект нескольким кнопкам безопасно. НО: никогда не вызывайте
+    у результата addPixmap()/addFile() — это испортит значок всем, кто получил
+    его из кэша; нужен другой значок — просите его с другими аргументами."""
     if overlay:
         return qta.icon(name, overlay, color=color, options=[
             {'scale_factor': 0.8},
@@ -135,9 +143,13 @@ def get_icon_pixmap(name, size=16, color='white'):
     return get_icon(name, color=color).pixmap(QSize(size, size))
 
 
-def icon_html(name, size=16, color='white'):
+def icon_html(name, size=16, color='white', style=''):
     """Иконка как <img …> для вставки в rich-text (QLabel/HTML), где нельзя
-    использовать setIcon(). Заменяет инлайновые эмодзи в HTML-подписях."""
+    использовать setIcon(). Заменяет инлайновые эмодзи в HTML-подписях.
+
+    `style` — доп. CSS для самого <img>: например `vertical-align:middle`,
+    иначе значок стоит на базовой линии строки и выглядит поднятым над
+    текстом (см. карточку пака в «Поиске пакетов»)."""
     from PyQt6.QtCore import QBuffer
     pm = get_icon_pixmap(name, size, color)
     ba = QByteArray()
@@ -146,8 +158,9 @@ def icon_html(name, size=16, color='white'):
     pm.save(buf, 'PNG')
     buf.close()
     b64 = bytes(ba.toBase64()).decode('ascii')
+    css = f" style='{style}'" if style else ""
     return (f"<img src='data:image/png;base64,{b64}' "
-            f"width='{size}' height='{size}'>")
+            f"width='{size}' height='{size}'{css}>")
 
 
 def status_html(icon_name, text, color='white', size=13):
@@ -159,10 +172,12 @@ def status_html(icon_name, text, color='white', size=13):
 
 
 # Optional libs
-try:
-    import yt_dlp
-except Exception:
-    yt_dlp = None
+# yt-dlp НЕ импортируется как модуль: программа всегда зовёт его отдельным
+# процессом (bin\yt-dlp.exe, системный yt-dlp или `python -m yt_dlp` в dev —
+# см. ytdlp_base_cmd ниже), а ни одного обращения к API пакета в коде нет.
+# Импорт стоил ~340 мс на каждом запуске и тянул за собой Cryptodome, curl_cffi,
+# chardet и websockets — всё это ради переменной, которую никто не читал.
+# Если когда-нибудь понадобится API — импортируйте его ЛЕНИВО, внутри функции.
 
 
 try:
@@ -182,13 +197,41 @@ except Exception:
     pillow_heif = None
 
 
+# ── Сеть: requests подключается ЛЕНИВО ──────────────────────────────────────
 # requests сам поставляет certifi-бандл и проверяет сертификаты — это решает
 # CERTIFICATE_VERIFY_FAILED в собранном .exe / Windows Sandbox без системных CA.
-try:
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except Exception:
-    pass
+#
+# Но импортировать его на старте незачем: первым в сеть выходит автообновление
+# через 2.5 секунды после показа окна, и делает это из ФОНОВОГО потока. Импорт
+# на уровне модуля стоил ~240 мс перед появлением окна (сам requests + urllib3 +
+# ssl + charset_normalizer), поэтому он перенесён внутрь _requests().
+#
+# Модульный __getattr__ ниже оставляет привычным `config.requests` — им
+# пользуются тесты, подменяя requests.get/Session.
+_requests_mod = None
+
+
+def _requests():
+    """Модуль requests: импортируем при первом обращении и запоминаем."""
+    global _requests_mod
+    if _requests_mod is None:
+        import requests as _r
+        try:
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
+        _requests_mod = _r
+    return _requests_mod
+
+
+def __getattr__(name):
+    # PEP 562: срабатывает только на `config.requests` извне модуля. Внутри
+    # самого config всегда зовите _requests() — глобальные имена ищутся в
+    # __dict__ напрямую, мимо этого хука.
+    if name == "requests":
+        return _requests()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class _Resp:
@@ -230,6 +273,7 @@ def http_get(url, headers=None, timeout=30, stream=True, allow_insecure=True):
     автообновления: иначе MITM мог бы подсунуть вредоносный .exe (повтор без
     проверки = установка непроверенного кода = RCE).
     Возвращает _Resp (совместим со старым urllib-кодом)."""
+    requests = _requests()
     h = headers or {}
     try:
         r = requests.get(url, headers=h, timeout=timeout, stream=stream)
@@ -527,7 +571,7 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.5.5"
+APP_VERSION = "0.6.0"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # Необязательное обновление: перед сборкой (build.bat) поставь True, если этот
 # релиз НЕ должен всплывать плашкой у уже установленных пользователей — сам
@@ -550,13 +594,6 @@ ERROR_REPORT_URL = "https://bold-shadow-2a11.longld342.workers.dev/"
 # который принимает/отдаёт текстовый обзор пака по коду комнаты. Пусто →
 # в самой вкладке можно вписать адрес вручную (поле «Сервер»). См. coop_worker.js.
 COOP_SYNC_URL = ""
-# Публикация тир-листа сыгранных паков (кнопка «Опубликовать» в окне тир-листа):
-# Cloudflare Worker + KV, который принимает модель тир-листа и отдаёт готовую
-# HTML-страницу по постоянной ссылке. Каждый пользователь поднимает СВОЙ воркер
-# (см. DEPLOY_TIER.md) и вписывает его адрес в окне публикации — адрес хранится
-# в его личном tier_list.json, а не тут. Здесь пусто СПЕЦИАЛЬНО: нельзя зашивать
-# чужой сервер, иначе все публикуют в чужое KV-хранилище.
-TIER_LIST_PUBLISH_URL = ""
 HTTP_PORT = 7432  # порт локального сервера для браузерного расширения
 
 # Метка для пунктов выпадающих списков, которые являются значением по умолчанию.

@@ -369,12 +369,15 @@ class TestDownloadCdnDirect:
         assert any("100%" in l for l in logs)
 
     def test_unsafe_chars_sanitized(self, monkeypatch, tmp_path):
+        """Режем только запрещённое файловой системой: пробелы и прочие законные
+        символы имени остаются (по просьбе — файлы называются как в источнике)."""
         monkeypatch.setattr(utils, "http_get",
                             lambda url, **kw: _FakeHttpResp(b"x"))
         out = utils.download_cdn_direct(
-            "https://v.fbcdn.net/dir/we%20ird$name!.mp4", str(tmp_path))
+            "https://v.fbcdn.net/dir/we%20ird$name!%3Cbad%3E.mp4", str(tmp_path))
         name = os.path.basename(out)
-        assert " " not in name and "$" not in name and "!" not in name
+        assert "<" not in name and ">" not in name
+        assert name.startswith("we ird$name!")
         assert name.endswith(".mp4")
 
     def test_no_extension_gets_mp4(self, monkeypatch, tmp_path):
@@ -397,6 +400,35 @@ class TestDownloadCdnDirect:
         monkeypatch.setattr(utils, "http_get", boom)
         with pytest.raises(OSError):
             utils.download_cdn_direct("https://v.fbcdn.net/f.mp4", str(tmp_path))
+
+
+# ── reveal_in_explorer ───────────────────────────────────────────────────────
+class TestRevealInExplorer:
+    """«Открыть в проводнике» открывало «Документы» вместо пака: аргументы
+    списком заставляют subprocess взять в кавычки «/select,путь» ЦЕЛИКОМ, а
+    explorer такую строку не разбирает и уходит в папку по умолчанию."""
+
+    def _patch(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(utils.os, "name", "nt")
+        monkeypatch.setattr(utils.subprocess, "Popen", lambda cmd, **kw: seen.append(cmd))
+        return seen
+
+    def test_quotes_wrap_only_the_path(self, monkeypatch, tmp_path):
+        seen = self._patch(monkeypatch)
+        target = tmp_path / "Аниме пак(изи).siq"
+        target.write_bytes(b"x")
+        assert utils.reveal_in_explorer(target) is True
+        assert len(seen) == 1
+        cmd = seen[0]
+        assert isinstance(cmd, str)          # список снова всё сломает
+        assert cmd == f'explorer /select,"{target}"'
+
+    def test_missing_file_does_not_open_anything(self, monkeypatch, tmp_path):
+        """Иначе explorer откроет «Документы» — хуже, чем не открыть ничего."""
+        seen = self._patch(monkeypatch)
+        assert utils.reveal_in_explorer(tmp_path / "нет.siq") is False
+        assert seen == []
 
 
 # ── play_done_sound ──────────────────────────────────────────────────────────

@@ -37,9 +37,16 @@ def _read_bool_setting(key, default=False):
         return default
 
 
-# Программный рендер видео отключён всегда (настройка убрана из UI): окно видео
-# идёт по аппаратному D3D/GL-свопчейну.
-os.environ.setdefault("QSG_RHI_BACKEND", "opengl")
+# Графический бэкенд сцены Qt Quick (на нём работает холст видео «Монтажа» —
+# см. VideoCanvas). Программный рендер отключён всегда (настройка убрана из UI),
+# а из двух аппаратных на Windows берём РОДНОЙ D3D11: замер того же холста на
+# одном файле (tools/bench_video_path.py, режим montage, 1080p60, окно
+# 1100x640) — d3d11 ЦП 19.7%, GUI-поток 5.3%; opengl ЦП 50.5%, GUI-поток 12.9%.
+# Здесь opengl остался с тех пор, когда единственной альтернативой был
+# "software" (обходной путь для оверлея RivaTuner), и осознанным выбором против
+# d3d11 никогда не был. setdefault сохраняет приоритет за переменной окружения:
+# QSG_RHI_BACKEND=opengl снаружи по-прежнему всё переключает обратно.
+os.environ.setdefault("QSG_RHI_BACKEND", "d3d11" if os.name == "nt" else "opengl")
 # QT_FFMPEG_DECODING_HW_DEVICE_TYPES (HW-декодер H.264/HEVC) задаёт config.py,
 # импортируемый выше, — он читает настройку video_hw_decode.
 os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")
@@ -60,7 +67,8 @@ except Exception:
 # Мультимедиа PyQt6 поставляется вместе с основным wheel'ом, но на некоторых
 # урезанных сборках его может не быть — деградируем мягко (заглушка во вкладке).
 try:
-    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
+    from PyQt6.QtMultimedia import (QAudioFormat, QAudioSink, QMediaPlayer,
+                                    QAudioOutput, QVideoSink, QMediaDevices)
     from PyQt6.QtMultimediaWidgets import QVideoWidget
     _HAS_MULTIMEDIA = True
 except Exception:
@@ -71,6 +79,7 @@ except Exception:
     # проблемы не было (неопределённые имена просто не трогались под гардом
     # _HAS_MULTIMEDIA). Использовать их можно ТОЛЬКО при _HAS_MULTIMEDIA=True.
     QMediaPlayer = QAudioOutput = QVideoSink = QVideoWidget = None
+    QMediaDevices = QAudioFormat = QAudioSink = None
     _HAS_MULTIMEDIA = False
 
 # Пути к ffmpeg/ffprobe и флаг скрытия консоли берём из общей конфигурации SI-HYX,
@@ -184,6 +193,46 @@ def _fmt_channels(ainfo):
     if ch:
         return f"{ch}ch"
     return "—"
+
+
+def install_audio_device_recovery(audio_output, owner=None):
+    """Пере-привязывает QAudioOutput к текущему устройству вывода, когда набор
+    звуковых устройств меняется. Возвращает объект-наблюдатель (его надо где-то
+    держать) или None.
+
+    Зачем: сеанс WASAPI привязан к КОНКРЕТНОМУ устройству. Стоит отключить
+    наушники, выключить устройство в «Звуке» или перезапуститься драйверу — и
+    сеанс аннулируется. Qt пишет это в консоль как
+    `IAudioClient3::GetCurrentPadding failed "AUDCLNT_E_DEVICE_INVALIDATED"`,
+    а плеер остаётся с мёртвым выводом: видео идёт, звука нет до перезапуска.
+    setDevice() пересоздаёт сеанс на живом устройстве.
+
+    Громкость и «без звука» переносим руками: setDevice поднимает новый sink
+    со своими значениями по умолчанию."""
+    if QMediaDevices is None or audio_output is None:
+        return None
+    try:
+        watcher = QMediaDevices(owner if owner is not None else audio_output)
+    except Exception:
+        return None
+
+    def _reattach():
+        try:
+            dev = QMediaDevices.defaultAudioOutput()
+            if dev is None or dev.isNull():
+                return
+            vol, muted = audio_output.volume(), audio_output.isMuted()
+            audio_output.setDevice(dev)
+            audio_output.setVolume(vol)
+            audio_output.setMuted(muted)
+        except Exception:
+            pass
+
+    try:
+        watcher.audioOutputsChanged.connect(_reattach)
+    except Exception:
+        return None
+    return watcher
 
 
 def _unique_output(path: str) -> str:
@@ -571,33 +620,10 @@ def _save_subtitle_presets(presets):
         pass
 
 
-# Минимальный размер блока для ПРЕДпоследнего (последнего «блочного») шага.
-# Раньше геометрия шла до 1px, и предпоследний шаг выходил ~2px — а 2px визуально
-# почти неотличим от чёткого кадра, шаг получался «пустым». Держим пол в 6px:
-# последний блочный шаг всегда заметно пикселизирован, потом сразу «чётко».
-_PIXELIZE_MIN_BLOCK = 6
-
-
-def _pixelize_block_sequence(block0, steps):
-    """Размеры блока (px) по шагам проявления: геометрически убывают от block0 до
-    пола (_PIXELIZE_MIN_BLOCK), а самый последний шаг — «чётко» (1). Каждый
-    следующий блок мельче → «пикселей становится больше», пока кадр не прояснится.
-    При steps==1 — один статичный уровень (block0) без финального прояснения.
-    Предпоследний шаг не опускается ниже пола (5px), чтобы не было «пустого» 2px-
-    шага у самой чёткости."""
-    block0 = max(2, int(block0)); steps = max(1, int(steps))
-    if steps == 1:
-        return [max(1, min(1024, block0))]
-    floor = min(block0, _PIXELIZE_MIN_BLOCK)   # пол не выше самого block0
-    n_block = steps - 1                        # шаги до финального «чётко»
-    seq = []
-    for i in range(n_block):
-        if n_block == 1:
-            b = block0
-        else:
-            # i=0 → block0, i=n_block-1 → floor (геометрически между ними).
-            t = i / (n_block - 1)
-            b = block0 * (floor / block0) ** t
-        seq.append(max(1, min(1024, int(round(b)))))
-    seq.append(1)                              # финальный шаг — чётко
-    return seq
+# Пикселизация («проявление из пикселей») живёт в общем модуле pixelize.py:
+# тем же эффектом с теми же блоками пользуется генератор аниме-паков (вопрос-
+# кадр, который проявляется). Здесь — только привычные имена, чтобы вкладка
+# «Монтаж» и её диалоги импортировали их как раньше.
+from pixelize import (MIN_BLOCK as _PIXELIZE_MIN_BLOCK,
+                      block_sequence as _pixelize_block_sequence,
+                      pixelize_filter as _pixelize_filter)

@@ -203,6 +203,37 @@ def _worker_loop(conn):
             conn.send(("error", str(e)))
 
 
+def _child_death_reason(exitcode):
+    """Человеческая причина обрыва дочернего процесса по его коду выхода.
+
+    EOFError/BrokenPipeError сами по себе пустые (str(e) == ""), и сообщение
+    вида «Процесс прервался: » не говорило пользователю ничего. Коды Windows
+    известны: 0xC0000005 — обращение по неверному адресу (обычно сбой в
+    onnxruntime/OpenCV), 0xC0000409 — порча стека, 1 — необработанное
+    исключение в дочернем процессе (его traceback уже в консоли)."""
+    known = {
+        -1073741819: "сбой в библиотеке модели (0xC0000005)",
+        -1073741571: "переполнение стека (0xC00000FD)",
+        -1073740791: "порча стека (0xC0000409)",
+        -1073741801: "не хватило памяти (0xC0000017)",
+    }
+    if exitcode is None:
+        return "процесс не ответил"
+    if exitcode in known:
+        return known[exitcode]
+    if exitcode == 1:
+        return "ошибка внутри процесса (подробности в консоли)"
+    return f"код выхода {exitcode}"
+
+
+class ModelCancelled(RuntimeError):
+    """Работу прервал сам пользователь (кнопка «Отмена») — не ошибка.
+
+    Отличается от настоящего краха атрибутом `cancelled`: по нему воркеры
+    не печатают traceback в консоль и не показывают окно с ошибкой."""
+    cancelled = True
+
+
 class RMBGProcessRemover:
     """Тот же интерфейс (is_available/warmup/remove/device_label), но ONNX-сессия
     исполняется в дочернем процессе. Вызовы блокирующие, НО на ожидании GIL
@@ -217,6 +248,7 @@ class RMBGProcessRemover:
         self._device = "—"
         self._fallback = None
         self._lock = threading.Lock()
+        self._cancelled = False     # обрыв пайпа — наших рук дело (кнопка «Отмена»)
 
     def is_available(self) -> bool:
         return cv2 is not None and os.path.exists(self.model_path)
@@ -263,6 +295,7 @@ class RMBGProcessRemover:
 
     def remove(self, img_bgr, progress=None):
         with self._lock:
+            self._cancelled = False
             if self._fallback is not None:
                 return self._fallback.remove(img_bgr, progress=progress)
             try:
@@ -281,9 +314,18 @@ class RMBGProcessRemover:
                         return rec[1]
                     elif tag == "error":
                         raise RuntimeError(rec[1])
-            except (EOFError, BrokenPipeError, ConnectionResetError) as e:
+            except (EOFError, BrokenPipeError, ConnectionResetError):
+                # Пайп рвётся и при ШТАТНОЙ отмене (cancel() убивает процесс,
+                # чтобы разблокировать recv()) — это не авария. Раньше отсюда
+                # летел RuntimeError с ПУСТЫМ текстом (str(EOFError()) == "")
+                # и полный traceback в консоль на каждое нажатие «Отмена».
+                cancelled = self._cancelled
+                code = self._proc.exitcode if self._proc is not None else None
                 self._kill_proc()
-                raise RuntimeError(f"Процесс удаления фона прервался: {e}")
+                if cancelled:
+                    raise ModelCancelled("Удаление фона отменено")
+                raise RuntimeError("Процесс удаления фона прервался: "
+                                   + _child_death_reason(code))
 
     def unload(self):
         """Выгружает модель из ОЗУ: убивает дочерний процесс (или сбрасывает
@@ -296,6 +338,7 @@ class RMBGProcessRemover:
     def cancel(self):
         """Прерывает ТЕКУЩИЙ remove(), заблокированный на recv() внутри
         self._lock — в отличие от unload(), лок НЕ берём (иначе дедлок)."""
+        self._cancelled = True
         self._kill_proc()
 
     def _kill_proc(self):

@@ -18,6 +18,7 @@
 import datetime
 import json
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -81,13 +82,49 @@ def _q_summary(q: dict) -> dict:
             if param in ("question", "", "background") and text:
                 qtext_parts.append(text)
     answers = [a.strip() for a in q.get("answers", []) if a and a.strip()]
-    return {
+    out = {
         "price": price,
         "q": " ".join(qtext_parts).strip(),
         "a": " / ".join(answers),
         "qm": sorted(qmedia),
         "am": sorted(amedia),
     }
+    # Вопрос с выбором варианта: правильный ответ записан меткой («B»), а не
+    # текстом. Помечаем, чтобы такие ответы не сравнивались между собой (см.
+    # _is_option_answer). Ключ кладём только когда он есть — обзор уходит по
+    # сети, лишнее поле на каждый вопрос ни к чему.
+    if q.get("answer_options"):
+        out["opt"] = True
+    return out
+
+
+_OPT_PREFIXES = ("вариант", "ответ", "буква", "вар.")
+_OPT_SPLIT = re.compile(r"[,;/+&]|\bи\b|\bили\b|\s+")
+_OPT_STRIP = " .)(»«\"'`-–—:"
+
+
+def _is_option_answer(q: dict) -> bool:
+    """Ответ — это метка варианта («B», «а)», «1»), а не содержательный текст.
+
+    Такие ответы совпадают у разных авторов постоянно и к дублям отношения не
+    имеют: «B» в вопросе про резьбу и «B» в вопросе про энтомологию — разные
+    ответы. Признаём вариантом по двум признакам: в паке у вопроса есть
+    answerOptions (надёжно), либо весь ответ состоит из односимвольных меток
+    (для паков, где варианты нарисованы прямо на картинке, а в ответе стоит
+    просто буква — а также для соавторов на старой сборке, которая флаг
+    answerOptions ещё не присылает)."""
+    if q.get("opt"):
+        return True
+    ans = (q.get("a") or "").strip().lower()
+    if not ans or len(ans) > 24:
+        return False
+    for w in _OPT_PREFIXES:
+        if ans.startswith(w):
+            ans = ans[len(w):]
+            break
+    tokens = [t.strip(_OPT_STRIP) for t in _OPT_SPLIT.split(ans)]
+    tokens = [t for t in tokens if t]
+    return bool(tokens) and all(len(t) == 1 and t.isalnum() for t in tokens)
 
 
 def _q_is_filled(q: dict) -> bool:
@@ -107,6 +144,17 @@ def pack_to_outline(pkg) -> dict:
             themes.append({"name": (th.get("name", "") or "").strip(), "questions": qs})
         rounds.append({"name": (rnd.get("name", "") or "").strip(), "themes": themes})
     return {"name": getattr(pkg, "name", "") or "", "rounds": rounds}
+
+
+def normalize_room(room: str) -> str:
+    """Привести код комнаты к единому виду.
+
+    На сервере комната — это просто ключ KV, поэтому «Collab» и «collab» были
+    РАЗНЫМИ комнатами: соавторы подключались «в одну и ту же» комнату и не
+    видели друг друга вообще. Схлопываем регистр и пробелы, чтобы совпадало у
+    всех. Ровно та же нормализация продублирована в coop_worker.js — тогда
+    старые сборки, где её ещё нет, попадают в ту же комнату, что и новые."""
+    return " ".join((room or "").split()).lower()
 
 
 def normalize_url(url: str) -> str:
@@ -167,12 +215,16 @@ class _CoopSync(QObject):
     def start(self, url: str, room: str, author: str):
         self.stop()
         self._url = normalize_url(url)
-        self._room = room or ""
+        self._room = normalize_room(room)
         self._author = author or "Аноним"
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._last_published = None
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        # События отдаём потоку АРГУМЕНТАМИ, а не через self: при переподключении
+        # start() заводит новые, и старый поток, читая self._stop, видел бы уже
+        # новое (несведённое) событие и крутился бы вечно вторым опросчиком.
+        self._thread = threading.Thread(
+            target=self._run, args=(self._stop, self._wake), daemon=True)
         self._thread.start()
 
     def stop(self):
@@ -199,19 +251,21 @@ class _CoopSync(QObject):
             self._wake.set()   # вернулись на вкладку — опросить немедленно
 
     # ── рабочий цикл ─────────────────────────────────────────────────────────
-    def _run(self):
+    def _run(self, stop_ev: threading.Event, wake_ev: threading.Event):
         self.statusChanged.emit("Подключение…", _C_MUTED)
-        while not self._stop.is_set():
+        while not stop_ev.is_set():
             with self._lock:
                 pending = self._pending
                 self._pending = None
             if pending is not None and pending != self._last_published:
                 if self._do_publish(pending):
                     self._last_published = pending
+            if stop_ev.is_set():
+                return
             if self._active:
                 self._do_poll()
-            self._wake.wait(self.POLL_INTERVAL)
-            self._wake.clear()
+            wake_ev.wait(self.POLL_INTERVAL)
+            wake_ev.clear()
 
     def _endpoint(self) -> str:
         return f"{self._url}/coop/{urllib.parse.quote(self._room, safe='')}"
@@ -245,7 +299,17 @@ class _CoopSync(QObject):
                 authors = {}
             self.remoteUpdated.emit(authors)
             now = datetime.datetime.now().strftime("%H:%M:%S")
-            self.statusChanged.emit(f"В сети • обновлено {now}", _C_MINE)
+            # Если в комнате никого, кроме нас, — почти всегда это разошедшийся
+            # код комнаты (или разные адреса сервера). Говорим об этом прямо,
+            # иначе «подключено, но пусто» выглядит как молчащий напарник.
+            others = [a for a in authors if a != self._author]
+            if others:
+                self.statusChanged.emit(
+                    f"В сети • соавторов: {len(others) + 1} • обновлено {now}", _C_MINE)
+            else:
+                self.statusChanged.emit(
+                    f"В комнате «{self._room}» пока только вы — проверьте, что код "
+                    f"комнаты и адрес сервера у всех одинаковые • {now}", _C_DUP)
         except Exception as e:
             self.statusChanged.emit(f"Нет связи с комнатой: {e}", _C_WARN)
 
@@ -313,7 +377,9 @@ class CoopTab(QWidget):
         row_conn.addWidget(QLabel("Комната:"))
         self.ed_room = QLineEdit(s.get("room", "") or "")
         self.ed_room.setPlaceholderText("код пака, напр. solevaya-volevaya")
-        self.ed_room.setToolTip("Общий код комнаты — одинаковый у всех соавторов пака")
+        self.ed_room.setToolTip(
+            "Общий код комнаты — одинаковый у всех соавторов пака.\n"
+            "Регистр и лишние пробелы не важны: «Collab» и «collab» — одна комната.")
         self.ed_room.setFixedWidth(200)
         row_conn.addWidget(self.ed_room)
 
@@ -466,7 +532,7 @@ class CoopTab(QWidget):
             self._refresh_enabled()
             return
         url = normalize_url(self.ed_url.text())
-        room = self.ed_room.text().strip()
+        room = normalize_room(self.ed_room.text())
         author = self.ed_author.text().strip()
         if not url or not room or not author:
             msgbox_information(
@@ -479,8 +545,11 @@ class CoopTab(QWidget):
         """Общая точка подключения — используется и кнопкой, и автоподключением
         при запуске (если раньше уже было успешно заполнено все три поля)."""
         url = normalize_url(url)
-        # Показать пользователю уже исправленный адрес (с https://, без слэша).
+        room = normalize_room(room)
+        # Показать пользователю уже исправленные адрес (с https://, без слэша) и
+        # код комнаты — чтобы было видно, в какую комнату он реально попал.
         self.ed_url.setText(url)
+        self.ed_room.setText(room)
         self.sync.start(url, room, author)
         # Сразу опубликуем текущий обзор (если файл уже загружен).
         if self._my_outline is not None:
@@ -560,7 +629,9 @@ class CoopTab(QWidget):
                         if _q_is_filled(q):
                             n_filled_all += 1
                         ans = (q.get("a", "") or "").strip().lower()
-                        if ans:
+                        # Метки вариантов («B») в подсчёт дублей не берём —
+                        # иначе половина пака красная от совпавших букв.
+                        if ans and not _is_option_answer(q):
                             answer_authors.setdefault(ans, set()).add(author)
 
         # Порядок тем: сперва непустые (по алфавиту), затем пустые названные,
@@ -585,7 +656,8 @@ class CoopTab(QWidget):
             visible_rows = []
             for author, q, rname in qs:
                 ans = (q.get("a", "") or "").strip().lower()
-                answer_dup = len(answer_authors.get(ans, set())) > 1 if ans else False
+                answer_dup = (bool(ans) and not _is_option_answer(q)
+                              and len(answer_authors.get(ans, set())) > 1)
                 if dup_only and not (shared_theme or answer_dup):
                     continue
                 if needle:
@@ -704,7 +776,7 @@ class CoopTab(QWidget):
     def get_settings(self) -> dict:
         return {
             "url": self.ed_url.text().strip(),
-            "room": self.ed_room.text().strip(),
+            "room": normalize_room(self.ed_room.text()),
             "author": self.ed_author.text().strip(),
             "file": self._my_path,
         }

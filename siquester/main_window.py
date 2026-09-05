@@ -936,8 +936,8 @@ class MainWindow(QMainWindow):
         self._auto_fetch_stats(real_idx, siq.name, list(siq.pkg_authors), siq.rounds)
 
     def _auto_fetch_stats(self, real_idx, name, authors, siq_rounds):
-        """Тянет статистику пакета с SIStatistics в фоне — та же логика имя+авторы,
-        что и в «Поиск пакетов» (см. sigstats/stats_api.py, siquester/auto_stats.py).
+        """Тянет статистику пакета с SIStatistics в фоне — логика имя+авторы
+        в siquester/stats_api.py и siquester/auto_stats.py.
         Без авторов запрос почти гарантированно 404 — не тратим время впустую."""
         if not authors:
             return

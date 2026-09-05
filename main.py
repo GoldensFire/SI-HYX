@@ -29,7 +29,8 @@ from config import (
     get_icon, http_get, icon_html, pyqtSignal, strip_default_tag,
     ytdlp_base_cmd
 )
-from utils import (check_ffmpeg, load_settings, parse_version, save_settings)
+from utils import (check_ffmpeg, load_settings, load_settings_ex, parse_version,
+                   save_settings, settings_files_exist)
 from widgets import (
     LatinKeySequenceEdit, RecentFilesStrip, WheelBlocker, combo_set_value,
     info_badge, install_hover_tips
@@ -84,6 +85,7 @@ class UnifiedWindow(QMainWindow):
     log_signal = pyqtSignal(str)              # потокобезопасный лог (из фоновых потоков → GUI)
     update_available_sig = pyqtSignal(str, str, int, str, str)  # версия, ссылка на zip, размер (байт), sha256 архива ("" = не проверять), ченжлог
     update_ready_sig = pyqtSignal(str)        # путь к распакованной новой версии (готово к установке)
+    ffmpeg_missing_sig = pyqtSignal()         # проверка ffmpeg в фоне не прошла (из потока → GUI)
 
     # ВНИМАНИЕ РАЗРАБОТЧИКА: В этом приложении категорически запрещено использовать
     # эмодзи. Все новые иконки добавлять строго через метод get_icon() из библиотеки
@@ -120,7 +122,13 @@ class UnifiedWindow(QMainWindow):
         self._wheel_changes_values = False
         self._wheel_filter = WheelBlocker(self, lambda: self._wheel_changes_values)
         QApplication.instance().installEventFilter(self._wheel_filter)
-        if not check_ffmpeg(): msgbox_critical(self, "Error", "FFmpeg not found!")
+        # Проверка ffmpeg — В ФОНЕ, уже после показа окна. check_ffmpeg() запускает
+        # bin\ffmpeg.exe (а это 215 МБ статической сборки) и ждёт его: на SSD это
+        # ~350 мс до первого кадра, на жёстком диске — секунды, и всё это время
+        # окна на экране просто нет. Результат нужен только чтобы показать
+        # сообщение об ошибке, так что оно подождёт полторы секунды.
+        self.ffmpeg_missing_sig.connect(self._on_ffmpeg_missing)
+        QTimer.singleShot(1500, self._check_ffmpeg_async)
 
         c = QWidget(); self.setCentralWidget(c); l = QVBoxLayout(c)
         l.setContentsMargins(8, 8, 8, 8); l.setSpacing(6)
@@ -200,10 +208,20 @@ class UnifiedWindow(QMainWindow):
             'coop': ("fa5s.users", "Collab",
                      "Совместная работа над .siq: темы, вопросы и ответы напарника "
                      "в реальном времени — видно, кто что сделал, и где дубли."),
-            'sigstats': ("fa5s.chart-bar", "Поиск пакетов",
-                         "Сбор и анализ статистики паков «Своя игра» с sibrowser.ru: "
-                         "поиск новых паков по скачиваниям/дате/теме/автору, таблица "
-                         "с фильтрами, карта тем, топ авторов."),
+            'animepack': ("fa5s.music", "Генерация аниме-пака",
+                          "Собирает готовый .siq по опенингам/эндингам: аниме "
+                          "берутся из базы AMQ или из списков MyAnimeList/"
+                          "Shikimori, песни — из AnisongDB, обложки и кадры — "
+                          "с Shikimori."),
+            'animepack_upgrade': ("fa5s.magic", "Апгрейд пака",
+                                  "Дорабатывает ГОТОВЫЙ .siq: превращает "
+                                  "спецвопросы (с секретом, со ставкой, для "
+                                  "себя) в обычные, дописывает в ответы "
+                                  "остальные названия — аниме с Shikimori, "
+                                  "фильмов с Wikidata, — правит их написание, "
+                                  "кладёт в ответ постер, сжимает тяжёлые "
+                                  "картинки, дорожки и ролики и выбрасывает "
+                                  "файлы, на которые нет ссылок."),
         }
         self.tabs.setIconSize(QSize(16, 16))
         self._add_tab(self.tab_media,  'media')
@@ -345,15 +363,38 @@ class UnifiedWindow(QMainWindow):
         self.tab_coop = None
         self._coop_settings = {}   # сохранённые поля вкладки Collab
 
-        # Экспериментальная вкладка Поиск пакетов (по умолчанию ВЫКЛ).
-        self._sigstats_tab_enabled = False
-        self.tab_sigstats = None
+        # Экспериментальная вкладка Генерация аниме-пака (по умолчанию ВЫКЛ).
+        self._animepack_tab_enabled = False
+        self.tab_animepack = None
+        self._animepack_settings = {}   # сохранённые настройки генератора
+
+        # Экспериментальная вкладка Апгрейд пака (по умолчанию ВЫКЛ).
+        self._animepack_upgrade_tab_enabled = False
+        self.tab_animepack_upgrade = None
+        self._animepack_upgrade_settings = {}   # сохранённые настройки доводки
 
         # Вкладка «Промпт» (по умолчанию ВЫКЛ).
         self._prompt_tab_enabled = False
 
-        try: self._load_settings()
-        except Exception: pass
+        # Настройки на диске есть, но прочитать их не удалось — см.
+        # _load_settings/_save_settings_now. Ставим ДО загрузки: она вызвана под
+        # `except: pass` ниже и может свалиться до присвоения флага.
+        self._settings_readonly = False
+
+        try:
+            self._load_settings()
+        except Exception as e:
+            # Загрузка оборвалась на полпути (например, правка кода сломала
+            # обращение к виджету). Всё, что шло ПОСЛЕ места сбоя, осталось с
+            # дефолтами — и автосохранение (висит на каждом поле) записало бы
+            # эти дефолты поверх живых настроек пользователя. Поэтому такой
+            # запуск тоже переводим в режим «ничего не сохраняем».
+            self._settings_readonly = settings_files_exist()
+            self.log(f"ОШИБКА ЗАГРУЗКИ НАСТРОЕК: {e}")
+            if self._settings_readonly:
+                self.log("Сохранение отключено до перезапуска — файл настроек на "
+                         "диске не тронут.")
+                self._warn_settings_readonly()
 
         self._attach_save_handlers()
 
@@ -365,21 +406,26 @@ class UnifiedWindow(QMainWindow):
         if getattr(self, "_siquester_tab_enabled", False):
             self._add_siquester_tab()
 
-        # …и вкладку ShikimoriHYX, если включена.
+        # Остальные экспериментальные вкладки — ПОСЛЕ показа окна, по одной за
+        # такт цикла событий (см. _build_deferred_tabs_step). Каждая из них
+        # строится 1–2 секунды, и раньше эти секунды набегали ДО show(): окна
+        # просто не было на экране ~10 секунд, нажать было нечего. Теперь окно
+        # появляется сразу, а вкладки досоздаются на глазах, не блокируя ввод
+        # между собой. Порядок — как в сохранённом _tab_order (каждая
+        # _add_*_tab в конце сама зовёт _apply_tab_order).
+        self._deferred_tabs = []
         if getattr(self, "_shikimori_tab_enabled", False):
-            self._add_shikimori_tab()
-
-        # …и вкладку ЛидербордHYX, если включена.
+            self._deferred_tabs.append(self._add_shikimori_tab)
         if getattr(self, "_leaderboard_tab_enabled", False):
-            self._add_leaderboard_tab()
-
-        # …и вкладку Collab, если включена.
+            self._deferred_tabs.append(self._add_leaderboard_tab)
         if getattr(self, "_coop_tab_enabled", False):
-            self._add_coop_tab()
-
-        # …и вкладку Поиск пакетов, если включена.
-        if getattr(self, "_sigstats_tab_enabled", False):
-            self._add_sigstats_tab()
+            self._deferred_tabs.append(self._add_coop_tab)
+        if getattr(self, "_animepack_tab_enabled", False):
+            self._deferred_tabs.append(self._add_animepack_tab)
+        if getattr(self, "_animepack_upgrade_tab_enabled", False):
+            self._deferred_tabs.append(self._add_animepack_upgrade_tab)
+        if self._deferred_tabs:
+            QTimer.singleShot(0, self._build_deferred_tabs_step)
 
         # Восстанавливаем сохранённый порядок вкладок (перетаскивание мышью).
         try:
@@ -413,6 +459,39 @@ class UnifiedWindow(QMainWindow):
         self._updating = False
         QTimer.singleShot(2500, lambda: self._check_updates(silent=True))
 
+    def _build_deferred_tabs_step(self):
+        """Достраивает по ОДНОЙ отложенной вкладке за такт цикла событий, чтобы
+        между ними окно успевало обработать ввод (см. __init__)."""
+        queue = getattr(self, "_deferred_tabs", None)
+        if not queue:
+            return
+        add_tab = queue.pop(0)
+        try:
+            add_tab()
+        except Exception as e:
+            self.log(f"Не удалось добавить отложенную вкладку: {e}")
+        if queue:
+            QTimer.singleShot(0, self._build_deferred_tabs_step)
+
+    def _check_ffmpeg_async(self):
+        """Запускает проверку ffmpeg в отдельном потоке (см. __init__): сам запуск
+        процесса блокирующий, а держать на нём цикл событий незачем."""
+        def worker():
+            ok = False
+            try:
+                ok = check_ffmpeg()
+            except Exception:
+                ok = False
+            if not ok:
+                try:
+                    self.ffmpeg_missing_sig.emit()
+                except Exception:
+                    pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_ffmpeg_missing(self):
+        msgbox_critical(self, "Error", "FFmpeg not found!")
+
     def add_paths(self, paths):
         """Роутит файлы из общего стрипа в активную вкладку."""
         current = self.tabs.currentWidget()
@@ -422,7 +501,28 @@ class UnifiedWindow(QMainWindow):
             self.tab_media.add_paths(paths)
 
     def _load_settings(self):
-        s = load_settings()
+        s, status = load_settings_ex()
+        # Прочитать не вышло, хотя сохранённые настройки на диске ЕСТЬ (файл
+        # занят антивирусом/другим процессом). Дальше всё поднимется на
+        # дефолтах, и первое же авто-сохранение (оно висит на КАЖДОМ
+        # чекбоксе/поле, см. _attach_save_handlers, и срабатывает при выходе)
+        # записало бы эти дефолты поверх настроек пользователя — насовсем,
+        # вместе с .bak. Именно так «слетали все настройки». Поэтому на такой
+        # запуск сохранение выключается целиком: настройки на диске остаются
+        # нетронутыми, а перезапуск (когда файл снова читается) всё возвращает.
+        self._settings_readonly = (status == "locked"
+                                   or bool(not s and settings_files_exist()))
+        if self._settings_readonly:
+            self.log("НАСТРОЙКИ НЕ ПРОЧИТАЛИСЬ: файл настроек есть, но открыть/разобрать "
+                     "его не удалось — работаем на значениях по умолчанию, СОХРАНЕНИЕ "
+                     "ОТКЛЮЧЕНО до перезапуска (файл на диске не тронут).")
+            self._warn_settings_readonly()
+        elif status == "recovered":
+            # Основной файл и .bak оказались непригодны, но настройки подняты из
+            # снимка истории (см. utils._snapshot_settings_history) — работаем
+            # как обычно, сохранение включено, просто сообщаем об этом.
+            self.log("Настройки восстановлены из резервного снимка: основной файл "
+                     "и .bak оказались повреждены.")
         tm = self.tab_media
         ty = self.tab_ytdlp
         self._server_enabled = bool(s.get("server_enabled", False))
@@ -444,8 +544,17 @@ class UnifiedWindow(QMainWindow):
         self._leaderboard_tab_enabled = bool(s.get("leaderboard_tab_enabled", False))
         self._coop_tab_enabled = bool(s.get("coop_tab_enabled", False))
         self._coop_settings = dict(s.get("coop", {}) or {})
-        self._sigstats_tab_enabled = bool(s.get("sigstats_tab_enabled", False))
+        self._animepack_tab_enabled = bool(s.get("animepack_tab_enabled", False))
+        self._animepack_settings = dict(s.get("animepack", {}) or {})
+        self._animepack_upgrade_tab_enabled = bool(
+            s.get("animepack_upgrade_tab_enabled", False))
+        self._animepack_upgrade_settings = dict(s.get("animepack_upgrade", {}) or {})
         self._prompt_tab_enabled = bool(s.get("prompt_tab_enabled", False))
+        # Ключи внешних API (Gemini, TMDB) — общие для всех вкладок и
+        # живут ТОЛЬКО тут: раньше поле ввода дублировалось в каждой вкладке,
+        # которой ключ нужен (см. Настройки → «Ключи API»).
+        self._api_keys = {k: str(v or "") for k, v in
+                          (s.get("api_keys", {}) or {}).items()}
         self._tab_order = list(s.get("tab_order", []) or [])
         m = s.get("media", {})
 
@@ -875,6 +984,21 @@ class UnifiedWindow(QMainWindow):
         except Exception: pass
 
     # ------------------------------------------------------------------
+    # Ключи внешних API — одно место на всю программу (Настройки → «Ключи API»)
+    # ------------------------------------------------------------------
+    def get_api_key(self, name: str) -> str:
+        """Ключ по имени ('gemini' / 'tmdb'); пусто, если не задан."""
+        return str((getattr(self, "_api_keys", None) or {}).get(name, "") or "").strip()
+
+    def set_api_key(self, name: str, value: str, save: bool = True):
+        if not hasattr(self, "_api_keys") or self._api_keys is None:
+            self._api_keys = {}
+        self._api_keys[name] = str(value or "").strip()
+        if save:
+            try: self._save_settings_soon()
+            except Exception: pass
+
+    # ------------------------------------------------------------------
     # Вкладки: подсказки (ⓘ) и сохраняемый порядок (drag-n-drop)
     # ------------------------------------------------------------------
     def _add_tab(self, widget, key):
@@ -1173,24 +1297,25 @@ class UnifiedWindow(QMainWindow):
         return dict(getattr(self, "_coop_settings", {}) or {})
 
     # ------------------------------------------------------------------
-    # Экспериментальная вкладка Поиск пакетов (сбор/анализ паков «Своя игра»)
+    # Экспериментальная вкладка Генерация аниме-пака (порт ASPG)
     # ------------------------------------------------------------------
-    def _add_sigstats_tab(self):
-        """Создаёт и добавляет вкладку Поиск пакетов (если ещё не добавлена).
-        Импорт ленивый — модуль тянет pandas/bs4 и грузится только когда включена."""
-        if getattr(self, "tab_sigstats", None) is not None:
+    def _add_animepack_tab(self):
+        """Создаёт и добавляет вкладку Генерация аниме-пака (если ещё не
+        добавлена). Импорт ленивый — модуль тянется только когда включена."""
+        if getattr(self, "tab_animepack", None) is not None:
             return
         try:
-            from sigstats_tab import SigstatsTab
-            self.tab_sigstats = SigstatsTab(self)
-            self._add_tab(self.tab_sigstats, 'sigstats')
+            from animepack_tab import AnimePackTab
+            self.tab_animepack = AnimePackTab(
+                self, dict(getattr(self, "_animepack_settings", {}) or {}))
+            self._add_tab(self.tab_animepack, 'animepack')
             self._apply_tab_order(getattr(self, "_tab_order", []))
         except Exception as e:
-            self.tab_sigstats = None
-            self.log(f"Не удалось добавить вкладку Поиск пакетов: {e}")
+            self.tab_animepack = None
+            self.log(f"Не удалось добавить вкладку Генерация аниме-пака: {e}")
 
-    def _remove_sigstats_tab(self):
-        t = getattr(self, "tab_sigstats", None)
+    def _remove_animepack_tab(self):
+        t = getattr(self, "tab_animepack", None)
         if t is None:
             return
         try:
@@ -1201,16 +1326,84 @@ class UnifiedWindow(QMainWindow):
             except Exception: pass
             t.deleteLater()
         except Exception: pass
-        self.tab_sigstats = None
+        self.tab_animepack = None
 
-    def _set_sigstats_tab_enabled(self, checked: bool):
-        self._sigstats_tab_enabled = bool(checked)
+    def _set_animepack_tab_enabled(self, checked: bool):
+        self._animepack_tab_enabled = bool(checked)
         if checked:
-            self._add_sigstats_tab()
+            self._add_animepack_tab()
         else:
-            self._remove_sigstats_tab()
+            # Перед закрытием запоминаем текущие настройки генератора.
+            self._animepack_settings = self._collect_animepack_settings()
+            self._remove_animepack_tab()
         try: self._save_settings_now()
         except Exception: pass
+
+    def _collect_animepack_settings(self):
+        """Актуальные настройки вкладки Генерация аниме-пака (или последние
+        сохранённые, если вкладка сейчас не открыта)."""
+        t = getattr(self, "tab_animepack", None)
+        if t is not None and hasattr(t, "get_settings"):
+            try:
+                return t.get_settings()
+            except Exception:
+                pass
+        return dict(getattr(self, "_animepack_settings", {}) or {})
+
+    # ------------------------------------------------------------------
+    # Экспериментальная вкладка Апгрейд пака
+    # ------------------------------------------------------------------
+    def _add_animepack_upgrade_tab(self):
+        """Создаёт и добавляет вкладку Апгрейд пака (если ещё не
+        добавлена). Импорт ленивый — модуль тянется только когда включена."""
+        if getattr(self, "tab_animepack_upgrade", None) is not None:
+            return
+        try:
+            from animepack_upgrade_tab import AnimePackUpgradeTab
+            self.tab_animepack_upgrade = AnimePackUpgradeTab(
+                self, dict(getattr(self, "_animepack_upgrade_settings", {}) or {}))
+            self._add_tab(self.tab_animepack_upgrade, 'animepack_upgrade')
+            self._apply_tab_order(getattr(self, "_tab_order", []))
+        except Exception as e:
+            self.tab_animepack_upgrade = None
+            self.log(f"Не удалось добавить вкладку Апгрейд пака: {e}")
+
+    def _remove_animepack_upgrade_tab(self):
+        t = getattr(self, "tab_animepack_upgrade", None)
+        if t is None:
+            return
+        try:
+            idx = self.tabs.indexOf(t)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            try: t.cleanup()
+            except Exception: pass
+            t.deleteLater()
+        except Exception: pass
+        self.tab_animepack_upgrade = None
+
+    def _set_animepack_upgrade_tab_enabled(self, checked: bool):
+        self._animepack_upgrade_tab_enabled = bool(checked)
+        if checked:
+            self._add_animepack_upgrade_tab()
+        else:
+            # Перед закрытием запоминаем настройки доводки.
+            self._animepack_upgrade_settings = \
+                self._collect_animepack_upgrade_settings()
+            self._remove_animepack_upgrade_tab()
+        try: self._save_settings_now()
+        except Exception: pass
+
+    def _collect_animepack_upgrade_settings(self):
+        """Актуальные настройки вкладки Апгрейд пака (или последние
+        сохранённые, если вкладка сейчас не открыта)."""
+        t = getattr(self, "tab_animepack_upgrade", None)
+        if t is not None and hasattr(t, "get_settings"):
+            try:
+                return t.get_settings()
+            except Exception:
+                pass
+        return dict(getattr(self, "_animepack_upgrade_settings", {}) or {})
 
     def _open_url(self, url: str):
         try:
@@ -1881,6 +2074,54 @@ class UnifiedWindow(QMainWindow):
         # отключён всегда (видео идёт по аппаратному D3D/GL-свопчейну).
         add_row(sec_edit, grp_render, "оверлей fps d3d11 рендер видео аппаратное ускорение hevc h264 dxva декодирование")
 
+        # ══ Секция «Ключи API» ═══════════════════════════════════════════════
+        # Единственное место ввода ключей на всю программу: раньше поле висело
+        # в каждой вкладке, которой ключ нужен (Генерация аниме-пака), и один и
+        # тот же ключ приходилось вбивать по нескольку раз.
+        sec_api = make_section("Ключи API")
+
+        def _key_row(box_layout, label_html, placeholder, name, note):
+            lbl = QLabel(label_html)
+            lbl.setOpenExternalLinks(True)
+            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+            lbl.setWordWrap(True)
+            box_layout.addWidget(lbl)
+            ed = QLineEdit(self.get_api_key(name))
+            ed.setPlaceholderText(placeholder)
+            ed.setEchoMode(QLineEdit.EchoMode.Password)
+            ed.setClearButtonEnabled(True)
+            ed.textChanged.connect(lambda t, n=name: self.set_api_key(n, t))
+            box_layout.addWidget(ed)
+            box_layout.addWidget(hint(note))
+            return ed
+
+        grp_gemini = QGroupBox("Gemini (Google AI Studio)")
+        vg = QVBoxLayout(grp_gemini)
+        _key_row(vg,
+                 'Бесплатный ключ: <a href="https://aistudio.google.com/apikey" '
+                 'style="color:#89b4fa;">aistudio.google.com/apikey</a>',
+                 "Ключ Gemini API", "gemini",
+                 "Нужен вкладке «Генерация аниме-пака» (вопросы по сюжету). Без "
+                 "ключа вкладка работает, просто без этой возможности. Тексты "
+                 "уходят в Google.")
+        add_row(sec_api, grp_gemini,
+                "gemini гемини google ключ api нейросеть повторы сюжет аниме aistudio")
+
+        grp_tmdb = QGroupBox("TMDB (themoviedb.org)")
+        vt = QVBoxLayout(grp_tmdb)
+        _key_row(vt,
+                 'Бесплатный ключ: <a href="https://www.themoviedb.org/settings/api" '
+                 'style="color:#89b4fa;">themoviedb.org → настройки профиля → API</a>',
+                 "Ключ TMDB (необязательно)", "tmdb",
+                 "ЗАПАСНОЙ источник обложек для вкладок «Генерация аниме-пака» и "
+                 "«Апгрейд пака»: идёт в дело там, где у карточки Shikimori "
+                 "постера нет вовсе или ссылка не открылась. В кино-паке нужнее "
+                 "всего: у Wikidata афиша есть далеко не у каждого фильма. "
+                 "Годятся оба вида ключа — старый «API Key» и токен «API Read "
+                 "Access». Пусто — обложки берутся только из основной базы.")
+        add_row(sec_api, grp_tmdb,
+                "tmdb themoviedb обложка постер ключ api аниме запасной источник")
+
         # ══ Секция «Экспериментально» (предпоследняя) ════════════════════════
         sec_exp = make_section("Экспериментально")
 
@@ -1930,21 +2171,43 @@ class UnifiedWindow(QMainWindow):
                             + " Для совместных паков: вы и соавторы видите темы, "
                             "вопросы и ответы друг друга в реальном времени и не дублируете "
                             "работу. Нужен адрес сервера синхронизации (см. coop_worker.js)."))
-        chk_sigstats = QCheckBox("Включить вкладку «Поиск пакетов» (сбор и анализ статистики паков)")
-        chk_sigstats.setChecked(bool(getattr(self, "_sigstats_tab_enabled", False)))
-        chk_sigstats.toggled.connect(self._set_sigstats_tab_enabled)
-        vexp.addWidget(chk_sigstats)
+        chk_animepack = QCheckBox("Включить вкладку «Генерация аниме-пака» (готовый .siq по опенингам)")
+        chk_animepack.setChecked(bool(getattr(self, "_animepack_tab_enabled", False)))
+        chk_animepack.toggled.connect(self._set_animepack_tab_enabled)
+        vexp.addWidget(chk_animepack)
         vexp.addWidget(hint(icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
-                            + " Экспериментально. Ищет новые паки на sibrowser.ru по "
-                            "скачиваниям/дате/теме (с % совпадения)/автору, показывает "
-                            "% завершения игр, карту тем и топ авторов."))
+                            + " Экспериментально. Собирает пак «угадай аниме по "
+                            "песне»: аниме берутся из базы AMQ или из списков "
+                            "MyAnimeList/Shikimori, песни — из AnisongDB, обложки "
+                            "и кадры — с Shikimori. Порт генератора ASPG (Leleath) "
+                            "с его разрешения."))
+        chk_ap_upgrade = QCheckBox("Включить вкладку «Апгрейд пака» "
+                                   "(доводка готового .siq)")
+        chk_ap_upgrade.setChecked(
+            bool(getattr(self, "_animepack_upgrade_tab_enabled", False)))
+        chk_ap_upgrade.toggled.connect(self._set_animepack_upgrade_tab_enabled)
+        vexp.addWidget(chk_ap_upgrade)
+        vexp.addWidget(hint(icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
+                            + " Экспериментально. Берёт ГОТОВЫЙ пак и правит "
+                            "его на выбор: превращает спецвопросы (с секретом, "
+                            "со ставкой, для себя) в обычные, дописывает в "
+                            "ответы остальные названия (аниме-пак спрашивает "
+                            "Shikimori, кино-пак — Wikidata, ключей не надо), "
+                            "переписывает название в тамошнем написании, кладёт "
+                            "в ответ постер, пережимает тяжёлые картинки в "
+                            "AVIF, дорожки в opus и ролики в AV1 и выбрасывает "
+                            "файлы, на которые в паке нет ссылок. Исходный файл "
+                            "не меняется — результат пишется рядом."))
         add_row(sec_exp, grp_siq,
                 "промпт prompt заготовки шаблоны "
                 "siquester сиквестер siq пакет вопросы статистика эксперимент вкладка просмотр sigame "
                 "shikimori шикимори аниме поиск оценка жанр год api "
                 "лидерборд leaderboard рекорды никнеймы firebase счёт ник "
                 "collab coop совместная работа пак напарник соавтор реалтайм темы вопросы ответы дубли синхронизация "
-                "sigstats статистика паки sibrowser сбор скачивания тема категория процент автор экспорт")
+                "генерация аниме пак опенинг эндинг песни amq anisongdb myanimelist shikimori aspg угадайка siq "
+                "апгрейд доводка спецвопросы с секретом ставка для себя варианты названий ромадзи синонимы "
+                "постер в ответе регистр написание названия заглавные буквы "
+                "сжать картинки avif вес пака мегабайт")
 
         # ══ Секция «О программе» ═════════════════════════════════════════════
         sec_about = make_section("О программе")
@@ -2088,16 +2351,51 @@ class UnifiedWindow(QMainWindow):
                 'leaderboard_tab_enabled': bool(getattr(self, '_leaderboard_tab_enabled', False)),
                 'coop_tab_enabled': bool(getattr(self, '_coop_tab_enabled', False)),
                 'coop': self._collect_coop_settings(),
-                'sigstats_tab_enabled': bool(getattr(self, '_sigstats_tab_enabled', False)),
+                'animepack_tab_enabled': bool(getattr(self, '_animepack_tab_enabled', False)),
+                'animepack': self._collect_animepack_settings(),
+                'animepack_upgrade_tab_enabled': bool(
+                    getattr(self, '_animepack_upgrade_tab_enabled', False)),
+                'animepack_upgrade': self._collect_animepack_upgrade_settings(),
                 'prompt_tab_enabled': bool(getattr(self, '_prompt_tab_enabled', False)),
                 'priority': tm.c_priority.currentText() if hasattr(tm, 'c_priority') else 'Обычный',
                 'prompt_file': getattr(getattr(self, 'tab_prompt', None), '_prompt_path', '') or '',
+                'api_keys': {k: str(v or '') for k, v in
+                             (getattr(self, '_api_keys', {}) or {}).items()},
                 'tab_order': list(getattr(self, '_tab_order', [])),
             }
             return s
         except Exception: return {}
 
+    def _warn_settings_readonly(self):
+        """Один раз, уже после появления окна, сообщает, что настройки этого
+        запуска не читаются и не сохраняются. Раньше это было полностью молча —
+        пользователь видел «все настройки слетели» и, поработав в этом сеансе,
+        получал дефолты на диске уже навсегда."""
+        def _show():
+            try:
+                from msgbox import msgbox_warning
+                msgbox_warning(
+                    self, "Настройки не прочитались",
+                    "Файл настроек существует, но открыть его сейчас не удалось "
+                    "(мог быть занят другой программой — например, антивирусом — "
+                    "или повреждён).\n\n"
+                    "Приложение работает на значениях по умолчанию, но НИЧЕГО не "
+                    "сохраняет: ваши настройки на диске не тронуты. Перезапустите "
+                    "программу — если файл снова читается, всё вернётся.")
+            except Exception:
+                pass
+        try:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(1500, _show)   # после того, как окно показано
+        except Exception:
+            pass
+
     def _save_settings_now(self):
+        if getattr(self, "_settings_readonly", False):
+            # Настройки не прочитались при старте — см. _load_settings.
+            self.log("save settings: настройки не прочитались при запуске — "
+                     "сохранение отключено до перезапуска (файл не затёрт)")
+            return
         try:
             data = self._collect_settings()
             # _collect_settings возвращает {} при любой ошибке (напр. после
@@ -2111,7 +2409,24 @@ class UnifiedWindow(QMainWindow):
         except Exception as e:
             self.log(f"save settings error: {e}")
 
+    def _save_settings_soon(self, *_args):
+        """Отложенное сохранение (400 мс без изменений). Сохранение висит на
+        КАЖДОМ поле, и протяжка ползунка раньше означала десятки полных
+        перезаписей settings.json подряд — лишняя нагрузка на диск и лишние окна
+        для сбоя ровно в момент подмены файла. Выход из программы и явные
+        действия по-прежнему зовут _save_settings_now напрямую."""
+        try:
+            self._save_timer.start(400)
+        except Exception:
+            self._save_settings_now()
+
     def _attach_save_handlers(self):
+        try:
+            self._save_timer = QTimer(self)
+            self._save_timer.setSingleShot(True)
+            self._save_timer.timeout.connect(self._save_settings_now)
+        except Exception:
+            pass
         try:
             tm = self.tab_media
             ty = self.tab_ytdlp
@@ -2142,13 +2457,13 @@ class UnifiedWindow(QMainWindow):
             text_widgets = [ty.out, ty.cookie_edit, ty.proxy_edit]
 
             for w in toggle_widgets:
-                w.toggled.connect(self._save_settings_now)
+                w.toggled.connect(self._save_settings_soon)
             for w in value_widgets:
-                w.valueChanged.connect(self._save_settings_now)
+                w.valueChanged.connect(self._save_settings_soon)
             for w in combo_widgets:
-                w.currentTextChanged.connect(self._save_settings_now)
+                w.currentTextChanged.connect(self._save_settings_soon)
             for w in text_widgets:
-                w.textChanged.connect(self._save_settings_now)
+                w.textChanged.connect(self._save_settings_soon)
         except Exception as e:
             self.log(f"_attach_save_handlers error: {e}")
     
@@ -2224,10 +2539,8 @@ class UnifiedWindow(QMainWindow):
             tcp = getattr(self, "tab_coop", None)
             is_coop = tcp is not None and cur is tcp
             is_photo = cur is getattr(self, "tab_photo", None)
-            tst = getattr(self, "tab_sigstats", None)
-            is_sigstats = tst is not None and cur is tst
-            self.console_panel.setVisible(not (is_edit or is_siq or is_shiki or is_lb or is_coop or is_photo or is_sigstats))
-            self.pbar.setVisible(not (is_siq or is_shiki or is_lb or is_coop or is_photo or is_sigstats))
+            self.console_panel.setVisible(not (is_edit or is_siq or is_shiki or is_lb or is_coop or is_photo))
+            self.pbar.setVisible(not (is_siq or is_shiki or is_lb or is_coop or is_photo))
         except Exception:
             pass
 
@@ -2283,28 +2596,12 @@ class UnifiedWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def _style_tab_scroll_buttons(self):
-        """QTabBar рисует прокрутку через обычные QToolButton — а те у нас
-        стилизованы глобально (config.STYLESHEET) под целую кнопку с фоном и
-        рамкой, из-за чего родная стрелка не рисуется и получаются «два
-        пустых квадратика». Ставим свою стрелку-иконку и снимаем фон/рамку
-        только у этих двух кнопок — как в браузере."""
-        bar = self.tabs.tabBar()
-        buttons = bar.findChildren(QToolButton)
-        if len(buttons) < 2:
-            return
-        # Непрозрачный фон обязателен: эти кнопки рисуются ПОВЕРХ последней
-        # вкладки, а не рядом с ней — с прозрачным/полупрозрачным фоном сквозь
-        # них было видно вкладку под низом (эффект «просвечивания»).
-        flat = ("QToolButton{background:#1e1e2e;border:none;border-radius:0px;"
-                "padding:0px;margin:0px;min-width:18px;min-height:0px;}"
-                "QToolButton:hover{background:#313244;}"
-                "QToolButton:disabled{background:#1e1e2e;}")
-        left, right = buttons[0], buttons[-1]
-        left.setIcon(get_icon('fa5s.chevron-left'))
-        right.setIcon(get_icon('fa5s.chevron-right'))
-        left.setText(""); right.setText("")
-        left.setIconSize(QSize(11, 11)); right.setIconSize(QSize(11, 11))
-        left.setStyleSheet(flat); right.setStyleSheet(flat)
+        """Стрелки прокрутки вкладок — как в браузере: своя стрелка-иконка
+        вместо «пустого квадратика» от глобального стиля QToolButton, левая у
+        левого края и только пока слева есть уехавшие вкладки, правая — у
+        правого (см. widgets.TabScrollArrows)."""
+        from widgets import install_tab_scroll_arrows
+        self._tab_arrows = install_tab_scroll_arrows(self.tabs.tabBar())
 
     def _tab_wheel_scroll(self, event):
         """Крутим вкладки колёсиком мыши, как в браузере — через нативные
@@ -2313,11 +2610,17 @@ class UnifiedWindow(QMainWindow):
             delta = event.angleDelta().y() or event.angleDelta().x()
             if not delta:
                 return
-            bar = self.tabs.tabBar()
-            buttons = [b for b in bar.findChildren(QToolButton) if b.isVisible()]
-            if not buttons:
+            arrows = getattr(self, "_tab_arrows", None)
+            if arrows is not None:
+                left, right = arrows.buttons()
+            else:
+                bar = self.tabs.tabBar()
+                buttons = [b for b in bar.findChildren(QToolButton) if b.isVisible()]
+                if not buttons:
+                    return
+                left, right = buttons[0], buttons[-1]
+            if left is None or right is None:
                 return
-            left, right = buttons[0], buttons[-1]
             btn = left if delta > 0 else right
             if btn.isEnabled():
                 btn.click()
@@ -2629,15 +2932,111 @@ def _install_crash_handler():
     sys.excepthook = _handle
 
 
+# Строка НАМЕРЕННО отличается от прежней «GoldensFire.SI-HYX»: Windows кэширует
+# значок панели задач по AppUserModelID, и на машинах, где кнопка уже успела
+# нарисоваться пустой (см. _set_taskbar_identity), кэш продолжал отдавать пустой
+# значок даже после починки. Новый идентификатор = новая запись кэша. Менять
+# строку просто так нельзя — с ней слетает закрепление кнопки на панели задач.
+_AUMID = "GoldensFire.SI-HYX.3"
+
+
+def _set_taskbar_identity(hwnd):
+    """Прописывает окну иконку и имя для КНОПКИ НА ПАНЕЛИ ЗАДАЧ.
+
+    Панель задач группирует окна по AppUserModelID (см. main()), а иконку для
+    группы берёт НЕ из окна, а из ярлыка Пуска с тем же AppUserModelID. Ярлыка
+    у нас нет (программа портативная, из папки), поэтому кнопка на панели задач
+    получала стандартную «пустую» иконку — при том что в заголовке окна и в
+    Alt+Tab иконка своя, правильная. Отсюда и «прога запускается без иконки».
+
+    Лечение по документации — свойства окна System.AppUserModel.*: Relaunch-
+    IconResource говорит панели задач, откуда брать иконку, когда ярлыка нет.
+    Ставим до первого показа окна: после показа панель уже нарисовала кнопку.
+
+    Тихо ничего не делает не на Windows и при любой ошибке COM — иконка в
+    заголовке от этого не зависит.
+    """
+    if not IS_WIN or not APP_ICON:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                        ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+        class _PROPERTYKEY(ctypes.Structure):
+            _fields_ = [("fmtid", _GUID), ("pid", ctypes.c_ulong)]
+
+        class _PROPVARIANT(ctypes.Structure):
+            # Строку кладём руками (vt = VT_LPWSTR, дальше указатель): штатной
+            # InitPropVariantFromString в propsys.dll нет — она инлайновая, по
+            # имени не экспортируется, и обращение к ней роняло всю функцию на
+            # первом же свойстве (иконка так и не выставлялась).
+            _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
+                        ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                        ("pwsz", ctypes.c_wchar_p),
+                        ("pad", ctypes.c_ubyte * 8)]
+
+        _VT_LPWSTR = 31
+
+        ole32, shell32 = ctypes.windll.ole32, ctypes.windll.shell32
+
+        def _guid(text):
+            g = _GUID()
+            ole32.CLSIDFromString(ctypes.c_wchar_p(text), ctypes.byref(g))
+            return g
+
+        store = ctypes.c_void_p()
+        iid = _guid("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}")   # IPropertyStore
+        if shell32.SHGetPropertyStoreForWindow(
+                wintypes.HWND(int(hwnd)), ctypes.byref(iid),
+                ctypes.byref(store)) or not store:
+            return
+        vtbl = ctypes.cast(store, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        SetValue = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(_PROPERTYKEY),
+            ctypes.POINTER(_PROPVARIANT))(vtbl[6])
+        Commit = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(vtbl[7])
+        Release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[2])
+
+        fmtid = _guid("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}")  # PKEY_AppUserModel_*
+        # 5 — ID, 3 — RelaunchIconResource, 4 — RelaunchDisplayNameResource.
+        # RelaunchCommand (2) сознательно не ставим: панель задач подставила бы
+        # его в «Закрепить», а для запуска из папки правильной команды нет.
+        values = ((5, _AUMID), (3, f"{APP_ICON},0"), (4, APP_NAME))
+        # Держим PROPVARIANT'ы живыми до Commit: строки принадлежат нам, а не
+        # CoTaskMem, и освобождать их через PropVariantClear нельзя.
+        alive = []
+        try:
+            for pid, value in values:
+                pv = _PROPVARIANT()
+                pv.vt = _VT_LPWSTR
+                pv.pwsz = str(value)
+                alive.append(pv)
+                key = _PROPERTYKEY(fmtid, pid)
+                SetValue(store, ctypes.byref(key), ctypes.byref(pv))
+            Commit(store)
+        finally:
+            Release(store)
+    except Exception:
+        pass
+
+
 def main():
-    # AppUserModelID задаём САМЫМ ПЕРВЫМ — до QLocalSocket, QApplication и любого
-    # обращения к панели задач. Иначе Windows успевает связать кнопку на панели
-    # задач с хост-процессом python.exe (его иконкой), и наша иконка окна больше
-    # не подхватывается (баг «иконка пропала при запуске main.py»).
+    # AppUserModelID задаём до QApplication и первого окна. Проверено запуском:
+    # БЕЗ него панель задач группирует окно под python.exe и рисует иконку
+    # питона; С ним, но без свойств окна из _set_taskbar_identity, — пустую
+    # (ярлыка Пуска с таким AUMID у портативной программы нет). Правильная
+    # иконка получается только парой AUMID + _set_taskbar_identity, поэтому
+    # выкидывать что-то одно нельзя — вернётся «иконка пропала при main.py».
+    # Порядок вызова сам по себе ни на что не влияет (в v0.4.0 его двигали сюда
+    # как «фикс» — не помогло).
     if IS_WIN:
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GoldensFire.SI-HYX")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(_AUMID)
         except Exception:
             pass
 
@@ -2691,6 +3090,9 @@ def main():
             w.tab_media.add_paths(cli_files)
         ))
 
+    # До show(): панель задач рисует кнопку в момент первого показа окна и
+    # свойства после этого уже не перечитывает (см. _set_taskbar_identity).
+    _set_taskbar_identity(int(w.winId()))
     w.show()
     sys.exit(app.exec())
 

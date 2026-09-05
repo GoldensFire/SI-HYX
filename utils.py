@@ -13,7 +13,6 @@ import io
 import json
 import os
 import re
-import requests
 import shutil
 import subprocess
 import sys
@@ -22,8 +21,18 @@ import uuid
 from config import (
     COOKIE_PATHS, CREATE_NO_WINDOW, FFMPEG, FFPROBE, IS_WIN, Image,
     ImageOps, QByteArray, QIcon, QPainter, QPixmap, QtGuiImage,
-    SETTINGS_FILE, TEMP_DIR, USER_AGENT, http_get
+    SETTINGS_FILE, TEMP_DIR, USER_AGENT, _requests, http_get
 )
+
+
+def __getattr__(name):
+    # requests подключается лениво (см. config._requests): на старте он никому не
+    # нужен, а стоил ~240 мс до появления окна. Хук оставляет привычным
+    # `utils.requests` — им пользуются тесты, подменяя requests.Session.
+    # Внутри самого utils зовите _requests(), а не глобальное имя.
+    if name == "requests":
+        return _requests()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ── Маскировка JS в HTML под VK ──────────────────────────────────────────────
@@ -152,6 +161,150 @@ def mask_html_js(html: str):
     return result, n_inline, n_external
 
 
+# ── Лёгкая маскировка (доп-режим) ────────────────────────────────────────────
+# ЧТО РЕЖЕТ VK (установлено эмпирически): фильтр «исполняемый файл» ловит
+# ЛИТЕРАЛЬНЫЕ <script>, eval, function/Function в открытой части документа. Не
+# длину base64, не MIME, не canvas/svg. Заведомо проходящий вывод = старый метод
+# (mask_html_js): в открытом HTML НЕТ ни одного <script>/eval/function — всё тело
+# и скрипты лежат в data-si одним base64, а запуск идёт через
+# `window['Fun'+'ction'](atob(<loader>))()` в onload скрытой картинки (в onload
+# нет слова Function — оно склеено 'Fun'+'ction'; loader/движок VK не видит,
+# они в base64). Ранние lite-версии оставляли `<script>…(0,eval)…</script>`
+# в открытую и потому отклонялись — этот подход в корне непригоден.
+#
+# Поэтому lite = ТОЧНО envelope старого метода (та же скрытность), но с одной
+# оптимизацией размера: крупные ассеты (аудио/картинки как длинные base64/data:
+# литералы в скриптах) НЕ попадают в base64 повторно. Старый метод кодирует их
+# внутри скрипта → они шифруются вторым слоем (+33% на мегабайтах). Здесь такой
+# ассет-литерал ВЫНОСИТСЯ из скрипта, кладётся в data-si ОДИН раз как отдельный
+# элемент `r:<idx>:<сам base64>` (без повторного кодирования), а на его месте в
+# коде — ссылка `__SI_Ak`. Loader объявляет `window.__SI_Ak` (реассемблирует,
+# НЕ декодируя) ДО запуска скриптов, движок читает их из глобальной области.
+# Всё остальное (разметка тела, обычные скрипты) прячется как в старом методе.
+_LITE_STRIP_RX = re.compile(
+    r'(?s)/\*.*?\*/'                       # блочные комментарии
+    r'|//[^\n]*'                           # строчные комментарии
+    r'|"(?:[^"\\]|\\.)*"'                  # "строки"
+    r"|'(?:[^'\\]|\\.)*'"                  # 'строки'
+    r'|`(?:[^`\\]|\\.)*`')                 # `шаблоны`
+# Крупный ассет: строковый литерал из ЧИСТОГО base64 (опц. с data:-префиксом)
+# длиной ≥ порога. Внутри такого литерала нет кавычек/скобок — выносится как есть.
+_LITE_HOIST_MIN = 512
+_LITE_ASSET_INNER_RX = re.compile(
+    r'(?:data:[\w.+/;=-]*?base64,)?[A-Za-z0-9+/=]+')
+
+
+def _lite_hoist_assets(code: str, assets: list) -> str:
+    """Выносит крупные ассет-литералы из инлайн-скрипта в общий список assets,
+    заменяя каждый на глобальную ссылку __SI_Ak (k = индекс в assets). Возвращает
+    slimmed-код скрипта. Сами ассеты кладутся в data-si один раз (без повторного
+    base64), а loader объявляет их как window.__SI_Ak до запуска скриптов."""
+    def _repl(m):
+        tok = m.group(0)
+        if tok[0] in "\"'":                          # строковый литерал (не комментарий)
+            inner = tok[1:-1]
+            if len(inner) >= _LITE_HOIST_MIN and _LITE_ASSET_INNER_RX.fullmatch(inner):
+                idx = len(assets)
+                assets.append(inner)                 # исходное значение (сырой b64 / data:)
+                return "__SI_A%d" % idx
+        return tok                                   # комментарии и обычные строки — как есть
+    # _LITE_STRIP_RX матчит комментарии и строковые литералы целиком, поэтому не
+    # заденем base64 внутри комментария или вложенные кавычки.
+    return _LITE_STRIP_RX.sub(_repl, code)
+
+
+# Loader lite: как в mask_html_js плюс тип элемента 'r' — сырой ассет, который
+# объявляется глобальной переменной window.__SI_Ak БЕЗ base64-декодирования
+# (только снимаем переносы строк через R). Порядок в data-si гарантирует, что
+# все 'r' идут до 'b'-скриптов, поэтому ссылки __SI_Ak уже определены.
+_LITE_LOADER = (
+    r"var im=document.querySelector('img[data-si]');"
+    r"var q=im.getAttribute('data-si').split('|');"
+    r"var td=new TextDecoder();"
+    r"function D(v){return td.decode(Uint8Array.from("
+    r"atob(v.replace(/[^A-Za-z0-9+\/=]/g,'')),"
+    r"function(c){return c.charCodeAt(0);}));}"
+    r"function R(v){return v.replace(/\s/g,'');}"
+    r"var i=0;function n(){if(i>=q.length)return;"
+    r"var it=q[i++],k=it.charAt(0),v=it.slice(2);"
+    r"if(k=='m'){document.body.innerHTML=D(v);n();}"
+    r"else if(k=='r'){var p=v.indexOf(':');"
+    r"window['__SI_A'+v.slice(0,p)]=R(v.slice(p+1));n();}"
+    r"else if(k=='s'){var s=document.createElement('script');"
+    r"s.src=v;s.onload=n;document.body.appendChild(s);}"
+    r"else{var s=document.createElement('script');"
+    r"s.textContent=D(v);document.body.appendChild(s);n();}}n();")
+
+
+def mask_html_js_lite(html: str):
+    """Лёгкая маскировка под VK: тот же скрытный envelope, что mask_html_js
+    (в открытом HTML НЕТ <script>/eval/function — всё в data-si, запуск через
+    onload+'Fun'+'ction'), но крупные ассеты кодируются ОДИН раз, а не дважды
+    (выносятся из скриптов в отдельные data-si элементы) — отсюда меньший размер.
+
+    Возвращает (masked_html, n_inline, n_external) — как mask_html_js. Если
+    прятать нечего — (html, 0, 0).
+    """
+    def _chunk(b):
+        return "\n".join(b[i:i + _B64_CHUNK] for i in range(0, len(b), _B64_CHUNK))
+
+    def _b64(s):
+        return _chunk(base64.b64encode(s.encode('utf-8')).decode('ascii'))
+
+    # 1) Скрипты вынимаем как в старом методе, но из инлайновых сначала выносим
+    #    крупные ассет-литералы (в общий assets → отдельные 'r'-элементы).
+    assets = []
+    scripts = []
+    def _take(m):
+        attrs, inner = m.group(1), m.group(2)
+        srcm = _B64_SRC_RX.search(attrs)
+        if srcm:
+            scripts.append(("s", srcm.group(1)))
+        elif inner.strip():
+            scripts.append(("b", _lite_hoist_assets(inner, assets)))
+        return ""
+    no_scripts = _B64_SCRIPT_RX.sub(_take, html)
+    n_inline = sum(1 for k, _ in scripts if k == "b")
+    n_external = sum(1 for k, _ in scripts if k == "s")
+    if not scripts:
+        return html, 0, 0            # нет скриптов — прятать нечего, VK и так примет
+
+    # 2) Тело <body> без скриптов → 'm'; ассеты → 'r' (по разу, БЕЗ повторного
+    #    base64) ДО скриптов; скрипты → 'b'/'s'.
+    bm = re.search(r"(?is)<body([^>]*)>(.*?)</body>", no_scripts)
+    items = []
+    if bm and bm.group(2).strip():
+        items.append("m:" + _b64(bm.group(2)))
+    for idx, a in enumerate(assets):
+        items.append("r:%d:%s" % (idx, _chunk(a)))
+    for k, v in scripts:
+        items.append(("s:" + v) if k == "s" else ("b:" + _b64(v)))
+    if not items:
+        return html, 0, 0
+
+    # 3) Payload в data-si (элементы через '|', которого нет ни в base64, ни в URL).
+    payload = "|".join(items)
+    payload_attr = (payload.replace("&", "&amp;").replace('"', "&quot;")
+                           .replace("<", "&lt;").replace(">", "&gt;"))
+
+    loader_b64 = base64.b64encode(_LITE_LOADER.encode('utf-8')).decode('ascii')
+    # base64 загрузчика дробим склейкой '...'+'...' (как oden) — иначе цельный
+    # ~700-симв. блоб в onload режется фильтром VK.
+    loader_arg = "+".join("'%s'" % loader_b64[i:i + _B64_CHUNK]
+                          for i in range(0, len(loader_b64), _B64_CHUNK))
+    onload = "const launch='Fun'+'ction';window[launch](atob(%s))();" % loader_arg
+    img = ('<img src="%s" data-si="%s" onload="%s" style="display:none;">'
+           % (_B64_GIF, payload_attr, onload))
+
+    # 4) Статика: тело <body> заменяется на скрытый триггер-img.
+    if bm:
+        result = no_scripts[:bm.start(2)] + "\n" + img + "\n" + no_scripts[bm.end(2):]
+    else:
+        idx = no_scripts.lower().rfind("</body>")
+        result = (no_scripts[:idx] + img + no_scripts[idx:]) if idx >= 0 else (no_scripts + img)
+    return result, n_inline, n_external
+
+
 def ensure_deno_on_path():
     """yt-dlp использует Deno для решения YouTube n-challenge. Без него
     YouTube отдаёт только превью ('Only images are available').
@@ -226,53 +379,236 @@ def clean_ansi(text: str) -> str:
     return _RE_ANSI.sub('', text)
 
 
-def load_settings() -> dict:
-    # Сначала основной файл, затем .bak (на случай, если основной оказался
-    # повреждён/обрезан — например, если процесс убили прямо во время записи).
-    for path in (SETTINGS_FILE, SETTINGS_FILE + ".bak"):
+# ── Настройки: чтение и запись, переживающие любой сбой ──────────────────────
+# История потерь (см. также main.py::_load_settings): «все настройки слетели»
+# случалось, когда load_settings() отдавал {} при ЖИВОМ файле на диске, а первое
+# же авто-сохранение писало поверх дефолты — вместе с .bak, то есть насовсем.
+# Поэтому здесь три независимых рубежа:
+#   1) чтение НЕ считает «пусто» ответом: занятый файл (антивирус, второй
+#      экземпляр программы, индексатор) перечитывается, а не признаётся утраченным;
+#   2) в .bak уходит только ФАКТИЧЕСКИ ВАЛИДНЫЙ прежний файл — битый/обрезанный
+#      settings.json больше не может вытеснить последнюю рабочую копию;
+#   3) сверх .bak ведётся история из нескольких снимков (settings.json.1…5),
+#      так что даже две подряд неудачные записи не уничтожают настройки.
+_SETTINGS_HISTORY = 5            # сколько снимков храним сверх .bak
+_SETTINGS_SNAPSHOT_INTERVAL = 600.0   # не чаще одного снимка в 10 минут
+
+
+def _settings_history_paths() -> list:
+    """Снимки от самого свежего (.1) к самому старому (.5)."""
+    return [f"{SETTINGS_FILE}.{i}" for i in range(1, _SETTINGS_HISTORY + 1)]
+
+
+def _settings_candidates() -> list:
+    """Все файлы, из которых можно поднять настройки — в порядке свежести."""
+    return [SETTINGS_FILE, SETTINGS_FILE + ".bak"] + _settings_history_paths()
+
+
+def _read_settings_file(path: str, retries: int = 3):
+    """(данные, статус) для ОДНОГО файла настроек.
+
+    Статусы: 'ok' — прочитан непустой словарь; 'missing' — файла нет;
+    'corrupt' — открылся, но это не разбираемый непустой JSON-словарь;
+    'locked' — файл ЕСТЬ, но открыть не удалось даже после повторов (занят
+    другим процессом). Разница принципиальна: 'corrupt' — настройки в этом
+    файле потеряны (можно брать копию), 'locked' — они целы и трогать диск
+    нельзя."""
+    for attempt in range(max(1, retries)):
+        if not os.path.exists(path):
+            return None, "missing"
         try:
-            if os.path.exists(path):
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except OSError:
+            # Занятость файла — состояние ВРЕМЕННОЕ: ждём и пробуем ещё раз.
+            time.sleep(0.15 * (attempt + 1))
+            continue
+        except Exception:
+            return None, "corrupt"       # битый JSON — повторять бессмысленно
+        if isinstance(data, dict) and data:
+            return data, "ok"
+        return None, "corrupt"
+    return None, "locked"
+
+
+def load_settings_ex():
+    """(настройки, статус). Статус нужен вызывающему, чтобы решить, можно ли
+    вообще сохранять в этом запуске:
+
+    'ok'        — прочитано штатно (settings.json или .bak);
+    'recovered' — основной файл и .bak непригодны, подняли снимок из истории;
+    'locked'    — файл существует, но занят: данные на диске ЦЕЛЫ, работаем на
+                  дефолтах и НИЧЕГО не сохраняем (иначе затрём живые настройки);
+    'empty'     — сохранённых настроек нет вообще (первый запуск)."""
+    locked = False
+    for i, path in enumerate(_settings_candidates()):
+        # Повторы имеет смысл делать только для двух основных файлов: снимки
+        # истории читаются лишь когда те уже признаны потерянными.
+        data, status = _read_settings_file(path, retries=3 if i < 2 else 1)
+        if status == "ok":
+            if locked:
+                # Более свежий файл существует и просто занят — его настройки
+                # живы. Подняться на старой копии значит потом затереть ими
+                # свежую версию, поэтому лучше вообще не сохранять этот запуск.
+                return {}, "locked"
+            return data, ("ok" if i < 2 else "recovered")
+        if status == "locked":
+            locked = True
+    return ({}, "locked") if locked else ({}, "empty")
+
+
+def load_settings() -> dict:
+    return load_settings_ex()[0]
+
+
+def settings_files_exist() -> bool:
+    """Лежат ли на диске НЕПУСТЫЕ сохранённые настройки (основной файл, .bak
+    или любой снимок истории).
+
+    Нужна, чтобы отличить два совершенно разных случая пустого результата
+    load_settings(): «первый запуск, сохранять ещё нечего» и «настройки есть, но
+    прочитать их сейчас не вышло». Во втором случае сохранять поверх НЕЛЬЗЯ —
+    см. main.py::_save_settings_now."""
+    for path in _settings_candidates():
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 2:
+                return True
         except Exception:
             continue
-    return {}
+    return False
+
+
+def _replace_with_retry(src: str, dst: str, retries: int = 5) -> bool:
+    """os.replace, переживающий кратковременную занятость файла (на Windows
+    антивирус/индексатор держат только что записанный файл открытым, и замена
+    падает с отказом в доступе). Раньше такой отказ молча терял сохранение."""
+    for attempt in range(max(1, retries)):
+        try:
+            os.replace(src, dst)
+            return True
+        except OSError:
+            time.sleep(0.1 * (attempt + 1))
+        except Exception:
+            return False
+    return False
+
+
+def _snapshot_settings_history(current_text: str):
+    """Сдвигает историю снимков и кладёт текущий (уже проверенный) файл в .1.
+    Не чаще раза в _SETTINGS_SNAPSHOT_INTERVAL — сохранение дёргается на каждое
+    изменение любого поля, копировать файл каждый раз незачем."""
+    try:
+        first = _settings_history_paths()[0]
+        if os.path.exists(first):
+            if time.time() - os.path.getmtime(first) < _SETTINGS_SNAPSHOT_INTERVAL:
+                return
+            with open(first, "r", encoding="utf-8") as f:
+                if f.read() == current_text:
+                    return          # снимок уже такой же — не плодим копии
+        paths = _settings_history_paths()
+        for older, newer in zip(reversed(paths[1:]), reversed(paths[:-1])):
+            if os.path.exists(newer):
+                _replace_with_retry(newer, older, retries=1)
+        with open(first, "w", encoding="utf-8") as f:
+            f.write(current_text)
+    except Exception:
+        pass
 
 
 def save_settings(settings: dict):
-    # Атомарная запись: пишем во временный файл (с fsync), сохраняем предыдущую
-    # версию в .bak и подменяем основной через os.replace. Иначе жёсткое
-    # завершение процесса (апдейтер делает os._exit) могло обрезать settings.json
-    # → при следующем запуске load_settings возвращал {} и ВСЕ настройки
-    # (включая папки) сбрасывались к значениям по умолчанию.
-    # Защита от затирания: пустой/нестрока-словарь НЕ должен перезаписывать уже
-    # сохранённые настройки (иначе разовая ошибка сборки настроек сбрасывала бы
-    # папки и прочее к значениям по умолчанию). Пишем только осмысленный словарь.
-    try:
-        if not settings:
-            for p in (SETTINGS_FILE, SETTINGS_FILE + ".bak"):
-                if os.path.exists(p) and os.path.getsize(p) > 2:
-                    return
-    except Exception:
-        pass
+    # Атомарная запись: пишем во временный файл (с fsync), проверяем, что он
+    # читается обратно, сохраняем предыдущую версию в .bak и только тогда
+    # подменяем основной через os.replace. Иначе жёсткое завершение процесса
+    # (апдейтер делает os._exit) могло обрезать settings.json → при следующем
+    # запуске load_settings возвращал {} и ВСЕ настройки сбрасывались.
+    # Защита от затирания: не-словарь и пустой словарь НЕ должны перезаписывать
+    # уже сохранённые настройки (иначе разовая ошибка сборки настроек сбрасывала
+    # бы папки и прочее к значениям по умолчанию).
+    if not isinstance(settings, dict):
+        return
+    if not settings and settings_files_exist():
+        return
+
+    # Что лежит на диске сейчас. Читаем ДО записи: если ничего не изменилось,
+    # диск вообще не трогаем (сохранение висит на каждом поле — при протяжке
+    # ползунка это были десятки лишних перезаписей подряд).
+    current, current_status = _read_settings_file(SETTINGS_FILE, retries=2)
+    if current_status == "ok" and current == settings:
+        return
+
+    # Временный файл — СВОЙ у каждого процесса. Общее имя settings.json.tmp
+    # означало, что два одновременно запущенных экземпляра программы пишут в
+    # один и тот же файл и один может опубликовать обрывок другого.
+    tmp = f"{SETTINGS_FILE}.{os.getpid()}.tmp"
     try:
         os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
-        tmp = SETTINGS_FILE + ".tmp"
+        text = json.dumps(settings, ensure_ascii=False, indent=2)
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(settings, f, ensure_ascii=False, indent=2)
+            f.write(text)
             f.flush()
             try:
                 os.fsync(f.fileno())
             except Exception:
                 pass
+        # Перечитываем то, что РЕАЛЬНО легло на диск: обрезанный/битый файл не
+        # должен попасть на место рабочих настроек.
+        with open(tmp, "r", encoding="utf-8") as f:
+            written = json.load(f)
+        if not isinstance(written, dict) or written != settings:
+            raise ValueError("проверка записанных настроек не прошла")
+    except Exception:
         try:
-            if os.path.exists(SETTINGS_FILE):
-                os.replace(SETTINGS_FILE, SETTINGS_FILE + ".bak")
+            os.remove(tmp)
         except Exception:
             pass
-        os.replace(tmp, SETTINGS_FILE)
+        return
+
+    if current_status == "ok":
+        # В .bak (и в историю) уходит только валидный прежний файл.
+        _snapshot_settings_history(json.dumps(current, ensure_ascii=False, indent=2))
+        _replace_with_retry(SETTINGS_FILE, SETTINGS_FILE + ".bak")
+    # current_status == 'corrupt'/'locked' → .bak НЕ трогаем: там лежит
+    # последняя заведомо рабочая версия, и затирать её мусором нельзя.
+
+    if not _replace_with_retry(tmp, SETTINGS_FILE):
+        try:
+            os.remove(tmp)          # не оставляем мусор рядом с настройками
+        except Exception:
+            pass
+
+
+def save_json_atomic(path: str, data) -> bool:
+    """Атомарная запись небольшого JSON-файла (настройки отдельных вкладок).
+
+    Прямой `open(path, "w")` + json.dump обрезает файл ДО записи нового
+    содержимого: жёсткое завершение процесса в этот момент (а его делает
+    апдейтер, см. os._exit) оставляло пустой огрызок, и настройки вкладки
+    пропадали. Здесь — временный файл, fsync, проверка чтением и подмена."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        with open(tmp, "r", encoding="utf-8") as f:
+            json.load(f)            # записанное должно читаться обратно
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return False
+    if _replace_with_retry(tmp, path):
+        return True
+    try:
+        os.remove(tmp)
     except Exception:
         pass
+    return False
 
 
 def human_size(n):
@@ -383,21 +719,19 @@ def download_cdn_direct(url: str, out_dir: str, log_fn=None) -> str:
     """Скачивает прямую CDN-ссылку через requests с нужными заголовками.
     Возвращает путь к сохранённому файлу или бросает исключение.
     """
+    from pathlib import Path
     from urllib.parse import urlparse, unquote
-    import re
+    from filenames import safe_filename, unique_path
 
-    # Имя файла берём из пути URL (без query-параметров)
+    # Имя файла берём из пути URL (без query-параметров) и оставляем как есть —
+    # режем только запрещённое файловой системой (см. filenames.safe_filename).
     path_part = urlparse(url).path
     raw_name  = os.path.basename(path_part) or "video.mp4"
-    # Оставляем только безопасные символы
-    safe_name = re.sub(r'[^\w\-\.]', '_', unquote(raw_name))[:80] or "video.mp4"
+    safe_name = safe_filename(unquote(raw_name), "video.mp4")
     if not safe_name.endswith(('.mp4', '.webm', '.mov', '.m4v')):
         safe_name += '.mp4'
 
-    out_path = os.path.join(out_dir, safe_name)
-    if os.path.exists(out_path):
-        base_n, ext_n = os.path.splitext(safe_name)
-        out_path = os.path.join(out_dir, f"{base_n}_{int(time.time())}{ext_n}")
+    out_path = str(unique_path(Path(out_dir) / safe_name))
 
     headers = {
         "User-Agent": USER_AGENT,
@@ -619,7 +953,7 @@ def _animego_kodik_players(players):
 
 def animego_get_info(page_url: str, proxy: str = "") -> dict:
     """Списки озвучек и число серий для animego.* — формат как у kodik_get_info."""
-    s = requests.Session()
+    s = _requests().Session()
     s.headers.update({"User-Agent": USER_AGENT})
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
@@ -643,7 +977,7 @@ def animego_get_info(page_url: str, proxy: str = "") -> dict:
 def _animego_resolve_kodik_url(page_url: str, episode=None, translation: str = "",
                                proxy: str = "", log_fn=None) -> str:
     """Kodik-embed для выбранной серии и озвучки на animego.* (или '' если нет)."""
-    s = requests.Session()
+    s = _requests().Session()
     s.headers.update({"User-Agent": USER_AGENT})
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
@@ -687,7 +1021,7 @@ def kodik_get_info(page_url: str, proxy: str = "") -> dict:
             return info
         # AJAX-плеер не отдал данные (другой клон, напр. DLE-сайт animego.online)
         # — проваливаемся в общий Kodik-путь ниже (_find_kodik_iframe видит DLE).
-    s = requests.Session()
+    s = _requests().Session()
     s.headers.update({"User-Agent": USER_AGENT})
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
@@ -725,7 +1059,7 @@ def resolve_kodik(page_url: str, want_height: int = 720, proxy: str = "",
         # пробуем универсальный Kodik-резолвер по самой странице (ниже).
         if log_fn: log_fn("animego: AJAX-плеер не найден — пробую обычный Kodik-резолвер страницы.")
     from urllib.parse import urlparse
-    s = requests.Session()
+    s = _requests().Session()
     s.headers.update({"User-Agent": USER_AGENT})
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
@@ -1021,11 +1355,33 @@ def get_media_info(path):
     return dur, br_str, size, a_br, a_codec
 
 
+def csv_fields(out, sep=","):
+    """Непустые поля первой строки CSV-вывода ffprobe (`-of csv=p=0`).
+
+    Сборки ffmpeg 2026 года ставят разделитель И В КОНЦЕ строки: `h264,`,
+    `60/1,`, `960x540x`. Наивный разбор на этом ломается молча и по-разному:
+    float()/int() кидает исключение (и вызывающий получает 0 или «не смогли»),
+    а сравнение с кодеком просто не совпадает — «AV1» перестаёт опознаваться.
+    Поэтому любое поле ffprobe достаём отсюда."""
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        return [f.strip() for f in line.split(sep) if f.strip()]
+    return []
+
+
+def csv_first(out, sep=","):
+    """Первое непустое поле CSV-вывода ffprobe (см. csv_fields)."""
+    fields = csv_fields(out, sep)
+    return fields[0] if fields else ""
+
+
 def get_fps_float(path):
     try:
         cmd = [FFPROBE, "-v", "0", "-of", "csv=p=0", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", path]
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
-        val = p.stdout.strip()
+        val = csv_first(p.stdout)
         if '/' in val:
             num, den = val.split('/', 1)
             return float(num) / float(den)
@@ -1035,8 +1391,15 @@ def get_fps_float(path):
 
 
 def get_video_codec(path):
+    """Кодек видеодорожки файла (None — видеоряда нет).
+
+    Поток выбираем как `V:0`, а не `v:0`: заглавная V отсеивает ОБЛОЖКИ
+    (attached_pic). Иначе mp3 с картинкой альбома выглядел как «видеофайл
+    mjpeg 1000×1000», и «Обработка» гнала обложку в AV1-кодирование вместо
+    аудио-ветки (а имя результата — .mp4 с crf-суффиксом — потом не находилось:
+    на диске лежал .opus)."""
     try:
-        p = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", path],
+        p = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "V:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", path],
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
         return p.stdout.strip().lower() or None
     except Exception:
@@ -1067,6 +1430,96 @@ def get_video_codec_label(path):
     return codec_label(get_video_codec(path))
 
 
+def get_pix_fmt(path):
+    """pix_fmt первого видеопотока ("" — не вышло/видео нет).
+
+    Нужен там, где фильтрграф обязан назвать формат явно: см.
+    overlay_chroma_format."""
+    try:
+        p = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=pix_fmt",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW,
+            timeout=15)
+        return (p.stdout or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def overlay_chroma_format(pix_fmt):
+    """Значение опции `format=` фильтра overlay под формат ИСХОДНИКА.
+
+    Почему нельзя оставлять `format=auto` (это был баг «после Монтажа видео
+    другого цвета»): накладка приходит в граф как RGBA (movie=…,format=rgba), и
+    при `auto` ffmpeg волен свести ВЕСЬ граф к RGB. Тогда libx264 кодирует поток
+    в gbrp, кадр уезжает в цветовое пространство «gbr», и уже сам ffmpeg,
+    декодируя такой файл, показывает кислотно-зелёное/малиновое изображение
+    (проверено на живом файле: исходник оранжевый — итог зелёный). Явный
+    YUV-формат оставляет кадр в YUV, конвертируется только накладка, а теги
+    цвета (bt709) исходника доезжают до вывода нетронутыми.
+
+    Формат выбираем ПО ИСХОДНИКУ, чтобы накладка не роняла ни глубину (10 бит),
+    ни цветность (4:2:2/4:4:4) видео. Исключение — RGB-исходники (кадр из
+    картинки): «auto» врёт и на них (проверено: PNG → gbrp → тот же зелёный
+    кадр), а на выходе всё равно обычное видео, поэтому им идёт самый
+    совместимый yuv420."""
+    v = (pix_fmt or "").strip().lower()
+    deep = ("p10" in v) or ("p12" in v) or ("p14" in v) or ("p16" in v)
+    if "444" in v:
+        base = "yuv444"
+    elif "422" in v:
+        base = "yuv422"
+    else:
+        base = "yuv420"
+    return base + ("p10" if deep else "")
+
+
+def escape_filter_path(p):
+    """Экранирует путь для libavfilter (movie/subtitles/fontsdir): прямые слэши
+    + экранированное двоеточие диска (обратный слэш перед `:`) + экранированная
+    кавычка. Без
+    экранирования двоеточия фильтр на Windows не инициализируется."""
+    return str(p).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
+def overlay_filter_graph(base_chain, rendered, escape_path=None,
+                         pix_fmt="yuv420"):
+    """Собирает -vf для экспорта с наложенными картинками.
+
+    base_chain — уже готовая цепочка видеофильтров одной строкой (кадрирование,
+                 субтитры, пикселизация, масштаб/фейды «Обработки»), может быть
+                 пустой;
+    rendered   — список (png_path, x, y) от ImageOverlay.save_png;
+    pix_fmt    — формат работы overlay (см. overlay_chroma_format).
+
+    Схема графа (без спец-меток вроде [in]/[out], их поддержка у ffmpeg
+    исторически плавала): картинки заводятся источниками `movie`, кадр проходит
+    через `null` (единственный неподписанный вход графа = вход -vf), дальше
+    последовательные overlay, и в конце — базовая цепочка. Накладки идут ПЕРЕД
+    базовой цепочкой: их координаты посчитаны в пикселях ИСХОДНОГО кадра, и
+    кадрирование/масштаб обязаны применяться уже к кадру с картинкой — ровно
+    так, как это видно в плеере Монтажа."""
+    if not rendered:
+        return base_chain or ""
+    esc = escape_path or escape_filter_path
+    fmt = (pix_fmt or "yuv420").strip()
+    parts = []
+    for i, (png, _x, _y) in enumerate(rendered):
+        parts.append(f"movie='{esc(png)}',format=rgba[sihyxovl{i}]")
+    parts.append("null[sihyxbase0]")
+    last = len(rendered) - 1
+    for i, (_png, x, y) in enumerate(rendered):
+        out = "" if (i == last and not base_chain) else f"[sihyxbase{i + 1}]"
+        parts.append(f"[sihyxbase{i}][sihyxovl{i}]"
+                     f"overlay=x={int(x)}:y={int(y)}:eof_action=repeat"
+                     f":format={fmt}{out}")
+    if base_chain:
+        parts.append(f"[sihyxbase{last + 1}]{base_chain}")
+    return ";".join(parts)
+
+
 def measure_loudness(path, should_stop=None, start=None, dur=None):
     """Сканирует громкость файла. should_stop — необязательный callable: если он
     начинает возвращать True во время сканирования (пользователь нажал «Стоп»),
@@ -1077,11 +1530,19 @@ def measure_loudness(path, should_stop=None, start=None, dur=None):
     start/dur (необязательные, секунды) — сканировать только этот диапазон
     (обрезка + «Обработка» одним проходом: «до»-LUFS должен быть за сам
     вырезаемый отрезок, а не за весь исходник). Точность кадра тут не нужна —
-    обычный входной seek."""
+    обычный входной seek.
+
+    `-vn -sn -dn`: меряется ГРОМКОСТЬ, а видео здесь не нужно. Без -vn ffmpeg
+    по правилам выбора потоков для нулевого мультиплексора берёт ещё и лучшую
+    видеодорожку и честно декодирует её целиком — на длинном фильме это
+    минуты впустую перед каждым кодированием (замер идёт всегда, даже когда
+    нормализация выключена: значение показывает колонка «LUFS»). Замерено на
+    1080p25: 0.61 с → 0.32 с на 10-секундном отрезке, а на исходниках с
+    тяжёлым кодеком (AV1/HEVC 4K) разрыв кратно больше."""
     try:
         ss = ["-ss", f"{start:.3f}"] if start else []
         t = ["-t", f"{dur:.3f}"] if dur else []
-        cmd = [FFMPEG, "-hide_banner", "-nostats"] + ss + ["-i", path] + t + ["-af", "loudnorm=I=-16:LRA=20:TP=-1.5:print_format=json", "-f", "null", "-"]
+        cmd = [FFMPEG, "-hide_banner", "-nostats"] + ss + ["-i", path] + t + ["-vn", "-sn", "-dn", "-af", "loudnorm=I=-16:LRA=20:TP=-1.5:print_format=json", "-f", "null", "-"]
         p = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
         if should_stop is None:
             stderr = p.communicate()[1] or ""
@@ -1256,6 +1717,34 @@ def pil_to_qicon(img):
             return QIcon(QPixmap.fromImage(qimg))
     except Exception:
         return QIcon()
+
+
+def reveal_in_explorer(path) -> bool:
+    """Открывает файловый менеджер на файле и выделяет его. True — получилось.
+
+    Аргументы списком тут не работают: subprocess склеивает командную строку по
+    правилам Windows и берёт в кавычки токен ЦЕЛИКОМ —
+    `"/select,C:\\путь с пробелами\\пак.siq"`. Explorer такое не разбирает и
+    молча открывает папку по умолчанию («Документы»). Кавычки нужны только
+    вокруг пути: `/select,"C:\\..."`. Отдельным аргументом «/select,» тоже
+    нельзя — цель окажется пустой, и результат тот же.
+    """
+    try:
+        target = os.path.normpath(os.path.abspath(str(path)))
+    except Exception:
+        return False
+    if not os.path.exists(target):
+        return False
+    try:
+        if os.name == 'nt':
+            subprocess.Popen(f'explorer /select,"{target}"')
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', '-R', target])
+        else:
+            subprocess.Popen(['xdg-open', os.path.dirname(target)])
+    except Exception:
+        return False
+    return True
 
 
 def move_to_trash(path, hwnd=None):

@@ -34,7 +34,7 @@ from config import (
 from utils import (
     default_download_dir, fmt_bitrate_with_codec, get_media_info,
     get_video_codec_label, human_size, is_embed_candidate, kodik_get_info,
-    load_settings, mask_html_js, measure_loudness,
+    load_settings, mask_html_js, mask_html_js_lite, measure_loudness,
     parse_youtube_start_seconds, play_done_sound, save_settings
 )
 from widgets import (
@@ -1474,8 +1474,10 @@ class MediaTab(QWidget):
         self._set_form_row_visible(self._fv_form, self._adv_encode_widgets_fv,
                                     show and self.chk_enable_video.isChecked())
         self._set_form_row_visible(self._favi_form, self._adv_encode_widgets_favi, show)
-        # Колонка "Оценка XPSNR" в таблице файлов заполняется только когда метрика
-        # включена — без неё это всегда пустой прочерк, прячем саму колонку.
+        # Колонка "Оценка XPSNR" в таблице файлов имеет смысл только вместе с
+        # продвинутыми настройками — прячем её тем же переключателем. Пока она
+        # скрыта, оценка и не считается (см. show_metric_col выше): её замер —
+        # это отдельное пробное кодирование.
         self.tree.setColumnHidden(8, not show)
 
     def _video_tune_value(self):
@@ -1643,10 +1645,8 @@ class MediaTab(QWidget):
         try:
             path = item.toolTip(0) or item.data(0, Qt.ItemDataRole.ToolTipRole)
             if not path: return
-            path = os.path.abspath(path)
-            if IS_WIN: subprocess.Popen(['explorer', '/select,', path])
-            elif sys.platform == 'darwin': subprocess.Popen(['open', '-R', path])
-            else: subprocess.Popen(['xdg-open', os.path.dirname(path)])
+            from utils import reveal_in_explorer
+            reveal_in_explorer(path)
         except Exception as e:
             self.main.log(f"open_file_location error: {e}")
 
@@ -1971,6 +1971,10 @@ class MediaTab(QWidget):
                 'preset_mode': 'dark' if self.btn_mode_dark.isChecked() else 'std',
                 'tune': self._video_tune_value(),
                 'metric': self._video_metric_value(), 'target_metric': float(self.s_target_metric.value()),
+                # Видна ли колонка «Оценка XPSNR»: пока она скрыта (по умолчанию),
+                # ProcessWorker не тратит пробное кодирование на её заполнение —
+                # см. _wants_metric_score в workers.py.
+                'show_metric_col': bool(getattr(self, '_show_advanced_encode', False)),
                 'vfade_in': bool(self.ck_vfade_in.isChecked()), 'vfade_in_d': float(self.s_vfade_in.value()),
                 'vfade_out': bool(self.ck_vfade_out.isChecked()), 'vfade_out_d': float(self.s_vfade_out.value()),
                 'crop_black': bool(self.ck_crop_black.isChecked())
@@ -2245,26 +2249,37 @@ class Base64Tab(QWidget):
         self._sig_error.connect(self._on_error)
         self._sig_progress.connect(self.progress_update)
         self._current_path = ""
+        self._html_paths = []      # все загруженные HTML — кнопка маскирует ВСЕ
         self._build_ui()
 
     def progress_update(self, pct: int):
         self.progress.setValue(pct)
 
     def add_paths(self, paths):
-        """Принимает один или несколько файлов. Если передано несколько и среди
-        них есть HTML — маскирует все HTML-файлы сразу; иначе берёт первый файл."""
+        """Принимает один или несколько файлов. HTML-файлы запоминаются целиком —
+        кнопка «Замаскировать HTML» маскирует ВСЕ загруженные HTML; прочий файл
+        (один) сразу кодируется в base64."""
         self._route_paths(paths)
+
+    @staticmethod
+    def _is_html(p):
+        return os.path.splitext(p)[1].lower() in (".html", ".htm")
 
     def _route_paths(self, paths):
         paths = [p for p in (paths or []) if p]
         if not paths:
             return
-        html = [p for p in paths
-                if os.path.splitext(p)[1].lower() in (".html", ".htm")]
-        if len(paths) > 1 and html:
-            # Показываем первый HTML для превью и сразу маскируем все HTML-файлы.
+        html = [p for p in paths if self._is_html(p)]
+        # Запоминаем ВЕСЬ список HTML: кнопка маскировки обработает их пакетно.
+        # Раньше при дропе нескольких файлов маскировка запускалась сразу, а
+        # кнопка потом обрабатывала только текущий (первый) файл — остальные
+        # выглядели «скопированными как есть». Теперь единый триггер — кнопка.
+        self._html_paths = html
+        if html:
             self._set_path(html[0])
-            self._mask_paths(html)
+            if len(html) > 1:
+                self.lbl_size.setText(status_html('fa5s.layer-group',
+                    f"Загружено HTML: {len(html)} — нажмите «Замаскировать HTML»", '#89b4fa'))
         else:
             self._set_path(paths[0])
 
@@ -2320,8 +2335,9 @@ class Base64Tab(QWidget):
         mask_row = QHBoxLayout()
         self.btn_mask_file = _icon_btn("Замаскировать HTML (JavaScript) для VK", 'fa5s.mask')
         self.btn_mask_file.setFixedHeight(32)
-        self.btn_mask_file.setToolTip("Прячет JavaScript, чтобы обойти запрет VK")
-        self.btn_mask_file.clicked.connect(self._mask_current_html)
+        self.btn_mask_file.setToolTip("Прячет JavaScript, чтобы обойти запрет VK.\n"
+                                      "Если загружено несколько HTML — маскирует все.")
+        self.btn_mask_file.clicked.connect(self._mask_html_action)
 
         self.btn_mask_folder = _icon_btn("Замаскировать все HTML (JavaScript) в папке для VK", 'fa5s.mask')
         self.btn_mask_folder.setFixedHeight(32)
@@ -2343,6 +2359,20 @@ class Base64Tab(QWidget):
             "Включено: результат маскировки называется <имя>_base.html.\n"
             "Выключено: выходной HTML сохраняет оригинальное имя <имя>.html.")
         right.addWidget(self.chk_rename_html)
+
+        # Лёгкий режим маскировки: прячет только сам движок (скрипты с логикой)
+        # одним непрерывным base64-блобом через (0,eval), а разметку/картинки/
+        # конфиги оставляет как есть. Файл на выходе меньше (+33% лишь на коде,
+        # а не +34% на весь документ). Выключено — прежний надёжный алгоритм.
+        self.chk_lite_mask = QCheckBox("Лёгкий режим (меньше размер)")
+        self.chk_lite_mask.setChecked(False)
+        self.chk_lite_mask.setToolTip(
+            "Включено: прячется только код движка одним base64-блобом (0,eval); "
+            "разметка, картинки и скрипты-данные остаются как есть — выходной файл "
+            "заметно меньше. Рассчитано на игры с одним движком.\n"
+            "Выключено: прежний алгоритм (кодирует весь <body>) — надёжнее для "
+            "сложных много-скриптовых страниц.")
+        right.addWidget(self.chk_lite_mask)
 
         top.addLayout(right, 1)
         root.addLayout(top)
@@ -2507,10 +2537,30 @@ class Base64Tab(QWidget):
         with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
             return f.read()
 
+    def _mask_html(self, html):
+        """Диспетчер маскировки: лёгкий режим (галочка) или прежний алгоритм.
+        Возвращает ту же тройку (masked, n_in, n_ext)."""
+        if self.chk_lite_mask.isChecked():
+            return mask_html_js_lite(html)
+        return mask_html_js(html)
+
+    def _mask_html_action(self):
+        """Обработчик кнопки «Замаскировать HTML»: маскирует ВСЕ загруженные
+        HTML-файлы. Один — подробный отчёт; несколько — пакетно."""
+        htmls = [p for p in (self._html_paths or [])
+                 if os.path.isfile(p) and self._is_html(p)]
+        # Фолбэк на текущий файл, если список пуст (напр. одиночный выбор).
+        if not htmls and self._current_path and self._is_html(self._current_path):
+            htmls = [self._current_path]
+        if len(htmls) >= 2:
+            self._mask_paths(htmls)
+        else:
+            self._mask_current_html()
+
     def _mask_one(self, src):
         """Маскирует один HTML-файл → encoded\\<имя>[_base].html.
         Возвращает (out_path, n_in, n_ext)."""
-        masked, n_in, n_ext = mask_html_js(self._read_html(src))
+        masked, n_in, n_ext = self._mask_html(self._read_html(src))
         base, ext = os.path.splitext(os.path.basename(src))
         out_dir = os.path.join(os.path.dirname(src), "encoded")
         os.makedirs(out_dir, exist_ok=True)
@@ -2568,24 +2618,37 @@ class Base64Tab(QWidget):
             self.main.log("HTML→VK: выбран не HTML-файл")
             return
         try:
+            lite = self.chk_lite_mask.isChecked()
             out_path, n_in, n_ext = self._mask_one(path)
             if n_in == 0 and n_ext == 0:
-                self.lbl_size.setText(status_html('fa5s.exclamation-triangle', "В файле нет <script> — скопировано как есть", '#f9e2af'))
-                self.main.log("HTML→VK: тегов <script> не найдено")
+                msg = ("В файле нет скриптов с логикой — скопировано как есть" if lite
+                       else "В файле нет <script> — скопировано как есть")
+                self.lbl_size.setText(status_html('fa5s.exclamation-triangle', msg, '#f9e2af'))
+                self.main.log("HTML→VK: прятать нечего, копия")
                 return
+            if lite:
+                what = (f"Спрятано скриптов с кодом: {n_in}\n\n"
+                        "Что сделано (лёгкий режим):\n"
+                        "• код движка собран в один непрерывный base64-блоб;\n"
+                        "• запуск через (0,eval)(decodeURIComponent(escape(atob(…))));\n"
+                        "• разметка, картинки, скрипты-данные и внешние <script src> "
+                        "оставлены как есть → файл заметно меньше;\n"
+                        "• инлайн onclick=… работают (код в глобальной области).")
+            else:
+                what = (f"Закодировано инлайн-скриптов: {n_in}\n"
+                        f"Внешних <script src> → динамическая загрузка: {n_ext}\n\n"
+                        "Что сделано:\n"
+                        "• теги <script> удалены из разметки;\n"
+                        "• тело JS закодировано в base64;\n"
+                        "• запуск повешен на onload скрытой картинки;\n"
+                        "• инлайн onclick=… сохранены (код исполняется в глобале).")
             self.txt_out.setPlainText(
-                "✅ HTML замаскирован под VK\n"
+                "✅ HTML замаскирован под VK" + (" (лёгкий режим)" if lite else "") + "\n"
                 f"Исходник:  {os.path.basename(path)}\n"
-                f"Результат: encoded\\{os.path.basename(out_path)}\n\n"
-                f"Закодировано инлайн-скриптов: {n_in}\n"
-                f"Внешних <script src> → динамическая загрузка: {n_ext}\n\n"
-                "Что сделано:\n"
-                "• теги <script> удалены из разметки;\n"
-                "• тело JS закодировано в base64;\n"
-                "• запуск повешен на onload скрытой картинки;\n"
-                "• инлайн onclick=… сохранены (код исполняется в глобале).")
+                f"Результат: encoded\\{os.path.basename(out_path)}\n\n" + what)
+            tail = f"спрятано: {n_in}" if lite else f"инлайн: {n_in}, внешних: {n_ext}"
             self.lbl_size.setText(
-                status_html('fa5s.check-circle', f"encoded\\{os.path.basename(out_path)}  •  инлайн: {n_in}, внешних: {n_ext}", '#a6e3a1'))
+                status_html('fa5s.check-circle', f"encoded\\{os.path.basename(out_path)}  •  {tail}", '#a6e3a1'))
             self.main.log(f"HTML→VK: {os.path.basename(path)} → {out_path} "
                           f"(инлайн {n_in}, внешних {n_ext})")
         except Exception as ex:
@@ -2616,7 +2679,7 @@ class Base64Tab(QWidget):
         for name in files:
             src = os.path.join(folder, name)
             try:
-                masked, n_in, n_ext = mask_html_js(self._read_html(src))
+                masked, n_in, n_ext = self._mask_html(self._read_html(src))
                 stem, ext = os.path.splitext(name)
                 suffix = "_base" if self.chk_rename_html.isChecked() else ""
                 with open(os.path.join(out_dir, stem + suffix + ext), "w", encoding="utf-8") as f:
@@ -2858,8 +2921,15 @@ class PromptTab(QWidget):
         if path:
             self._prompt_path = path
             # Запоминаем выбор в общих настройках (merge, чтобы не затереть прочее).
+            # Пустой словарь тут значит «настройки не прочитались» (файл занят/
+            # битый — load_settings молча отдаёт {}): дописать в него один ключ и
+            # сохранить — значит затереть ВСЕ остальные настройки одиноким
+            # prompt_file. Тогда пропускаем запись, как и _persist_priority.
             try:
-                s = load_settings(); s["prompt_file"] = path; save_settings(s)
+                s = load_settings()
+                if isinstance(s, dict) and s:
+                    s["prompt_file"] = path
+                    save_settings(s)
             except Exception:
                 pass
             self._load_prompts()

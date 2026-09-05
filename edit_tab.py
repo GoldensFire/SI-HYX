@@ -12,6 +12,7 @@
 #   edit_tab_workers — фоновые QThread-воркеры (резка, прокси, волна, субтитры)
 #   edit_tab_widgets — виджеты (волна, холст видео, полный экран, превью)
 #   edit_tab_dialogs — диалоги (маска, редактор/конструктор субтитров, пикселизация)
+#   edit_tab_frames  — покадровая сетка и предекодирование кадров вокруг плейхеда
 #   edit_tab.py      — сам EditTab и standalone-entry main() (этот файл)
 #
 # ВАЖНО: edit_tab_base стоит первым в цепочке — он выставляет env-переменные
@@ -34,26 +35,29 @@ from config import (
     CONFIG_DIR, CREATE_NO_WINDOW, FFMPEG, FFPROBE, QAction, QApplication,
     QCheckBox, QComboBox, QCursor, QDialog, QEvent, QFileDialog, QFont,
     QFontMetrics, QFrame, QHBoxLayout, QKeySequence, QLabel, QLineEdit,
-    QMenu, QMessageBox, QPoint, QProgressBar, QPushButton, QScrollArea,
+    QMenu, QMessageBox, QPoint, QProgressBar, QPushButton, QRectF, QScrollArea,
     QSize, QSlider, QSpinBox, QTimer, QVBoxLayout, QWidget, Qt, get_icon,
     icon_html
 )
 from widgets import (info_badge)
+from utils import get_pix_fmt, save_json_atomic
 from msgbox import (
     msgbox_critical, msgbox_information, msgbox_question, msgbox_warning
 )
 from edit_tab_base import (
-    C, EDITOR_SETTINGS_PATH, LIBASS_AVAILABLE, QAudioOutput, QMediaPlayer,
-    QVideoWidget,
+    C, EDITOR_SETTINGS_PATH, LIBASS_AVAILABLE, QAudioFormat,
+    QAudioOutput, QAudioSink, QMediaDevices, QMediaPlayer,
+    QVideoWidget, install_audio_device_recovery,
     _HAS_MULTIMEDIA, _cues_to_ass, _fmt_channels, _fullscreen_icon,
-    _libass, _parse_srt, _pixelize_block_sequence, _unique_output,
+    _libass, _parse_srt, _pixelize_block_sequence, _pixelize_filter,
+    _unique_output,
     format_fps, make_divider, make_icon_btn, run_ffprobe, s_to_time,
     time_to_s
 )
 from edit_tab_workers import (
     AssExtractor, AudioSegmentWaveformLoader, AudioWaveformLoader,
     FfmpegWorker, ProxyWorker, ShareDeleteIODevice, SmartCutWorker,
-    SubtitleExtractor, VideoInpaintWorker
+    SubtitleExtractor, TrackOverlayWorker, TrackPathWorker, VideoInpaintWorker
 )
 from edit_tab_widgets import (
     AudioMeter, FullscreenVideo, InfoCard, SeekPreview, SeekSlider,
@@ -62,11 +66,37 @@ from edit_tab_widgets import (
 )
 from edit_tab_dialogs import (
     SubtitleCreatorDialog, SubtitleEditDialog, _PixelizeDialog,
-    _VideoMaskDialog
+    _TrackAttachDialog, _VideoMaskDialog
+)
+from edit_tab_frames import (AudioScrubber, FrameGrid, FramePrefetcher,
+                             probe_frame_size)
+from edit_tab_overlay import (
+    ImageOverlay, OverlayCropDialog, OverlayLayersPanel, fit_rect_norm,
+    load_overlay_image, overlay_chroma_format, overlay_filter_graph,
+    qimage_to_bgra, render_overlays
 )
 from PyQt6.QtCore import (QUrl)
-from PyQt6.QtGui import (QImage, QShortcut)
+from PyQt6.QtGui import (QImage, QPainter, QShortcut)
 from PyQt6.QtWidgets import (QScrollBar, QSizePolicy, QStyle, QToolTip)
+
+
+def _is_attached_pic(stream):
+    """True, если поток ffprobe — ОБЛОЖКА (attached_pic), а не видеоряд.
+
+    Обложка альбома в mp3/flac/m4a лежит в контейнере как «видеопоток» (mjpeg
+    1000×1000, r_frame_rate 90000/1) из одного кадра. Принимать её за видео
+    нельзя: fps 90000 давал сетку кадров на 20 млн кадров, покадровый декодер
+    гонял ffmpeg вхолостую (после -ss обложка не выдаётся вовсе), а метка
+    времени начинала жить по «часам кадра», которых у такого файла нет. Плюс
+    сам QtMultimedia обложку видеорядом НЕ считает (hasVideo=False) — то есть
+    вкладка считала иначе, чем её собственный плеер. Такой файл — чистое аудио."""
+    try:
+        if int((stream.get('disposition') or {}).get('attached_pic', 0) or 0):
+            return True
+    except Exception:
+        pass
+    return False
+
 
 # ─── Edit Tab ─────────────────────────────────────────────────────────────────
 class EditTab(QWidget):
@@ -141,6 +171,19 @@ class EditTab(QWidget):
         self._ass_extractor = None
         self._ass_path = None         # временный .ass-файл (удаляем при смене)
         self._ass_timer = None        # таймер перерисовки караоке во время игры
+        # ── Покадровый движок (см. edit_tab_frames.py) ───────────────────────
+        # Вся арифметика перемотки ведётся в НОМЕРАХ кадров, а не в миллисекундах:
+        # плеер принимает мс, и при дробном fps (23.976/29.97) шаг «позиция ±
+        # 1000/fps» копил ошибку округления (каждый ~60-й шаг терял кадр), а
+        # попадание ровно на границу кадра давало то текущий, то соседний кадр.
+        self._grid = FrameGrid(0.0, 0.0)
+        # Номер кадра, на котором стоит монтаж НА ПАУЗЕ (во время игры — None:
+        # там истина у самих кадров плеера, см. _current_frame_index).
+        self._frame_idx = None
+        # Предекодер соседних кадров: держит вокруг плейхеда буфер точных кадров,
+        # поэтому шаг стрелкой рисуется мгновенно и ровно тем кадром, что просили.
+        self._frames = None
+        self._frames_src = None
         # Флаг «скраб кадрами»: во время покадрового шага плеер кратко play→pause,
         # чтобы отрисовать кадр; кнопку play/pause при этом НЕ переключаем (иначе
         # она дёргается). См. step_frame_scrub / on_playback_changed.
@@ -150,27 +193,44 @@ class EditTab(QWidget):
         self._frame_seek_pending = None  # см. step_frame/_dispatch_frame_seek
         self._frame_seek_target_ms = None
         self._frame_seek_gen = 0
-        # Флаг «прогрев аудио»: после СТОП беззвучно поднимаем аудио-декодер в
-        # точке IN, чтобы следующее воспроизведение стартовало без задержки звука
-        # (см. _preroll_at / stop_playback). Кнопку/иконку при этом не трогаем.
+        # Флаг «прогрев аудио»: беззвучно поднимаем аудио-декодер в точке, где
+        # встал плейхед, чтобы следующее «Воспроизвести» стартовало со звуком
+        # без задержки (см. _preroll_at). ЖЕЛЕЗНОЕ правило: прогрев не имеет
+        # права быть виден — пока он идёт, интерфейс заморожен на цели
+        # (см. _ui_pinned_ms), кнопку/иконку он не трогает.
         self._prerolling = False
         self._preroll_prev_muted = False
+        self._preroll_target_ms = None   # цель прогрева «с разбега» (см. _preroll_at)
+        self._preroll_gen = 0
+        # «Воспроизвести» нажато посреди разбега: доигрываем разбег под mute и
+        # снимаем mute на цели, не трогая позицию (см. toggle_play).
+        self._preroll_handoff = False
+        self._preroll_watch_timer = None
         # Скраб-звук: при покадровом шаге (WASD/стрелки) играем короткий звуковой
         # блип в новой позиции — как в Filmora. В painted-режиме основной плеер
         # кадр доставляет setPosition'ом БЕЗ play() (иначе мерцает), поэтому звука
         # не было; даём его ОТДЕЛЬНЫМ лёгким аудиоплеером по оригиналу файла, не
         # трогая видео. Включается/выключается в Настройках → «Монтаж».
         self._scrub_audio_enabled = True
-        self._scrub_audio_player = None
-        self._scrub_audio_output = None
-        self._scrub_audio_dev = None
-        self._scrub_audio_src = None
-        self._scrub_blip_timer = None
-        self._scrub_blip_player = None
-        self._scrub_blip_output = None
-        self._scrub_hard_pause_timer = None
-        self._scrub_pending = None
-        self._scrub_media_status_wired = False
+        # Позиция блипа (мс) = НАЧАЛО показанного кадра. Плееру мы отдаём
+        # середину кадра (так он не промахивается мимо кадра), но звук обязан
+        # начинаться там же, где кадр — иначе слышно не то, что видно.
+        self._scrub_audio_ms = None
+        # Звук шага играет НЕ второй QMediaPlayer (он перематывался по границе
+        # аудиопакета и опаздывал на 140–160 мс — см. AudioScrubber), а точный
+        # PCM-срез из фонового окна, записанный прямо в QAudioSink.
+        self._audio_scrub = None      # AudioScrubber (окна PCM вокруг плейхеда)
+        self._scrub_sink_obj = None   # QAudioSink (открыт, пока жива вкладка)
+        self._scrub_sink_io = None
+        self._scrub_fmt = None
+        self._scrub_wait = None       # (время, когда) — шаг ждёт окно PCM
+        # Громкость до выключения звука кликом по динамику (см. toggle_mute).
+        self._vol_before_mute = 100
+        # Режим «только звук» (кнопка наушников): видео снято с плеера, чтобы
+        # тяжёлый файл не лагал. Живёт до перезапуска приложения и НЕ пишется в
+        # настройки — иначе через месяц «пропало видео» было бы загадкой.
+        self._audio_only_mode = False
+        self._audio_only_prev_track = 0
         # Папка экспорта обрезки ("" = рядом с исходником)
         self.export_dir = ""
         self.undo_stack: deque = deque(maxlen=50)
@@ -184,6 +244,10 @@ class EditTab(QWidget):
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
+        # Отключили наушники / сменилось устройство вывода — переезжаем на
+        # живое, иначе сеанс WASAPI аннулируется и звук пропадает до
+        # перезапуска (см. install_audio_device_recovery).
+        self._audio_dev_watch = install_audio_device_recovery(self.audio_output)
         # Метод субтитров: True (по умолчанию) — рендер ПРЯМО В КАДР (VideoCanvas,
         # как в VLC: субтитры обрезаются по видео и перекрываются окнами сверху);
         # False — старый метод (QVideoWidget + отдельное окно-оверлей). Значение
@@ -370,6 +434,8 @@ class EditTab(QWidget):
             "Перекодировать",
             "Только аудио (MP3)",
             "Smart Cut (умная)",
+            "Перекодировать настройками «Обработки»",
+            "(Аудио) Перекодировать настройками «Обработки»",
         ])
         # По умолчанию — «Перекодировать» (кадрово точная обрезка).
         self.cmb_mode.setCurrentIndex(1)
@@ -377,7 +443,16 @@ class EditTab(QWidget):
             "Быстро — copy без перекодировки (начало прилипает к ключевому кадру).\n"
             "Перекодировать — кадрово точно, но медленно и с потерями.\n"
             "Smart Cut — точные границы реза перекодируются, середина копируется "
-            "без потерь (быстро и с сохранением качества).")
+            "без потерь (быстро и с сохранением качества).\n"
+            "Перекодировать настройками «Обработки» — точный рез и текущие настройки "
+            "вкладки «Обработка» (кодек/CRF/скорость/громкость/fps) ОДНИМ проходом, "
+            "без двойной перекодировки. Наложенные картинки вшиваются тем же "
+            "проходом; кодировщик и «Вшить субтитры»/кадрирование/пикселизация "
+            "в этом режиме не применяются.\n"
+            "(Аудио) Перекодировать настройками «Обработки» — то же самое, но "
+            "видеоряд отбрасывается: на выходе ТОЛЬКО звуковая дорожка (.opus) с "
+            "текущими настройками звука «Обработки» (битрейт/громкость/фейды/"
+            "скорость).")
         # Не даём комбобоксу диктовать ширину панели по длине пункта (иначе панель
         # переполняется и обрезается). Закрытый комбо подстраивается под N символов,
         # полный текст пунктов виден в выпадающем списке.
@@ -685,9 +760,31 @@ class EditTab(QWidget):
         side.setObjectName("SidePanel")
         side.setFixedWidth(196)
         side.setStyleSheet(f"#SidePanel {{ background: {C['surface']}; border-left: 1px solid {C['border']}; }}")
-        side_l = QVBoxLayout(side)
-        side_l.setContentsMargins(10, 10, 10, 10)
+        side_outer = QVBoxLayout(side)
+        side_outer.setContentsMargins(0, 0, 0, 0)
+        side_outer.setSpacing(0)
+        # Содержимое панели — в прокрутке, как в правом сайдбаре. Панель растёт
+        # динамически (список слоёв появляется вместе с наложенными картинками),
+        # и в невысоком окне Qt раньше ужимал виджеты НИЖЕ их минимума: список
+        # слоёв сплющивался в синюю полоску, а подпись «Прозрачность» налезала
+        # на кнопки слоя. Со скроллом каждый элемент держит свой размер, а при
+        # высоком окне поведение прежнее — widgetResizable растягивает
+        # содержимое на всю высоту (шкала уровня звука по-прежнему тянется).
+        side_scroll = QScrollArea()
+        side_scroll.setObjectName("SidePanelScroll")
+        side_scroll.setWidgetResizable(True)
+        side_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        side_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        side_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        side_scroll.setStyleSheet("QScrollArea#SidePanelScroll { border: none; }")
+        side_content = QWidget()
+        side_l = QVBoxLayout(side_content)
+        # Правый отступ 4px — дорожка под вертикальный скроллбар, чтобы он не
+        # наезжал на комбобоксы (общий стиль приложения даёт узкий ползунок).
+        side_l.setContentsMargins(10, 10, 4, 10)
         side_l.setSpacing(6)
+        side_scroll.setWidget(side_content)
+        side_outer.addWidget(side_scroll)
 
         _combo_css = f"""
             QComboBox {{
@@ -789,6 +886,16 @@ class EditTab(QWidget):
 
         # Чекбокс «Вшить субтитры» — НАД индикатором уровня звука (по просьбе
         # пользователя). Кнопки кадра/удаления переехали в самый низ панели.
+        # Список наложенных картинок (появляется, только когда слои есть).
+        self.overlay_panel = OverlayLayersPanel()
+        self.overlay_panel.selected.connect(self._on_overlay_selected)
+        self.overlay_panel.cropRequested.connect(self._crop_image_overlay)
+        self.overlay_panel.deleteRequested.connect(self._delete_image_overlay)
+        self.overlay_panel.opacityChanged.connect(self._set_overlay_opacity)
+        self.overlay_panel.resetRequested.connect(self._reset_image_overlay)
+        side_l.addSpacing(6)
+        side_l.addWidget(self.overlay_panel)
+
         side_l.addSpacing(6)
         side_l.addWidget(self.chk_burn_subs)
 
@@ -868,6 +975,37 @@ class EditTab(QWidget):
             "субтитров — открывает её же на редактирование")
         self.btn_create_subs.clicked.connect(self.create_subtitles)
         self.btn_create_subs.setEnabled(False)
+        # «Привязать к объекту» — отслеживание выбранной области (DyHiT/HiT, ONNX;
+        # запасной трекер — CSRT из OpenCV) и накладка (текст/картинка), едущая
+        # вместе с объектом. См. track_object_overlay.
+        self.btn_track_object = make_icon_btn("")
+        self.btn_track_object.setIcon(get_icon('fa5s.crosshairs'))
+        self.btn_track_object.setIconSize(QSize(18, 18))
+        self._relax_width(self.btn_track_object)
+        self.btn_track_object.setToolTip(
+            "Привязать к объекту: обведите движущийся объект (руку, лицо, "
+            "машину) — нейросеть проследит за ним, и выбранный текст или "
+            "картинка поедут вместе с ним. Накладка сразу видна в плеере; "
+            "в файл её вшивает «Обрезать», повторное нажатие — убирает")
+        self.btn_track_object.clicked.connect(self.track_object_overlay)
+        self.btn_track_object.setEnabled(False)
+        # «Наложить картинку» — неподвижный логотип/водяной знак/рамка поверх
+        # видео: картинка появляется прямо в плеере, её двигают/тянут/крутят
+        # мышью, кадрируют отдельным окном, а «Обрезать» вшивает её в файл
+        # (overlay=…, требует перекодировки — как кадрирование).
+        self.btn_image_overlay = make_icon_btn("")
+        self.btn_image_overlay.setIcon(get_icon('fa5s.image'))
+        self.btn_image_overlay.setIconSize(QSize(18, 18))
+        self._relax_width(self.btn_image_overlay)
+        self.btn_image_overlay.setToolTip(
+            "Наложить картинку: выберите файл — он ляжет слоем поверх видео. "
+            "Перетаскивайте мышью, тяните за уголки, крутите за «антенну» "
+            "сверху (Shift — шаг 15°), Ctrl+стрелки — точная сдвижка, "
+            "Delete — убрать слой; обрезать саму картинку и задать "
+            "прозрачность — в списке слоёв справа. "
+            "Вшивается при «Обрезать» (перекодировка)")
+        self.btn_image_overlay.clicked.connect(self.add_image_overlay)
+        self.btn_image_overlay.setEnabled(False)
         self.btn_delete_source = make_icon_btn("", danger=True)
         self.btn_delete_source.setIcon(get_icon('fa5s.trash-alt', color='#11111b'))
         self.btn_delete_source.setIconSize(QSize(18, 18))
@@ -882,7 +1020,8 @@ class EditTab(QWidget):
         # держим самой нижней — как и раньше в одной колонке.
         self._montage_side_btns = [self.btn_crop_frame, self.btn_pixelize,
                                    self.btn_save_frame, self.btn_remove_object,
-                                   self.btn_create_subs, self.btn_delete_source]
+                                   self.btn_create_subs, self.btn_track_object,
+                                   self.btn_image_overlay, self.btn_delete_source]
         col_l = QVBoxLayout(); col_l.setContentsMargins(0, 0, 0, 0)
         col_l.setSpacing(self._MSIDE_GAP)
         col_l.addStretch(1)
@@ -892,7 +1031,8 @@ class EditTab(QWidget):
         col_r = QVBoxLayout(); col_r.setContentsMargins(0, 0, 0, 0)
         col_r.setSpacing(self._MSIDE_GAP)
         col_r.addStretch(1)
-        for _b in (self.btn_create_subs, self.btn_delete_source):
+        for _b in (self.btn_create_subs, self.btn_track_object,
+                   self.btn_image_overlay, self.btn_delete_source):
             col_r.addWidget(_b)
         btn_col = QHBoxLayout(); btn_col.setContentsMargins(0, 0, 0, 0)
         btn_col.setSpacing(self._MSIDE_GAP)
@@ -1089,10 +1229,43 @@ class EditTab(QWidget):
 
         pctrl_row.addStretch()
 
+        # «Только звук» — снимает видеодорожку с ПЛЕЕРА. На тяжёлых исходниках
+        # (AV1/HEVC 1080p60, ЦП-декод) отрисовка кадров съедает главный поток и
+        # монтаж начинает лагать, а картинка нужна не всегда: половину работы
+        # режут по волне и на слух. Кнопка убирает видео из превью целиком —
+        # на РЕЗУЛЬТАТ обрезки это не влияет (её гонит отдельный ffmpeg).
+        self.btn_audio_only = make_icon_btn("")
+        self.btn_audio_only.setIcon(get_icon('fa5s.headphones'))
+        self.btn_audio_only.setIconSize(QSize(18, 18))
+        self.btn_audio_only.setFixedWidth(40)
+        self.btn_audio_only.setCheckable(True)
+        # NoFocus — иначе клик уводит фокус с вкладки и Пробел начинает жать
+        # кнопку вместо воспроизведения (та же беда, что у «Обрезать старт»).
+        self.btn_audio_only.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_audio_only.setToolTip(
+            "Только звук: отключить видео в плеере, чтобы не лагало.\n"
+            "На обрезку и экспорт не влияет — там видео остаётся.")
+        # make_icon_btn не стилизует :checked — подсвечиваем включённый режим
+        # акцентом, иначе не видно, что видео отключено намеренно.
+        self.btn_audio_only.setStyleSheet(self.btn_audio_only.styleSheet() + f"""
+            QPushButton:checked {{
+                background: {C['accent']}; color: #11111b;
+                border: 1px solid transparent;
+            }}
+            QPushButton:checked:hover {{ background: {C['accent2']}; }}
+        """)
+        self.btn_audio_only.toggled.connect(self._toggle_audio_only)
+        self.btn_audio_only.setEnabled(False)   # активна только при видео
+        pctrl_row.addWidget(self.btn_audio_only)
+
+        pctrl_row.addSpacing(8)
+
         # Регулятор громкости — у правого края, рядом с полноэкранным режимом.
         # (Кнопки «Сохранить кадр»/«Удалить исходник» — внизу боковой панели.)
         self.vol_lbl = VolumeLabel(lambda: getattr(self, "vol_slider", None))
         self.vol_lbl.setStyleSheet(f"color: {C['text2']}; font-size: 14px;")
+        # Клик по динамику — mute/unmute с возвратом прежнего уровня.
+        self.vol_lbl.clicked.connect(self.toggle_mute)
         pctrl_row.addWidget(self.vol_lbl)
         self.vol_slider = VolumeSlider(Qt.Orientation.Horizontal)
         self.vol_slider.setRange(0, 100)
@@ -1487,11 +1660,25 @@ class EditTab(QWidget):
             # Кадрирование завершено кнопкой на холсте — снимаем чек с «Кадрировать».
             self.video_widget.cropApplied.connect(self._on_crop_applied)
             self.video_widget.cropCancelled.connect(self._on_crop_cancelled)
+            self.video_widget.overlaysChanged.connect(self._on_overlays_changed)
+            self.video_widget.overlaySelected.connect(self._on_overlay_picked)
         try:
             self.video_widget.setAcceptDrops(True)
             self.video_widget.installEventFilter(self)
         except Exception:
             pass
+        # Кадр выводит сцена Qt Quick (GPU). Если она не поднялась (нет модулей
+        # в сборке, не создался графический контекст), холст молча переходит на
+        # ЦП-отрисовку — она в разы дороже, и об этом надо знать, а не гадать,
+        # почему «Монтаж вдруг лагает».
+        if (isinstance(self.video_widget, VideoCanvas)
+                and getattr(self.video_widget, "_quick", None) is None):
+            try:
+                if self.main is not None and hasattr(self.main, "log"):
+                    self.main.log("Монтаж: сцена Qt Quick не поднялась — кадры "
+                                  "рисуются на ЦП (заметно медленнее)")
+            except Exception:
+                pass
 
     def set_subs_in_frame(self, in_frame, save=True):
         """Переключает метод субтитров (Монтаж → Настройки). Применяется на лету:
@@ -2806,6 +2993,13 @@ class EditTab(QWidget):
         # Очищаем последний кадр на холсте (frame-режим).
         if isinstance(self.video_widget, VideoCanvas):
             self.video_widget.clear_frame()
+        # …и отпускаем покадровый слой: буфер кадров прошлого файла больше не
+        # нужен, а его ffmpeg нельзя оставлять работать по удалённому источнику.
+        self._grid = FrameGrid(0.0, 0.0)
+        self._frame_idx = None
+        if getattr(self, '_frames', None) is not None:
+            self._frames.set_source(None)
+        self._frames_src = None
 
         # Сбрасываем субтитры.
         self._stop_sub_extractor()
@@ -2839,6 +3033,9 @@ class EditTab(QWidget):
         if _pb is not None and _pb.isChecked():
             _pb.blockSignals(True); _pb.setChecked(False); _pb.blockSignals(False)
         self._sync_pixelize_icon()
+        # Наложенные картинки — тоже строго «на файл»: следующий клип начинается
+        # без чужих слоёв (иначе экспорт молча вшил бы логотип с прошлого видео).
+        self._clear_image_overlays()
         self.selected_audio_abs_index = None
         self._clear_external_audio()
         self._audio_streams = []
@@ -2959,7 +3156,17 @@ class EditTab(QWidget):
         if _pb is not None and _pb.isChecked():
             _pb.blockSignals(True); _pb.setChecked(False); _pb.blockSignals(False)
         self._sync_pixelize_icon()
+        # Наложенные картинки — тоже строго «на файл»: следующий клип начинается
+        # без чужих слоёв (иначе экспорт молча вшил бы логотип с прошлого видео).
+        self._clear_image_overlays()
         self.waveform.reset_markers()
+        # …и «часы кадра» холста: pts последнего показанного кадра принадлежит
+        # ПРОШЛОМУ файлу. Без сброса метка времени/жёлтая полоска нового файла
+        # вставали по чужому времени (у аудиофайла с обложкой кадров нет вовсе —
+        # полоска намертво прилипала к концу волны, а «обрезать старт до
+        # плейхеда» ставило IN/OUT в самый конец).
+        if isinstance(self.video_widget, VideoCanvas):
+            self.video_widget.clear_frame()
 
         self.actual_source_file = Path(path)
         self.filepath = self.actual_source_file
@@ -3021,12 +3228,7 @@ class EditTab(QWidget):
         # клик по полосе во время «Создание превью…»/«Загрузка волны…» сикал в 0.
         self.waveform.prime_duration(self.duration)
 
-        vinfo = None; ainfo = None
-        for s in metadata.get('streams', []):
-            if s.get('codec_type') == 'video' and vinfo is None:
-                vinfo = s
-            if s.get('codec_type') == 'audio' and ainfo is None:
-                ainfo = s
+        vinfo, ainfo = self._pick_av_streams(metadata.get('streams', []))
 
         # Все аудио- и субтитровые дорожки контейнера (для выбора в боковой панели)
         self._audio_streams = [s for s in metadata.get('streams', [])
@@ -3122,6 +3324,21 @@ class EditTab(QWidget):
             return {0: 1.0, 1: 0.5, 2: 0.25}.get(self.cmb_pb_quality.currentIndex(), 1.0)
         except Exception:
             return 1.0
+
+    @staticmethod
+    def _pick_av_streams(streams):
+        """(видеопоток, аудиопоток) для плеера — первые подходящие из ffprobe.
+
+        Обложки (attached_pic) видеопотоком НЕ считаются: см. _is_attached_pic.
+        Чистая функция."""
+        vinfo = None; ainfo = None
+        for s in streams or []:
+            if (s.get('codec_type') == 'video' and vinfo is None
+                    and not _is_attached_pic(s)):
+                vinfo = s
+            if s.get('codec_type') == 'audio' and ainfo is None:
+                ainfo = s
+        return vinfo, ainfo
 
     @staticmethod
     def _parse_fps(vinfo):
@@ -3341,6 +3558,10 @@ class EditTab(QWidget):
         self.filepath = Path(path)
         self._pending_pb_seek = getattr(self, '_pb_restore', None)
         self._set_player_file(path)
+        # Точные кадры обязаны браться из ТОГО ЖЕ файла, что играет плеер:
+        # иначе после смены качества превью стоп-кадр остался бы от прежнего
+        # источника (другое разрешение — заметный «скачок» резкости на паузе).
+        self._frames_set_source()
 
     def _set_player_file(self, path):
         """Грузит файл в плеер через девайс с FILE_SHARE_DELETE — тогда исходник
@@ -3413,14 +3634,22 @@ class EditTab(QWidget):
         self._update_media_buttons()
         self._update_audio_only_placeholder()
         self.lbl_fps.setText(format_fps(self.fps))
+        # Покадровый слой перенастраиваем на новый клип: сетка кадров (fps +
+        # длительность) и источник точных кадров — ТОТ ЖЕ файл, что уйдёт в
+        # плеер (оригинал или превью-прокси, см. _frames_set_source).
+        self._refresh_frame_grid()
+        self._frame_idx = 0
+        self._frames_set_source()
 
         self.undo_stack.clear(); self.redo_stack.clear()
         self.current_in = 0.0; self.current_out = max(0.001, self.duration)
         self.set_in_out(0.0, self.current_out, skip_undo=True)
 
-        # Новый файл — сбрасываем зум/панораму превью (если активен холст-режим).
+        # Новый файл — сбрасываем зум/панораму превью (если активен холст-режим)
+        # и снимаем предпросмотр привязки: он посчитан по ПРОШЛОМУ видео.
         if isinstance(self.video_widget, VideoCanvas):
             self.video_widget.reset_view()
+            self._clear_track_preview()
 
         self._set_player_file(self.filepath)
         self.player.setPosition(0); self.player.pause()
@@ -3439,13 +3668,17 @@ class EditTab(QWidget):
         QTimer.singleShot(0, self._prime_scrub_audio)
 
     def _prime_scrub_audio(self):
-        """Заранее создаёт и подгружает плеер скраб-звука, чтобы первые блипы при
-        покадровом шаге уже звучали (AV1+Opus оригинал открывается не мгновенно).
-        Только подгрузка медиа — без воспроизведения (тишина при загрузке файла)."""
+        """Заранее декодирует окно PCM вокруг текущей точки, чтобы ПЕРВЫЙ же
+        покадровый шаг звучал сразу (окно готовится ~80 мс — на первом шаге это
+        было бы слышно как «звук появляется не всегда»). Только подготовка —
+        ничего не играем (тишина при загрузке файла)."""
         if not getattr(self, "_scrub_audio_enabled", True):
             return
         try:
-            self._ensure_scrub_audio_player()
+            eng = self._sync_scrub_audio_source()
+            if eng is not None:
+                eng.request(max(0.0, self.player.position() / 1000.0))
+            self._scrub_sink()          # поднять устройство заранее (~45 мс)
         except Exception:
             pass
 
@@ -3758,6 +3991,7 @@ class EditTab(QWidget):
         self.lbl_duration.setText(s_to_time(self.duration))
         self._update_total_time()
         # Синхронизируем current_out / waveform.out_s с новой длительностью (баг #4).
+        self._refresh_frame_grid()   # у сетки кадров новый предел
         new_out = new_dur if was_full else min(self.current_out, new_dur)
         new_in  = min(self.current_in, max(0.0, new_out - 0.001))
         if abs(new_out - self.current_out) > 1e-4 or abs(new_in - self.current_in) > 1e-4:
@@ -3777,18 +4011,20 @@ class EditTab(QWidget):
             pass
 
     def on_position_changed(self, pos_ms):
-        self._confirm_frame_seek(pos_ms)   # см. step_frame/_dispatch_frame_seek
-        pos_s = pos_ms / 1000.0
-        self.lbl_current_time.setText(s_to_time(pos_s))
-        if self.duration and self.duration > 0 and not self.slider.is_user_seeking():
-            self.slider.blockSignals(True)
-            self.slider.setValue(int((pos_s / self.duration) * 1000))
-            self.slider.blockSignals(False)
-        self.waveform.set_playhead(pos_s)
+        self._preroll_watch(pos_ms)        # см. _preroll_at (прогрев с разбега)
+        if not getattr(self, "_prerolling", False):
+            # Во время разбега позиция пробегает мимо любых целей покадрового
+            # seek'а — «подтверждать» ими чужой seek нельзя.
+            self._confirm_frame_seek(pos_ms)   # см. step_frame/_dispatch_frame_seek
+        # Интерфейс — по мастер-часам (кадр на экране), а не по «сырой» позиции
+        # плеера: иначе метка и картинка живут каждая своей жизнью, что и было
+        # видно как рассинхрон метки с видео. Для аудиофайлов _clock_pos_s сам
+        # возвращает позицию плеера.
+        pinned_ms = self._ui_pinned_ms()
+        pos_s = (pinned_ms / 1000.0) if pinned_ms is not None else self._clock_pos_s()
+        self._paint_playhead(pos_s)
         self._update_meter(pos_s)
         self._update_subtitle(pos_s)
-        self._update_seg_duration(pos_s)
-        self._fs_sync_position()
 
     def _update_meter(self, pos_s, force=False):
         """Кормит индикатор уровня значением аудиоволны на позиции плейхеда.
@@ -3845,6 +4081,10 @@ class EditTab(QWidget):
             if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
                 self.player.pause()
             out_s = self._effective_out_s()
+            # Кадр остановки задаём явно: иначе пауза «пришпилила» бы последний
+            # ПОКАЗАННЫЙ кадр, и метка отскочила бы от границы на кадр назад.
+            if self._grid.valid:
+                self._frame_idx = self._grid.index_at(out_s)
             self.player.setPosition(int(out_s * 1000))
             self.lbl_current_time.setText(s_to_time(out_s))
             self.waveform.set_playhead(out_s)
@@ -3855,34 +4095,42 @@ class EditTab(QWidget):
     def sync_ui(self):
         if self.duration <= 0.1:
             return
+        # Часы плеера (по сути аудио-часы) — ими проверяем границу OUT: она
+        # обязана срабатывать по звуку, даже если видеокадры отстают.
         pos_s = self.player.position() / 1000.0
-        self.lbl_current_time.setText(s_to_time(pos_s))
+        # А интерфейс (метка времени, полоса, плейхед на волне, субтитры) ведём
+        # по МАСТЕР-ЧАСАМ — времени кадра, который сейчас на экране. Пока плеер
+        # занят служебным делом (разбег, транзиентный play скраба), часы стоят
+        # на отметке пользователя — см. _ui_pinned_ms.
+        pinned_ms = self._ui_pinned_ms()
+        disp_s = (pinned_ms / 1000.0) if pinned_ms is not None else self._clock_pos_s()
         # Авто-пауза в конце воспроизводимого участка (резерв к покадровому
         # блоку VideoCanvas: ловит границу в overlay-режиме и как страховка).
         effective_out = self._effective_out_s()
         if effective_out > self.current_in and pos_s >= effective_out:
             self.player.pause()
+            if self._grid.valid:
+                self._frame_idx = self._grid.index_at(effective_out)
             self.player.setPosition(int(effective_out * 1000))
             self.lbl_current_time.setText(s_to_time(effective_out))
             self.waveform.set_playhead(effective_out)
             self._update_seg_duration(effective_out)
             return
-        if self.duration > 0 and not self.slider.is_user_seeking():
-            self.slider.blockSignals(True)
-            self.slider.setValue(int((pos_s / self.duration) * 1000))
-            self.slider.blockSignals(False)
-        self.waveform.set_playhead(pos_s)
-        self._update_meter(pos_s)
-        self._update_subtitle(pos_s)
-        self._update_seg_duration(pos_s)
-        self._fs_sync_position()
-        # Корректируем рассинхрон внешней озвучки (только если ушла заметно).
+        self._paint_playhead(disp_s)
+        self._update_meter(disp_s)
+        self._update_subtitle(disp_s)
+        # Рассинхрон внешней озвучки. Порог опущен с 220 до 130 мс: 220 мс — это
+        # уже отчётливо слышимое «эхо» относительно картинки (заметно от ~40 мс),
+        # а ниже сотни ставить нельзя — каждая правка это setPosition, то есть
+        # микро-заминка в звуке. Сверяемся с ЧАСАМИ ПЛЕЕРА (звук к звуку), а не с
+        # часами кадра: рассинхрон двух звуковых дорожек между собой слышен, а
+        # отставание рендера видео к нему отношения не имеет.
         if self._ext_audio_active and self._ext_audio_player is not None:
             try:
                 if (self._ext_audio_player.playbackState()
                         == QMediaPlayer.PlaybackState.PlayingState):
                     drift = self._ext_audio_player.position() - self.player.position()
-                    if abs(drift) > 220:
+                    if abs(drift) > 130:
                         self._ext_audio_player.setPosition(self.player.position())
             except Exception:
                 pass
@@ -3894,9 +4142,31 @@ class EditTab(QWidget):
     def seek_to(self, t_s):
         try:
             ms = int(max(0.0, min(t_s, max(0.0, self.duration))) * 1000)
+            # Идёт беззвучный разбег — гасим его ПЕРВЫМ делом. Иначе плеер
+            # продолжил бы играть уже от новой отметки и уехал бы с неё.
+            if getattr(self, "_prerolling", False):
+                self._preroll_cancel()
             if isinstance(self.video_widget, VideoCanvas):
                 self.video_widget.set_scrub_active(True)
                 self._scrub_idle_timer.start()   # перезапуск — «перемотка ещё идёт»
+            # Целевой кадр запоминаем сразу: от него пойдёт покадровый шаг.
+            # Пин ПЕРЕВОДИМ на новый кадр тут же — без этого холст продолжал бы
+            # считать «своим» кадр, где перемотка началась, и отбрасывал бы все
+            # кадры плеера: картинка стояла бы всю протяжку. Точные кадры при
+            # этом не заказываем (ffmpeg на каждый пиксель протяжки не нужен) —
+            # но если нужный кадр уже лежит в буфере, показываем его мгновенно.
+            if self._grid.valid:
+                self._frame_idx = self._grid.index_at(ms / 1000.0)
+                vw = getattr(self, "video_widget", None)
+                if isinstance(vw, VideoCanvas):
+                    span = self._grid.pts_span_us(self._frame_idx)
+                    vw.arm_frame_pin(span)
+                    eng = getattr(self, "_frames", None)
+                    img = eng.frame(self._frame_idx) if eng is not None else None
+                    if img is not None:
+                        vw.set_exact_frame(
+                            img, span,
+                            int(self._grid.start_of(self._frame_idx) * 1_000_000))
             self.player.setPosition(ms)
             self.waveform.set_playhead(t_s)
             self._ext_audio_seek(ms)
@@ -3908,25 +4178,67 @@ class EditTab(QWidget):
         возвращаем сглаженную отрисовку кадра в VideoCanvas."""
         if isinstance(self.video_widget, VideoCanvas):
             self.video_widget.set_scrub_active(False)
-        # Прогреваем аудио-декодер в новой позиции, пока на паузе — иначе
-        # следующее «Воспроизвести» после перемотки/скраба волной (не только
-        # после кнопки «Стоп», для которой прогрев уже был) ловит ту же
-        # «холодную» задержку звука на пару секунд (см. _preroll_at) — из-за
-        # неё было не докрутить покадровую обрезку по слуху.
-        if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            self._preroll_at(self.player.position() / 1000.0)
+        prerolling = getattr(self, "_prerolling", False)
+        playing = (self.player.playbackState()
+                   == QMediaPlayer.PlaybackState.PlayingState)
+        if not playing or prerolling:
+            # Перемотка кончилась — ставим на холст ТОЧНЫЙ кадр этой позиции и
+            # набиваем буфер соседями, чтобы первый же шаг стрелкой был мгновенным.
+            # Во время прогрева («с разбега») плеер формально играет, но кадр всё
+            # равно наш: пин прячет пробегающие кадры разбега.
+            self._show_exact_frame(self._frame_idx)
+        if not playing:
+            # Окно PCM для скраб-звука — в новой точке (первый шаг после клика
+            # по шкале обязан звучать сразу, см. AudioScrubber).
+            self._prime_scrub_audio()
+            # Греем аудио-конвейер в новой точке, пока стоим на паузе: иначе
+            # первое «Воспроизвести» после перемотки начиналось с ~0.35 с тишины
+            # и докрутить обрезку по слуху было нельзя (см. _preroll_at).
+            self._preroll_at(self._playhead_target_s())
 
     def toggle_play(self):
         self._scrubbing = False   # явное play/pause не должно гаситься скрабом
         # Пользователь нажал Play в окне беззвучного прогрева: отменяем прогрев,
         # возвращаем mute и продолжаем уже как обычный запуск (плеер уже играет
-        # под mute с точки IN — достаточно снять mute, не дёргая позицию).
+        # под mute — достаточно снять mute, не дёргая позицию).
         if getattr(self, "_prerolling", False):
             self._prerolling = False
+            tgt = getattr(self, "_preroll_target_ms", None)
+            # Прогрев идёт «с разбега», то есть плеер сейчас может быть ЕЩЁ НЕ
+            # доехавшим до отметки пользователя. Продолжить прямо отсюда значило
+            # бы начать воспроизведение раньше плейхеда. Но и перематывать на
+            # цель нельзя: перемотка кладёт аудио-конвейер, и звук появится
+            # только через ~0.35 с (ровно тот баг, ради которого прогрев и
+            # существует). Поэтому пока остаток разбега короткий — ДОИГРЫВАЕМ
+            # его под mute и снимаем mute на цели (_preroll_handoff): и картинка
+            # (пин точного кадра держится), и звук стартуют ровно на отметке.
+            behind = 0
             try:
-                self.audio_output.setMuted(self._preroll_prev_muted)
+                behind = (int(tgt) - self.player.position()) if tgt is not None else 0
+            except Exception:
+                behind = 0
+            if tgt is not None and 0 < behind <= self._PREROLL_HANDOFF_MS:
+                self._preroll_handoff = True
+                self._preroll_timer().start()
+                # Страховка: разбег мог упереться в конец файла и не доехать.
+                QTimer.singleShot(self._PREROLL_HANDOFF_MS + 300,
+                                  self._preroll_handoff_finish)
+                self.on_playback_changed(self.player.playbackState())
+                return
+            self._preroll_target_ms = None
+            try:
+                self._preroll_timer().stop()
             except Exception:
                 pass
+            try:
+                self.audio_output.setMuted(self._preroll_prev_muted)
+                # Остаток разбега длиннее порога — ждать дольше, чем стоит
+                # перемотка; доводим позицию.
+                if tgt is not None and behind > self._PREROLL_HANDOFF_MS:
+                    self.player.setPosition(int(tgt))
+            except Exception:
+                pass
+            self._release_frame_lock()
             self.on_playback_changed(self.player.playbackState())
             return
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -3935,6 +4247,11 @@ class EditTab(QWidget):
             pos_s = self.player.position() / 1000.0
             if abs(pos_s - self.current_out) < 0.15 and self.current_out > (self.current_in + 0.5):
                 self.seek_to(self.current_in)
+            # Пин снимаем ДО play(): иначе первые кадры воспроизведения (у них
+            # уже другой pts) холст отбросил бы как «чужие», и картинка стояла бы
+            # лишние доли секунды. Предекодер тоже глушим — во время игры
+            # процессор нужен декодеру плеера, а не буферу стоп-кадров.
+            self._release_frame_lock()
             self.player.play()
 
     def stop_playback(self):
@@ -3946,53 +4263,335 @@ class EditTab(QWidget):
             self.waveform.update()
         except Exception:
             pass
-        # Прогреваем аудио-конвейер в точке IN — следующее «Воспроизвести»
-        # стартует без задержки звука (см. _preroll_at).
-        self._preroll_at(self.current_in)
+        # Точный кадр точки IN — на холст СРАЗУ (до прогрева): иначе кадры
+        # «разбега» успели бы мелькнуть на экране.
+        self._show_exact_frame(self._frame_idx)
+        # Прогреваем конвейер в точке IN — следующее «Воспроизвести» стартует
+        # без задержки (см. _preroll_at). Цель берём у КАДРА (seek_to уже
+        # поставил на него _frame_idx), иначе прогрев целился бы мимо сетки.
+        self._preroll_at(self._playhead_target_s())
+
+    # Сколько миллисекунд играем ДО целевой точки при прогреве («разбег»).
+    # Замерено на живых файлах: после перемотки QtMultimedia раскручивает
+    # конвейер ~300 мс, и ВСЁ это время часы плеера стоят, а потом одним скачком
+    # догоняют реальное время. С коротким разбегом (было 140 мс) этот скачок
+    # перелетал цель на 240–540 мс, из-за чего прогрев всегда заканчивался
+    # обратной перемоткой — то есть ровно тем, чего он и должен избегать
+    # (см. _preroll_finish). 500 мс разбега скачок поглощают: промах падает до
+    # ±40 мс, обратной перемотки не остаётся вовсе.
+    _PREROLL_LEAD_MS = 500
+    # Короче этого разбег бессмыслен и ОПАСЕН: play() и pause() попадают в один
+    # такт, и пауза теряется (см. _preroll_at).
+    _PREROLL_MIN_LEAD_MS = 120
+    # Как часто щупаем позицию во время разбега. Сигнал positionChanged приходит
+    # раз в ~50 мс — этого мало: за такт плеер успевал уехать за цель дальше, чем
+    # на кадр, и снова включалась обратная перемотка. Свой таймер на 5 мс ловит
+    # цель настолько рано, насколько плеер вообще о ней сообщает.
+    _PREROLL_POLL_MS = 5
+    # Упреждение: тормозим чуть РАНЬШЕ цели — промахнуться назад безопаснее
+    # (ничего не теряется), чем вперёд.
+    _PREROLL_GUARD_MS = 8
+    # Промах больше этого правим перемоткой, меньше — оставляем как есть.
+    # Цена перемотки — ~350 мс тишины на старте (аудио-конвейер после seek'а
+    # поднимается только на play(), проверено: пауза любой длины его не греет).
+    # Цена промаха — столько же миллисекунд, срезанных со старта отрезка, причём
+    # на экране всё равно пришпилен точный кадр цели. 80 мс — верх реального
+    # разброса с разбегом 500 мс.
+    _PREROLL_SNAP_MS = 80
+    # Нажали «Воспроизвести» ПОСРЕДИ разбега и до цели осталось не больше этого —
+    # не перематываем (это остудило бы звук), а доигрываем разбег под mute и
+    # снимаем mute ровно на цели. Дальше этого порога ждать дольше, чем стоит
+    # перемотка, — тогда перематываем.
+    _PREROLL_HANDOFF_MS = 250
+
+    def _playhead_target_s(self):
+        """Куда ЦЕЛИТСЯ плеер для текущего плейхеда, с.
+
+        Это середина кадра, на котором стоит монтаж, — та же цель, что у шага
+        (см. FrameGrid.center_of). Брать вместо неё player.position() нельзя:
+        после перемотки плеер стоит где-то ВНУТРИ кадра (замерено — промах до
+        3 кадров), а при удержании стрелки ещё и отстаёт от плейхеда на
+        недоехавший seek. Кто считал прогрев от позиции плеера, тот утаскивал
+        туда же и номер кадра, и метку — «шагнул вправо, а он пятится назад»."""
+        if self._grid.valid and self._frame_idx is not None:
+            return self._grid.center_of(self._frame_idx)
+        try:
+            return max(0.0, self.player.position() / 1000.0)
+        except Exception:
+            return 0.0
+
+    def _ui_pinned_ms(self):
+        """Позиция (мс), на которой ОБЯЗАН стоять интерфейс, или None.
+
+        Плеер иногда играет НЕ для пользователя: беззвучный разбег прогрева и
+        транзиентный play() покадрового шага в overlay-режиме. В обоих случаях
+        его позиция уезжает и возвращается — и раньше это ехало прямо на шкалу:
+        бегунок «разгонялся» к отметке, а шаг стрелкой на один кадр сначала
+        сдвигал плейхед, а потом тащил его назад к точке разбега. Резать с таким
+        поведением невозможно.
+
+        Поэтому пока плеер занят собой, часы интерфейса стоят на ЗАКАЗАННОЙ
+        точке: метка времени, бегунок, жёлтая полоса на волне, «старт→плейхед»
+        и полноэкранная панель показывают ровно тот кадр, который выбрал
+        пользователь. Наружу прогрева не существует."""
+        busy = (getattr(self, "_prerolling", False)
+                or getattr(self, "_preroll_handoff", False)
+                or getattr(self, "_scrubbing", False))
+        if not busy:
+            return None
+        # Истина у интерфейса одна — НАЧАЛО кадра, на котором стоит монтаж
+        # (плееру мы отдаём середину кадра, чтобы он не промахнулся мимо него,
+        # но метка обязана совпадать с картинкой). Раньше прогрев отдавал сюда
+        # свою цель в миллисекундах, то есть СЕРЕДИНУ кадра, и метка времени
+        # после каждого шага дёргалась на полкадра: 00:01:00.017 → .025 → .017.
+        if self._grid.valid and self._frame_idx is not None:
+            return int(round(self._grid.start_of(self._frame_idx) * 1000.0))
+        if (getattr(self, "_prerolling", False)
+                or getattr(self, "_preroll_handoff", False)):
+            tgt = getattr(self, "_preroll_target_ms", None)
+            if tgt is not None:
+                return tgt
+        ms = getattr(self, "_scrub_audio_ms", None)
+        if ms is None:
+            ms = getattr(self, "_scrub_target", None)
+        return ms
 
     def _preroll_at(self, t_s):
-        """Беззвучный микро-прогрев в точке t_s: QtMultimedia после перемотки
-        поднимает аудио-декодер «холодно» только на play() — отсюда задержка
-        звука при СТОП→Воспроизвести. Делаем очень короткий play под mute и сразу
-        ставим паузу, вернув позицию ровно на t_s. Слышимого щелчка нет, кадр не
-        уезжает, а декодер уже «тёплый» — реальный запуск идёт мгновенно."""
+        """Беззвучный прогрев конвейера «с разбега» перед точкой t_s.
+
+        Зачем вообще: QtMultimedia (ffmpeg-бэкенд) поднимает декодер и аудио-
+        устройство только на play(), поэтому первое воспроизведение после
+        перемотки начиналось с заметной паузы — на длинных GOP (аниме-BDRip,
+        250+ кадров между ключевыми) картинка «думала» до пары секунд.
+
+        Как это делалось раньше и почему это же и мешало: играли 45 мс под mute,
+        потом ПАУЗА и setPosition НАЗАД, на исходную точку. Обратный seek — это
+        ещё одна полная раскрутка GOP, и попадала она ровно в момент, когда
+        пользователь жал «Воспроизвести»: плеер сперва доигрывал этот seek и
+        только потом стартовал. Прогрев лечил симптом и создавал его же.
+
+        Теперь прогрев идёт С РАЗБЕГА: встаём на _PREROLL_LEAD_MS РАНЬШЕ цели,
+        играем под mute и тормозим, когда позиция САМА дошла до t_s. Обратной
+        перемотки нет вовсе (а если проскочили больше кадра — правим, но это
+        редкость), декодер уже раскрутил цепочку через нужную точку, и реальный
+        старт продолжает воспроизведение, а не начинает его заново.
+
+        И главное: снаружи прогрева НЕ ВИДНО. На холсте пришпилен точный кадр
+        цели (см. _show_exact_frame), кадры разбега холст отбрасывает, а часы
+        интерфейса заморожены на цели (см. _ui_pinned_ms) — бегунок, метка и
+        жёлтая полоса стоят там, куда встал пользователь, и никуда не едут."""
         if self.duration <= 0.1 or not self.filepath:
             return
         if getattr(self, "_prerolling", False):
-            return
+            # Разбег уже идёт. Если греем ровно эту точку — не мешаем ему. А вот
+            # если пользователь тем временем перемотал в другое место, старый
+            # разбег обязан быть отменён: он ждёт СВОЮ цель, а плеер уже стоит на
+            # новой, и, дождавшись, утащил бы позицию обратно к прежней отметке.
+            if abs((getattr(self, "_preroll_target_ms", None) or -10 ** 9)
+                   - int(max(0.0, t_s) * 1000)) <= self._PREROLL_GUARD_MS:
+                return
+            self._preroll_cancel()
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             return
+        if getattr(self, "_scrubbing", False):
+            return          # идёт серия покадровых шагов — не мешаем ей плеером
         try:
             ms = int(max(0.0, t_s) * 1000)
+            lead = max(0, ms - self._PREROLL_LEAD_MS)
+            if ms - lead < self._PREROLL_MIN_LEAD_MS:
+                # У самого начала файла разбегаться негде: плеер получил бы
+                # play() и pause() в одном такте, а такую пару ffmpeg-бэкенд
+                # теряет — плеер оставался ИГРАТЬ, пин снимался устаревшим
+                # playbackStateChanged, и монтаж уезжал со стартового кадра сам
+                # (проверено вживую: шаг у нулевого кадра «уплывал» вперёд).
+                # Греть тут всё равно нечего: до начала файла меньше 120 мс.
+                return
             # prev_muted держим на self — если пользователь нажмёт «Воспроизвести»
             # прямо в окне прогрева, toggle_play восстановит mute и отменит прогрев.
             self._preroll_prev_muted = self.audio_output.isMuted()
             self._prerolling = True
+            self._preroll_handoff = False
+            self._preroll_target_ms = ms
+            self._preroll_gen = getattr(self, "_preroll_gen", 0) + 1
+            gen = self._preroll_gen
             self.audio_output.setMuted(True)
+            # Номер кадра прогрев НЕ трогает: на нём стоит монтаж, и вычислять
+            # его заново из миллисекунд цели — способ потерять кадр на границе.
+            if self._grid.valid and self._frame_idx is None:
+                self._frame_idx = self._grid.index_at(ms / 1000.0)
+            # Пин цели ДО старта разбега — экран остаётся на нужном кадре.
+            self._show_exact_frame(self._frame_idx)
+            if lead < ms:
+                self.player.setPosition(lead)
             self.player.play()
-
-            def _finish():
-                if not self._prerolling:
-                    return  # прогрев отменён (пользователь нажал Play) — не трогаем
-                try:
-                    self.player.pause()
-                    self.player.setPosition(ms)
-                    # Восстанавливаем прежнее состояние mute (могло быть включено
-                    # внешней озвучкой — тогда звук видео должен остаться немым).
-                    self.audio_output.setMuted(self._preroll_prev_muted)
-                    self.waveform.set_playhead(t_s)
-                    self.lbl_current_time.setText(s_to_time(t_s))
-                except Exception:
-                    pass
-                self._prerolling = False
-
-            QTimer.singleShot(45, _finish)
+            # Тормозим по СВОЕМУ таймеру (5 мс), а не по positionChanged (50 мс):
+            # см. _PREROLL_POLL_MS.
+            self._preroll_timer().start()
+            # Страховка: если позиция почему-то не дойдёт до цели (короткий
+            # клип, упёрлись в конец, seek не отработал) — заканчиваем сами.
+            # Запас считаем от разбега: 500 мс разбега + ~300 мс раскрутки
+            # конвейера + запас.
+            QTimer.singleShot(self._PREROLL_LEAD_MS + 1500,
+                              lambda g=gen: self._preroll_finish(g, forced=True))
         except Exception:
             self._prerolling = False
+            self._preroll_target_ms = None
             try:
                 self.audio_output.setMuted(False)
             except Exception:
                 pass
+
+    def _preroll_cancel(self):
+        """Гасит разбег БЕЗ доводки позиции: цель устарела (пользователь перемотал
+        в другое место или шагнул кадром), поэтому ни тормозить «на цели», ни
+        возвращаться к ней не нужно — тот, кто отменил, сам поставит позицию."""
+        if not getattr(self, "_prerolling", False):
+            return
+        self._prerolling = False
+        self._preroll_target_ms = None
+        # Новое поколение — чтобы хвосты старого (страховочный singleShot,
+        # positionChanged) прошли мимо.
+        self._preroll_gen = getattr(self, "_preroll_gen", 0) + 1
+        try:
+            self._preroll_timer().stop()
+        except Exception:
+            pass
+        try:
+            self.player.pause()
+        except Exception:
+            pass
+        try:
+            self.audio_output.setMuted(self._preroll_prev_muted)
+        except Exception:
+            pass
+
+    def _preroll_timer(self):
+        """Таймер-сторож разбега (создаётся один раз, см. _PREROLL_POLL_MS)."""
+        t = getattr(self, "_preroll_watch_timer", None)
+        if t is None:
+            t = QTimer(self)
+            t.setInterval(self._PREROLL_POLL_MS)
+            t.timeout.connect(self._preroll_tick)
+            self._preroll_watch_timer = t
+        return t
+
+    def _preroll_tick(self):
+        """Позиция дошла до цели — тормозим разбег (или, если пользователь уже
+        нажал «Воспроизвести», снимаем mute и отдаём ему воспроизведение)."""
+        tgt = getattr(self, "_preroll_target_ms", None)
+        handoff = getattr(self, "_preroll_handoff", False)
+        if tgt is None or not (handoff or getattr(self, "_prerolling", False)):
+            self._preroll_timer().stop()
+            return
+        try:
+            pos = self.player.position()
+            # Пока play() не отработал, тормозить нечего: pause() в одном такте
+            # с play() ffmpeg-бэкенд теряет, и плеер уезжает играть дальше.
+            if (self.player.playbackState()
+                    != QMediaPlayer.PlaybackState.PlayingState):
+                return
+        except Exception:
+            return
+        if pos < tgt - self._PREROLL_GUARD_MS:
+            return
+        if handoff:
+            self._preroll_handoff_finish()
+        else:
+            self._preroll_finish(getattr(self, "_preroll_gen", 0))
+
+    def _preroll_watch(self, pos_ms):
+        """Резервный сторож разбега по positionChanged: сигнал приходит раз в
+        ~50 мс, поэтому обычно первым срабатывает _preroll_tick (5 мс). Оставлен
+        на случай, если таймер не успел (загруженный интерфейс)."""
+        if not (getattr(self, "_prerolling", False)
+                or getattr(self, "_preroll_handoff", False)):
+            return
+        tgt = getattr(self, "_preroll_target_ms", None)
+        if tgt is None:
+            return
+        if pos_ms >= tgt - self._PREROLL_GUARD_MS:
+            if getattr(self, "_preroll_handoff", False):
+                self._preroll_handoff_finish()
+            else:
+                self._preroll_finish(getattr(self, "_preroll_gen", 0))
+
+    def _preroll_handoff_finish(self):
+        """Разбег доигран до цели, а «Воспроизвести» уже нажато: просто снимаем
+        mute и отпускаем покадровый слой. Ни паузы, ни перемотки — конвейер как
+        играл, так и играет, поэтому звук появляется ровно на цели и мгновенно."""
+        if not getattr(self, "_preroll_handoff", False):
+            return
+        self._preroll_handoff = False
+        self._preroll_target_ms = None
+        try:
+            self._preroll_timer().stop()
+        except Exception:
+            pass
+        try:
+            self.audio_output.setMuted(self._preroll_prev_muted)
+        except Exception:
+            pass
+        # Воспроизведение успели остановить (Пробел ещё раз, СТОП, граница OUT) —
+        # тогда мы просто возвращаем mute: пин точного кадра там уже поставлен
+        # паузой, и снимать его нельзя.
+        try:
+            if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                return
+        except Exception:
+            return
+        self._release_frame_lock()
+
+    def _preroll_finish(self, gen=None, forced=False):
+        if not getattr(self, "_prerolling", False):
+            return
+        if gen is not None and gen != getattr(self, "_preroll_gen", 0):
+            return          # это хвост от ПРЕДЫДУЩЕГО прогрева
+        self._prerolling = False
+        try:
+            self._preroll_timer().stop()
+        except Exception:
+            pass
+        tgt = getattr(self, "_preroll_target_ms", None)
+        self._preroll_target_ms = None
+        try:
+            self.player.pause()
+            if tgt is not None:
+                # Возвращаемся назад ТОЛЬКО при ГРУБОМ промахе: лишний seek — это
+                # та самая раскрутка конвейера, ради избавления от которой прогрев
+                # и переделан (см. докстроку _preroll_at). Порог не «кадр», как
+                # было: с кадровым порогом перемотка срабатывала практически
+                # всегда (часы плеера меняются шагами по ~40–60 мс), и каждое
+                # воспроизведение после перемотки начиналось с ~0.35 с тишины.
+                tol = max(self._PREROLL_SNAP_MS,
+                          int(1000.0 / self.fps) if (self.fps and self.fps > 0) else 40)
+                if abs(self.player.position() - tgt) > tol:
+                    self.player.setPosition(tgt)
+                t_s = tgt / 1000.0
+                if self._grid.valid:
+                    if self._frame_idx is None:
+                        self._frame_idx = self._grid.index_at(t_s)
+                    # Метка и волна показывают НАЧАЛО кадра — ровно то, что
+                    # на экране; цель прогрева (середина кадра) сюда не идёт.
+                    t_s = self._grid.start_of(self._frame_idx)
+                    self._show_exact_frame(self._frame_idx)
+                self.waveform.set_playhead(t_s)
+                self.lbl_current_time.setText(s_to_time(t_s))
+            # Восстанавливаем прежнее состояние mute (могло быть включено
+            # внешней озвучкой — тогда звук видео должен остаться немым).
+            self.audio_output.setMuted(self._preroll_prev_muted)
+        except Exception:
+            pass
+
+    def _release_frame_lock(self):
+        """Отпускает покадровый слой перед воспроизведением: снимает пин с холста
+        и отменяет фоновое декодирование кадров."""
+        self._frame_idx = None
+        vw = getattr(self, "video_widget", None)
+        if isinstance(vw, VideoCanvas):
+            vw.clear_frame_pin()
+        eng = getattr(self, "_frames", None)
+        if eng is not None:
+            eng.cancel()
 
     def on_playback_changed(self, state):
         # Во время покадрового скраба play→pause транзиентны — не трогаем кнопку,
@@ -4002,10 +4601,38 @@ class EditTab(QWidget):
         if self._scrubbing or getattr(self, "_prerolling", False):
             return
         playing = (state == QMediaPlayer.PlaybackState.PlayingState)
+        # Сигнал приходит с задержкой: «играю» могло прилететь уже ПОСЛЕ того,
+        # как прогрев остановил плеер. Верим текущему состоянию, а не почтальону:
+        # иначе устаревший сигнал снимал пин с холста и отпускал буфер кадров —
+        # картинка уезжала с кадра, на котором стоял монтаж.
+        try:
+            if playing and (self.player.playbackState()
+                            != QMediaPlayer.PlaybackState.PlayingState):
+                return
+        except Exception:
+            pass
         # Painted-режим: во время игры ресайзим кадр быстрым методом (экономим ЦП).
         vw = getattr(self, "video_widget", None)
         if isinstance(vw, VideoCanvas):
             vw.set_playing(playing)
+        # Покадровый слой: во время игры главные — кадры плеера (пин снят,
+        # предекодер молчит); на паузе, наоборот, пришпиливаем к холсту точный
+        # кадр остановки и греем соседей — тогда первый же шаг стрелкой
+        # мгновенный и ровно тем кадром, что просили.
+        if playing:
+            # Исключение — «передача» разбега (см. toggle_play): пока доигрывается
+            # немой остаток до отметки, пин точного кадра ОБЯЗАН держаться, иначе
+            # на экране мелькнёт кусочек до отметки. Снимет его
+            # _preroll_handoff_finish ровно на цели.
+            if not getattr(self, "_preroll_handoff", False):
+                self._release_frame_lock()
+        elif self._grid.valid and self.video_stream_index is not None:
+            # Сбрасываем ПЕРЕД вычислением: иначе _current_frame_index вернул бы
+            # прежний номер (он на паузе доверяет _frame_idx), а нам нужен кадр,
+            # на котором воспроизведение реально остановилось.
+            self._frame_idx = None
+            self._frame_idx = self._current_frame_index()
+            self._show_exact_frame(self._frame_idx)
         if playing:
             self.btn_play.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
             self.sync_timer.start()
@@ -4023,6 +4650,13 @@ class EditTab(QWidget):
                 pass
 
     def on_media_status_changed(self, status):
+        # Дорожки известны только у загруженного медиа — поэтому режим «только
+        # звук» доводим до плеера здесь же, а не в момент нажатия кнопки (иначе
+        # у нового файла видео возвращалось само).
+        if status in (QMediaPlayer.MediaStatus.LoadedMedia,
+                      QMediaPlayer.MediaStatus.BufferedMedia):
+            if getattr(self, "_audio_only_mode", False):
+                self._apply_audio_only_to_player()
         # После смены качества воспроизведения (swap источника) восстанавливаем
         # позицию и состояние, как только медиа загрузилось.
         if (status in (QMediaPlayer.MediaStatus.LoadedMedia,
@@ -4052,6 +4686,29 @@ class EditTab(QWidget):
         except Exception:
             pass
 
+    def toggle_mute(self):
+        """Клик по значку динамика: выключает звук и включает обратно, возвращая
+        ПРЕЖНИЙ уровень громкости.
+
+        Через сам ползунок (а не audio_output.setMuted): его valueChanged уже
+        разводит громкость по всем трём выходам — видео, внешняя озвучка и
+        скраб-звук покадрового шага, — обновляет значок динамика и полноэкранную
+        панель. Плюс setMuted тут занят: им глушится звук видео, когда выбрана
+        внешняя озвучка (см. _set_external_audio), и mute «поверх» него оставил
+        бы пользователя без способа вернуть звук."""
+        sl = getattr(self, "vol_slider", None)
+        if sl is None:
+            return
+        cur = int(sl.value())
+        if cur > 0:
+            self._vol_before_mute = cur
+            sl.setValue(0)
+        else:
+            # Прежний уровень мог быть нулевым (ползунок утащили в 0 руками) —
+            # тогда возвращаем разумную громкость, а не «включаем в тишину».
+            prev = int(getattr(self, "_vol_before_mute", 0) or 0)
+            sl.setValue(prev if prev > 0 else 100)
+
     def _on_volume_changed(self, v):
         try:
             self.audio_output.setVolume(v / 100.0)
@@ -4064,9 +4721,9 @@ class EditTab(QWidget):
             except Exception:
                 pass
         # …и для скраб-звука покадровой перемотки.
-        if getattr(self, "_scrub_audio_output", None) is not None:
+        if getattr(self, "_scrub_sink_obj", None) is not None:
             try:
-                self._scrub_audio_output.setVolume(v / 100.0)
+                self._scrub_sink_obj.setVolume(max(0.0, min(1.0, v / 100.0)))
             except Exception:
                 pass
         try:
@@ -4090,10 +4747,20 @@ class EditTab(QWidget):
         # Для still-картинки доступны кадрирование/пикселизация/сохранение кадра
         # (полноэкранный режим — нет, он завязан на плеер).
         has_visual = has_video or is_image
+        audio_only_mode = bool(getattr(self, "_audio_only_mode", False))
         _fsb = getattr(self, "btn_fullscreen", None)
         if _fsb is not None:
-            _fsb.setEnabled(has_video)
-        for name in ("btn_save_frame", "btn_crop_frame", "btn_pixelize", "btn_create_subs"):
+            # В режиме «только звук» смотреть в полный экран нечего.
+            _fsb.setEnabled(has_video and not audio_only_mode)
+        _aob = getattr(self, "btn_audio_only", None)
+        if _aob is not None:
+            _aob.setEnabled(has_video)
+            if not has_video and _aob.isChecked():
+                # Загрузили аудиофайл — режим сам себя выключает: у плеера и так
+                # нет видео, а подсвеченная кнопка сбивала бы с толку.
+                _aob.setChecked(False)
+        for name in ("btn_save_frame", "btn_crop_frame", "btn_pixelize",
+                     "btn_create_subs", "btn_image_overlay"):
             b = getattr(self, name, None)
             if b is not None:
                 b.setEnabled(has_visual)
@@ -4101,6 +4768,10 @@ class EditTab(QWidget):
         # фоторедактор) и только если не идёт уже обработка.
         b = getattr(self, "btn_remove_object", None)
         if b is not None and not getattr(self, "_vinp_running", False):
+            b.setEnabled(has_video)
+        # «Привязать к объекту» — тоже только для видео (нужно движение).
+        b = getattr(self, "btn_track_object", None)
+        if b is not None and not getattr(self, "_trk_running", False):
             b.setEnabled(has_video)
         # Нет визуала (ни видео, ни картинки) — выходим из режима кадрирования рамки.
         if not has_visual:
@@ -4116,6 +4787,7 @@ class EditTab(QWidget):
                 if b is not None and b.isChecked():
                     b.blockSignals(True); b.setChecked(False); b.blockSignals(False)
                 self._sync_pixelize_icon()
+            self._clear_image_overlays()
         # «Удалить исходник» активна при любом загруженном файле (видео/аудио).
         try:
             src = getattr(self, "actual_source_file", None)
@@ -4137,6 +4809,64 @@ class EditTab(QWidget):
         except Exception:
             pass
 
+    def _toggle_audio_only(self, on):
+        """Кнопка «Только звук»: снимает/возвращает видеодорожку у плеера.
+
+        Декодирование видео прекращается на уровне QMediaPlayer (активный
+        видеотрек = -1), предекодер точных кадров глушится, на холсте вместо
+        картинки — надпись. Звук, волна, покадровый шаг, прогрев конвейера и
+        обрезка работают как обычно: резать по волне и на слух можно ровно так
+        же, а экспорт идёт отдельным ffmpeg по исходнику и видео сохраняет."""
+        on = bool(on)
+        if on == getattr(self, "_audio_only_mode", False):
+            return
+        self._audio_only_mode = on
+        # Разбег греет звук — но он играет плеером, а мы сейчас плееру меняем
+        # набор дорожек. Гасим, чтобы не столкнулись.
+        if getattr(self, "_prerolling", False):
+            self._preroll_cancel()
+        self._apply_audio_only_to_player()
+        eng = getattr(self, "_frames", None)
+        if eng is not None:
+            eng.cancel()          # ffmpeg больше не декодирует кадры впустую
+        self._update_audio_only_placeholder()
+        if not on:
+            # Вернули видео — сразу возвращаем и точный кадр под плейхедом.
+            self._show_exact_frame(self._frame_idx)
+        self._update_media_buttons()
+
+    def _apply_audio_only_to_player(self):
+        """Переключает видеодорожку плеера под текущий режим.
+
+        Смена активного трека у ffmpeg-бэкенда может сбросить позицию, поэтому
+        запоминаем её и возвращаем: плейхед обязан остаться там же, где стоял
+        (см. _ui_pinned_ms — позиция в Монтаже священна)."""
+        player = getattr(self, "player", None)
+        if player is None:
+            return
+        on = getattr(self, "_audio_only_mode", False)
+        try:
+            pos = player.position()
+        except Exception:
+            pos = None
+        try:
+            if on:
+                cur = player.activeVideoTrack()
+                if cur is not None and cur >= 0:
+                    self._audio_only_prev_track = cur
+                player.setActiveVideoTrack(-1)
+            else:
+                prev = getattr(self, "_audio_only_prev_track", 0)
+                player.setActiveVideoTrack(prev if (prev is not None and prev >= 0) else 0)
+        except Exception as e:
+            self.main.log(f"audio-only: не удалось переключить видеодорожку: {e}")
+            return
+        try:
+            if pos is not None and player.position() != pos:
+                player.setPosition(int(pos))
+        except Exception:
+            pass
+
     def _update_audio_only_placeholder(self):
         """В области видео показываем поясняющий текст, когда у загруженного файла
         нет видеоряда (редактируется чистое аудио). При наличии видео или без файла
@@ -4150,8 +4880,18 @@ class EditTab(QWidget):
                       and not getattr(self, "is_still_image", False)
                       and getattr(self, "video_stream_index", None) is None
                       and getattr(self, "duration", 0) > 0.1)
-        vw.set_audio_only_message(
-            "Вы редактируете аудиофайл — видеоряд отсутствует" if audio_only else "")
+        if audio_only:
+            vw.set_audio_only_message("Вы редактируете аудиофайл — видеоряд отсутствует")
+        elif getattr(self, "_audio_only_mode", False) and bool(src):
+            # Видео у файла есть, но пользователь сам отключил его кнопкой —
+            # прямо говорим об этом и как вернуть, иначе пустой холст читается
+            # как поломка.
+            vw.set_audio_only_message(
+                "Только звук — видео отключено кнопкой 🎧 в панели плеера.\n"
+                "Нажмите её ещё раз, чтобы вернуть картинку. "
+                "На обрезку и экспорт это не влияет.")
+        else:
+            vw.set_audio_only_message("")
 
     def _update_mode_combo_for_media(self, has_video):
         """Для аудиофайла оставляем только применимые режимы обрезки: «Быстро
@@ -4170,6 +4910,9 @@ class EditTab(QWidget):
             audio_only = (bool(src) and not has_video
                           and getattr(self, "duration", 0) > 0.1)
             model = cmb.model()
+            # 4 («настройками «Обработки»») и 5 («(Аудио) …») аудио НЕ ломают:
+            # ProcessWorker сам умеет аудио-онли (Pass-1 в opus), а 5 в него же
+            # и целится, поэтому их не гасим.
             audio_invalid = (1, 3)   # «Перекодировать», «Smart Cut»
             for i in range(cmb.count()):
                 item = model.item(i)
@@ -4275,21 +5018,12 @@ class EditTab(QWidget):
         """
         if not getattr(self, "_pixelize_active", False) or dur is None or dur <= 0:
             return None
-        steps = max(1, int(getattr(self, "_pixelize_steps", 6)))
-        block0 = max(2, int(getattr(self, "_pixelize_block", 64)))
-        seq = _pixelize_block_sequence(block0, steps)
-        win = dur / steps
-        off = max(0.0, float(offset))
-        parts = []
-        for i, b in enumerate(seq):
-            if b <= 1:
-                continue  # блок 1 = без изменений (чётко) — фильтр не нужен
-            t0 = off + i * win
-            t1 = off + (i + 1) * win
-            parts.append(f"pixelize=w={b}:h={b}:enable='between(t,{t0:.3f},{t1:.3f})'")
-        if not parts:
-            return None  # всё чётко — пикселить нечего
-        return ",".join(parts)
+        # Сама цепочка собирается общим модулем pixelize (им же пользуется
+        # генератор аниме-паков) — эффект в обеих вкладках один и тот же.
+        return _pixelize_filter(dur,
+                                max(1, int(getattr(self, "_pixelize_steps", 6))),
+                                max(2, int(getattr(self, "_pixelize_block", 64))),
+                                offset)
 
     def _on_crop_applied(self):
         """Холст: нажата «Применить» — снимаем чек с кнопки (режим правки закрыт),
@@ -4330,6 +5064,241 @@ class EditTab(QWidget):
         return (f"crop=trunc(iw*{w:.6f}/2)*2:trunc(ih*{h:.6f}/2)*2:"
                 f"trunc(iw*{x:.6f}/2)*2:trunc(ih*{y:.6f}/2)*2")
 
+    # ── Наложение картинки поверх видео ──────────────────────────────────────
+    #
+    # Слои живут на холсте (VideoCanvas), правятся мышью, а в файл попадают
+    # фильтром overlay=… при «Обрезать». Порядок фильтров: НАКЛАДКИ → кадрирование
+    # → субтитры → пикселизация (см. edit_tab_overlay.overlay_filter_graph) —
+    # ровно как это видно в плеере.
+    def _overlay_frame_size(self):
+        """Размер кадра в пикселях ИСХОДНИКА (в плеере может идти прокси меньшего
+        разрешения — по нему координаты считать нельзя). Для картинки-исходника
+        берём её собственный размер, для видео — ffprobe, а если не вышло —
+        размер кадра на холсте."""
+        if getattr(self, "is_still_image", False) and self.still_image_path:
+            img = QImage(str(self.still_image_path))
+            if not img.isNull():
+                return (img.width(), img.height())
+        src = self.actual_source_file or self.filepath
+        if src and os.path.exists(str(src)):
+            w, h = probe_frame_size(str(src))
+            if w > 0 and h > 0:
+                return (w, h)
+        vw = getattr(self, "video_widget", None)
+        if isinstance(vw, VideoCanvas):
+            img = vw.current_frame_image()
+            if img is not None and not img.isNull():
+                return (img.width(), img.height())
+        return (0, 0)
+
+    def image_overlays(self):
+        """Список наложенных картинок (пустой, если холст без них)."""
+        vw = getattr(self, "video_widget", None)
+        if not isinstance(vw, VideoCanvas):
+            return []
+        return vw.image_overlays()
+
+    def has_image_overlays(self):
+        return bool(self.image_overlays())
+
+    def add_image_overlay(self):
+        """Кнопка «Наложить картинку»: выбор файла → новый слой поверх кадра."""
+        vw = getattr(self, "video_widget", None)
+        if not isinstance(vw, VideoCanvas):
+            msgbox_information(
+                self, "Недоступно",
+                "Наложение картинки работает только с собственным холстом видео "
+                "(Настройки → Монтаж → метод субтитров «в кадр»).")
+            return
+        if not (getattr(self, "video_stream_index", None) is not None
+                or getattr(self, "is_still_image", False)):
+            msgbox_information(self, "Нет видео",
+                               "Сначала загрузите видео или картинку.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите картинку для наложения", "",
+            "Изображения (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.avif);;"
+            "Все файлы (*.*)")
+        if not path:
+            return
+        img = load_overlay_image(path)
+        if img is None:
+            msgbox_warning(self, "Не удалось открыть",
+                           "Файл не похож на картинку или формат не поддерживается.")
+            return
+        fw, fh = self._overlay_frame_size()
+        if fw <= 0 or fh <= 0:
+            msgbox_warning(self, "Не удалось определить кадр",
+                           "Не получилось узнать размер кадра видео — "
+                           "перезагрузите файл и попробуйте снова.")
+            return
+        vw.add_image_overlay(ImageOverlay(path, img, fw, fh))
+        self._refresh_overlay_panel()
+        try:
+            if self.main is not None and hasattr(self.main, "log"):
+                self.main.log(
+                    f"Наложена картинка {os.path.basename(path)}: двигайте мышью, "
+                    "тяните за уголки, крутите за кружок сверху (Shift — шаг 15°), "
+                    "Ctrl+стрелки — точная сдвижка, Delete — убрать. "
+                    "Вшивается при «Обрезать» (перекодировка).")
+        except Exception:
+            pass
+
+    def _refresh_overlay_panel(self, current=None):
+        """Пересобирает список слоёв в боковой панели по состоянию холста."""
+        panel = getattr(self, "overlay_panel", None)
+        if panel is None:
+            return
+        vw = getattr(self, "video_widget", None)
+        items = vw.image_overlays() if isinstance(vw, VideoCanvas) else []
+        if current is None:
+            current = (vw.selected_overlay_index()
+                       if isinstance(vw, VideoCanvas) else -1)
+        panel.refresh(items, int(current))
+
+    def _on_overlays_changed(self):
+        """Холст: слой подвинули/растянули/удалили — обновляем список."""
+        self._refresh_overlay_panel()
+
+    def _on_overlay_picked(self, idx):
+        """Холст: слой выбрали мышью — подсвечиваем строку в списке."""
+        panel = getattr(self, "overlay_panel", None)
+        if panel is not None:
+            panel.list.setCurrentRow(int(idx))
+
+    def _on_overlay_selected(self, idx):
+        """Список: выбрана строка — тот же слой выделяем на холсте."""
+        vw = getattr(self, "video_widget", None)
+        if isinstance(vw, VideoCanvas) and idx >= 0:
+            vw.set_selected_overlay(int(idx))
+            vw.set_overlay_edit(True)
+
+    def _delete_image_overlay(self, idx):
+        vw = getattr(self, "video_widget", None)
+        if isinstance(vw, VideoCanvas):
+            vw.remove_image_overlay(int(idx))
+            self._refresh_overlay_panel()
+
+    def _set_overlay_opacity(self, idx, value):
+        items = self.image_overlays()
+        if 0 <= idx < len(items):
+            items[idx].opacity = max(0.05, min(1.0, float(value)))
+            self.video_widget.update()
+
+    def _reset_image_overlay(self, idx):
+        """Сброс слоя к исходному виду: без поворота, без обрезки, стандартный
+        размер/место (удобно, когда картинку «закрутили» и потеряли)."""
+        items = self.image_overlays()
+        if not (0 <= idx < len(items)):
+            return
+        it = items[idx]
+        it.angle = 0.0
+        it.set_crop(QRectF(0.0, 0.0, 1.0, 1.0), keep_width=False)
+        cw, ch = it.cropped_size()
+        it.rect = fit_rect_norm(cw, ch, it.frame_w, it.frame_h)
+        self.video_widget.update()
+        self._refresh_overlay_panel(idx)
+
+    def _crop_image_overlay(self, idx):
+        """Кадрирование самой картинки (отдельное окно с рамкой обрезки)."""
+        items = self.image_overlays()
+        if not (0 <= idx < len(items)):
+            return
+        it = items[idx]
+        dlg = OverlayCropDialog(it, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if it.set_crop(dlg.crop_norm()):
+            self.video_widget.update()
+            self._refresh_overlay_panel(idx)
+
+    def _clear_image_overlays(self):
+        """Убирает все слои (новый файл начинается чистым, как и пикселизация)."""
+        vw = getattr(self, "video_widget", None)
+        if isinstance(vw, VideoCanvas):
+            vw.clear_image_overlays()
+        self._refresh_overlay_panel()
+
+    def _render_export_overlays(self):
+        """Готовит PNG всех накладок под размер ИСХОДНОГО кадра. Возвращает
+        список (путь, x, y) для overlay_filter_graph (пустой — накладок нет).
+
+        PNG кладутся во временную папку вкладки и переписываются на каждом
+        экспорте; папку убирает shutdown()."""
+        items = self.image_overlays()
+        if not items:
+            return []
+        fw, fh = self._overlay_frame_size()
+        if fw <= 0 or fh <= 0:
+            return []
+        d = getattr(self, "_overlay_tmp_dir", None)
+        if not d or not os.path.isdir(d):
+            d = tempfile.mkdtemp(prefix="sihyx_overlay_")
+            self._overlay_tmp_dir = d
+        return render_overlays(items, d, fw, fh)
+
+    def _paint_overlays_on_image(self, img):
+        """Впечатывает наложенные картинки в готовый кадр (QImage) — тем же
+        порядком и в тех же долях, что и экспорт. Возвращает новый QImage (или
+        исходный, если накладок нет)."""
+        items = self.image_overlays()
+        if not items or img is None or img.isNull():
+            return img
+        out = img.convertToFormat(QImage.Format.Format_ARGB32)
+        p = QPainter(out)
+        try:
+            for it in items:
+                ovl, x, y = it.rendered(out.width(), out.height())
+                if ovl is not None:
+                    p.drawImage(int(x), int(y), ovl)
+        finally:
+            p.end()
+        return out
+
+    def _static_overlays_bgra(self, frame_w, frame_h):
+        """Наложенные картинки в виде (BGRA, x, y) под размер кадра — для путей,
+        которые правят кадры сами (TrackOverlayWorker), а не через -vf."""
+        out = []
+        for it in self.image_overlays():
+            img, x, y = it.rendered(frame_w, frame_h)
+            if img is None:
+                continue
+            bgra = qimage_to_bgra(img)
+            if bgra is not None:
+                out.append((bgra, int(x), int(y)))
+        return out
+
+    def _wrap_vf(self, chain, src=None):
+        """Оборачивает готовую цепочку -vf графом с накладками (если они есть).
+        `chain` — строка фильтров Монтажа (может быть пустой), `src` — файл, из
+        которого идёт кодирование (по умолчанию открытый в Монтаже).
+
+        Формат работы overlay берём ПО ИСХОДНИКУ (см. overlay_chroma_format):
+        при `format=auto` граф с RGBA-накладкой уводил ВЕСЬ кадр в RGB, libx264
+        писал gbrp — и итог получался кислотно-зелёным/малиновым."""
+        rendered = self._render_export_overlays()
+        if not rendered:
+            return chain or ""
+        return overlay_filter_graph(chain or "", rendered,
+                                    self._escape_filter_path,
+                                    pix_fmt=self._overlay_pix_fmt(src))
+
+    def _overlay_pix_fmt(self, src=None):
+        """Значение `format=` для overlay под pix_fmt исходника (кэшируется на
+        файл: ffprobe на каждый экспорт тут ни к чему)."""
+        path = str(src or getattr(self, "actual_source_file", "") or "")
+        if not path or not os.path.exists(path):
+            return "yuv420"
+        cache = getattr(self, "_ovl_fmt_cache", None)
+        if cache is None:
+            cache = self._ovl_fmt_cache = {}
+        stamp = self._file_cache_stamp(path)
+        key = (path, stamp)
+        got = cache.get(key)
+        if got is None:
+            got = cache[key] = overlay_chroma_format(get_pix_fmt(path))
+        return got
+
     @staticmethod
     def _apply_frame_crop(img, n):
         """Обрезает QImage по нормализованной рамке n (QRectF 0..1). Координаты
@@ -4356,7 +5325,9 @@ class EditTab(QWidget):
         _vw = getattr(self, "video_widget", None)
         if isinstance(_vw, VideoCanvas):
             crop_n = _vw.crop_norm()
-        pos = max(0.0, self.player.position() / 1000.0)
+        # Время кадра, который на экране (см. _clock_pos_s) — им же назван файл,
+        # и по нему же идёт резервное извлечение через ffmpeg.
+        pos = max(0.0, self._clock_pos_s())
         base = os.path.splitext(os.path.basename(src))[0]
         stamp = s_to_time(pos).replace(':', '-').replace('.', '_')
         save_dir = (self.export_dir if (self.export_dir and os.path.isdir(self.export_dir))
@@ -4373,6 +5344,7 @@ class EditTab(QWidget):
             try:
                 img = self.video_widget.current_frame_image()
                 if img is not None and not img.isNull():
+                    img = self._paint_overlays_on_image(img)
                     if crop_n is not None:
                         img = self._apply_frame_crop(img, crop_n)
                     ok = bool(img.save(fname, "PNG"))
@@ -4382,8 +5354,12 @@ class EditTab(QWidget):
         #    -ss перед -i точен, но позиция может прийтись между кадрами; вычитаем
         #    половину интервала кадра, чтобы попасть в текущий, а не следующий.
         if not ok:
-            eps = (0.5 / self.fps) if getattr(self, "fps", None) else 0.02
-            seek = max(0.0, pos - eps)
+            # Целимся четвертью кадра НИЖЕ его pts: ffmpeg отдаёт первый кадр с
+            # pts ≥ -ss, значит это ровно наш кадр (см. FrameGrid.seek_of).
+            if self._grid.valid:
+                seek = self._grid.seek_of(self._grid.index_at(pos))
+            else:
+                seek = max(0.0, pos - 0.02)
             cmd = [FFMPEG, "-y", "-ss", f"{seek:.3f}", "-i", src,
                    "-frames:v", "1", "-update", "1", fname]
             kw = {}
@@ -4397,11 +5373,14 @@ class EditTab(QWidget):
             except Exception:
                 ok = False
             # Полноразмерный кадр из ffmpeg обрезаем под рамку кадрирования.
-            if ok and crop_n is not None:
+            if ok and (crop_n is not None or self.has_image_overlays()):
                 try:
                     _qi = QImage(fname)
                     if not _qi.isNull():
-                        self._apply_frame_crop(_qi, crop_n).save(fname, "PNG")
+                        _qi = self._paint_overlays_on_image(_qi)
+                        if crop_n is not None:
+                            _qi = self._apply_frame_crop(_qi, crop_n)
+                        _qi.save(fname, "PNG")
                 except Exception:
                     pass
         msg = (f"🖼 Кадр сохранён: {os.path.basename(fname)}" if ok
@@ -4438,11 +5417,14 @@ class EditTab(QWidget):
         разрешении (через ffmpeg) и возвращает numpy BGR. Способ совпадает с тем,
         как VideoInpaintWorker позже извлечёт все кадры, поэтому нарисованная маска
         попадает в кадры попиксельно (то же разрешение и дисплейная ориентация)."""
-        pos = max(0.0, self.player.position() / 1000.0)
-        # -ss перед -i точен, но позиция может прийтись между кадрами — вычитаем
-        # половину интервала кадра, чтобы попасть в текущий, а не следующий.
-        eps = (0.5 / self.fps) if getattr(self, "fps", None) else 0.02
-        seek = max(0.0, pos - eps)
+        pos = max(0.0, self._clock_pos_s())
+        # -ss перед -i точен, но позиция может прийтись между кадрами — целимся
+        # четвертью кадра ниже pts нужного кадра (см. FrameGrid.seek_of), иначе
+        # ffmpeg отдаст СЛЕДУЮЩИЙ кадр и маска ляжет не на тот кадр.
+        if self._grid.valid:
+            seek = self._grid.seek_of(self._grid.index_at(pos))
+        else:
+            seek = max(0.0, pos - 0.02)
         tmp = os.path.join(tempfile.gettempdir(),
                            f"sihyx_vmask_{os.getpid()}_{int(time.time() * 1000)}.png")
         cmd = [FFMPEG, "-y", "-ss", f"{seek:.3f}", "-i", src,
@@ -4655,6 +5637,254 @@ class EditTab(QWidget):
         self._finish_video_inpaint()
         self.on_ffmpeg_finished(False, message)
 
+    # ── Привязка текста/картинки к движущемуся объекту ───────────────────────
+    def track_object_overlay(self):
+        """Привязывает текст или картинку к ДВИЖУЩЕМУСЯ объекту: пользователь
+        обводит объект рамкой на текущем кадре, трекер DyHiT (нейросеть, ONNX;
+        без модели — запасной CSRT из OpenCV) находит его на каждом следующем
+        кадре, и накладка едет вместе с ним. Результат — новый файл; исходник не
+        трогаем. Вся тяжёлая работа в TrackOverlayWorker, с отменой.
+
+        Доступно только для видео: у одиночной картинки нечему двигаться."""
+        # Пока идёт обработка — кнопка работает как «Отмена».
+        if getattr(self, "_trk_running", False):
+            self._cancel_track_overlay()
+            return
+        # Накладка уже висит в плеере — второе нажатие её снимает (отдельной
+        # кнопки «Отмена» на холсте нет, экспортом занимается «Обрезать»).
+        if self.has_track_preview():
+            self._clear_track_preview()
+            return
+        self._clear_track_preview()
+
+        src = self.actual_source_file or self.filepath
+        if not src or not os.path.exists(str(src)) or self.duration <= 0:
+            return
+        if getattr(self, "video_stream_index", None) is None:
+            msgbox_information(
+                self, "Только для видео",
+                "Привязка к объекту работает с видео: нужно движение, за которым "
+                "можно следить.")
+            return
+        src = str(src)
+
+        try:
+            import dyhit_tracker
+        except Exception as e:
+            msgbox_warning(
+                self, "Отслеживание недоступно",
+                f"Не удалось загрузить движок отслеживания (нужны numpy/opencv):\n{e}")
+            return
+        if not (dyhit_tracker.dyhit_available()
+                or dyhit_tracker.opencv_tracker_available()):
+            msgbox_warning(
+                self, "Отслеживание недоступно",
+                "Не найден ни один трекер. Для нейросетевого варианта положите "
+                "файл модели DyHiT/HiT (.onnx) в папку models — ожидается "
+                f"{dyhit_tracker.expected_model_path()} — либо установите "
+                "opencv-python с трекерами (CSRT).")
+            return
+
+        # Кадр для выбора области — из оригинала на текущей позиции, полный размер
+        # (тот же способ, что у маски удаления объекта, поэтому рамка попадает в
+        # кадры воркера попиксельно).
+        frame = self._grab_source_frame_bgr(src)
+        if frame is None:
+            msgbox_warning(self, "Ошибка",
+                           "Не удалось получить кадр видео для выбора объекта.")
+            return
+
+        fps = float(self.fps) if getattr(self, "fps", None) else 25.0
+        pos = max(0.0, self.player.position() / 1000.0)
+        start_s = max(0.0, pos - 0.5 / fps)
+        zone_end = float(self.current_out) if getattr(self, "current_out", 0) else 0.0
+
+        dlg = _TrackAttachDialog(frame, self, start_s=start_s,
+                                 end_s=float(self.duration), zone_end_s=zone_end)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        spec = dlg.values()
+        if not spec.get("box") or spec.get("overlay_bgra") is None:
+            return
+
+        h, w = frame.shape[:2]
+        self._trk_spec = dict(spec)
+        self._trk_spec.update({"src": src, "fps": fps, "src_w": w, "src_h": h})
+
+        # Шаг 1 — только путь объекта, без кодирования: он считается в разы
+        # быстрее полного рендера, и по нему сразу показываем предпросмотр.
+        self._trk_running = True
+        self._set_track_export_busy(True)
+        self._report_progress(-1, "Привязка к объекту…")
+        self._set_cut_status("Привязка к объекту… подготовка",
+                             icon='fa5s.hourglass-half')
+        self.log_label.setText("Отслеживание объекта на видео…")
+
+        self._trk_worker = TrackPathWorker(
+            src, fps, (w, h), spec["box"], spec["start_s"], spec["end_s"],
+            smooth=spec["smooth"])
+        self._trk_worker.progress.connect(self._on_trk_progress)
+        self._trk_worker.done.connect(self._on_track_path_ready)
+        self._trk_worker.failed.connect(self._on_trk_failed)
+        self._trk_worker.start()
+
+    def _on_track_path_ready(self, boxes):
+        """Путь объекта посчитан — показываем накладку прямо в плеере. Ничего
+        никуда не записано: в файл накладка попадёт обычным экспортом, то есть
+        кнопкой «Обрезать» (см. start_cut)."""
+        self._finish_track_overlay()
+        spec = getattr(self, "_trk_spec", None)
+        if not spec or not boxes:
+            return
+        spec["boxes"] = boxes
+        canvas = self.video_widget
+        if not isinstance(canvas, VideoCanvas):
+            # Классический QVideoWidget не умеет рисовать поверх кадра — там
+            # предпросмотра нет, сразу рендерим (как раньше).
+            self._render_track_overlay()
+            return
+
+        from photo_tab import np_bgra_to_qimage
+        qimg = np_bgra_to_qimage(spec["overlay_bgra"])
+        canvas.set_track_preview({
+            "overlay": qimg, "boxes": boxes,
+            "src_w": spec["src_w"], "src_h": spec["src_h"], "fps": spec["fps"],
+            "start_s": spec["start_s"], "end_s": spec["end_s"],
+            "anchor": spec["anchor"], "off": (spec["off_x"], spec["off_y"]),
+            "scale_with_box": spec["scale_with_box"],
+        })
+        canvas.set_track_time(max(0.0, self.player.position() / 1000.0))
+        self._connect_track_preview_signals(canvas)
+        self._set_cut_status("Накладка привязана — сохранит её «Обрезать»",
+                             icon='fa5s.crosshairs')
+        self.log_label.setText(
+            "Смотрите, как накладка едет за объектом. «Обрезать» сохранит видео "
+            "с накладкой, кнопка привязки — уберёт её.")
+
+    def _connect_track_preview_signals(self, canvas):
+        """Подключает сигналы предпросмотра ровно один раз на КАЖДЫЙ холст (при
+        смене способа показа видео в настройках виджет пересоздаётся)."""
+        if getattr(self, "_trk_signals_canvas", None) is canvas:
+            return
+        canvas.trackCancelled.connect(self._clear_track_preview)
+        self._trk_signals_canvas = canvas
+
+    def has_track_preview(self):
+        """Есть ли посчитанная накладка, ждущая экспорта («Обрезать»)."""
+        spec = getattr(self, "_trk_spec", None)
+        return bool(spec and spec.get("boxes"))
+
+    def _clear_track_preview(self):
+        """Убирает накладку из плеера (Esc, повторное нажатие кнопки привязки,
+        новый файл)."""
+        canvas = getattr(self, "video_widget", None)
+        if isinstance(canvas, VideoCanvas) and canvas.has_track_preview():
+            canvas.set_track_preview(None)
+            self._set_cut_status("")
+            self.log_label.setText("Готово")
+        self._trk_spec = None
+
+    def _render_track_overlay(self, trim_in=None, trim_out=None):
+        """Экспорт видео с накладкой по УЖЕ посчитанной траектории (отслеживать
+        заново нечего, этап только кодирующий). trim_in/trim_out — выделенный в
+        Монтаже отрезок: «Обрезать» с активной накладкой и режет, и вшивает."""
+        spec = getattr(self, "_trk_spec", None)
+        if not spec or getattr(self, "_trk_running", False):
+            return
+        src = spec["src"]
+        if not os.path.exists(src):
+            return
+        base = Path(src)
+        out_dir = (Path(self.export_dir)
+                   if (self.export_dir and os.path.isdir(self.export_dir))
+                   else base.parent)
+        suffix = base.suffix.lower()
+        if suffix not in (".mp4", ".mkv", ".mov", ".m4v"):
+            suffix = ".mp4"
+        out_path = str(out_dir / f"{base.stem}_привязка{suffix}")
+        if os.path.exists(out_path):
+            out_path = _unique_output(out_path)
+
+        has_audio = getattr(self, "audio_stream_index", None) is not None
+        # hardsub-профиль: у текста и краёв картинки резкие границы, на «fast»/
+        # высоком CRF они мылятся — берём тот же профиль, что при вшивании субтитров.
+        venc = self._video_encoder_args(hardsub=True)
+        # Экспорт накладки идёт своим путём (кадры собираются в python), поэтому
+        # фильтры обычной обрезки к нему не применяются — честно предупреждаем,
+        # а не делаем вид, что кадрирование/пикселизация учтены.
+        if (self._video_crop_filter() is not None
+                or getattr(self, "_pixelize_active", False)):
+            msgbox_information(
+                self, "Только накладка",
+                "Сейчас в файл уйдёт видео с привязанной накладкой — "
+                "кадрирование и пикселизация в этот экспорт не попадут. "
+                "Сначала сохраните их обычной обрезкой, а привязку сделайте "
+                "уже по готовому файлу.")
+
+        self._trk_running = True
+        self._set_track_export_busy(True)
+        self._report_progress(-1, "Привязка к объекту…")
+        self._set_cut_status("Привязка к объекту… подготовка",
+                             icon='fa5s.hourglass-half')
+        self.log_label.setText("Наложение на кадры…")
+
+        self._trk_worker = TrackOverlayWorker(
+            src, out_path, venc, has_audio, spec["fps"],
+            (spec["src_w"], spec["src_h"]), float(self.duration),
+            spec["box"], spec["start_s"], spec["end_s"], spec["overlay_bgra"],
+            anchor=spec["anchor"], off_x=spec["off_x"], off_y=spec["off_y"],
+            scale_with_box=spec["scale_with_box"], smooth=spec["smooth"],
+            boxes=spec.get("boxes"), trim_in=trim_in, trim_out=trim_out,
+            static_overlays=self._static_overlays_bgra(spec["src_w"],
+                                                       spec["src_h"]))
+        self._trk_worker.progress.connect(self._on_trk_progress)
+        self._trk_worker.done.connect(self._on_trk_done)
+        self._trk_worker.failed.connect(self._on_trk_failed)
+        self._trk_worker.start()
+
+    def _cancel_track_overlay(self):
+        """Просит фоновый воркер прерваться (временные файлы он уберёт сам)."""
+        w = getattr(self, "_trk_worker", None)
+        if w is not None and w.isRunning():
+            self._set_cut_status("Отмена…", icon='fa5s.hourglass-half')
+            if getattr(self, "btn_track_object", None) is not None:
+                self.btn_track_object.setEnabled(False)
+            w.cancel()
+
+    def _on_trk_progress(self, pct, text):
+        self._report_progress(pct, text)
+        self._set_cut_status(text, icon='fa5s.crosshairs' if pct >= 0
+                             else 'fa5s.hourglass-half')
+
+    def _set_track_export_busy(self, busy):
+        """На время отслеживания/рендера «Обрезать» превращается в «Отмена» (как
+        при обычном экспорте), а кнопка привязки выключается."""
+        b = getattr(self, "btn_track_object", None)
+        if b is not None:
+            b.setEnabled(not busy)
+        self._set_cut_btn_cancel(busy, self._cancel_track_overlay)
+
+    def _finish_track_overlay(self):
+        self._trk_running = False
+        self._trk_worker = None
+        self._set_track_export_busy(False)
+        self._update_media_buttons()
+
+    def _on_trk_done(self, final_path):
+        self._finish_track_overlay()
+        # Файл готов — накладка-предпросмотр больше не нужна.
+        self._clear_track_preview()
+        try:
+            if self.main is not None and hasattr(self.main, "log"):
+                self.main.log(f"Накладка привязана к объекту: {final_path}")
+        except Exception:
+            pass
+        self.on_ffmpeg_finished(True, "Готово")
+
+    def _on_trk_failed(self, message):
+        self._finish_track_overlay()
+        self.on_ffmpeg_finished(False, message)
+
     # ── Удаление исходного файла ─────────────────────────────────────────────
     def delete_source_file(self):
         """Удаляет загруженный исходный файл с диска (с подтверждением). Перед
@@ -4762,6 +5992,12 @@ class EditTab(QWidget):
             fs.sync_volume()
             fs.update_play_icon(
                 self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
+            # Холст переехал в другое окно, а с ним и его сцена Qt Quick:
+            # графический контекст пересоздан, и показанный кадр в нём не
+            # переживает переезд. На паузе кадров от плеера больше не будет —
+            # ставим точный кадр заново (на воспроизведении метод сам ничего не
+            # делает: там следующий кадр приедет через ~16 мс).
+            QTimer.singleShot(0, self._restore_canvas_frame)
             try:
                 self._update_subtitle(self.player.position() / 1000.0)
                 QTimer.singleShot(0, self._position_overlay)
@@ -4798,6 +6034,25 @@ class EditTab(QWidget):
             self.btn_fullscreen.setToolTip("Полноэкранный режим (F / двойной клик по видео)")
             self._adjust_video_height()
             QTimer.singleShot(0, self._position_overlay)
+            # Обратный переезд — та же история, что и при входе (см. там).
+            QTimer.singleShot(0, self._restore_canvas_frame)
+        except Exception:
+            pass
+
+    def _restore_canvas_frame(self):
+        """Возвращает кадр на холст после переезда в другое окно.
+
+        Нужен только на паузе: сцена холста теряет показанный кадр вместе с
+        графическим контекстом, а новых кадров плеер на паузе не шлёт. Точный
+        кадр берётся из того же предекодера, что и при покадровом шаге, так что
+        на экране оказывается ровно тот кадр, на котором стояли."""
+        try:
+            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                return
+        except Exception:
+            return
+        try:
+            self._show_exact_frame(self._frame_idx)
         except Exception:
             pass
 
@@ -4811,29 +6066,221 @@ class EditTab(QWidget):
             except Exception:
                 pass
 
+    # ── Покадровый движок: кадры, часы, буфер ────────────────────────────────
+    def _frames_engine(self):
+        """Ленивая инициализация предекодера кадров (поток создаётся при первом
+        файле с видео, а не при запуске приложения)."""
+        eng = getattr(self, "_frames", None)
+        if eng is None:
+            eng = FramePrefetcher(self)
+            eng.ready.connect(self._on_exact_frame)
+            eng.start()
+            self._frames = eng
+        return eng
+
+    def _frames_set_source(self):
+        """Переводит предекодер на ТОТ ЖЕ файл, что играет плеер (оригинал или
+        превью-прокси): стоп-кадр обязан выглядеть ровно так же, как
+        воспроизведение, иначе на паузе картинка «дёргалась» бы в резкость."""
+        src = str(self.filepath) if self.filepath else None
+        has_video = (self.video_stream_index is not None
+                     and not getattr(self, "is_still_image", False))
+        if not has_video or not src:
+            eng = getattr(self, "_frames", None)
+            if eng is not None:
+                eng.set_source(None)
+            self._frames_src = None
+            return
+        eng = self._frames_engine()
+        eng.set_source(src, self.fps or 0.0)
+        self._frames_src = src
+
+    def _refresh_frame_grid(self):
+        """Пересобирает сетку кадров (fps/длительность могли измениться)."""
+        self._grid = FrameGrid(self.fps or 0.0, self.duration or 0.0)
+
+    def _current_frame_index(self):
+        """Номер кадра, на котором СЕЙЧАС стоит монтаж.
+
+        На паузе истина — _frame_idx (его ведут seek/шаг/остановка): позиция
+        плеера после seek'а может отличаться от запрошенной на доли кадра, и
+        считать шаг от неё значило бы копить ту же ошибку, что и раньше.
+        Во время воспроизведения истина — pts ПОКАЗАННОГО кадра (часы кадра),
+        и только если их нет (аудиофайл, overlay-режим) — позиция плеера."""
+        grid = self._grid
+        if not grid.valid:
+            return 0
+        try:
+            playing = (self.player.playbackState()
+                       == QMediaPlayer.PlaybackState.PlayingState)
+        except Exception:
+            playing = False
+        if not playing and self._frame_idx is not None:
+            return grid.clamp(self._frame_idx)
+        vw = getattr(self, "video_widget", None)
+        if isinstance(vw, VideoCanvas):
+            pts = vw.last_frame_pts()
+            if pts is not None:
+                return grid.index_of_pts(pts)
+        try:
+            return grid.index_at(self.player.position() / 1000.0)
+        except Exception:
+            return 0
+
+    def _clock_pos_s(self):
+        """Время монтажа для ИНТЕРФЕЙСА — то, что реально видно на экране.
+
+        Мастер-часы: во время игры это pts последнего показанного кадра (Qt
+        рендерит кадры по аудио-часам, так что метка идёт за звуком, но при этом
+        гарантированно совпадает с картинкой); на паузе — начало кадра, который
+        пришпилен к холсту. Раньше метка жила по player.position(), который
+        опрашивался таймером раз в 80 мс и к картинке отношения не имел — отсюда
+        и ощущение, что видео, звук и метка разъезжаются."""
+        try:
+            pos_s = self.player.position() / 1000.0
+        except Exception:
+            pos_s = 0.0
+        vw = getattr(self, "video_widget", None)
+        if (not isinstance(vw, VideoCanvas) or self.video_stream_index is None
+                # «Только звук»: кадров нет вовсе, часы кадра застыли бы на
+                # последнем показанном — ведём время по плееру, как для аудио.
+                or getattr(self, "_audio_only_mode", False)):
+            return pos_s
+        pts = vw.last_frame_pts()
+        if pts is None:
+            return pos_s
+        age = vw.frame_clock_age()
+        try:
+            playing = (self.player.playbackState()
+                       == QMediaPlayer.PlaybackState.PlayingState)
+        except Exception:
+            playing = False
+        if playing:
+            # Часы кадра «живые» — берём их. Если кадры перестали приходить
+            # (декодер захлебнулся/нет видео) — возвращаемся к часам плеера,
+            # иначе метка замерла бы вместе с картинкой.
+            if age is not None and age < 0.35:
+                return pts
+            return pos_s
+        # На паузе показанный кадр и есть текущее время — но только если он
+        # действительно наш (пин с картинкой, часы в его диапазоне), а не
+        # случайный кадр после смены источника: заявленный, но не приехавший пин
+        # раньше отдавал pts ПРОШЛОГО кадра, и метка «замерзала» на нём.
+        pinned = vw.pinned_frame_pts()
+        if pinned is not None:
+            return pinned
+        return pos_s
+
+    def _show_exact_frame(self, idx=None, direction=1):
+        """Ставит на холст ТОЧНЫЙ кадр idx и заказывает соседние в буфер.
+
+        Кадр из буфера рисуется мгновенно (0 мс, без ожидания плеера), чего от
+        QMediaPlayer добиться нельзя в принципе; если кадра ещё нет — «пин»
+        просто объявляет, какой кадр сейчас правильный, и холст перестаёт
+        показывать чужие кадры, как только точный доедет."""
+        grid = self._grid
+        vw = getattr(self, "video_widget", None)
+        if (not grid.valid or not isinstance(vw, VideoCanvas)
+                or self.video_stream_index is None
+                or getattr(self, "is_still_image", False)
+                # «Только звук»: картинки нет — гонять ffmpeg за кадрами незачем
+                # (ровно от этой работы пользователь и уходит, включая режим).
+                or getattr(self, "_audio_only_mode", False)):
+            return
+        # Во время НАСТОЯЩЕГО воспроизведения пин не ставим ни при каких
+        # обстоятельствах (например, стрелка нажата на ходу): иначе холст начал
+        # бы отбрасывать кадры плеера как чужие и картинка бы встала. Прогрев
+        # («с разбега») — исключение: там играем мы сами и как раз прячем разбег.
+        try:
+            if (self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                    and not getattr(self, "_prerolling", False)):
+                return
+        except Exception:
+            pass
+        idx = self._current_frame_index() if idx is None else grid.clamp(idx)
+        span = grid.pts_span_us(idx)
+        vw.arm_frame_pin(span)
+        eng = self._frames_engine()
+        if self._frames_src != (str(self.filepath) if self.filepath else None):
+            self._frames_set_source()
+        img = eng.frame(idx)
+        if img is not None:
+            vw.set_exact_frame(img, span, int(grid.start_of(idx) * 1_000_000))
+        # Буфер вокруг плейхеда: шагаем вперёд — греем кадры впереди, назад —
+        # позади. Сам кадр idx всегда декодируется первым (см. FramePrefetcher).
+        if direction >= 0:
+            eng.request(idx, ahead=8, behind=3)
+        else:
+            eng.request(idx, ahead=2, behind=8)
+
+    def _paint_playhead(self, t_s):
+        """Рисует положение плейхеда: метка времени, полоса, жёлтая линия на
+        волне, «старт→плейхед» и полноэкранная панель. Одно место на все
+        источники времени (кадр, позиция плеера, точный кадр из буфера)."""
+        self.lbl_current_time.setText(s_to_time(t_s))
+        if self.duration and self.duration > 0 and not self.slider.is_user_seeking():
+            self.slider.blockSignals(True)
+            self.slider.setValue(int((t_s / self.duration) * 1000))
+            self.slider.blockSignals(False)
+        self.waveform.set_playhead(t_s)
+        self._update_seg_duration(t_s)
+        self._fs_sync_position()
+
+    def _on_exact_frame(self, idx, img):
+        """Точный кадр доехал из предекодера — показываем, если монтаж всё ещё
+        стоит на нём (иначе это устаревший результат прошлого шага)."""
+        try:
+            # Прогрев — не воспроизведение: там играем мы сами, под mute, и кадр
+            # цели на холсте нужен именно наш (иначе, пока идёт разбег, экран
+            # остался бы на старом кадре — а пользователь его уже перемотал).
+            if (self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                    and not getattr(self, "_prerolling", False)):
+                return
+        except Exception:
+            return
+        if self._frame_idx is None or int(idx) != int(self._frame_idx):
+            return
+        vw = getattr(self, "video_widget", None)
+        if not isinstance(vw, VideoCanvas) or not self._grid.valid:
+            return
+        vw.set_exact_frame(img, self._grid.pts_span_us(idx),
+                           int(self._grid.start_of(idx) * 1_000_000))
+        # Кадр сменился — метка/полоса/волна обязаны показать ЕГО время.
+        self._paint_playhead(self._grid.start_of(idx))
+
     def step_frame(self, step):
         if not self.duration:
             return
-        # База шага — последняя ЦЕЛЬ скраба, а не «живая» позиция: во время
-        # play→pause-скраба позиция уезжает вперёд, и шаг назад от неё фактически
-        # уходил вперёд/вправо. От цели шаги детерминированы (особенно при
-        # удержании ←/→ с автоповтором).
-        if getattr(self, "_scrubbing", False) and self._scrub_target is not None:
-            ms = self._scrub_target
-        else:
-            ms = self.player.position()
-        ms_per_frame = (1000.0 / self.fps) if (self.fps and self.fps > 0) else 40
-        new_ms = max(0, min(int(self.duration * 1000), ms + int(step * ms_per_frame)))
+        grid = self._grid
+        if not grid.valid:
+            # fps неизвестен (битые метаданные) — старое поведение по времени.
+            ms = (self._scrub_target if (getattr(self, "_scrubbing", False)
+                                         and self._scrub_target is not None)
+                  else self.player.position())
+            new_ms = max(0, min(int(self.duration * 1000), ms + int(step * 40)))
+            self._scrub_target = new_ms
+            self._scrub_audio_ms = new_ms
+            self._dispatch_frame_seek(new_ms)
+            return
+        # Шаг считаем в КАДРАХ от текущего кадра — не в миллисекундах от позиции
+        # плеера. Так серия шагов (удержание ←/→) детерминирована и не копит
+        # ошибку округления, а «туда-обратно» возвращает ровно тот же кадр.
+        idx = grid.clamp(self._current_frame_index() + int(step))
+        self._frame_idx = idx
+        # Плееру отдаём СЕРЕДИНУ кадра: она дальше полукадра от границ, поэтому
+        # округление до миллисекунд не может перекинуть его на соседний кадр.
+        new_ms = grid.ms_of(idx)
         self._scrub_target = new_ms
-        # Цель шага (_scrub_target) обновляем ВСЕГДА и мгновенно — арифметика шага
-        # держащейся клавиши остаётся точной. А вот реальный player.setPosition()
-        # диспетчеризуем через _dispatch_frame_seek: держать ←/→ = автоповтор ОС
-        # шлёт events быстрее, чем плеер успевает довести seek до кадра, и они
-        # раньше просто копились в очереди — отсюда «догоняющий» скачок на
-        # несколько секунд ПОСЛЕ отпускания клавиши. Теперь в полёте не больше
-        # одного seek'а: если предыдущий ещё не подтверждён — новая цель просто
-        # ЗАМЕНЯЕТ предыдущую отложенную (как уже сделано для превью-миниатюр
-        # наведения), и в итоге всегда доезжаем ровно до последней зажатой цели.
+        # А звук скраба начинается с НАЧАЛА кадра — там же, где картинка.
+        self._scrub_audio_ms = int(round(grid.start_of(idx) * 1000.0))
+        # Кадр на холст — сразу из буфера (не ждём плеер).
+        self._show_exact_frame(idx, direction=step)
+        # Реальный player.setPosition() диспетчеризуем через _dispatch_frame_seek:
+        # держать ←/→ = автоповтор ОС шлёт events быстрее, чем плеер успевает
+        # довести seek до кадра, и они раньше просто копились в очереди — отсюда
+        # «догоняющий» скачок на несколько секунд ПОСЛЕ отпускания клавиши.
+        # Теперь в полёте не больше одного seek'а: новая цель ЗАМЕНЯЕТ предыдущую
+        # отложенную, и в итоге всегда доезжаем ровно до последней зажатой цели.
         self._dispatch_frame_seek(new_ms)
 
     def _dispatch_frame_seek(self, new_ms):
@@ -4883,6 +6330,13 @@ class EditTab(QWidget):
             self._dispatch_frame_seek(pending)
 
     def step_frame_scrub(self, step):
+        # Идёт беззвучный прогрев — гасим его ДО шага: иначе плеер играет (пусть
+        # и под mute), а мы тут же дёргаем ему позицию, и они мешают друг другу.
+        # Именно cancel, а не finish: доводить позицию до УСТАРЕВШЕЙ цели незачем,
+        # шаг сейчас поставит свою — лишний seek только съел бы кадр времени.
+        # Прогрев вернётся, когда серия шагов утихнет (см. _end_scrub_painted).
+        if getattr(self, "_prerolling", False):
+            self._preroll_cancel()
         playing = (self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
         painted = isinstance(self.video_widget, VideoCanvas)
         # Серия шагов: при удержании ←/→ считаем от _scrub_target (детерминизм),
@@ -4900,7 +6354,10 @@ class EditTab(QWidget):
         self._scrub_audio_blip(painted)
         # Оживляем индикатор уровня и на покадровом шаге (на паузе он иначе молчит,
         # из-за чего казалось, что звука нет).
-        tgt_ms = self._scrub_target if self._scrub_target is not None else self.player.position()
+        tgt_ms = getattr(self, "_scrub_audio_ms", None)
+        if tgt_ms is None:
+            tgt_ms = (self._scrub_target if self._scrub_target is not None
+                      else self.player.position())
         self._update_meter((tgt_ms or 0) / 1000.0, force=True)
         if painted:
             # painted-режим (VideoCanvas + QVideoSink): пауза + setPosition сама
@@ -4921,166 +6378,255 @@ class EditTab(QWidget):
 
     def _end_scrub_painted(self):
         self._scrubbing = False
+        # Серия покадровых шагов закончилась — прогреваем конвейер там, где
+        # встали. Обычный сценарий монтажа «долистал кадрами → Пробел» после
+        # этого стартует без заминки (см. _preroll_at). Ни звука (mute), ни
+        # движения на шкале (часы заморожены на цели) прогрев не даёт.
+        try:
+            if (self.player.playbackState()
+                    != QMediaPlayer.PlaybackState.PlayingState):
+                self._preroll_at(self._playhead_target_s())
+        except Exception:
+            pass
 
     # ── Скраб-звук при покадровой перемотке ─────────────────────────────────
-    def _ensure_scrub_audio_player(self):
-        """Лениво создаёт/перепривязывает отдельный аудиоплеер для скраб-звука.
-        Источник — ОРИГИНАЛ файла (а не прокси: у прокси звук может быть хуже или
-        отсутствовать), открыт через ShareDeleteIODevice, чтобы исходник всё так
-        же можно было удалить из Проводника во время монтажа."""
+    # Длина «блипа»: кадр, но не короче — на 60 fps один кадр (16.7 мс) на слух
+    # почти щелчок. При удержании клавиши срезы идут подряд и складываются в
+    # непрерывную перемотку по звуку, как в монтажках.
+    _SCRUB_BLIP_MIN_S = 0.045
+    _SCRUB_BLIP_MAX_S = 0.120
+
+    def _scrub_audio_engine(self):
+        """Лениво поднимает фоновый декодер PCM вокруг плейхеда."""
+        eng = getattr(self, "_audio_scrub", None)
+        if eng is None:
+            eng = AudioScrubber(self)
+            eng.ready.connect(self._on_scrub_audio_window)
+            eng.start()
+            self._audio_scrub = eng
+        return eng
+
+    def _scrub_audio_source(self):
+        """(файл, поток) для скраб-звука: внешняя озвучка, если выбрана, иначе
+        ОРИГИНАЛ (не прокси: у прокси звук пережат в AAC, а дорожка может быть
+        и не одна). Поток — абсолютный индекс выбранной дорожки, чтобы звук шага
+        совпадал с тем, что играет плеер."""
+        ext = getattr(self, "selected_audio_ext_path", None)
+        if ext:
+            return (str(ext), "a:0")
         src = getattr(self, "actual_source_file", None)
         if not src:
+            return (None, "a:0")
+        idx = getattr(self, "selected_audio_abs_index", None)
+        return (str(src), str(int(idx)) if idx is not None else "a:0")
+
+    def _sync_scrub_audio_source(self):
+        """Держит источник скраб-звука в согласии с выбранной дорожкой."""
+        src, stream = self._scrub_audio_source()
+        if not src:
             return None
-        src = str(src)
-        if self._scrub_audio_player is None:
-            self._scrub_audio_player = QMediaPlayer()
-            self._scrub_audio_output = QAudioOutput()
-            self._scrub_audio_player.setAudioOutput(self._scrub_audio_output)
-            try:
-                self._scrub_audio_output.setVolume(self.vol_slider.value() / 100.0)
-            except Exception:
-                pass
-        if self._scrub_audio_src != src:
-            old = self._scrub_audio_dev
-            dev = ShareDeleteIODevice(src)
-            opened = False
-            try:
-                opened = dev.open()
-            except Exception:
-                opened = False
-            try:
-                if opened:
-                    self._scrub_audio_dev = dev
-                    self._scrub_audio_player.setSourceDevice(dev, QUrl.fromLocalFile(src))
-                else:
-                    self._scrub_audio_dev = None
-                    self._scrub_audio_player.setSource(QUrl.fromLocalFile(src))
-                self._scrub_audio_src = src
-            except Exception:
-                self._scrub_audio_src = None
+        eng = self._scrub_audio_engine()
+        if eng.source() != (src, stream):
+            fmt = self._scrub_sink_format()
+            if fmt is not None:
+                eng.configure(fmt.sampleRate(), fmt.channelCount(),
+                              4 if fmt.sampleFormat() == QAudioFormat.SampleFormat.Float else 2)
+            eng.set_source(src, stream)
+        return eng
+
+    def _scrub_sink_format(self):
+        """Формат вывода для скраб-звука (создаётся один раз под устройство)."""
+        fmt = getattr(self, "_scrub_fmt", None)
+        if fmt is not None:
+            return fmt
+        if QAudioFormat is None or QMediaDevices is None:
+            return None
+        try:
+            dev = QMediaDevices.defaultAudioOutput()
+            if dev is None or dev.isNull():
                 return None
-            if old is not None and old is not dev:
-                QTimer.singleShot(0, lambda d=old: self._close_play_device(d))
-        return self._scrub_audio_player
+            fmt = QAudioFormat()
+            fmt.setSampleRate(48000)
+            fmt.setChannelCount(2)
+            fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+            if not dev.isFormatSupported(fmt):
+                # Устройство не тянет 48 кГц/16 бит — берём его собственный
+                # формат и просим ffmpeg отдавать PCM ровно в нём.
+                fmt = dev.preferredFormat()
+            self._scrub_fmt = fmt
+            return fmt
+        except Exception:
+            return None
 
-    _SCRUB_READY_STATUSES = None   # заполняется лениво в _scrub_audio_blip (нужен QMediaPlayer)
+    def _scrub_sink(self):
+        """QAudioSink для блипов (push-режим). Открывается один раз и живёт:
+        pause/play у QMediaPlayer заново открывали бы аудиоустройство, а это на
+        Windows заметная задержка — здесь же запись в устройство слышна через
+        1–9 мс (замерено)."""
+        sink = getattr(self, "_scrub_sink_obj", None)
+        if sink is not None:
+            return sink
+        if QAudioSink is None:
+            return None
+        fmt = self._scrub_sink_format()
+        if fmt is None:
+            return None
+        try:
+            dev = QMediaDevices.defaultAudioOutput()
+            sink = QAudioSink(dev, fmt, self)
+            # Буфер с запасом на пару срезов: сама задержка звука от него не
+            # зависит (устройство играет то, что в очереди, а очередь мы держим
+            # короткой — см. _play_scrub_slice), зато длинный срез влезает
+            # целиком и не режется.
+            bytes_per_s = fmt.sampleRate() * fmt.channelCount() * fmt.bytesPerSample()
+            sink.setBufferSize(max(4096, int(bytes_per_s * 0.25)))
+            sink.setVolume(self._scrub_volume())
+            self._scrub_sink_obj = sink
+            # start() стоит ~45 мс (поднимается сеанс WASAPI) — поэтому делаем
+            # его РОВНО ОДИН РАЗ, при первом обращении, а дальше только пишем в
+            # устройство (запись — 0 мс). Именно поэтому здесь нет ни stop(), ни
+            # reset() на каждый шаг: они убивают QIODevice, и следующий шаг
+            # платил бы за start() те же 45 мс задержки перед звуком.
+            self._scrub_sink_io = sink.start()
+            return sink
+        except Exception:
+            self._scrub_sink_obj = None
+            self._scrub_sink_io = None
+            return None
 
-    def _scrub_audio_blip(self, painted):
-        """Короткий звуковой блип (~400 мс) в текущей целевой позиции шага. Видео
-        не трогаем. Источник звука:
-          • выбрана внешняя озвучка → её отдельный плеер (звук видео заглушён);
-          • painted-режим → отдельный скраб-плеер по оригиналу;
-          • overlay-режим → ничего (там звук даст основной player.play() ниже).
-        Между шагами плеер НЕ ставится на паузу: pause()/play() у QMediaPlayer
-        заново открывает аудиоустройство (на Windows это заметная задержка).
-        Вместо паузы — mute/unmute вывода, это мгновенно. Настоящая пауза
-        (отпустить устройство) — только после долгого простоя, см.
-        _hard_pause_scrub_audio. Если скраб-плеер только что создан/сменил
-        источник (первый шаг после смены файла), setSourceDevice/setSource
-        асинхронны — setPosition/play() сразу может тихо ничего не дать; тогда
-        откладываем реальный старт до mediaStatusChanged (см. _on_scrub_media_ready)
-        вместо того, чтобы просто промолчать (была жалоба «нет звука вообще»)."""
-        if self._SCRUB_READY_STATUSES is None:
-            self._SCRUB_READY_STATUSES = (
-                QMediaPlayer.MediaStatus.LoadedMedia,
-                QMediaPlayer.MediaStatus.BufferedMedia,
-                QMediaPlayer.MediaStatus.EndOfMedia)
+    def _scrub_volume(self):
+        try:
+            return max(0.0, min(1.0, self.vol_slider.value() / 100.0))
+        except Exception:
+            return 1.0
+
+    def _scrub_blip_seconds(self):
+        """Длина блипа: ровно кадр, но в разумных пределах слышимости."""
+        fps = float(self.fps or 0.0)
+        one = (1.0 / fps) if fps > 0 else self._SCRUB_BLIP_MIN_S
+        return max(self._SCRUB_BLIP_MIN_S, min(self._SCRUB_BLIP_MAX_S, one))
+
+    def _scrub_audio_time_s(self):
+        """Время, с которого обязан звучать шаг, — НАЧАЛО показанного кадра
+        (плееру мы отдаём середину кадра, но слышно должно быть то же, что
+        видно). Берём его из НОМЕРА кадра, а не из округлённых миллисекунд."""
+        if self._grid.valid and self._frame_idx is not None:
+            return self._grid.start_of(self._frame_idx)
+        ms = getattr(self, "_scrub_audio_ms", None)
+        if ms is None:
+            ms = getattr(self, "_scrub_target", None)
+        if ms is None:
+            try:
+                ms = self.player.position()
+            except Exception:
+                return None
+        return max(0.0, ms / 1000.0)
+
+    def _scrub_audio_blip(self, painted=True):
+        """Короткий звук нового кадра: точный PCM-срез с pts кадра в устройство.
+
+        В overlay-режиме (QVideoWidget) кадр доставляется коротким play()
+        основного плеера, который несёт и звук, — там мы молчим. Исключение —
+        выбранная внешняя озвучка: звук видео тогда заглушён, и слышно только
+        то, что сыграем здесь."""
         if not getattr(self, "_scrub_audio_enabled", True):
             return
-        tgt = self._scrub_target
-        if tgt is None:
+        if not painted and not getattr(self, "_ext_audio_active", False):
+            return
+        t_s = self._scrub_audio_time_s()
+        if t_s is None:
+            return
+        eng = self._sync_scrub_audio_source()
+        if eng is None:
+            return
+        eng.request(t_s)                    # окно вокруг плейхеда — заранее
+        data = eng.slice_at(t_s, self._scrub_blip_seconds())
+        if data:
+            self._play_scrub_slice(data)
+            self._scrub_wait = None
+            return
+        # Окна ещё нет (первый шаг после загрузки/перемотки) — доиграем, как
+        # только фоновый декодер его принесёт (см. _on_scrub_audio_window).
+        # Раньше в этом месте звука просто не было — жалоба «при AV1 звук на
+        # шаге появляется не всегда».
+        self._scrub_wait = (t_s, time.monotonic())
+
+    def _on_scrub_audio_window(self):
+        """Окно PCM доехало: если шаг был только что и с тех пор никуда не
+        ушли — играем его звук с опозданием, а не молчим."""
+        pending = getattr(self, "_scrub_wait", None)
+        self._scrub_wait = None
+        if not pending or not getattr(self, "_scrub_audio_enabled", True):
+            return
+        t_s, at = pending
+        if time.monotonic() - at > 0.4:
+            return                          # поздно, звук был бы «из прошлого»
+        cur = self._scrub_audio_time_s()
+        if cur is None or abs(cur - t_s) > 0.001:
+            return                          # плейхед уже ушёл — играть нечего
+        eng = getattr(self, "_audio_scrub", None)
+        data = eng.slice_at(t_s, self._scrub_blip_seconds()) if eng else None
+        if data:
+            self._play_scrub_slice(data)
+
+    def _play_scrub_slice(self, data):
+        """Пишет срез в аудиоустройство, НЕ давая очереди расти.
+
+        Очередь длиннее одного среза — это и есть «звук уехал вперёд»: при
+        удержании клавиши шаги идут чаще, чем звук успевает проигрываться, и
+        хвост копится, а следующий шаг слышится уже с опозданием. Поэтому
+        пишем ровно столько, сколько успело проиграться: одиночный шаг звучит
+        целиком, а удержание даёт непрерывную перемотку по звуку, отстающую от
+        картинки не больше чем на срез."""
+        sink = self._scrub_sink()
+        io = getattr(self, "_scrub_sink_io", None)
+        if sink is None or io is None:
+            return
+        try:
+            sink.setVolume(self._scrub_volume())
+            free = int(sink.bytesFree())
+            pending = max(0, int(sink.bufferSize()) - free)
+            budget = min(free, len(data) - pending)
+            if budget <= 0:
+                return              # предыдущий срез ещё звучит — не наслаиваем
+            io.write(data[:budget])
+        except Exception:
+            # Устройство могло пропасть (наушники выдернули) — пересоберём.
+            self._release_scrub_sink()
+
+    def _release_scrub_sink(self):
+        sink = getattr(self, "_scrub_sink_obj", None)
+        self._scrub_sink_obj = None
+        self._scrub_sink_io = None
+        self._scrub_fmt = None
+        if sink is not None:
             try:
-                tgt = self.player.position()
+                sink.stop()
             except Exception:
-                return
-        tgt_ms = int(max(0, tgt))
-        if getattr(self, "_ext_audio_active", False) and self._ext_audio_player is not None:
-            # Внешняя озвучка синхронно следует за основным плеером — уже
-            # загружена и играет, риска «холодного» источника тут нет.
-            self._start_scrub_blip_playback(self._ext_audio_player, self._ext_audio_output, tgt_ms)
-            return
-        if not painted:
-            return
-        player = self._ensure_scrub_audio_player()
-        if player is None:
-            return
-        out = self._scrub_audio_output
-        self._scrub_pending = (player, out, tgt_ms)
-        try:
-            status = player.mediaStatus()
-        except Exception:
-            status = None
-        if status is not None and status not in self._SCRUB_READY_STATUSES:
-            if not getattr(self, "_scrub_media_status_wired", False):
-                self._scrub_media_status_wired = True
-                player.mediaStatusChanged.connect(self._on_scrub_media_ready)
-            return
-        self._start_scrub_blip_playback(player, out, tgt_ms)
-
-    def _on_scrub_media_ready(self, status):
-        if status not in self._SCRUB_READY_STATUSES:
-            return
-        pending = getattr(self, "_scrub_pending", None)
-        if pending is None:
-            return
-        self._scrub_pending = None
-        self._start_scrub_blip_playback(*pending)
-
-    def _start_scrub_blip_playback(self, player, out, tgt_ms):
-        try:
-            if out is not None:
-                out.setMuted(False)
-            player.setPosition(tgt_ms)
-            if player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-                player.play()
-        except Exception:
-            return
-        self._scrub_blip_player = player
-        self._scrub_blip_output = out
-        # Таймер mute: перезапускается на каждом шаге — при удержании ←/→ звук
-        # идёт непрерывно, а после отпускания глохнет (но плеер продолжает
-        # тихо играть — см. docstring). 400мс — запас на то, что сиик по
-        # сжатому потоку сам по себе может занять заметное время: слишком
-        # короткое окно душило звук ДО того, как он вообще успевал начаться.
-        if self._scrub_blip_timer is None:
-            self._scrub_blip_timer = QTimer(self)
-            self._scrub_blip_timer.setSingleShot(True)
-            self._scrub_blip_timer.timeout.connect(self._stop_scrub_audio_blip)
-        self._scrub_blip_timer.start(400)
-        # Таймер жёсткой паузы: куда дольше — реально отпускаем аудиоустройство,
-        # только когда пользователь давно не шагает по кадрам.
-        if self._scrub_hard_pause_timer is None:
-            self._scrub_hard_pause_timer = QTimer(self)
-            self._scrub_hard_pause_timer.setSingleShot(True)
-            self._scrub_hard_pause_timer.timeout.connect(self._hard_pause_scrub_audio)
-        self._scrub_hard_pause_timer.start(1200)
+                pass
+            try:
+                sink.deleteLater()
+            except Exception:
+                pass
 
     def _stop_scrub_audio_blip(self):
-        out = getattr(self, "_scrub_blip_output", None)
-        if out is not None:
-            try:
-                out.setMuted(True)
-            except Exception:
-                pass
-
-    def _hard_pause_scrub_audio(self):
-        """Реально ставит скраб-плеер на паузу (отпускает аудиоустройство) —
-        вызывается только после долгого простоя между шагами, см.
-        _scrub_audio_blip. Звук уже приглушён _stop_scrub_audio_blip, так что
-        сама пауза не даёт слышимого щелчка."""
-        p = getattr(self, "_scrub_blip_player", None)
-        if p is not None:
-            try:
-                p.pause()
-            except Exception:
-                pass
+        """Обрывает звучащий срез (выключение скраб-звука в Настройках).
+        reset() уничтожает QIODevice устройства, поэтому сразу берём новый —
+        иначе следующий блип писал бы в мёртвый объект."""
+        sink = getattr(self, "_scrub_sink_obj", None)
+        if sink is None:
+            return
+        try:
+            sink.reset()
+            self._scrub_sink_io = sink.start()
+        except Exception:
+            self._release_scrub_sink()
 
     def set_scrub_audio(self, enabled, save=True):
         """Вкл/выкл скраб-звук при покадровой перемотке (из Настроек)."""
         self._scrub_audio_enabled = bool(enabled)
         if not enabled:
             self._stop_scrub_audio_blip()
-            self._hard_pause_scrub_audio()
         if save:
             try:
                 self.save_settings()
@@ -5266,6 +6812,12 @@ class EditTab(QWidget):
             msgbox_warning(self, "Внимание", "Конечная точка должна быть позже начальной.")
             return
 
+        # Висит предпросмотр привязки к объекту — «Обрезать» и есть его экспорт:
+        # режем выбранный отрезок и вшиваем накладку по уже посчитанному пути.
+        if self.has_track_preview():
+            self._render_track_overlay(in_s, out_s)
+            return
+
         mode = self.cmb_mode.currentIndex()
         # Субтитры можно вшить, если выбрана любая дорожка (встроенная или внешний
         # файл) — пункт 0 = «Выкл».
@@ -5292,16 +6844,63 @@ class EditTab(QWidget):
         # Пикселизация (эффект -vf) тоже несовместима с copy/Smart Cut — требует
         # перекодировки, как и кадрирование.
         pix_active = getattr(self, "_pixelize_active", False)
+        # Наложенные картинки — такой же «фильтровый» эффект: copy/Smart Cut их
+        # не умеют (путь «настройками Обработки» умеет — см. ниже).
+        ovl_active = self.has_image_overlays()
         # Smart Cut несовместим с вшиванием субтитров (середина копируется): при
         # запросе hardsub откатываемся на полную перекодировку (mode 1).
+        if mode in (4, 5):
+            # 4 — «Перекодировать настройками «Обработки»», 5 — то же самое, но
+            # ТОЛЬКО звук: точный рез + текущие настройки вкладки «Обработка»
+            # одним проходом ProcessWorker (тот же путь, что кнопка «Обрезать и
+            # обработать» в диалоге точности реза).
+            audio_only = (mode == 5)
+            # Наложенные картинки этот путь ТЕПЕРЬ умеет: их PNG уезжают в
+            # item['overlays'] и вшиваются тем же единственным проходом
+            # ProcessWorker (см. _execute_cut_and_process). Но только когда
+            # «Обработка» реально перекодирует видео: с выключенной галочкой
+            # «Перекодировать видео» поток копируется (-c:v copy), а к копии
+            # никакие видеофильтры неприменимы. В аудио-режиме видеоряда нет
+            # вовсе — там накладки теряются по определению режима.
+            ovl_lost = ovl_active and (audio_only
+                                       or not self._process_tab_encodes_video())
+            # Остальных своих видеофильтров путь не знает — если что-то из них
+            # включено, спрашиваем, а не выкидываем молча. В аудио-режиме
+            # спрашивать нечего: видеоряда на выходе нет по определению самого
+            # режима — просто честно пишем в лог, что эффекты картинки к нему
+            # не применяются.
+            if burn_subs or crop_active or pix_active or ovl_lost:
+                what = ", ".join(n for n, on in (
+                    ("вшивание субтитров", burn_subs), ("кадрирование", crop_active),
+                    ("пикселизация", pix_active),
+                    ("наложенные картинки", ovl_lost)) if on)
+                if audio_only:
+                    self.log_label.setText(
+                        icon_html('fa5s.info-circle', 12, C['text2'])
+                        + " Аудио-режим: эффекты картинки не применяются")
+                    self.log_label.setStyleSheet(f"color: {C['text2']}; font-size: 12px;")
+                    if self.main is not None and hasattr(self.main, "log"):
+                        self.main.log("Монтаж: аудио-режим «Обработки» — на выходе "
+                                      f"только звук, поэтому не применяются: {what}.")
+                else:
+                    ans = msgbox_question(
+                        self, "Настройки «Обработки»",
+                        f"В режиме «Перекодировать настройками «Обработки»» не применяется: "
+                        f"{what}.\n\nОбрезать настройками «Обработки» без этого?\n"
+                        "«Нет» — обычная перекодировка средствами Монтажа (со всеми эффектами).")
+                    if ans != QMessageBox.StandardButton.Yes:
+                        self._execute_cut(in_s, out_s, 1, burn_subs)
+                        return
+            self._execute_cut_and_process(in_s, out_s, audio_only=audio_only)
+            return
         if mode == 3:
-            if burn_subs or crop_active or pix_active:
+            if burn_subs or crop_active or pix_active or ovl_active:
                 self._execute_cut(in_s, out_s, 1, burn_subs)
             else:
                 self._execute_smartcut(in_s, out_s)
             return
-        if (crop_active or pix_active) and mode == 0:
-            mode = 1  # быстрый copy не умеет crop/pixelize → перекодируем
+        if (crop_active or pix_active or ovl_active) and mode == 0:
+            mode = 1  # быстрый copy не умеет crop/pixelize/накладки → перекодируем
         self._execute_cut(in_s, out_s, mode, burn_subs)
 
     def _export_still_pixelize(self):
@@ -5328,7 +6927,7 @@ class EditTab(QWidget):
         pix_vf = self._video_pixelize_filter(dur, 0.0)
         chain = [p for p in (crop_vf, pix_vf) if p]
         chain.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
-        vf = ",".join(chain)
+        vf = self._wrap_vf(",".join(chain), src)
 
         out_dir = (Path(self.export_dir) if (self.export_dir and os.path.isdir(self.export_dir))
                    else src.parent)
@@ -5455,19 +7054,24 @@ class EditTab(QWidget):
         # добавлять фильтр (от offset это не зависит), а сам фильтр строится с
         # правильным смещением времени отдельно в каждой ветке (см. _vf_args ниже).
         pix_on = self._video_pixelize_filter(dur_cut, 0.0) is not None
-        if pix_on and mode == 0:
+        # Наложенные картинки (логотип/водяной знак) — тоже фильтр: copy их не
+        # умеет, поэтому при активных слоях идём перекодировкой, как с crop.
+        ovl_on = self.has_image_overlays()
+        if (pix_on or ovl_on) and mode == 0:
             mode = 1
-        # Любой видеофильтр (crop/pixelize) — это перекодировка, а не lossless-copy:
-        # не вводим в заблуждение уведомитель точности реза.
-        if crop_vf or pix_on:
+        # Любой видеофильтр (crop/pixelize/накладка) — это перекодировка, а не
+        # lossless-copy: не вводим в заблуждение уведомитель точности реза.
+        if crop_vf or pix_on or ovl_on:
             exact_copy = False
 
         def _vf_args(offset):
-            """Аргументы -vf для текущей ветки: crop (без времени) + пикселизация со
-            смещением `offset` (время фильтрграфа в начале клипа — зависит от способа
-            seek в ветке). Пустой список, если фильтровать нечего."""
+            """Аргументы -vf для текущей ветки: наложенные картинки + crop (без
+            времени) + пикселизация со смещением `offset` (время фильтрграфа в
+            начале клипа — зависит от способа seek в ветке). Пустой список, если
+            фильтровать нечего."""
             chain = [p for p in (crop_vf, self._video_pixelize_filter(dur_cut, offset)) if p]
-            return ["-vf", ",".join(chain)] if chain else []
+            vf = self._wrap_vf(",".join(chain), src)
+            return ["-vf", vf] if vf else []
 
         fonts_dir = None
         if burn_subs:
@@ -5527,6 +7131,9 @@ class EditTab(QWidget):
             _pix = self._video_pixelize_filter(dur_cut, in_s)
             if _pix:
                 vf = f"{vf},{_pix}"
+            # Наложенные картинки идут ПЕРЕД кадрированием и субтитрами (см.
+            # overlay_filter_graph) — так же, как их видно в плеере.
+            vf = self._wrap_vf(vf, src)
             if ext_audio:
                 # Видео+субтитры из исходника (вход 0), звук — из внешнего файла
                 # (вход 1). Выходной seek (-ss/-t как опции вывода) равно режет оба.
@@ -5550,7 +7157,9 @@ class EditTab(QWidget):
             # Внешняя озвучка без вшивания субтитров. Видео берём по режиму
             # (copy/перекодировка), звук — из внешнего файла (перекодируем в AAC,
             # т.к. контейнер/кодек могут не совпадать).
-            vargs = ["-c:v", "copy"] if (mode == 0 and not crop_vf and not pix_on) else venc
+            vargs = (["-c:v", "copy"]
+                     if (mode == 0 and not crop_vf and not pix_on and not ovl_on)
+                     else venc)
             # ВХОДНОЙ seek по видео (-ss до -i src) → фильтрграф стартует с 0.
             cmd = [FFMPEG, "-y", "-ss", in_str, "-i", str(src),
                    "-ss", in_str, "-i", ext_audio, "-t", dur_str,
@@ -5872,13 +7481,33 @@ class EditTab(QWidget):
         self.ffmpeg_thread.finished.connect(_on_finished)
         self.ffmpeg_thread.start()
 
-    def _execute_cut_and_process(self, in_s, out_s, out_path=None, src=None):
+    def _process_tab_encodes_video(self):
+        """Перекодирует ли «Обработка» видео прямо сейчас (её галочка
+        «Перекодировать видео»). При выключенной видеопоток копируется
+        (-c:v copy), и никакие видеофильтры — в том числе наложенные картинки —
+        к нему не применимы. Вкладка недоступна → считаем, что перекодирует
+        (обычная настройка по умолчанию)."""
+        tm = getattr(self.main, 'tab_media', None) if self.main is not None else None
+        try:
+            return bool(tm.chk_enable_video.isChecked())
+        except Exception:
+            return True
+
+    def _execute_cut_and_process(self, in_s, out_s, out_path=None, src=None,
+                                 audio_only=False):
         """Кнопка «Обрезать и обработать»: режет диапазон [in_s,out_s) И сразу
         применяет вкладку «Обработка» ЕЁ ТЕКУЩИМИ настройками (CRF/preset/
         скорость/loudnorm/fps/…) — одним ffmpeg-проходом внутри
         ProcessWorker.process_media (item['trim']), без отдельного x264-реэнкода
         в Монтаже, который иначе перекодировался бы ЕЩЁ РАЗ при последующем
         прогоне через «Обработку» (двойное поколение потерь).
+
+        audio_only=True (режим обрезки «(Аудио) Перекодировать настройками
+        «Обработки»») — то же самое, но видеоряд отбрасывается и на выходе
+        остаётся ТОЛЬКО звуковая дорожка (.opus) с текущими настройками звука
+        «Обработки». Технически это item['audio_only'] — process_media гонит
+        такой элемент своей аудио-онли веткой, той же, что и для файлов без
+        видео (см. workers.py).
 
         Настройки НЕ копируем — вызываем тот же MediaTab._run_items(), что и
         кнопка «НАЧАТЬ» на вкладке «Обработка», поэтому любые настройки,
@@ -5890,7 +7519,12 @@ class EditTab(QWidget):
         speed/norm/fade/noaudio — ровно то, что показывает суффикс в обычной
         «Обработке»), и (б) для источников не-.mp4 (mkv/…) итог process_media
         (всегда .mp4 для AV1) переименовывался под ЧУЖОЕ расширение источника —
-        файл с mp4-содержимым получал имя «*.mkv», что вводило в заблуждение."""
+        файл с mp4-содержимым получал имя «*.mkv», что вводило в заблуждение.
+
+        Два РАЗНЫХ отрезка одного исходника получают разные файлы: имя занято —
+        уходим на «…_обрез_1» (см. _unique_output), а не затираем предыдущий
+        клип. Перезапись остаётся только для внутреннего пере-реза (out_path)
+        и правки «на месте»."""
         src = Path(src) if src else self.actual_source_file
         if not src or not src.exists():
             msgbox_warning(self, "Внимание", "Файл не загружен.")
@@ -5913,11 +7547,20 @@ class EditTab(QWidget):
         stem = src.stem
         out_dir = (Path(self.export_dir)
                    if (self.export_dir and os.path.isdir(self.export_dir)) else src.parent)
-        replace_original = self.chk_overwrite.isChecked()
+        # out_path приходит только от ВНУТРЕННЕГО пере-реза (предложение
+        # «переделать точно» после быстрой обрезки — там неточный файл уже
+        # удалён _discard_temp_cut, и его имя законно занять снова). Само имя
+        # не берём: расширение результата «Обработки» может отличаться от
+        # исходного (AV1 всегда .mp4), поэтому имя по-прежнему собираем по
+        # факту — см. ниже. Флаг разрешает перезапись, и только её.
+        force_overwrite = bool(out_path)
 
         self._report_progress(0, "Обработка…")
-        self.log_label.setText("Отправлено в «Обработку»…")
-        self._set_cut_status("Обработка… подготовка", icon='fa5s.hourglass-half')
+        self.log_label.setText("Отправлено в «Обработку»…"
+                               + (" (только звук)" if audio_only else ""))
+        self._set_cut_status(
+            ("Обработка звука… подготовка" if audio_only else "Обработка… подготовка"),
+            icon='fa5s.hourglass-half')
         self._set_cut_btn_cancel(True, cancel_handler=lambda: self._cancel_cut_and_process(tm))
         self._cut_t0 = time.time(); self._cut_lastp = 0.0
         if getattr(self, "_cut_ticker", None) is None:
@@ -5933,7 +7576,19 @@ class EditTab(QWidget):
                      and len(self._audio_streams) > 1) else None)
         item = {'iid': iid, 'path': str(src), 'type': 'MEDIA',
                 'dur': max(0.0, out_s - in_s), 'is_done': False,
-                'trim': (in_s, out_s), 'audio_index': sel_a}
+                'trim': (in_s, out_s), 'audio_index': sel_a,
+                'audio_only': bool(audio_only)}
+        # Наложенные картинки едут в «Обработку» готовыми PNG (уже отрисованы
+        # под размер ИСХОДНОГО кадра, координаты — в его пикселях). process_media
+        # подмешивает их фильтром overlay ПЕРЕД своей цепочкой (crop чёрных
+        # полос/scale/fade), поэтому кадрирование и масштаб применяются уже к
+        # кадру с картинкой — ровно как это видно в плеере Монтажа. Аудио-режим
+        # видеоряда не выводит, поэтому там накладки не рендерим вовсе.
+        if not audio_only:
+            ovl = self._render_export_overlays()
+            if ovl:
+                item['overlays'] = ovl
+                item['overlay_format'] = self._overlay_pix_fmt(src)
         # _run_items сама собирает настройки со всех виджетов «Обработки» и
         # запускает ProcessWorker (тот же путь, что кнопка «НАЧАТЬ»); в очереди —
         # только наш синтетический элемент, чужие файлы не затрагиваются.
@@ -5978,6 +7633,18 @@ class EditTab(QWidget):
                 temp_stem, temp_ext = os.path.splitext(os.path.basename(temp_out))
                 tail = temp_stem[len(stem):] if temp_stem.startswith(stem) else ("_" + temp_stem)
                 final_out = str(out_dir / f"{stem}_обрез{tail}{temp_ext}")
+                # Второй отрезок ИЗ ТОГО ЖЕ файла с теми же настройками даёт
+                # ровно то же имя — и раньше «Перезаписать файл» (галочка
+                # включена по умолчанию) молча стирала первый клип. Правило
+                # здесь теперь такое же, как у обычной обрезки (_execute_cut):
+                # перезаписываем ТОЛЬКО внутренний пере-рез (force_overwrite)
+                # либо правку «на месте», когда цель — сам открытый файл.
+                # Во всех остальных случаях уходим на «…_обрез_1», «_2», …
+                loaded = str(self.actual_source_file) if self.actual_source_file else ""
+                in_place = bool(loaded) and (os.path.normpath(loaded) ==
+                                             os.path.normpath(final_out))
+                replace_original = force_overwrite or (self.chk_overwrite.isChecked()
+                                                       and in_place)
                 if os.path.exists(final_out) and not replace_original:
                     final_out = _unique_output(final_out)
 
@@ -6443,7 +8110,9 @@ class EditTab(QWidget):
         if self.duration <= 0:
             return
         self.push_undo()
-        t = self.player.position() / 1000.0
+        # Берём время ПОКАЗАННОГО кадра, а не «сырую» позицию плеера: они могут
+        # отличаться на доли кадра, а рез обязан совпадать с тем, что видно.
+        t = self._clock_pos_s()
         new_in = max(0.0, min(t, self.duration))
         if new_in >= self.current_out:
             new_in = max(0.0, self.current_out - 0.04)
@@ -6458,7 +8127,7 @@ class EditTab(QWidget):
         if self.duration <= 0:
             return
         self.push_undo()
-        t = self.player.position() / 1000.0
+        t = self._clock_pos_s()
         new_out = max(0.0, min(t, self.duration))
         if new_out <= self.current_in:
             new_out = min(self.duration, self.current_in + 0.04)
@@ -6587,8 +8256,10 @@ class EditTab(QWidget):
                     if hasattr(self, 'spin_proxy_min') else 0,
                 'subtitle_style': dict(getattr(self, '_last_subtitle_style', None) or {}) or None,
             }
-            with open(EDITOR_SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump(settings, f, ensure_ascii=False, indent=2)
+            # Атомарно (временный файл + подмена): прямая запись обрезала файл
+            # ДО того, как в него ляжет новое содержимое, и жёсткое завершение
+            # процесса в этот момент теряло настройки Монтажа целиком.
+            save_json_atomic(EDITOR_SETTINGS_PATH, settings)
         except Exception:
             pass
 
@@ -6647,24 +8318,18 @@ class EditTab(QWidget):
             self.player.stop()
         except Exception:
             pass
-        # Останавливаем скраб-плеер покадровой перемотки и отпускаем его файл.
+        # Останавливаем звук покадровой перемотки: устройство вывода и фоновый
+        # декодер окон PCM (он держит запущенный ffmpeg).
         try:
-            if self._scrub_blip_timer is not None:
-                self._scrub_blip_timer.stop()
-            if self._scrub_hard_pause_timer is not None:
-                self._scrub_hard_pause_timer.stop()
+            self._release_scrub_sink()
         except Exception:
             pass
         try:
-            if self._scrub_audio_player is not None:
-                self._scrub_audio_player.stop()
-                self._scrub_audio_player.setSource(QUrl())
-        except Exception:
-            pass
-        try:
-            if self._scrub_audio_dev is not None:
-                self._close_play_device(self._scrub_audio_dev)
-                self._scrub_audio_dev = None
+            eng = getattr(self, "_audio_scrub", None)
+            if eng is not None:
+                eng.stop()
+                eng.wait(1500)
+                self._audio_scrub = None
         except Exception:
             pass
         # Останавливаем фоновый поток превью кадров полосы воспроизведения.
@@ -6673,8 +8338,16 @@ class EditTab(QWidget):
                 self.seek_preview.shutdown()
         except Exception:
             pass
+        # …и поток предекодера точных кадров (он держит запущенный ffmpeg).
+        try:
+            eng = getattr(self, '_frames', None)
+            if eng is not None:
+                eng.stop(); eng.wait(1500)
+        except Exception:
+            pass
         # Убиваем все фоновые ffmpeg-процессы, чтобы не остались зомби (баг #3).
-        for attr in ('ffmpeg_thread', 'proxy_thread', 'audio_worker', '_vinp_worker'):
+        for attr in ('ffmpeg_thread', 'proxy_thread', 'audio_worker',
+                     '_vinp_worker', '_trk_worker'):
             w = getattr(self, attr, None)
             if w is None:
                 continue
@@ -6731,6 +8404,15 @@ class EditTab(QWidget):
             for d in self._subtitle_fonts_cache.values():
                 shutil.rmtree(d, ignore_errors=True)
             self._subtitle_fonts_cache.clear()
+        except Exception:
+            pass
+        # …и временные PNG наложенных картинок (см. _render_export_overlays).
+        try:
+            import shutil
+            d = getattr(self, "_overlay_tmp_dir", None)
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
+            self._overlay_tmp_dir = None
         except Exception:
             pass
 

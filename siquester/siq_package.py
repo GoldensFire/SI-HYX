@@ -257,8 +257,8 @@ class SiqPackage:
         _item_tag = tag('item')
         _true_set = frozenset(('true', '1', 'yes'))
         _MEDIA_ITEM_TYPES = ('image', 'audio', 'video', 'html')  # a_items normalizes voice→audio
-        # q_items/a_items — тот же формат, что sigstats/siq.py::_item_info, для
-        # общей логики группировки/итога длительности из siq_duration.py (см.
+        # q_items/a_items — формат, который ждёт общая логика группировки/итога
+        # длительности из siq_duration.py (см.
         # question_duration ниже). Отдельно от items[] (используется в
         # UI-редакторе вопроса, формат которого не меняем).
         q_items: list[dict] = []
@@ -313,11 +313,11 @@ class SiqPackage:
                               "wait_for_finish": wait_for_finish,
                               "xml_duration": xml_duration})
 
-                # Классификация для siq_duration — та же, что sigstats/siq.py:
-                # только пункты из params "question"/"answer" (не "background" —
-                # у sigstats тоже нет спецобработки по имени параметра, только по
-                # атрибуту placement на самом пункте), группировка одновременного
-                # показа — по placement=="background"/waitForFinish=="false".
+                # Классификация для siq_duration: только пункты из params
+                # "question"/"answer" (не "background" — спецобработки по имени
+                # параметра нет, только по атрибуту placement на самом пункте),
+                # группировка одновременного показа — по
+                # placement=="background"/waitForFinish=="false".
                 if pname in ('question', 'answer'):
                     dest = q_items if pname == 'question' else a_items
                     dest.append({
@@ -329,7 +329,7 @@ class SiqPackage:
                     })
 
         # «время на ответ»: таймер на вопросе целиком или на блоке ответа
-        # (та же семантика, что sigstats/siq.py::_parse_question).
+
         answer_time = siq_duration.parse_dur_attr(q_el.get('duration'))
         for p in params_by_name.get('answer', []):
             if answer_time is None:

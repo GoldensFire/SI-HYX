@@ -2,8 +2,7 @@
 """Тесты siquester/auto_stats.py — обёртка над SIStatistics с формулами SIOnline."""
 import pytest
 
-from siquester import auto_stats
-from sigstats import stats_api
+from siquester import auto_stats, stats_api
 
 
 class TestFetch:

@@ -553,6 +553,7 @@ class InpaintCanvas(QWidget):
     TOOL_MASK = "mask"     # кисть-маска: красным помечает область для удаления (LaMa)
     TOOL_ERASE = "erase"
     TOOL_CROP = "crop"
+    TOOL_BLUR = "blur"     # кисть размытия: замыливает фото под мазком (в img_bgr)
     TOOL_MOVE = "move"   # перемещение наложенного (второго) изображения-слоя
     # Фигуры и текст (как в Paint) — рисуются прямо в изображение (self.img_bgr),
     # а не в маску-оверлей.
@@ -595,6 +596,14 @@ class InpaintCanvas(QWidget):
         self._tool = self.TOOL_MOVE
         self._brush = 30                # диаметр кисти в ЭКРАННЫХ px
         self._brush_color = QColor(235, 45, 45)   # цвет рисующей кисти (по фото)
+        # «Размытие»: степень = сигма гауссова размытия в ПИКСЕЛЯХ ИЗОБРАЖЕНИЯ.
+        # Замыленная копия и маска штриха живут только на время одного мазка
+        # (см. _begin_blur_stroke): так повторный проход кистью по тому же месту
+        # не «умножает» размытие внутри одного штриха, а между штрихами — да.
+        self._blur_strength = 12
+        self._blur_orig = None          # картинка на начало штриха (numpy BGR)
+        self._blur_dst = None           # она же, размытая целиком
+        self._blur_mask = None          # numpy (H,W) uint8 — где провели кистью
         self._painting = False
         self._panning = False
         self._last_img_pt = None        # последняя точка штриха (коорд. изображения)
@@ -1186,6 +1195,10 @@ class InpaintCanvas(QWidget):
         self._brush = max(2, int(diameter))
         self.update()
 
+    def set_blur_strength(self, v):
+        """Степень размытия кисти «Размытие» (сигма гаусса в пикселях изображения)."""
+        self._blur_strength = max(1, int(v))
+
     def set_brush_color(self, color):
         if color is not None and color.isValid():
             self._brush_color = QColor(color.red(), color.green(), color.blue())
@@ -1720,6 +1733,47 @@ class InpaintCanvas(QWidget):
         self._update_crop_buttons()
         self.update()
 
+    # ── Чёрные полосы ────────────────────────────────────────────────────────
+    def detect_black_bars(self):
+        """(x0, y0, x1, y1) содержимого без чёрных полос по краям или None, если
+        полос нет. Логика ТА ЖЕ, что во вкладке «Обработка» (ProcessWorker):
+        линия — полоса, только если ярких (> порога) пикселей в ней не больше
+        допуска на шум. Считаем по одному кадру-картинке, поэтому нужен лишь
+        разбор счётчиков — сам подсчёт кадров видео здесь не при чём."""
+        if self.img_bgr is None or _np is None or _cv2 is None:
+            return None
+        from workers import ProcessWorker
+        gray = _cv2.cvtColor(self.composited_bgr(), _cv2.COLOR_BGR2GRAY)
+        bright = gray > ProcessWorker._CROP_LUMA_LIMIT
+        if self._alpha is not None:
+            # Фон уже удалён: прозрачное — не содержимое, иначе «полосой» не
+            # считался бы даже полностью пустой край.
+            bright &= self._alpha > 10
+        ih, iw = gray.shape[:2]
+        box = ProcessWorker._crop_from_counts(bright.sum(axis=1),
+                                              bright.sum(axis=0), iw, ih)
+        if box is None:
+            return None
+        w, h, x, y = box
+        return x, y, x + w, y + h
+
+    def crop_black_bars(self):
+        """Убирает чёрные полосы по краям (тот же детект, что в «Обработке»).
+        Возвращает (ширина, высота) результата или None, если полос нет."""
+        box = self.detect_black_bars()
+        if box is None:
+            self.statusChanged.emit("Чёрные полосы не обнаружены.")
+            return None
+        x0, y0, x1, y1 = box
+        self._crop_a = QPointF(x0, y0)
+        self._crop_b = QPointF(x1, y1)
+        # Дальше всё делает обычное кадрирование: снимок для Ctrl+Z, вжигание
+        # мазков кисти, обрезка альфы/слоёв, вписывание в окно.
+        if not self.apply_crop():
+            self.cancel_crop()
+            return None
+        return x1 - x0, y1 - y0
+
     def _crop_rect_w(self):
         """Текущая рамка кадрирования в ЭКРАННЫХ координатах (нормализованная)."""
         a = self._i2w(self._crop_a)
@@ -2022,6 +2076,9 @@ class InpaintCanvas(QWidget):
         if self._tool == self.TOOL_ERASE:
             self._paint_image_to(img_pt, erase=True)
             return
+        if self._tool == self.TOOL_BLUR:
+            self._blur_to(img_pt)
+            return
         # TOOL_MASK — красная маска удаления (вход для нейросети).
         p = QPainter(self._overlay)
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -2081,6 +2138,62 @@ class InpaintCanvas(QWidget):
         self._last_img_pt = img_pt
         if not erase:
             self._has_paint = True
+
+    # ── Кисть «Размытие» ─────────────────────────────────────────────────────
+    def _begin_blur_stroke(self):
+        """Готовит один мазок размытия: замыленная копия всей картинки + пустая
+        маска штриха. Сама картинка заменяется НОВЫМ массивом (копией) — так кэш
+        PNG-кодирования истории (_bgr_snap_src сравнивает по identity) не
+        протухает, пока мы правим пиксели на месте."""
+        if self.img_bgr is None:
+            return
+        sigma = float(self._blur_strength)
+        self._blur_orig = self.img_bgr
+        self._blur_dst = _cv2.GaussianBlur(self.img_bgr, (0, 0), sigma)
+        h, w = self.img_bgr.shape[:2]
+        self._blur_mask = _np.zeros((h, w), _np.uint8)
+        self.img_bgr = self.img_bgr.copy()
+
+    def _end_blur_stroke(self):
+        self._blur_orig = self._blur_dst = self._blur_mask = None
+
+    def _blur_to(self, img_pt):
+        if self._blur_mask is None or self.img_bgr is None:
+            return
+        h, w = self.img_bgr.shape[:2]
+        width = max(1, int(round(self._brush / self._scale)))
+        a = self._last_img_pt if self._last_img_pt is not None else img_pt
+        p0 = (int(round(a.x())), int(round(a.y())))
+        p1 = (int(round(img_pt.x())), int(round(img_pt.y())))
+        if p0 == p1:
+            _cv2.circle(self._blur_mask, p1, max(1, width // 2), 255, -1,
+                        _cv2.LINE_AA)
+        else:
+            _cv2.line(self._blur_mask, p0, p1, 255, width, _cv2.LINE_AA)
+        # Пересчитываем только прямоугольник вокруг сегмента — иначе на крупных
+        # фото каждое движение мыши пережёвывало бы весь кадр.
+        pad = width // 2 + 2
+        x0 = max(0, min(p0[0], p1[0]) - pad); x1 = min(w, max(p0[0], p1[0]) + pad + 1)
+        y0 = max(0, min(p0[1], p1[1]) - pad); y1 = min(h, max(p0[1], p1[1]) + pad + 1)
+        if x1 <= x0 or y1 <= y0:
+            return
+        m = (self._blur_mask[y0:y1, x0:x1].astype(_np.float32) / 255.0)[..., None]
+        src = self._blur_orig[y0:y1, x0:x1].astype(_np.float32)
+        dst = self._blur_dst[y0:y1, x0:x1].astype(_np.float32)
+        self.img_bgr[y0:y1, x0:x1] = (src * (1.0 - m) + dst * m).astype(_np.uint8)
+        self._blit_base_region(x0, y0, x1, y1)
+        self._last_img_pt = img_pt
+
+    def _blit_base_region(self, x0, y0, x1, y1):
+        """Обновляет в кэше-пиксмапе только изменённый прямоугольник (полный
+        _rebuild_base на 4K-фото — десятки мс на каждое движение мыши)."""
+        if self._base_pix is None or self._alpha is not None:
+            self._rebuild_base()
+            return
+        qi = np_bgr_to_qimage(self.img_bgr[y0:y1, x0:x1])
+        p = QPainter(self._base_pix)
+        p.drawImage(x0, y0, qi)
+        p.end()
 
     # ── События мыши/колеса/клавиатуры ───────────────────────────────────────
     def mousePressEvent(self, ev):
@@ -2157,8 +2270,13 @@ class InpaintCanvas(QWidget):
             self._shape_drawing = True
             self.update()
             return
-        # Кисть/ластик — новый штрих: фиксируем состояние для отмены.
+        # Кисть/ластик/размытие — новый штрих: фиксируем состояние для отмены.
         self._push_history()
+        if self._tool == self.TOOL_BLUR:
+            # Мазки «Кисти» лежат отдельным слоем — вжигаем их, иначе размытие
+            # ушло бы ПОД них (как и при кадрировании/удалении объекта).
+            self.bake_paint()
+            self._begin_blur_stroke()
         self._painting = True
         self._last_img_pt = None
         self._paint_to(ipt)
@@ -2277,6 +2395,9 @@ class InpaintCanvas(QWidget):
             # Ластик стирает мазки кисти (слой краски) — пересчитываем флаг краски.
             if self._tool == self.TOOL_ERASE:
                 self._recompute_paint_flag()
+            if self._tool == self.TOOL_BLUR:
+                self._end_blur_stroke()
+                self.imageChanged.emit()
             # Кисть/ластик могли изменить _has_paint — сигналим вкладке пере-включить
             # кнопки (кнопка «Ластик» неактивна, пока нечего стирать, см. _refresh_enabled).
             if self._tool in (self.TOOL_BRUSH, self.TOOL_ERASE):
@@ -2480,7 +2601,8 @@ class InpaintCanvas(QWidget):
 
         # Кольцо-курсор кисти/ластика (не показываем под Alt-пипеткой).
         if (self._mouse_w is not None and not self._panning and not self._alt
-                and self._tool in (self.TOOL_BRUSH, self.TOOL_MASK, self.TOOL_ERASE)):
+                and self._tool in (self.TOOL_BRUSH, self.TOOL_MASK,
+                                   self.TOOL_ERASE, self.TOOL_BLUR)):
             rad = self._brush / 2.0
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(QColor(0, 0, 0, 160), 2))
@@ -2527,7 +2649,10 @@ class InpaintWorker(QThread):
                 progress=lambda d, t: self.progress.emit(int(d), int(t)))
             self.done.emit(res)
         except Exception as e:
-            import traceback; traceback.print_exc()
+            # Отмена пользователем (ModelCancelled) — не авария: сигнал шлём,
+            # но консоль пугающим traceback'ом не засоряем.
+            if not getattr(e, "cancelled", False):
+                import traceback; traceback.print_exc()
             self.failed.emit(str(e))
 
 
@@ -2549,7 +2674,10 @@ class BgRemoveWorker(QThread):
                 progress=lambda d, t: self.progress.emit(int(d), int(t)))
             self.done.emit(alpha)
         except Exception as e:
-            import traceback; traceback.print_exc()
+            # Отмена пользователем (ModelCancelled) — не авария: сигнал шлём,
+            # но консоль пугающим traceback'ом не засоряем.
+            if not getattr(e, "cancelled", False):
+                import traceback; traceback.print_exc()
             self.failed.emit(str(e))
 
 
@@ -2660,6 +2788,10 @@ class InpaintTab(QWidget):
                                         "Размер — ползунком «Кисть».")
         self.btn_crop = self._tool_btn("Кадрировать", 'fa5s.crop-alt',
                                        "Выделите прямоугольник и нажмите «Применить» прямо на холсте (или Enter)")
+        self.btn_blur = self._tool_btn("Размытие", 'fa5s.tint',
+                                       "Замыливает фото там, где провели кистью (лица, номера, "
+                                       "фон). Размер — ползунком «Кисть», силу — ползунком "
+                                       "«Степень размытия» ниже. Ctrl+Z отменяет мазок.")
         # «Удалить объект» — это инструмент-кисть удаления (как Spot Healing Brush в
         # Photoshop): выбрал → закрашиваешь красным объект/водяной знак → он сразу
         # стирается, а фон дорисовывает нейросеть. Отдельной кнопки «выделить»
@@ -2670,6 +2802,13 @@ class InpaintTab(QWidget):
         # «Удалить фон» — одноразовое действие (НЕ инструмент-кисть): нейросеть
         # RMBG-2.0 отделяет объект от фона, фон становится прозрачным (как «Удалить
         # фон» в Photoshop). Поэтому НЕ кладём её в tool_group (не залипает).
+        # «Удалить чёрные полосы» — тоже одноразовое действие (не инструмент-кисть):
+        # находит чёрную рамку по краям и сразу кадрирует по ней. Детект общий с
+        # вкладкой «Обработка» (ProcessWorker), чтобы картинка и видео резались
+        # одинаково.
+        self.btn_bars = _icon_btn("Удалить чёрные полосы", 'fa5s.compress-arrows-alt')
+        self.btn_bars.setToolTip("Обрезать чёрные полосы по краям изображения "
+                                 "(тот же детект, что во вкладке «Обработка»).")
         self.btn_bg = _icon_btn("Удалить фон", 'fa5s.cut')
         self.btn_bg.setToolTip("Удалить фон автоматически (нейросеть RMBG-2.0): объект "
                                "остаётся, фон становится прозрачным. Сохраняйте в PNG.")
@@ -2677,8 +2816,29 @@ class InpaintTab(QWidget):
         # «Фигуры»/«Текст» с всплывающими панелями, как flyout в Photoshop).
         # «Курсор» — инструмент по умолчанию и первый в списке.
         self.btn_move.setChecked(True)
-        for b in (self.btn_move, self.btn_brush, self.btn_erase, self.btn_crop):
+        for b in (self.btn_move, self.btn_brush, self.btn_erase, self.btn_crop,
+                  self.btn_blur):
             self.tool_group.addButton(b); tl.addWidget(b)
+        # Степень размытия — сразу под кнопкой «Размытие» (это её параметр).
+        row_blur = QHBoxLayout()
+        row_blur.setContentsMargins(0, 0, 0, 0); row_blur.setSpacing(5)
+        row_blur.addWidget(QLabel("Степень:"))
+        self.sld_blur = _JumpSlider(Qt.Orientation.Horizontal)
+        self.sld_blur.setRange(1, 60); self.sld_blur.setValue(12)
+        self.sld_blur.setToolTip("Насколько сильно замыливать под кистью "
+                                 "(радиус размытия в пикселях изображения).")
+        self.sld_blur.valueChanged.connect(self._on_blur_strength)
+        row_blur.addWidget(self.sld_blur, 1)
+        self.lbl_blur = QLabel("12"); self.lbl_blur.setFixedWidth(30)
+        row_blur.addWidget(self.lbl_blur)
+        tl.addLayout(row_blur)
+        # Рядом с «Кадрировать» по смыслу, но ставим после ползунка размытия, чтобы
+        # не разрывать пару «Размытие» + его «Степень».
+        tl.addLayout(self._tool_row(
+            self.btn_bars,
+            "Ищет чёрную рамку по краям (как «Обрезать чёрные полосы» во вкладке "
+            "«Обработка») и сразу кадрирует по ней. Если полос нет — ничего не "
+            "меняет. Ctrl+Z отменяет."))
         self.tool_group.addButton(self.btn_run)
         # «Удалить объект» и «Удалить фон» — со значком ⓘ и кратким описанием рядом
         # (по просьбе: что именно делает каждая кнопка).
@@ -2697,7 +2857,9 @@ class InpaintTab(QWidget):
         self.btn_brush.clicked.connect(lambda: self._set_tool(InpaintCanvas.TOOL_BRUSH))
         self.btn_erase.clicked.connect(lambda: self._set_tool(InpaintCanvas.TOOL_ERASE))
         self.btn_crop.clicked.connect(lambda: self._set_tool(InpaintCanvas.TOOL_CROP))
+        self.btn_blur.clicked.connect(lambda: self._set_tool(InpaintCanvas.TOOL_BLUR))
         self.btn_run.clicked.connect(self._activate_delete_tool)
+        self.btn_bars.clicked.connect(self._remove_black_bars)
         self.btn_bg.clicked.connect(self._remove_bg)
         # «Применить кадрирование» теперь живёт ПРЯМО на холсте (как в Photoshop) —
         # см. InpaintCanvas._crop_apply_btn. Отдельной кнопки в панели больше нет.
@@ -3198,6 +3360,10 @@ class InpaintTab(QWidget):
         self.lbl_brush.setText(str(v))
         self.canvas.set_brush(v)
 
+    def _on_blur_strength(self, v):
+        self.lbl_blur.setText(str(v))
+        self.canvas.set_blur_strength(v)
+
     def _set_status(self, text):
         self.lbl_status.setText(text)
 
@@ -3211,7 +3377,7 @@ class InpaintTab(QWidget):
         has = self.canvas.has_image() if hasattr(self, "canvas") else False
         busy = ((self._worker is not None and self._worker.isRunning())
                 or (self._bg_worker is not None and self._bg_worker.isRunning()))
-        for b in (self.btn_run, self.btn_bg, self.btn_save, self.btn_fit):
+        for b in (self.btn_run, self.btn_bg, self.btn_bars, self.btn_save, self.btn_fit):
             b.setEnabled(has and not busy)
         self.btn_open.setEnabled(not busy)
         self.btn_outdir.setEnabled(not busy)
@@ -3354,21 +3520,25 @@ class InpaintTab(QWidget):
             msgbox_warning(self, "Ошибка", f"Не удалось сохранить:\n{exc}")
 
     def _show_saved_toast(self, name: str):
-        """Зелёный плавающий баннер «Файл сохранён» по центру сверху вкладки,
-        автоскрытие через 3 с (как в SiQuesterHYX). Создаётся лениво."""
+        """Зелёный плавающий баннер «Файл сохранён» по центру сверху вкладки."""
+        self._show_toast(f"✅  Файл сохранён: {name}")
+
+    def _show_toast(self, text: str, bg: str = "rgba(166,227,161,0.94)"):
+        """Плавающий баннер по центру сверху вкладки, автоскрытие через 3 с
+        (как в SiQuesterHYX). Создаётся лениво."""
         lbl = getattr(self, "_saved_toast", None)
         if lbl is None:
             lbl = QLabel(self)
-            lbl.setStyleSheet(
-                "background:rgba(166,227,161,0.94);color:#181825;font-size:13px;"
-                "font-weight:700;border-radius:8px;padding:8px 24px;")
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
             self._saved_toast = lbl
             self._saved_toast_timer = QTimer(self)
             self._saved_toast_timer.setSingleShot(True)
             self._saved_toast_timer.timeout.connect(lbl.hide)
-        lbl.setText(f"✅  Файл сохранён: {name}")
+        lbl.setStyleSheet(
+            f"background:{bg};color:#181825;font-size:13px;"
+            "font-weight:700;border-radius:8px;padding:8px 24px;")
+        lbl.setText(text)
         lbl.adjustSize()
         lbl.move(max(0, (self.width() - lbl.width()) // 2), 12)
         lbl.raise_(); lbl.show()
@@ -3703,6 +3873,31 @@ class InpaintTab(QWidget):
         msgbox_warning(self, "Ошибка обработки", str(err))
 
     # ── Удаление фона (RMBG-2.0) ─────────────────────────────────────────────
+    def _remove_black_bars(self):
+        """«Удалить чёрные полосы»: тот же детект, что во вкладке «Обработка»
+        (ProcessWorker._crop_from_counts), только по одной картинке. Работает
+        мгновенно и локально — нейросети и фоновые потоки не нужны."""
+        self._touch()
+        if not self.canvas.has_image():
+            return
+        if (self._worker is not None and self._worker.isRunning()) or \
+           (self._bg_worker is not None and self._bg_worker.isRunning()):
+            return
+        # Плавающий слой (наложенная картинка/фигура/текст) вжимаем — иначе он
+        # остался бы висеть поверх уже обрезанного кадра со старыми координатами.
+        self.canvas.commit_pending()
+        size = self.canvas.crop_black_bars()
+        if size is None:
+            self._set_status(status_html('fa5s.info-circle',
+                             "Чёрные полосы не обнаружены.", '#89b4fa'))
+            self._show_toast("Чёрные полосы не обнаружены",
+                             bg="rgba(249,226,175,0.94)")
+        else:
+            self._set_status(status_html('fa5s.check-circle',
+                             f"Чёрные полосы обрезаны → {size[0]}×{size[1]}.", '#a6e3a1'))
+            self._show_toast(f"✂  Чёрные полосы обрезаны → {size[0]}×{size[1]}")
+        self._refresh_enabled()
+
     def _remove_bg(self):
         self._touch()
         if not self.canvas.has_image():

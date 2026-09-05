@@ -7,7 +7,8 @@
 //                       → сохраняет/обновляет обзор автора в комнате.
 //   GET  /coop/<room>   → {authors: {<author>: {outline, updated}}}
 //
-// Комната — это просто ключ KV `room:<room>`, значение — JSON вида
+// Комната — это просто ключ KV `room:<room>` (код приводится к нижнему
+// регистру, крайние/двойные пробелы схлопываются), значение — JSON вида
 //   {authors: {"Голден": {outline, updated}, "Напарник": {outline, updated}}}
 // с TTL 14 дней (продлевается при каждой записи), чтобы старые комнаты сами
 // вычищались.
@@ -58,7 +59,13 @@ export default {
     if (!m) {
       return json({ error: "not found" }, 404);
     }
-    const room = decodeURIComponent(m[1]).slice(0, 200);
+    // Комната нечувствительна к регистру и лишним пробелам. Иначе «Collab» и
+    // «collab» — два разных ключа KV, и соавторы, уверенные, что сидят в одной
+    // комнате, не видят друг друга совсем. Та же нормализация есть в
+    // coop_tab.py (normalize_room); дублируется здесь, чтобы старые сборки без
+    // неё попадали в ту же комнату, что и новые.
+    const room = decodeURIComponent(m[1])
+      .trim().replace(/\s+/g, " ").toLowerCase().slice(0, 200);
     const key = `room:${room}`;
 
     if (request.method === "GET") {

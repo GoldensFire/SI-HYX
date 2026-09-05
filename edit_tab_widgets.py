@@ -10,6 +10,7 @@
 
 import math
 import os
+import tempfile
 import time
 from functools import partial
 from config import (
@@ -20,11 +21,15 @@ from config import (
 )
 from edit_tab_base import (
     C, QAudioOutput, QMediaPlayer, QVideoSink, _fullscreen_icon,
-    _paint_subtitle, _paint_subtitle_styled, make_icon_btn, s_to_time
+    _paint_subtitle, _paint_subtitle_styled, install_audio_device_recovery,
+    make_icon_btn, s_to_time
 )
-from edit_tab_workers import (_SeekThumbnailer)
-from PyQt6.QtCore import (QRect, QUrl)
-from PyQt6.QtGui import (QBrush, QLinearGradient, QPainterPath)
+from edit_tab_overlay import (MIN_SIZE_NORM)
+from edit_tab_workers import (_SeekThumbnailer, overlay_top_left, track_box_at)
+from PyQt6.QtCore import (QObject, QRect, QUrl)
+from PyQt6.QtGui import (QBrush, QImage, QLinearGradient, QPainterPath,
+                         QTransform)
+from PyQt6.QtMultimedia import QVideoFrame
 from PyQt6.QtWidgets import (QSizePolicy, QStyle, QStyleOptionSlider, QToolTip)
 
 
@@ -901,36 +906,98 @@ class _SubtitleTimeline(QWidget):
         self.update()
 
 
+def slider_value_at(slider, x):
+    """Значение горизонтального QSlider в точке x (координаты виджета).
+
+    Стандартный QSlider по клику лишь «подкрадывается» к курсору page-step'ами;
+    чтобы ручка прыгала РОВНО в точку клика, значение надо посчитать самим по
+    геометрии желоба и ручки. Общий помощник для полосы воспроизведения
+    (SeekSlider) и ползунка громкости (VolumeSlider) — раньше эта арифметика
+    жила только в SeekSlider."""
+    opt = QStyleOptionSlider()
+    slider.initStyleOption(opt)
+    groove = slider.style().subControlRect(
+        QStyle.ComplexControl.CC_Slider, opt,
+        QStyle.SubControl.SC_SliderGroove, slider)
+    handle = slider.style().subControlRect(
+        QStyle.ComplexControl.CC_Slider, opt,
+        QStyle.SubControl.SC_SliderHandle, slider)
+    span = (groove.right() - groove.left() - handle.width())
+    pos = x - groove.left() - handle.width() // 2
+    if span <= 0:
+        return slider.minimum()
+    return QStyle.sliderValueFromPosition(
+        slider.minimum(), slider.maximum(), pos, span)
+
+
 class VolumeSlider(QSlider):
     """Ползунок громкости: колёсико над ним всегда меняет громкость шагом 5
     (как и над значком динамика), независимо от глобальной опции «колесо меняет
-    значения». Помечен свойством wheelAlways, чтобы WheelBlocker его не глушил."""
+    значения». Помечен свойством wheelAlways, чтобы WheelBlocker его не глушил.
+
+    Клик по шкале ставит громкость РОВНО в точку клика (instant jump, как в
+    плеерах), а не двигает ручку в её сторону page-step'ами — та же механика,
+    что у полосы воспроизведения (см. slider_value_at)."""
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
         self.setProperty("wheelAlways", True)
+        self._dragging = False
 
     def wheelEvent(self, ev):
         step = 5 if ev.angleDelta().y() > 0 else -5
         self.setValue(max(self.minimum(), min(self.maximum(), self.value() + step)))
         ev.accept()
 
+    def mousePressEvent(self, ev):
+        if (ev.button() == Qt.MouseButton.LeftButton
+                and self.orientation() == Qt.Orientation.Horizontal):
+            self._dragging = True
+            self.setValue(slider_value_at(self, int(ev.position().x())))
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._dragging and self.orientation() == Qt.Orientation.Horizontal:
+            self.setValue(slider_value_at(self, int(ev.position().x())))
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if self._dragging and ev.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
+
 
 class VolumeLabel(QLabel):
-    """Значок динамика: прокрутка колёсиком над ним меняет громкость.
-    slider_getter — функция, возвращающая связанный QSlider громкости."""
+    """Значок динамика: клик выключает/включает звук (mute), прокрутка колёсиком
+    меняет громкость. slider_getter — функция, возвращающая связанный QSlider
+    громкости."""
+
+    clicked = pyqtSignal()
 
     def __init__(self, slider_getter, parent=None):
         super().__init__(parent)
         self._slider_getter = slider_getter
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Громкость — прокрутите колёсиком над динамиком")
+        self.setToolTip("Клик — выключить/включить звук, колёсико — громкость")
         self.update_glyph(100)
 
     def update_glyph(self, vol):
         name = ('fa5s.volume-mute' if vol <= 0
                 else ('fa5s.volume-down' if vol < 55 else 'fa5s.volume-up'))
         self.setPixmap(get_icon_pixmap(name, 18))
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
 
     def wheelEvent(self, ev):
         sl = self._slider_getter() if self._slider_getter else None
@@ -1140,15 +1207,23 @@ class SubtitleOverlay(QWidget):
         p.end()
 
 
-class VideoCanvas(QWidget):
-    """Холст видео: сам рисует кадры (через QVideoSink + QPainter) и накладывает
-    субтитры ПРЯМО В КАДР, как VLC. В отличие от QVideoWidget не использует
-    нативную RHI-поверхность, поэтому субтитры корректно обрезаются по видео и
-    перекрываются любыми панелями/окнами сверху. Кадр вписывается с сохранением
-    пропорций (letterbox). Совместим по API субтитров с SubtitleOverlay.
+class _PaintedVideoCanvas(QWidget):
+    """Холст видео на ЦП: сам рисует кадры (QVideoSink → frame.toImage() →
+    QPainter) и накладывает субтитры ПРЯМО В КАДР, как VLC. Кадр вписывается с
+    сохранением пропорций (letterbox). Совместим по API субтитров с
+    SubtitleOverlay.
 
-    Чуть дороже QVideoWidget (кадр конвертируется в QImage на ЦП), поэтому в
-    настройках можно вернуть старый метод (QVideoWidget + окно-оверлей)."""
+    ВНИМАНИЕ: во вкладке «Монтаж» этот класс больше НЕ используется — там кадр
+    выводит GPU-путь (VideoCanvas ниже: QQuickWidget + QML VideoOutput), потому
+    что toImage() каждого кадра занимал главный поток на 8-9 мс при бюджете
+    кадра 16.7 мс (1080p60), и вкладка «лагала». Здесь остался ЦП-путь для
+    мини-плеера диалога субтитров (_SubtitlePreview): у него поверх холста живёт
+    обычный дочерний виджет-оверлей (_StyledSubtitleOverlay), и переезд на Quick
+    ему ничего не даёт.
+
+    Вся логика, не связанная с САМИМ выводом кадра (пин кадра, часы кадра,
+    граница OUT, кадрирование, накладки, трек-превью, зум/панорама, мышь), живёт
+    здесь же — GPU-холст наследует её и переопределяет только вывод."""
 
     # Кадр пришёл с PTS за границей OUT (см. set_play_bound) — плеер надо ставить
     # на паузу ДО показа этого кадра (защита от проскока правой границы).
@@ -1157,6 +1232,13 @@ class VideoCanvas(QWidget):
     # «Редактировании фото») — вкладка снимает чек с кнопки «Кадрировать».
     cropApplied = pyqtSignal()
     cropCancelled = pyqtSignal()
+    # Предпросмотр привязки к объекту снят с холста (Esc). Рендер в файл делает
+    # обычная кнопка экспорта «Обрезать» — отдельной кнопки «Применить» нет.
+    trackCancelled = pyqtSignal()
+    # Наложенные картинки: состав списка изменился (добавили/удалили) либо слой
+    # подвинули/растянули/повернули мышью — вкладка обновляет список слоёв.
+    overlaysChanged = pyqtSignal()
+    overlaySelected = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1166,6 +1248,18 @@ class VideoCanvas(QWidget):
         self._sink.videoFrameChanged.connect(self._on_frame)
         self._bound_us = None          # граница OUT (µs) для блокировки кадров
         self._frame_img = None
+        # ── Покадровая точность (см. edit_tab_frames.py) ──────────────────────
+        # «Пин» — заявка «на холсте стоит кадр N»: пока он держится, кадры
+        # плеера с ЧУЖИМ pts (а плеер после seek'а любит отдать соседний)
+        # игнорируются, и на экране не может оказаться не тот кадр. Пин снимает
+        # вкладка на воспроизведении (там кадры плеера и есть истина).
+        self._pin_span = None          # (lo_us, hi_us) — pts, считающиеся кадром N
+        self._pin_has_img = False      # точный кадр уже нарисован (не только заявка)
+        # Часы кадра: pts последнего ПОКАЗАННОГО кадра. Это единственное время,
+        # которое реально совпадает с картинкой на экране, поэтому по нему
+        # вкладка и ведёт метку таймлайна во время воспроизведения.
+        self._last_pts_us = -1
+        self._last_frame_at = 0.0
         self._text = ""
         self._image = None
         self._image_pos = (0, 0)
@@ -1211,6 +1305,19 @@ class VideoCanvas(QWidget):
         self._crop_cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._crop_cancel_btn.setToolTip("Отменить кадрирование (Esc)")
         self._crop_cancel_btn.clicked.connect(self.cancel_crop)
+        # Предпросмотр привязки к объекту (как в монтажках вроде Filmora): путь
+        # объекта уже посчитан, накладка рисуется поверх кадра ПРЯМО В ПЛЕЕРЕ —
+        # можно смотреть и крутить, а в файл это попадёт обычным экспортом
+        # («Обрезать»), поэтому своих кнопок у предпросмотра нет.
+        self._trk = None            # словарь-задание (см. set_track_preview)
+        self._trk_t = 0.0           # текущее время видео, с (из PTS кадра)
+        # Наложенные картинки (edit_tab_overlay.ImageOverlay) — статичный слой
+        # поверх кадра: перетаскивание, ручки размера, поворот. В файл их вшивает
+        # экспорт («Обрезать») фильтром overlay=… по тем же долям кадра.
+        self._ovls = []
+        self._ovl_sel = -1
+        self._ovl_edit = False
+        self._ovl_drag = None
         for _b in (self._crop_apply_btn, self._crop_cancel_btn):
             _b.setVisible(False)
 
@@ -1248,7 +1355,7 @@ class VideoCanvas(QWidget):
         on = bool(on)
         if on != self._playing:
             self._playing = on
-            if not on and self._frame_img is not None:
+            if not on and self._has_frame():
                 self.update()
 
     def has_crop(self) -> bool:
@@ -1376,11 +1483,320 @@ class VideoCanvas(QWidget):
         if 'b' in d: bo = max(y, t + minsz)
         self._crop_norm = QRectF(l, t, r - l, bo - t)
 
+    # ── Предпросмотр привязки к объекту ──────────────────────────────────────
+    def set_track_preview(self, spec):
+        """Включает/выключает показ накладки, едущей за объектом.
+
+        spec: словарь с готовым заданием (None — выключить):
+          overlay  — QImage накладки в пикселях ИСХОДНОГО кадра;
+          boxes    — траектория рамки (список [x, y, w, h], тоже в px исходника);
+          src_w/src_h — размер исходного кадра (на холсте может идти прокси в
+                     меньшем разрешении — пересчитываем по пропорции);
+          fps, start_s, end_s, anchor, off (x, y), scale_with_box.
+        Рендера здесь нет: это ровно то же вычисление позиции, что и в
+        TrackOverlayWorker (общая функция overlay_top_left)."""
+        self._trk = spec or None
+        if self._trk is not None:
+            b0 = (self._trk.get("boxes") or [[0, 0, 1, 1]])[0]
+            self._trk["_base_area"] = max(1.0, float(b0[2]) * float(b0[3]))
+        self.update()
+
+    def has_track_preview(self):
+        return self._trk is not None
+
+    def set_track_time(self, t_s):
+        """Время, на котором показываем накладку (секунды исходника)."""
+        if self._trk is None:
+            return
+        t = max(0.0, float(t_s))
+        if abs(t - self._trk_t) < 1e-4:
+            return
+        self._trk_t = t
+        self.update()
+
+    def _track_overlay_rect(self, vr):
+        """Прямоугольник накладки НА ЭКРАНЕ (и рамка объекта) для текущего
+        времени, либо (None, None), если сейчас накладку показывать не нужно."""
+        spec = self._trk
+        if spec is None or not self._has_frame():
+            return None, None
+        t = self._trk_t
+        if t < spec["start_s"] - 1e-3 or t > spec["end_s"] + 1e-3:
+            return None, None
+        box = track_box_at(spec.get("boxes"), t, spec["start_s"], spec["fps"])
+        if box is None:
+            return None, None
+        ovl = spec.get("overlay")
+        if ovl is None or ovl.isNull():
+            return None, None
+        ow, oh = float(ovl.width()), float(ovl.height())
+        if spec.get("scale_with_box"):
+            k = math.sqrt(max(1.0, box[2] * box[3]) / spec["_base_area"])
+            k = max(0.25, min(4.0, k))
+            ow, oh = ow * k, oh * k
+        ox, oy = overlay_top_left(box, ow, oh, spec.get("anchor", "center"),
+                                  *spec.get("off", (0, 0)))
+        # Из пикселей исходника — в пиксели холста (кадр вписан в vr).
+        sx = vr.width() / float(max(1, spec["src_w"]))
+        sy = vr.height() / float(max(1, spec["src_h"]))
+        rect = QRectF(vr.left() + ox * sx, vr.top() + oy * sy, ow * sx, oh * sy)
+        brect = QRectF(vr.left() + box[0] * sx, vr.top() + box[1] * sy,
+                       box[2] * sx, box[3] * sy)
+        return rect, brect
+
+    def _paint_track_preview(self, p, vr):
+        rect, brect = self._track_overlay_rect(vr)
+        if rect is None:
+            return
+        p.save()
+        p.setClipRect(QRectF(vr).intersected(QRectF(self.rect())))
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        p.drawImage(rect, self._trk["overlay"])
+        # Тонкая рамка отслеживаемого объекта — видно, за чем именно едет
+        # накладка (в готовое видео она, разумеется, не попадает).
+        pen = QPen(QColor(C['accent']), 1, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(brect)
+        p.restore()
+
+    # ── Наложенные картинки (логотип/водяной знак/рамка) ─────────────────────
+    #
+    # Слои живут прямо на холсте: их видно поверх кадра, их же двигают/тянут/
+    # крутят мышью. Координаты — доли КАДРА (см. edit_tab_overlay.ImageOverlay),
+    # поэтому предпросмотр на прокси и итоговый файл совпадают попиксельно.
+    def set_image_overlays(self, items):
+        self._ovls = list(items or [])
+        if self._ovl_sel >= len(self._ovls):
+            self._ovl_sel = len(self._ovls) - 1
+        self.update()
+
+    def image_overlays(self):
+        return list(self._ovls)
+
+    def has_image_overlays(self):
+        return bool(self._ovls)
+
+    def add_image_overlay(self, item):
+        self._ovls.append(item)
+        self._ovl_sel = len(self._ovls) - 1
+        self.set_overlay_edit(True)
+        self.update()
+        self.overlaysChanged.emit()
+
+    def remove_image_overlay(self, idx):
+        if not (0 <= idx < len(self._ovls)):
+            return
+        del self._ovls[idx]
+        self._ovl_sel = min(idx, len(self._ovls) - 1)
+        if not self._ovls:
+            self.set_overlay_edit(False)
+        self.update()
+        self.overlaysChanged.emit()
+
+    def clear_image_overlays(self):
+        if not self._ovls:
+            return
+        self._ovls = []
+        self._ovl_sel = -1
+        self.set_overlay_edit(False)
+        self.update()
+        self.overlaysChanged.emit()
+
+    def selected_overlay_index(self):
+        return self._ovl_sel
+
+    def set_selected_overlay(self, idx):
+        idx = int(idx)
+        if idx == self._ovl_sel:
+            return
+        self._ovl_sel = idx if 0 <= idx < len(self._ovls) else -1
+        self.update()
+
+    def overlay_edit_mode(self):
+        return self._ovl_edit
+
+    def set_overlay_edit(self, on):
+        """Режим правки слоёв: рамка с ручками у выбранной картинки. Выключенный
+        режим ничего не убирает — картинки остаются на кадре и в экспорте."""
+        on = bool(on) and bool(self._ovls)
+        if on == self._ovl_edit:
+            return
+        self._ovl_edit = on
+        self._ovl_drag = None
+        if on:
+            self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            self.setFocus()
+        else:
+            self.unsetCursor()
+        self.update()
+
+    def _ovl_rect_screen(self, ovl, vr):
+        """Место накладки НА ЭКРАНЕ без учёта поворота (доли кадра → пиксели)."""
+        r = ovl.rect
+        return QRectF(vr.left() + r.x() * vr.width(),
+                      vr.top() + r.y() * vr.height(),
+                      r.width() * vr.width(), r.height() * vr.height())
+
+    @staticmethod
+    def _ovl_transform(ovl, rect):
+        """Поворот вокруг центра рамки (экранные координаты)."""
+        t = QTransform()
+        c = rect.center()
+        t.translate(c.x(), c.y())
+        t.rotate(ovl.angle)
+        t.translate(-c.x(), -c.y())
+        return t
+
+    def _ovl_hit(self, pos, vr):
+        """Что под курсором: (индекс слоя, ручка) или (-1, None). Ручки: угловые
+        tl/tr/bl/br, боковые l/r/t/b, 'rot' (поворот) и 'move' (тело картинки).
+        Ищем сверху вниз — верхний слой перехватывает клик первым."""
+        order = list(range(len(self._ovls)))
+        # Выбранный слой проверяем первым: его ручки должны ловиться даже когда
+        # сверху лежит край соседней картинки.
+        if 0 <= self._ovl_sel < len(self._ovls):
+            order.remove(self._ovl_sel)
+            order.insert(0, self._ovl_sel)
+        else:
+            order.reverse()
+        for i in order:
+            ovl = self._ovls[i]
+            r = self._ovl_rect_screen(ovl, vr)
+            inv, ok = self._ovl_transform(ovl, r).inverted()
+            p = inv.map(pos) if ok else pos
+            m = 7.0
+            if i == self._ovl_sel:
+                # Ручка поворота — «антенна» над серединой верхней стороны.
+                rp = QPointF(r.center().x(), r.top() - 22.0)
+                if (abs(p.x() - rp.x()) <= m + 2) and (abs(p.y() - rp.y()) <= m + 2):
+                    return i, 'rot'
+                nl = abs(p.x() - r.left()) <= m
+                nr = abs(p.x() - r.right()) <= m
+                nt = abs(p.y() - r.top()) <= m
+                nb = abs(p.y() - r.bottom()) <= m
+                inx = r.left() - m <= p.x() <= r.right() + m
+                iny = r.top() - m <= p.y() <= r.bottom() + m
+                if nl and nt: return i, 'tl'
+                if nr and nt: return i, 'tr'
+                if nl and nb: return i, 'bl'
+                if nr and nb: return i, 'br'
+                if nl and iny: return i, 'l'
+                if nr and iny: return i, 'r'
+                if nt and inx: return i, 't'
+                if nb and inx: return i, 'b'
+            if r.contains(p):
+                return i, 'move'
+        return -1, None
+
+    @staticmethod
+    def _ovl_cursor(handle):
+        return {
+            'tl': Qt.CursorShape.SizeFDiagCursor, 'br': Qt.CursorShape.SizeFDiagCursor,
+            'tr': Qt.CursorShape.SizeBDiagCursor, 'bl': Qt.CursorShape.SizeBDiagCursor,
+            'l': Qt.CursorShape.SizeHorCursor, 'r': Qt.CursorShape.SizeHorCursor,
+            't': Qt.CursorShape.SizeVerCursor, 'b': Qt.CursorShape.SizeVerCursor,
+            'rot': Qt.CursorShape.CrossCursor,
+            'move': Qt.CursorShape.SizeAllCursor,
+        }.get(handle, Qt.CursorShape.ArrowCursor)
+
+    def _ovl_drag_to(self, pos, vr):
+        """Тянем захваченную ручку/тело к точке `pos` (экранные координаты)."""
+        d = self._ovl_drag
+        if not d:
+            return
+        ovl = self._ovls[d['i']]
+        start = d['rect']              # рамка (доли кадра) на момент захвата
+        if vr.width() <= 0 or vr.height() <= 0:
+            return
+        if d['handle'] == 'rot':
+            c = QPointF(vr.left() + (start.x() + start.width() / 2) * vr.width(),
+                        vr.top() + (start.y() + start.height() / 2) * vr.height())
+            ang = math.degrees(math.atan2(pos.y() - c.y(), pos.x() - c.x())) + 90.0
+            if QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier:
+                ang = round(ang / 15.0) * 15.0      # Shift — шаг в 15°
+            ovl.angle = ang
+            self.update()
+            return
+        # Смещение курсора в долях кадра от точки захвата.
+        dx = (pos.x() - d['pos'].x()) / vr.width()
+        dy = (pos.y() - d['pos'].y()) / vr.height()
+        if d['handle'] == 'move':
+            ovl.set_rect(QRectF(start.x() + dx, start.y() + dy,
+                                start.width(), start.height()))
+            self.update()
+            return
+        # Правка идёт в СИСТЕМЕ САМОЙ КАРТИНКИ: при повороте курсор надо
+        # разложить по её осям, иначе рамка «убегает» от мыши.
+        if abs(ovl.angle) > 0.01:
+            a = math.radians(ovl.angle)
+            ca, sa = math.cos(a), math.sin(a)
+            px = dx * vr.width(); py = dy * vr.height()
+            lx = px * ca + py * sa
+            ly = -px * sa + py * ca
+            dx, dy = lx / vr.width(), ly / vr.height()
+        h = d['handle']
+        l, t = start.x(), start.y()
+        r, b = start.x() + start.width(), start.y() + start.height()
+        if 'l' in h: l += dx
+        if 'r' in h: r += dx
+        if 't' in h: t += dy
+        if 'b' in h: b += dy
+        w = max(MIN_SIZE_NORM, r - l)
+        hgt = max(MIN_SIZE_NORM, b - t)
+        if h in ('tl', 'tr', 'bl', 'br'):
+            # Углы держат пропорции картинки (растянуть можно сторонами).
+            k = start.height() / max(1e-6, start.width())
+            if abs(w - start.width()) >= abs(hgt - start.height()):
+                hgt = max(MIN_SIZE_NORM, w * k)
+            else:
+                w = max(MIN_SIZE_NORM, hgt / max(1e-6, k))
+        if 'l' in h:
+            l = r - w
+        if 't' in h:
+            t = b - hgt
+        ovl.set_rect(QRectF(l, t, w, hgt))
+        self.update()
+
+    def _paint_image_overlays(self, p, vr):
+        """Рисует накладки поверх кадра (и рамку правки у выбранной)."""
+        clip = QRectF(vr).intersected(QRectF(self.rect()))
+        for i, ovl in enumerate(self._ovls):
+            img = ovl.cropped()
+            if img is None or img.isNull():
+                continue
+            r = self._ovl_rect_screen(ovl, vr)
+            p.save()
+            p.setClipRect(clip)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            p.setTransform(self._ovl_transform(ovl, r), True)
+            p.setOpacity(max(0.05, min(1.0, ovl.opacity)))
+            p.drawImage(r, img)
+            p.setOpacity(1.0)
+            if self._ovl_edit and i == self._ovl_sel:
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.setPen(QPen(QColor(C['accent']), 1.5, Qt.PenStyle.DashLine))
+                p.drawRect(r)
+                # «Антенна» поворота над верхней стороной.
+                top_c = QPointF(r.center().x(), r.top())
+                rot_c = QPointF(r.center().x(), r.top() - 22.0)
+                p.setPen(QPen(QColor(C['accent']), 1.5))
+                p.drawLine(top_c, rot_c)
+                p.setBrush(QColor(C['accent']))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawEllipse(rot_c, 5.0, 5.0)
+                for hx, hy in ((r.left(), r.top()), (r.center().x(), r.top()),
+                               (r.right(), r.top()), (r.left(), r.center().y()),
+                               (r.right(), r.center().y()), (r.left(), r.bottom()),
+                               (r.center().x(), r.bottom()), (r.right(), r.bottom())):
+                    p.drawRect(QRectF(hx - 4, hy - 4, 8, 8))
+            p.restore()
+
     def _update_crop_buttons(self):
         """Показывает/прячет и позиционирует «Применить/Отмена» у рамки (плавающая
         панель, как в Photoshop). Зовётся при любом изменении рамки/зума/размера."""
         show = (self._crop_mode and self.has_crop()
-                and self._frame_img is not None)
+                and self._has_frame())
         if not show:
             if self._crop_apply_btn.isVisible():
                 self._crop_apply_btn.setVisible(False)
@@ -1410,6 +1826,27 @@ class VideoCanvas(QWidget):
         self._update_crop_buttons()
 
     def keyPressEvent(self, ev):
+        # Правка слоёв: Delete убирает выбранную картинку, Esc выходит из режима
+        # (сами картинки остаются), Ctrl+стрелки двигают на 1/200 кадра.
+        # ИМЕННО Ctrl+стрелки: голые ←/→ заняты покадровым шагом, и он идёт
+        # через QAction (WidgetWithChildrenShortcut), то есть срабатывает РАНЬШЕ
+        # keyPressEvent холста — обработчик на голой стрелке был бы мёртвым.
+        if self._ovl_edit and not self._crop_mode and self._ovls:
+            k = ev.key()
+            if k == Qt.Key.Key_Delete:
+                self.remove_image_overlay(self._ovl_sel); ev.accept(); return
+            if k == Qt.Key.Key_Escape:
+                self.set_overlay_edit(False); ev.accept(); return
+            step = 0.005
+            d = ({Qt.Key.Key_Left: (-step, 0.0), Qt.Key.Key_Right: (step, 0.0),
+                  Qt.Key.Key_Up: (0.0, -step), Qt.Key.Key_Down: (0.0, step)}.get(k)
+                 if (ev.modifiers() & Qt.KeyboardModifier.ControlModifier) else None)
+            if d is not None and 0 <= self._ovl_sel < len(self._ovls):
+                self._ovls[self._ovl_sel].move_by(*d)
+                self.update(); self.overlaysChanged.emit(); ev.accept(); return
+        if self._trk is not None and not self._crop_mode:
+            if ev.key() == Qt.Key.Key_Escape:
+                self.trackCancelled.emit(); ev.accept(); return
         if self._crop_mode and self.has_crop():
             if ev.key() == Qt.Key.Key_Escape:
                 self.cancel_crop(); ev.accept(); return
@@ -1425,6 +1862,9 @@ class VideoCanvas(QWidget):
 
     def clear_frame(self):
         self._frame_img = None
+        self.clear_frame_pin()
+        self._last_pts_us = -1
+        self._last_frame_at = 0.0
         self.update()
 
     def set_static_image(self, qimg):
@@ -1434,6 +1874,7 @@ class VideoCanvas(QWidget):
         self._text = ""
         self._image = None
         self._audio_only_msg = ""
+        self.clear_frame_pin()
         self._frame_img = qimg if (qimg is not None and not qimg.isNull()) else None
         self.reset_view()
         self.update()
@@ -1482,15 +1923,27 @@ class VideoCanvas(QWidget):
         if changed:
             self.update()
 
+    def _has_frame(self):
+        """Стоит ли сейчас на холсте кадр. Здесь это просто «есть ЦП-копия»;
+        GPU-холст переопределяет — там пиксели кадра в ЦП обычно не приезжают
+        вовсе, а признак кадра — известный размер (см. VideoCanvas)."""
+        return self._frame_img is not None
+
+    def _frame_size(self):
+        """Размер кадра в пикселях (QSize) — от него считается letterbox."""
+        img = self._frame_img
+        return img.size() if img is not None else QSize()
+
     def _base_video_rect(self):
         """Прямоугольник кадра при зуме 100% (letterbox по пропорциям)."""
         w, h = self.width(), self.height()
-        img = self._frame_img
-        if img is None or w <= 0 or h <= 0 or img.width() <= 0 or img.height() <= 0:
+        fs = self._frame_size()
+        fw, fh = fs.width(), fs.height()
+        if fw <= 0 or fh <= 0 or w <= 0 or h <= 0:
             return QRect(0, 0, max(0, w), max(0, h))
-        scale = min(w / img.width(), h / img.height())
-        rw = max(1, int(img.width() * scale))
-        rh = max(1, int(img.height() * scale))
+        scale = min(w / fw, h / fh)
+        rw = max(1, int(fw * scale))
+        rh = max(1, int(fh * scale))
         return QRect((w - rw) // 2, (h - rh) // 2, rw, rh)
 
     def _clamp_pan(self):
@@ -1508,7 +1961,7 @@ class VideoCanvas(QWidget):
     def wheelEvent(self, ev):
         # Зум только с зажатым Ctrl (как в редакторах) и при наличии кадра.
         if (ev.modifiers() & Qt.KeyboardModifier.ControlModifier
-                and self._frame_img is not None):
+                and self._has_frame()):
             old = self._zoom
             new = (min(8.0, old * 1.2) if ev.angleDelta().y() > 0
                    else max(1.0, old / 1.2))
@@ -1541,7 +1994,7 @@ class VideoCanvas(QWidget):
 
     def mousePressEvent(self, ev):
         if (self._crop_mode and ev.button() == Qt.MouseButton.LeftButton
-                and self._frame_img is not None):
+                and self._has_frame()):
             handle = self._crop_handle_at(ev.position())
             if handle is not None:
                 # Захватили ручку/тело существующей рамки — тянем её.
@@ -1560,6 +2013,22 @@ class VideoCanvas(QWidget):
             self.update()
             ev.accept()
             return
+        if (self._ovl_edit and self._ovls and self._has_frame()
+                and ev.button() == Qt.MouseButton.LeftButton):
+            vr = QRectF(self.video_rect())
+            i, handle = self._ovl_hit(ev.position(), vr)
+            if i >= 0:
+                if i != self._ovl_sel:
+                    self._ovl_sel = i
+                    self.overlaySelected.emit(i)
+                self._ovl_drag = {'i': i, 'handle': handle,
+                                  'pos': QPointF(ev.position()),
+                                  'rect': QRectF(self._ovls[i].rect),
+                                  'angle': self._ovls[i].angle}
+                self.setCursor(self._ovl_cursor(handle))
+                self.update()
+                ev.accept()
+                return
         if self._zoom > 1.0 and ev.button() == Qt.MouseButton.LeftButton:
             self._panning = True
             self._pan_last = ev.position()
@@ -1569,7 +2038,7 @@ class VideoCanvas(QWidget):
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
-        if self._crop_mode and self._frame_img is not None:
+        if self._crop_mode and self._has_frame():
             if self._crop_drag and (ev.buttons() & Qt.MouseButton.LeftButton):
                 npt = self._widget_to_norm(ev.position(), clamp=False)
                 if npt is not None:
@@ -1582,6 +2051,14 @@ class VideoCanvas(QWidget):
             self.setCursor(self._crop_cursor(self._crop_handle_at(ev.position())))
             ev.accept()
             return
+        if self._ovl_edit and self._ovls and self._has_frame():
+            if self._ovl_drag is not None and (ev.buttons() & Qt.MouseButton.LeftButton):
+                self._ovl_drag_to(ev.position(), QRectF(self.video_rect()))
+                ev.accept()
+                return
+            if not (ev.buttons() & Qt.MouseButton.LeftButton):
+                _i, _h = self._ovl_hit(ev.position(), QRectF(self.video_rect()))
+                self.setCursor(self._ovl_cursor(_h))
         if self._panning and self._pan_last is not None:
             d = ev.position() - self._pan_last
             self._pan_last = ev.position()
@@ -1608,6 +2085,13 @@ class VideoCanvas(QWidget):
             self.update()
             ev.accept()
             return
+        if self._ovl_drag is not None and ev.button() == Qt.MouseButton.LeftButton:
+            self._ovl_drag = None
+            self.update()
+            # Геометрия слоя поменялась — вкладке пора пересобрать список/подпись.
+            self.overlaysChanged.emit()
+            ev.accept()
+            return
         if self._panning and ev.button() == Qt.MouseButton.LeftButton:
             self._panning = False
             self.unsetCursor()
@@ -1619,6 +2103,68 @@ class VideoCanvas(QWidget):
         """Граница OUT для блокировки кадров при воспроизведении (None — снять)."""
         self._bound_us = (int(out_seconds * 1_000_000)
                           if (out_seconds and out_seconds > 0) else None)
+
+    # ── Покадровый пин ───────────────────────────────────────────────────────
+    def arm_frame_pin(self, span_us):
+        """Заявить, что холст стоит на кадре с pts из span_us=(lo, hi).
+
+        Пока точной картинки нет, кадры плеера ПРИНИМАЮТСЯ (что-то лучше, чем
+        застывший старый кадр); как только придёт точный (set_exact_frame),
+        чужие pts начинают отбрасываться."""
+        self._pin_span = span_us
+        self._pin_has_img = False
+
+    def set_exact_frame(self, img, span_us=None, pts_us=None):
+        """Показать точный кадр, декодированный вкладкой (FramePrefetcher).
+
+        pts_us — время САМОГО кадра (начало показа): по нему вкладка ведёт метку
+        таймлайна, поэтому оно должно быть точным, а не серединой диапазона."""
+        if img is None or img.isNull():
+            return
+        if span_us is not None:
+            self._pin_span = span_us
+        self._pin_has_img = True
+        self._frame_img = img
+        if pts_us is not None and pts_us >= 0:
+            self._last_pts_us = int(pts_us)
+            self._last_frame_at = time.monotonic()
+        if self.isVisible():
+            self.update()
+
+    def clear_frame_pin(self):
+        """Снять пин — кадры плеера снова главные (воспроизведение)."""
+        self._pin_span = None
+        self._pin_has_img = False
+
+    def has_frame_pin(self):
+        return self._pin_span is not None
+
+    def pinned_frame_pts(self):
+        """pts (с) кадра, который РЕАЛЬНО пришпилен к холсту, иначе None.
+
+        Пин без картинки (arm_frame_pin) — это только заявка «сейчас должен быть
+        кадр N»: часы кадра при этом ещё показывают ПРОШЛЫЙ кадр — нередко вообще
+        от прошлого файла (у аудио с обложкой точный кадр не придёт никогда).
+        Поэтому наличия пина мало: требуем и картинку, и попадание часов в
+        диапазон пина — тогда время кадра действительно = время на экране."""
+        if self._pin_span is None or not self._pin_has_img:
+            return None
+        if self._last_pts_us < 0:
+            return None
+        lo, hi = self._pin_span
+        if not (lo <= self._last_pts_us < hi):
+            return None
+        return self._last_pts_us / 1_000_000.0
+
+    def last_frame_pts(self):
+        """pts последнего показанного кадра в секундах (None — кадров не было)."""
+        return None if self._last_pts_us < 0 else (self._last_pts_us / 1_000_000.0)
+
+    def frame_clock_age(self):
+        """Сколько секунд назад пришёл последний кадр (для проверки «часы живы»)."""
+        if self._last_frame_at <= 0:
+            return None
+        return max(0.0, time.monotonic() - self._last_frame_at)
 
     def _on_frame(self, frame):
         # Аудиофайл (видеоряда нет): игнорируем любые «поздние» кадры от плеера
@@ -1634,6 +2180,16 @@ class VideoCanvas(QWidget):
             if pts >= 0 and pts >= self._bound_us:
                 self.boundaryReached.emit()
                 return
+        # Пин кадра N: пока на холсте стоит ТОЧНЫЙ кадр, чужие pts от плеера
+        # (а после seek'а он нередко отдаёт соседний) на экран не пускаем —
+        # иначе шаг стрелкой показывает не тот кадр, что просили.
+        if self._pin_has_img and self._pin_span is not None:
+            try:
+                pts = frame.startTime() if frame is not None else -1
+            except Exception:
+                pts = -1
+            if pts >= 0 and not (self._pin_span[0] <= pts < self._pin_span[1]):
+                return
         img = None
         try:
             if frame is not None and frame.isValid():
@@ -1642,6 +2198,24 @@ class VideoCanvas(QWidget):
             img = None
         if img is not None and not img.isNull():
             self._frame_img = img
+            # Часы кадра — время картинки, которая СЕЙЧАС на экране.
+            try:
+                pts_us = frame.startTime()
+            except Exception:
+                pts_us = -1
+            if pts_us is not None and pts_us >= 0:
+                self._last_pts_us = pts_us
+                self._last_frame_at = time.monotonic()
+            # Время для предпросмотра накладки берём из PTS самого кадра: так
+            # накладка стоит ровно на своём кадре и при воспроизведении, и при
+            # покадровой перемотке (positionChanged плеера приходит реже).
+            if self._trk is not None:
+                try:
+                    pts = frame.startTime()
+                except Exception:
+                    pts = -1
+                if pts is not None and pts >= 0:
+                    self._trk_t = pts / 1_000_000.0
             if self.isVisible():
                 self.update()
 
@@ -1701,7 +2275,7 @@ class VideoCanvas(QWidget):
     def video_rect(self):
         """Прямоугольник, где реально показан кадр (letterbox + текущий зум/пан)."""
         base = self._base_video_rect()
-        if self._frame_img is None or self._zoom == 1.0:
+        if not self._has_frame() or self._zoom == 1.0:
             return base
         rw = max(1, int(base.width() * self._zoom))
         rh = max(1, int(base.height() * self._zoom))
@@ -1734,6 +2308,62 @@ class VideoCanvas(QWidget):
         self._text = ""
         self.update()
 
+    def _paint_overlays(self, p, vr):
+        """Всё, что лежит ПОВЕРХ кадра: накладки-картинки → субтитры → рамка
+        кадрирования → трек-превью. Порядок ровно такой же, как в фильтре
+        экспорта (overlay → subtitles), поэтому плеер и файл совпадают.
+
+        Вынесено из paintEvent отдельным методом: GPU-холст (VideoCanvas) сам
+        кадр не рисует, но эти же слои кладёт поверх него в QML-сцене."""
+        # Наложенные картинки — сразу поверх кадра и ПОД субтитрами.
+        if self._ovls:
+            self._paint_image_overlays(p, QRectF(vr))
+        # Субтитры рисуем в ВИДИМОЙ части кадра (пересечение зумированного vr
+        # с областью виджета), а не во всём vr. Иначе при приближении кадра
+        # низ vr уходит далеко за нижнюю границу виджета, и субтитры,
+        # привязанные к низу кадра, «улетают» за экран (баг с приближением).
+        sub_rect = vr.intersected(self.rect())
+        if sub_rect.width() < 10 or sub_rect.height() < 10:
+            sub_rect = self.rect()
+        px = max(15, int(min(sub_rect.height(), self.height()) * 0.052))
+        _paint_subtitle(p, sub_rect, self._text, px, self._image, self._image_pos)
+        # Рамка кадрирования видео (как в «Редактировании фото»): в режиме
+        # правки — затемнение/сетка/ручки, иначе (рамка «вооружена») — тонкая
+        # пунктирная подсказка, что экспорт кадрируется по ней.
+        if self._crop_mode and self._crop_norm is not None:
+            self._paint_crop_overlay(p, vr)
+        elif self._crop_norm is not None:
+            self._paint_crop_indicator(p, vr)
+        if self._trk is not None:
+            self._paint_track_preview(p, vr)
+
+    def _paint_audio_only(self, p):
+        """Видеоряда нет — иконка ноты и поясняющий текст по центру холста."""
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        icon_px = max(28, int(min(self.width(), self.height()) * 0.16))
+        pm = get_icon_pixmap('fa5s.music', icon_px, C['text3'])
+        gap = 14
+        font = p.font()
+        font.setPointSize(11)
+        font.setFamily("Segoe UI" if os.name == 'nt' else "SF Pro Display")
+        p.setFont(font)
+        fm = QFontMetrics(font)
+        text_rect = fm.boundingRect(
+            QRect(0, 0, max(60, self.width() - 40), 1000),
+            int(Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap),
+            self._audio_only_msg)
+        ih = (icon_px + gap) if (pm is not None and not pm.isNull()) else 0
+        total_h = ih + text_rect.height()
+        top = (self.height() - total_h) // 2
+        if pm is not None and not pm.isNull():
+            ix = (self.width() - icon_px) // 2
+            p.drawPixmap(QRect(ix, top, icon_px, icon_px), pm)
+        p.setPen(QPen(QColor(C['text3'])))
+        tr = QRect((self.width() - text_rect.width()) // 2, top + ih,
+                   text_rect.width(), text_rect.height())
+        p.drawText(tr, int(Qt.AlignmentFlag.AlignHCenter
+                           | Qt.TextFlag.TextWordWrap), self._audio_only_msg)
+
     def paintEvent(self, ev):
         p = QPainter(self)
         p.fillRect(self.rect(), self._bg)
@@ -1746,49 +2376,512 @@ class VideoCanvas(QWidget):
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform,
                             not (self._scrub_active or self._playing))
             p.drawImage(vr, img)
-            # Субтитры рисуем в ВИДИМОЙ части кадра (пересечение зумированного vr
-            # с областью виджета), а не во всём vr. Иначе при приближении кадра
-            # низ vr уходит далеко за нижнюю границу виджета, и субтитры,
-            # привязанные к низу кадра, «улетают» за экран (баг с приближением).
-            sub_rect = vr.intersected(self.rect())
-            if sub_rect.width() < 10 or sub_rect.height() < 10:
-                sub_rect = self.rect()
-            px = max(15, int(min(sub_rect.height(), self.height()) * 0.052))
-            _paint_subtitle(p, sub_rect, self._text, px, self._image, self._image_pos)
-            # Рамка кадрирования видео (как в «Редактировании фото»): в режиме
-            # правки — затемнение/сетка/ручки, иначе (рамка «вооружена») — тонкая
-            # пунктирная подсказка, что экспорт кадрируется по ней.
-            if self._crop_mode and self._crop_norm is not None:
-                self._paint_crop_overlay(p, vr)
-            elif self._crop_norm is not None:
-                self._paint_crop_indicator(p, vr)
+            self._paint_overlays(p, vr)
         elif self._audio_only_msg:
-            # Видеоряда нет — рисуем иконку ноты и поясняющий текст по центру.
-            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            icon_px = max(28, int(min(self.width(), self.height()) * 0.16))
-            pm = get_icon_pixmap('fa5s.music', icon_px, C['text3'])
-            gap = 14
-            font = p.font()
-            font.setPointSize(11)
-            font.setFamily("Segoe UI" if os.name == 'nt' else "SF Pro Display")
-            p.setFont(font)
-            fm = QFontMetrics(font)
-            text_rect = fm.boundingRect(
-                QRect(0, 0, max(60, self.width() - 40), 1000),
-                int(Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap),
-                self._audio_only_msg)
-            ih = (icon_px + gap) if (pm is not None and not pm.isNull()) else 0
-            total_h = ih + text_rect.height()
-            top = (self.height() - total_h) // 2
-            if pm is not None and not pm.isNull():
-                ix = (self.width() - icon_px) // 2
-                p.drawPixmap(QRect(ix, top, icon_px, icon_px), pm)
-            p.setPen(QPen(QColor(C['text3'])))
-            tr = QRect((self.width() - text_rect.width()) // 2, top + ih,
-                       text_rect.width(), text_rect.height())
-            p.drawText(tr, int(Qt.AlignmentFlag.AlignHCenter
-                               | Qt.TextFlag.TextWordWrap), self._audio_only_msg)
+            self._paint_audio_only(p)
         p.end()
+
+
+
+
+# ─── Холст видео на GPU: QQuickWidget + QML VideoOutput ──────────────────────
+#
+# Зачем. ЦП-холст (_PaintedVideoCanvas) на каждый кадр делал frame.toImage()
+# (NV12 → RGBA) и drawImage со скейлом — всё в ГЛАВНОМ потоке. На 1080p60 это
+# 8-9 мс при бюджете кадра 16.7 мс: главный поток занят третью своего времени и
+# не успевает ни мышь обработать, ни плейхед подвинуть — это и есть «Монтаж
+# лагает». Замер tools/bench_video_path.py (1080p60 H.264, окно 1100x640):
+#   canvas (ЦП-путь)  ЦП 54.7%  GUI-поток 29.3%  toImage 8.2 мс  нарисовано 57.2/60
+#   qml    (GPU-путь) ЦП 11.5%  GUI-поток  1.2%  кадр через ЦП не идёт вовсе
+#
+# Как устроено. Кадр от плеера НЕ конвертируется: QML VideoOutput получает
+# QVideoFrame как есть. Но между плеером и сценой стоит наш QVideoSink (его и
+# отдаёт videoSink()) — без него не выжили бы пин кадра, граница OUT и часы
+# кадра: они решают ПО PTS, показывать кадр или нет, и решение обязано быть
+# принято ДО показа. Проброс через Python-слот стоит около 4 п.п. ЦП (замер:
+# 15.9% против 11.5% у голого QML) и почти ничего — главному потоку.
+#
+# Оверлеи (субтитры, рамка кропа, накладки, трек-превью) рисует тот же
+# QPainter-код, что и раньше (_paint_overlays), но внутри QQuickPaintedItem в
+# той же сцене — поэтому они ложатся ПОВЕРХ кадра с правильной альфой (у
+# QVideoWidget так не выходит: видео композитится последним). Quick держит их в
+# текстуре, так что paint() зовётся не на каждый кадр, а только когда оверлей
+# реально изменился.
+#
+# Почему не QVideoWidget и не QGraphicsVideoItem: первый не пускает поверх себя
+# ни виджет-оверлей, ни что-либо ещё (проверено на экране), второй в этом
+# бэкенде идёт через ЦП и стоит дороже текущего пути (79% ЦП).
+try:
+    from PyQt6.QtQuick import QQuickPaintedItem
+    from PyQt6.QtQuickWidgets import QQuickWidget
+    _QUICK_AVAILABLE = True
+except Exception:                      # Qt Quick не собран/не установлен
+    QQuickPaintedItem = object
+    QQuickWidget = None
+    _QUICK_AVAILABLE = False
+
+
+_QML_CANVAS_SOURCE = """import QtQuick
+import QtMultimedia
+
+Item {
+    id: root
+    // При зуме кадр намеренно вылезает за границы виджета — режем по ним.
+    clip: true
+    property alias sink: vo.videoSink
+
+    Rectangle { anchors.fill: parent; color: "__BG__" }
+
+    // Геометрию задаёт Python (VideoCanvas.video_rect): letterbox, зум и
+    // панорама считаются там же, где координаты оверлеев, — иначе кадр и
+    // рамка кадрирования разъезжаются.
+    VideoOutput {
+        id: vo
+        objectName: "videoOutput"
+        fillMode: VideoOutput.PreserveAspectFit
+    }
+}
+"""
+
+
+def _canvas_qml_path():
+    """Кладёт QML-сцену холста во временный файл и возвращает путь.
+
+    Файлом, а не строкой: QQuickWidget.setContent() в PyQt6 не проброшен, а
+    setSource() принимает только URL. Держать .qml отдельным ресурсом сборки
+    ради двадцати строк не хочется — при первом холсте пишем заново."""
+    tmp = tempfile.gettempdir()
+    path = os.path.join(tmp, f"sihyx_video_canvas_{os.getpid()}.qml")
+    try:
+        if not os.path.exists(path):
+            # Подчищаем сцены прошлых запусков (файл на процесс, иначе они
+            # копились бы в temp по одному за каждый запуск программы).
+            for name in os.listdir(tmp):
+                if (name.startswith("sihyx_video_canvas_")
+                        and name.endswith(".qml") and name != os.path.basename(path)):
+                    try:
+                        os.remove(os.path.join(tmp, name))
+                    except OSError:
+                        pass
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(_QML_CANVAS_SOURCE.replace("__BG__", C["bg"]))
+        return path
+    except OSError:
+        return None
+
+
+class _CanvasOverlayItem(QQuickPaintedItem):
+    """Слой оверлеев поверх кадра в QML-сцене холста.
+
+    Рисует ровно то же и тем же кодом, что рисовал paintEvent ЦП-холста, —
+    просто в сцене Quick, а не в backing store виджета."""
+
+    def __init__(self, canvas, parent=None):
+        super().__init__(parent)
+        self._canvas = canvas
+
+    def paint(self, p):
+        c = self._canvas
+        if c is None:
+            return
+        try:
+            if c._has_frame():
+                c._paint_overlays(p, c.video_rect())
+            elif c._audio_only_msg:
+                c._paint_audio_only(p)
+        except RuntimeError:            # холст уже снесён Qt — рисовать нечего
+            pass
+
+
+class VideoCanvas(_PaintedVideoCanvas):
+    """Холст видео вкладки «Монтаж»: кадр выводит GPU (QML VideoOutput), всё
+    остальное поведение — от ЦП-холста, у которого этот класс унаследован.
+
+    Публичный API совпадает с прежним холстом полностью (videoSink, video_rect,
+    субтитры, пин кадра, кадрирование, накладки, трек-превью, зум/панорама) —
+    вкладка не знает, каким путём кадр попадает на экран.
+
+    Единственное отличие в поведении: current_frame_image() во время
+    ВОСПРОИЗВЕДЕНИЯ отдаёт None (ЦП-копии кадра в этот момент нет и не должно
+    быть). «Сохранить кадр» тогда сам уходит на резервный ffmpeg-путь, который
+    для этого и написан. На паузе и на покадровом шаге копия есть, и кадр
+    сохраняется ровно тот, что на экране."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Размер кадра в пикселях (уже с учётом поворота из метаданных) — по
+        # нему считается letterbox. Раньше его давал QImage кадра, которого в
+        # GPU-пути попросту нет.
+        self._px_size = QSize()
+        self._quick = None
+        self._out_sink = None
+        self._vo = None
+        self._ovl_item = None
+        self._vo_geom = None            # последняя выставленная геометрия кадра
+        # Когда в последний раз приходил кадр ИМЕННО ОТ ПЛЕЕРА (см.
+        # _want_cpu_copy). Отдельно от часов кадра (_last_frame_at): те ведёт и
+        # точный кадр от предекодера, а нам нужен признак «идёт поток».
+        self._last_player_frame_at = 0.0
+        self._setup_quick()
+        if self._quick is not None:
+            # Кнопки «Применить/Отмена» созданы РАНЬШЕ сцены и оказались бы под
+            # ней (порядок стека = порядок создания).
+            for b in (self._crop_apply_btn, self._crop_cancel_btn):
+                b.raise_()
+
+    # ── Сцена ────────────────────────────────────────────────────────────────
+    def _setup_quick(self):
+        """Поднимает QML-сцену. Если не вышло (нет Qt Quick, не создался
+        контекст) — молча остаёмся на ЦП-пути предка: вкладка обязана работать
+        в любом случае, пусть и дороже."""
+        if not _QUICK_AVAILABLE:
+            return
+        quick = None
+        try:
+            path = _canvas_qml_path()
+            if not path:
+                return
+            quick = QQuickWidget(self)
+            # Мышь/колесо/клавиши обрабатывает сам холст (кроп, накладки, зум,
+            # панорама) — сцена не должна перехватывать события.
+            quick.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            quick.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
+            quick.setClearColor(QColor(C["bg"]))
+            quick.setSource(QUrl.fromLocalFile(path))
+            root = quick.rootObject()
+            sink = root.property("sink") if root is not None else None
+            if root is None or sink is None:
+                errs = "; ".join(e.toString() for e in quick.errors())
+                raise RuntimeError(errs or "QML-сцена холста не поднялась")
+            self._vo = root.findChild(QObject, "videoOutput")
+            self._ovl_item = _CanvasOverlayItem(self, root)
+            self._ovl_item.setZ(10)
+            quick.setGeometry(0, 0, max(1, self.width()), max(1, self.height()))
+            quick.lower()
+            quick.show()
+            self._quick = quick
+            self._out_sink = sink
+            self._sync_scene()
+        except Exception:
+            self._quick = None
+            self._out_sink = None
+            self._vo = None
+            self._ovl_item = None
+            if quick is not None:
+                try:
+                    quick.setParent(None)
+                    quick.deleteLater()
+                except Exception:
+                    pass
+
+    def _sync_scene(self):
+        """Подгоняет сцену под виджет: размер QQuickWidget и слоя оверлеев, а
+        главное — прямоугольник кадра (letterbox + зум + панорама). Источник
+        правды один — video_rect(), тот же, по которому считаются координаты
+        рамки кадрирования и накладок."""
+        quick = getattr(self, "_quick", None)
+        if quick is None:
+            return
+        w, h = max(1, self.width()), max(1, self.height())
+        if quick.width() != w or quick.height() != h or quick.x() or quick.y():
+            quick.setGeometry(0, 0, w, h)
+        ovl = self._ovl_item
+        if ovl is not None and (int(ovl.width()) != w or int(ovl.height()) != h):
+            ovl.setWidth(float(w))
+            ovl.setHeight(float(h))
+        vo = self._vo
+        if vo is None:
+            return
+        if self._has_frame():
+            vr = self.video_rect()
+            geom = (vr.left(), vr.top(), max(1, vr.width()), max(1, vr.height()))
+        else:
+            geom = None
+        if geom == self._vo_geom:
+            return
+        self._vo_geom = geom
+        if geom is None:
+            vo.setProperty("visible", False)
+            return
+        vo.setProperty("x", float(geom[0]))
+        vo.setProperty("y", float(geom[1]))
+        vo.setProperty("width", float(geom[2]))
+        vo.setProperty("height", float(geom[3]))
+        vo.setProperty("visible", True)
+
+    def update(self, *args):
+        """Вся унаследованная логика заявляет об изменениях через self.update() —
+        здесь этот вызов заодно двигает кадр в сцене и перерисовывает оверлеи.
+
+        В горячем пути кадра update() НЕ зовётся (см. _on_frame): кадр рисует
+        сама сцена, а перерисовывать из-за него слой оверлеев значило бы гнать
+        текстуру размером с виджет 60 раз в секунду — ровно та работа, от
+        которой мы ушли."""
+        if getattr(self, "_quick", None) is not None:
+            self._sync_scene()
+            if self._ovl_item is not None:
+                self._ovl_item.update()
+        super().update(*args)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        if getattr(self, "_quick", None) is not None:
+            self._sync_scene()
+            if self._ovl_item is not None:
+                self._ovl_item.update()
+
+    def paintEvent(self, ev):
+        # Кадр и оверлеи рисует сцена; виджету остаётся фон — он виден разве что
+        # в момент до первого кадра сцены.
+        if getattr(self, "_quick", None) is None:
+            super().paintEvent(ev)
+            return
+        p = QPainter(self)
+        p.fillRect(self.rect(), self._bg)
+        p.end()
+
+    # ── Наличие и размер кадра ───────────────────────────────────────────────
+    def _has_frame(self):
+        if self._px_size.width() > 0 and self._px_size.height() > 0:
+            return True
+        return super()._has_frame()
+
+    def _frame_size(self):
+        if self._px_size.width() > 0 and self._px_size.height() > 0:
+            return self._px_size
+        return super()._frame_size()
+
+    @staticmethod
+    def _pts_of(frame):
+        try:
+            pts = frame.startTime()
+        except Exception:
+            return -1
+        return int(pts) if pts is not None else -1
+
+    @staticmethod
+    def _frame_px_size(frame):
+        """Размер кадра ТАК, КАК ЕГО ПОКАЖЕТ СЦЕНА — с учётом поворота из
+        метаданных. Раньше поворот за нас применял toImage(); теперь его
+        применяет VideoOutput, и letterbox обязан считаться по повёрнутому
+        размеру, иначе у вертикалок с телефона рамка кадрирования, субтитры и
+        накладки лягут мимо кадра."""
+        try:
+            w, h = int(frame.width()), int(frame.height())
+        except Exception:
+            return QSize()
+        if w <= 0 or h <= 0:
+            return QSize()
+        rot = 0
+        try:
+            r = frame.surfaceFormat().rotation()
+            rot = int(getattr(r, "value", r))
+        except Exception:
+            rot = 0
+        # В разных версиях Qt это либо градусы (0/90/180/270), либо номер в
+        # перечислении (0..3) — принимаем оба.
+        if rot in (90, 270, 1, 3):
+            w, h = h, w
+        return QSize(w, h)
+
+    def _publish_frame(self, frame):
+        sink = self._out_sink
+        if sink is None:
+            return
+        try:
+            sink.setVideoFrame(frame)
+        except Exception:
+            pass
+
+    def _publish_image(self, img):
+        """Кладёт готовую картинку (точный кадр от предекодера, статичный кадр
+        режима «картинка → видео») в ту же сцену, что и кадры плеера — одним
+        путём, без второго слоя поверх видео."""
+        sink = self._out_sink
+        if sink is None or img is None or img.isNull():
+            return
+        try:
+            frame = QVideoFrame(img)
+            if not frame.isValid():
+                frame = QVideoFrame(img.convertToFormat(QImage.Format.Format_RGB32))
+            if frame.isValid():
+                sink.setVideoFrame(frame)
+        except Exception:
+            pass
+
+    def _clear_scene_frame(self):
+        """Убирает кадр со сцены (новый файл, аудио без видеоряда)."""
+        self._px_size = QSize()
+        self._vo_geom = None
+        sink = self._out_sink
+        if sink is not None:
+            try:
+                sink.setVideoFrame(QVideoFrame())
+            except Exception:
+                pass
+        vo = self._vo
+        if vo is not None:
+            vo.setProperty("visible", False)
+
+    def _want_cpu_copy(self):
+        """Нужна ли ЦП-копия ЭТОГО кадра (см. _grab_cpu_copy).
+
+        Мало спросить у флагов, которые ставит вкладка (воспроизведение,
+        протяжка): кадры сыплются потоком и в тех местах, где вкладка о
+        воспроизведении не объявляет — например, во время беззвучного прогрева
+        аудио (EditTab._preroll_at: плеер реально играет, но on_playback_changed
+        молчит). Поэтому смотрим и на сами кадры: если предыдущий пришёл меньше
+        120 мс назад — идёт поток, и конвертировать каждый кадр нельзя ни в
+        коем случае (ровно эта работа и грузила главный поток)."""
+        if self._playing or self._scrub_active:
+            return False
+        last = self._last_player_frame_at
+        return not (last > 0.0 and (time.monotonic() - last) < 0.12)
+
+    def _grab_cpu_copy(self, frame):
+        """ЦП-копия кадра для «Сохранить кадр». Делается ТОЛЬКО когда монтаж
+        стоит: там кадр приходит по одному на перемотку, и 8 мс на конвертацию
+        никому не мешают. Во время воспроизведения копии нет вовсе — ровно от
+        этой работы мы и ушли, а держать ссылку на сам QVideoFrame до
+        востребования бесполезно: после возврата из слота бэкенд переиспользует
+        буфер, и toImage() отдаёт пустую картинку (проверено экспериментом)."""
+        try:
+            img = frame.toImage()
+        except Exception:
+            return None
+        return img if (img is not None and not img.isNull()) else None
+
+    # ── Кадр от плеера ───────────────────────────────────────────────────────
+    def _on_frame(self, frame):
+        if getattr(self, "_quick", None) is None:
+            super()._on_frame(frame)
+            return
+        # Аудиофайл (видеоряда нет): «поздние» кадры прошлого источника не
+        # должны перекрывать сообщение «нет видео».
+        if self._audio_only_msg:
+            return
+        try:
+            if frame is None or not frame.isValid():
+                return
+        except Exception:
+            return
+        pts = self._pts_of(frame)
+        # Граница OUT по PTS — ДО показа кадра: кадр за границей не показываем
+        # вовсе и просим плеер на паузу (анти-overshoot правой границы).
+        if self._bound_us is not None and pts >= 0 and pts >= self._bound_us:
+            self.boundaryReached.emit()
+            return
+        # Пин кадра N: пока на холсте стоит ТОЧНЫЙ кадр, кадры плеера с чужим
+        # pts на экран не пускаем — иначе шаг стрелкой показывает не тот кадр.
+        if (self._pin_has_img and self._pin_span is not None and pts >= 0
+                and not (self._pin_span[0] <= pts < self._pin_span[1])):
+            return
+        size = self._frame_px_size(frame)
+        if size.width() > 0 and size != self._px_size:
+            self._px_size = size
+            self._vo_geom = None        # прямоугольник кадра пересчитать
+        self._frame_img = (self._grab_cpu_copy(frame)
+                           if self._want_cpu_copy() else None)
+        self._last_player_frame_at = time.monotonic()
+        self._publish_frame(frame)
+        # Часы кадра — время картинки, которая СЕЙЧАС на экране.
+        if pts >= 0:
+            self._last_pts_us = pts
+            self._last_frame_at = time.monotonic()
+            # Время предпросмотра накладки берём из PTS самого кадра: так
+            # накладка стоит на своём кадре и при воспроизведении, и при
+            # покадровой перемотке (positionChanged плеера приходит реже).
+            if self._trk is not None:
+                self._trk_t = pts / 1_000_000.0
+        if self._vo_geom is None:      # сменился размер кадра — переставить
+            self._sync_scene()
+        # Слой оверлеев перерисовываем, только если он зависит от кадра: трек-
+        # превью едет за объектом по времени кадра. Субтитры, рамка кропа и
+        # накладки от смены кадра не меняются — и не стоят ничего.
+        if self._trk is not None and self._ovl_item is not None:
+            self._ovl_item.update()
+
+    # ── Кадры, которые ставит вкладка ────────────────────────────────────────
+    def set_exact_frame(self, img, span_us=None, pts_us=None):
+        if (getattr(self, "_quick", None) is not None
+                and img is not None and not img.isNull()):
+            if img.size() != self._px_size:
+                self._px_size = img.size()
+                self._vo_geom = None
+            self._publish_image(img)
+        super().set_exact_frame(img, span_us, pts_us)
+
+    def set_static_image(self, qimg):
+        if getattr(self, "_quick", None) is not None:
+            if qimg is not None and not qimg.isNull():
+                self._px_size = qimg.size()
+                self._vo_geom = None
+                self._publish_image(qimg)
+            else:
+                self._clear_scene_frame()
+        super().set_static_image(qimg)
+
+    def clear_frame(self):
+        if getattr(self, "_quick", None) is not None:
+            self._clear_scene_frame()
+        super().clear_frame()
+
+    def set_audio_only_message(self, text):
+        if getattr(self, "_quick", None) is not None and text:
+            self._clear_scene_frame()
+        super().set_audio_only_message(text)
+
+    def current_frame_image(self):
+        """Кадр, который сейчас на холсте, — или None во время воспроизведения
+        (ЦП-копии в этот момент нет, см. _grab_cpu_copy). Возвращать устаревшую
+        картинку нельзя: «Сохранить кадр» сохранил бы не тот кадр — пусть лучше
+        сработает резервный ffmpeg-путь вкладки."""
+        return super().current_frame_image()
+
+    # ── Полноэкранный режим ──────────────────────────────────────────────────
+    def _republish_frame(self):
+        """Возвращает картинку на сцену после пересоздания графического
+        контекста (перенос холста в полноэкранное окно и обратно). Во время
+        воспроизведения ничего делать не нужно — следующий кадр приедет сам
+        через ~16 мс; а вот на паузе сцена осталась бы чёрной."""
+        quick = getattr(self, "_quick", None)
+        if quick is None:
+            return
+        self._sync_scene()
+        img = self._frame_img
+        if img is not None and not img.isNull():
+            # Просто подать картинку мало: VideoOutput после переезда держит
+            # кадр от ПРЕЖНЕГО графического контекста и новый сам не
+            # подхватывает — экран остаётся чёрным (проверено скриншотом
+            # реального окна). Сбрасываем кадр, будим сцену, подаём заново.
+            sink = self._out_sink
+            if sink is not None:
+                try:
+                    sink.setVideoFrame(QVideoFrame())
+                except Exception:
+                    pass
+            quick.update()
+            self._px_size = img.size()
+            self._vo_geom = None
+            self._publish_image(img)
+            self._sync_scene()
+            quick.update()
+        if self._ovl_item is not None:
+            self._ovl_item.update()
+
+    def event(self, ev):
+        if (getattr(self, "_quick", None) is not None
+                and ev.type() == QEvent.Type.ParentChange):
+            # Перенос в полноэкранное окно пересоздаёт контекст сцены — кадр
+            # надо подать заново, но уже ПОСЛЕ того, как Qt закончит перенос.
+            QTimer.singleShot(0, self._republish_frame)
+        return super().event(ev)
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        if getattr(self, "_quick", None) is not None:
+            self._sync_scene()
+            QTimer.singleShot(0, self._republish_frame)
 
 
 # ─── Полоса воспроизведения с мгновенной перемоткой по клику ────────────────────
@@ -1843,20 +2936,7 @@ class SeekSlider(QSlider):
             self.sliderMoved.emit(v)
 
     def _value_at(self, x):
-        opt = QStyleOptionSlider()
-        self.initStyleOption(opt)
-        groove = self.style().subControlRect(
-            QStyle.ComplexControl.CC_Slider, opt,
-            QStyle.SubControl.SC_SliderGroove, self)
-        handle = self.style().subControlRect(
-            QStyle.ComplexControl.CC_Slider, opt,
-            QStyle.SubControl.SC_SliderHandle, self)
-        span = (groove.right() - groove.left() - handle.width())
-        pos = x - groove.left() - handle.width() // 2
-        if span <= 0:
-            return self.minimum()
-        return QStyle.sliderValueFromPosition(
-            self.minimum(), self.maximum(), pos, span)
+        return slider_value_at(self, x)
 
     def mousePressEvent(self, ev):
         if (ev.button() == Qt.MouseButton.LeftButton
@@ -2219,6 +3299,9 @@ class FullscreenVideo(QWidget):
         # Громкость — связана с основным ползунком вкладки (он управляет звуком).
         self.vol_lbl = VolumeLabel(lambda: getattr(self, "vol_slider", None), self.bar)
         self.vol_lbl.setStyleSheet("color:#cdd6f4; font-size:15px; background:transparent;")
+        # Mute/unmute — общий с вкладкой (он же вернёт прежний уровень и сюда:
+        # _on_volume_changed вкладки синхронизирует этот ползунок, см. sync_volume).
+        self.vol_lbl.clicked.connect(self.edit.toggle_mute)
         row.addWidget(self.vol_lbl)
         self.vol_slider = VolumeSlider(Qt.Orientation.Horizontal, self.bar)
         self.vol_slider.setRange(0, 100)
@@ -2486,11 +3569,169 @@ class _StyledSubtitleOverlay(QWidget):
         p.end()
 
 
+class _TrackSelectCanvas(QWidget):
+    """Холст выбора области для отслеживания: показывает кадр видео и позволяет
+    обвести объект рамкой (протяжкой мыши), а также сразу показывает, как рядом
+    с рамкой ляжет накладка (текст/картинка).
+
+    Рамка хранится в ПИКСЕЛЯХ ИСХОДНОГО кадра (не в координатах виджета) — она
+    уходит в трекер как есть, поэтому не зависит от размера окна."""
+
+    boxChanged = pyqtSignal()
+
+    _MIN_SIDE = 8            # меньше — случайный клик, а не рамка
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(260)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setMouseTracking(True)
+        self._img = None          # QImage кадра (полное разрешение)
+        self._box = None          # QRectF в пикселях кадра
+        self._overlay = None      # QImage накладки (BGRA→QImage), уже отрисованная
+        self._anchor = "center"
+        self._off = (0, 0)
+        self._drag_start = None   # точка начала протяжки (координаты кадра)
+        self._move_from = None    # для перетаскивания готовой рамки
+
+    # ── данные ────────────────────────────────────────────────────────────────
+    def set_image(self, qimg):
+        self._img = qimg
+        self._box = None
+        self.update()
+
+    def set_overlay(self, qimg, anchor="center", off=(0, 0)):
+        """Накладка для превью (может быть None — тогда рисуется только рамка)."""
+        self._overlay = qimg
+        self._anchor = anchor
+        self._off = (int(off[0]), int(off[1]))
+        self.update()
+
+    def box_px(self):
+        """Выбранная область как (x, y, w, h) в пикселях кадра или None."""
+        if self._box is None:
+            return None
+        r = self._box
+        return (float(r.x()), float(r.y()), float(r.width()), float(r.height()))
+
+    def set_box_px(self, box):
+        self._box = QRectF(*box) if box else None
+        self.update()
+
+    # ── геометрия «кадр ↔ виджет» ─────────────────────────────────────────────
+    def _fit(self):
+        """(scale, dx, dy) для вписывания кадра в виджет с сохранением пропорций."""
+        if self._img is None or self._img.isNull():
+            return 1.0, 0.0, 0.0
+        iw, ih = self._img.width(), self._img.height()
+        if iw <= 0 or ih <= 0:
+            return 1.0, 0.0, 0.0
+        s = min(self.width() / iw, self.height() / ih)
+        return s, (self.width() - iw * s) / 2.0, (self.height() - ih * s) / 2.0
+
+    def _to_img(self, pt):
+        s, dx, dy = self._fit()
+        if s <= 0:
+            return QPointF(0, 0)
+        x = (pt.x() - dx) / s
+        y = (pt.y() - dy) / s
+        if self._img is not None:
+            x = max(0.0, min(float(self._img.width()), x))
+            y = max(0.0, min(float(self._img.height()), y))
+        return QPointF(x, y)
+
+    def _to_widget_rect(self, r):
+        s, dx, dy = self._fit()
+        return QRectF(dx + r.x() * s, dy + r.y() * s, r.width() * s, r.height() * s)
+
+    # ── мышь ──────────────────────────────────────────────────────────────────
+    def mousePressEvent(self, ev):
+        if self._img is None or ev.button() != Qt.MouseButton.LeftButton:
+            return
+        p = self._to_img(ev.position())
+        if self._box is not None and self._box.contains(p):
+            self._move_from = (p, QRectF(self._box))
+        else:
+            self._drag_start = p
+            self._box = QRectF(p, p)
+        self.update()
+
+    def mouseMoveEvent(self, ev):
+        if self._img is None:
+            return
+        p = self._to_img(ev.position())
+        if self._drag_start is not None:
+            self._box = QRectF(self._drag_start, p).normalized()
+            self.update()
+        elif self._move_from is not None:
+            start, rect0 = self._move_from
+            r = QRectF(rect0)
+            r.translate(p.x() - start.x(), p.y() - start.y())
+            # Не выпускаем рамку за пределы кадра.
+            r.moveLeft(max(0.0, min(self._img.width() - r.width(), r.x())))
+            r.moveTop(max(0.0, min(self._img.height() - r.height(), r.y())))
+            self._box = r
+            self.update()
+        else:
+            inside = self._box is not None and self._box.contains(p)
+            self.setCursor(Qt.CursorShape.SizeAllCursor if inside
+                           else Qt.CursorShape.CrossCursor)
+
+    def mouseReleaseEvent(self, ev):
+        if self._drag_start is not None:
+            self._drag_start = None
+            if self._box is not None and (self._box.width() < self._MIN_SIDE
+                                          or self._box.height() < self._MIN_SIDE):
+                self._box = None       # случайный клик — рамку не создаём
+        self._move_from = None
+        self.update()
+        self.boxChanged.emit()
+
+    # ── отрисовка ─────────────────────────────────────────────────────────────
+    def paintEvent(self, ev):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(C["bg"]))
+        if self._img is None or self._img.isNull():
+            p.setPen(QColor(C["text3"]))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Нет кадра")
+            return
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        s, dx, dy = self._fit()
+        target = QRectF(dx, dy, self._img.width() * s, self._img.height() * s)
+        p.drawImage(target, self._img)
+
+        if self._box is None:
+            p.setPen(QColor(C["text2"]))
+            p.drawText(target, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                       "\nОбведите объект рамкой")
+            return
+
+        wr = self._to_widget_rect(self._box)
+        # Превью накладки — ровно там, где её положит воркер (та же геометрия,
+        # что в overlay_top_left, только в масштабе превью).
+        if self._overlay is not None and not self._overlay.isNull():
+            ow, oh = self._overlay.width(), self._overlay.height()
+            ox, oy = overlay_top_left(self.box_px(), ow, oh, self._anchor, *self._off)
+            p.drawImage(QRectF(dx + ox * s, dy + oy * s, ow * s, oh * s), self._overlay)
+
+        pen = QPen(QColor(C["accent"]))
+        pen.setWidth(2)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRect(wr)
+        # Уголки рамки — чтобы её было видно на пёстром кадре.
+        pen2 = QPen(QColor("#ffffff")); pen2.setWidth(1)
+        p.setPen(pen2)
+        for cx, cy in ((wr.left(), wr.top()), (wr.right(), wr.top()),
+                       (wr.left(), wr.bottom()), (wr.right(), wr.bottom())):
+            p.drawRect(QRectF(cx - 3, cy - 3, 6, 6))
+
+
 class _SubtitlePreview(QWidget):
-    """Мини-плеер для SubtitleCreatorDialog: собственный QMediaPlayer + VideoCanvas
-    (независимо от плеера основной вкладки монтажа — второй набор player+canvas,
-    как _build_video_output собирает первый), поверх кадра — свой прозрачный
-    оверлей со стилизованным текстом текущей реплики."""
+    """Мини-плеер для SubtitleCreatorDialog: собственный QMediaPlayer +
+    _PaintedVideoCanvas (независимо от плеера основной вкладки монтажа — второй
+    набор player+canvas, как _build_video_output собирает первый), поверх кадра —
+    свой прозрачный оверлей со стилизованным текстом текущей реплики."""
 
     positionChanged = pyqtSignal(float)
     durationChanged = pyqtSignal(float)
@@ -2499,7 +3740,9 @@ class _SubtitlePreview(QWidget):
         super().__init__(parent)
         lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(6)
 
-        self.canvas = VideoCanvas(self)
+        # ЦП-холст (не GPU): поверх него живёт обычный дочерний виджет-оверлей
+        # со стилизованным текстом, и переезд диалога на Quick ничего не даёт.
+        self.canvas = _PaintedVideoCanvas(self)
         self.canvas.setMinimumHeight(220)
         # По умолчанию QWidget без явного focusPolicy фокус не берёт — сюда
         # его отдаём осознанно, чтобы было куда деть начальный фокус диалога
@@ -2557,7 +3800,7 @@ class _SubtitlePreview(QWidget):
         # покадровом шаге (WASD/стрелки) — как _scrub_audio_blip в EditTab.
         # Через ОСНОВНОЙ self.player звук на паузе не идёт (setPosition на
         # паузе не проигрывает буфер), а короткий play()/pause() на painted-
-        # холсте (VideoCanvas) даёт мерцание/скачок кадра — отдельный плеер
+        # холсте (_PaintedVideoCanvas) даёт мерцание/скачок кадра — отдельный плеер
         # (видео не подключено ни к какому sink'у) звучит без побочных эффектов.
         self._src_path = None
         self._blip_player = None
@@ -2573,6 +3816,7 @@ class _SubtitlePreview(QWidget):
         self.player = QMediaPlayer(self)
         self.audio_output = QAudioOutput(self)
         self.player.setAudioOutput(self.audio_output)
+        self._audio_dev_watch = install_audio_device_recovery(self.audio_output, self)
         self.player.setVideoSink(self.canvas.videoSink())
         self.player.positionChanged.connect(self._on_position)
         self.player.durationChanged.connect(self._on_duration)

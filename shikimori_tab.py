@@ -19,7 +19,6 @@
 # оркестровка фоновых задач. Вкладка по умолчанию ВЫКЛЮЧЕНА (включается в
 # Настройках, как SiQuesterHYX).
 import csv
-import datetime
 import json
 import os
 import re
@@ -89,6 +88,8 @@ try:
         ORDERS, DEFAULT_BASE_URL, CONTENT_ANIME, CONTENT_MANGA,
         kinds_for, statuses_for, kind_label, status_label, views_from_card,
         index_base_from_card, index_components_from_card,
+        age_years as _age_years, index_factors as _index_factors,
+        popularity_index as _popularity_index,
         genre_group, GENRE_GROUP_LABELS, GENRE_GROUP_ORDER,
     )
     _HAS_API = True
@@ -143,56 +144,10 @@ ORDER_LABELS = {
     "id": "По id", "random": "Случайно",
 }
 
-# Параметры «индекса популярности». Половина узнаваемости теряется примерно за
-# 5 лет — подобрано так, чтобы свежий тайтл с заметно меньшими просмотрами
-# обходил старый «миллионник» (пример пользователя: тайтл 2025 г. с 8k узнают
-# лучше, чем 2012 г. с 41k). Пол (floor) не даёт классике обнулиться совсем.
-_INDEX_HALF_LIFE_YEARS = 5.0
-_INDEX_RECENCY_FLOOR = 0.12
-# Очень слабое влияние оценки тайтла на индекс (просьба «прям незначительно»):
-# отклонение оценки от ~7 баллов меняет индекс лишь на проценты.
-_INDEX_SCORE_INFLUENCE = 0.04
-_INDEX_SCORE_PIVOT = 7.0
-
-
-def _age_years(when) -> "Optional[float]":
-    """Возраст тайтла в годах (дробных) на сегодня. when — datetime.date (точно по
-    дню/месяцу), int-год (грубо по году) или None. None/ошибка → None («возраст
-    неизвестен»)."""
-    if when is None:
-        return None
-    try:
-        if isinstance(when, datetime.date):
-            return max(0.0, (datetime.date.today() - when).days / 365.25)
-        return max(0.0, float(datetime.date.today().year - int(when)))
-    except (TypeError, ValueError):
-        return None
-
-
-def _index_factors(when, score: float = 0.0) -> tuple[float, float]:
-    """Множители индекса: (свежесть выхода, оценка). recency ∈ [floor, 1.0],
-    score_factor ∈ [0.6, 1.4]. when — дата выхода (точно по дню/месяцу) или год.
-    Вынесено, чтобы и считать индекс, и показывать в подсказке влияние года/оценки."""
-    age = _age_years(when)
-    if age is None:
-        recency = _INDEX_RECENCY_FLOOR   # дата неизвестна — считаем «старым»
-    else:
-        recency = max(_INDEX_RECENCY_FLOOR,
-                      0.5 ** (age / _INDEX_HALF_LIFE_YEARS))
-    score_factor = 1.0 + _INDEX_SCORE_INFLUENCE * (float(score or 0.0) - _INDEX_SCORE_PIVOT)
-    score_factor = max(0.6, min(1.4, score_factor))
-    return recency, score_factor
-
-
-def _popularity_index(base: float, when, score: float = 0.0) -> float:
-    """«Индекс популярности»: взвешенная по статусам база (index_base_from_card —
-    просмотрено=10, смотрю=8, брошено/отложено=6, запланировано=2), домноженная
-    на свежесть выхода тайтла (точно по дате) и СЛАБО — на его оценку. Чем свежее
-    тайтл и выше оценка, тем выше индекс при той же базе."""
-    if base <= 0:
-        return 0.0
-    recency, score_factor = _index_factors(when, score)
-    return base * recency * score_factor
+# Сама формула «индекса популярности» (возраст → свежесть, оценка, веса
+# статусов) живёт в shikimori_api — оттуда её берёт и генератор аниме-паков,
+# чтобы цены вопросов считались ровно по тому же правилу, что и сортировка
+# здесь. Имена _age_years/_index_factors/_popularity_index импортированы выше.
 
 # Размер обложки в списке (постер 7:10). Покрупнее — постеры хорошо видно.
 _THUMB_W, _THUMB_H = 96, 136
