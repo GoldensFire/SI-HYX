@@ -29,7 +29,7 @@ from config import (
     get_icon, http_get, icon_html, pyqtSignal, strip_default_tag,
     ytdlp_base_cmd
 )
-from utils import (check_ffmpeg, load_settings, load_settings_ex, parse_version,
+from utils import (check_ffmpeg, load_settings_ex, parse_version,
                    save_settings, settings_files_exist)
 from widgets import (
     LatinKeySequenceEdit, RecentFilesStrip, WheelBlocker, combo_set_value,

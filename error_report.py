@@ -192,9 +192,3 @@ class ErrorReportDialog(QDialog):
             self.btn_send.setEnabled(True)
             self._attach.setEnabled(True)
             self._desc.setReadOnly(False)
-
-
-def show_error(summary, detail="", where="", title="Ошибка", parent=None):
-    """Удобный шорткат: создать и показать модально ErrorReportDialog."""
-    dlg = ErrorReportDialog(title, summary, detail=detail, where=where, parent=parent)
-    return dlg.exec()

@@ -38,20 +38,6 @@ from PyQt6.QtWidgets import (QAbstractScrollArea, QSizePolicy, QAbstractButton,
 from PyQt6.QtCore import QUrl
 
 
-class SmallIconDelegate(QStyledItemDelegate):
-    """Делегат для колонок со статус-иконкой. Дерево загрузок выставляет
-    крупный iconSize (160×90) для превью в 0-й колонке — без этого делегата
-    значок статуса («галочка Готово») наследовал бы тот же размер и раздувался
-    на всю строку. Здесь принудительно ограничиваем размер декорации."""
-    def __init__(self, size=20, parent=None):
-        super().__init__(parent)
-        self._sz = QSize(size, size)
-
-    def initStyleOption(self, option, index):
-        super().initStyleOption(option, index)
-        option.decorationSize = self._sz
-
-
 class StatusColorDelegate(QStyledItemDelegate):
     """Делегат, рисующий цветной фон строки независимо от стилшита.
     

@@ -645,7 +645,6 @@ class MainWindow(QMainWindow):
                 if drop_area is None: return
                 try:
                     drop_area.select_tile(p)
-                    scroll_area = rp._scroll
                     tile_global = drop_area.mapToGlobal(drop_area.rect().topLeft())
                     content_local = rp._content_widget.mapFromGlobal(tile_global)
                     rp._scroll.verticalScrollBar().setValue(
@@ -667,7 +666,6 @@ class MainWindow(QMainWindow):
                         local = panel.mapFromGlobal(gp)
                         if panel.rect().contains(local): continue
                         # Don't hide if click is on a toolbar button (toggle handles it)
-                        tb_local = self.menuWidget().mapFromGlobal(gp) if self.menuWidget() else None
                         # Find the toolbar frame (first child QFrame of central widget)
                         click_on_toolbar = False
                         for tb in self.centralWidget().findChildren(QFrame):

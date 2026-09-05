@@ -400,7 +400,7 @@ class SiqPackage:
             _do_extract(self._zip)
             self._extract_cache[zpath] = out
             return out
-        except Exception as e:
+        except Exception:
             # Stale zip handle (e.g. after a rewrite) — reopen once and retry.
             try:
                 if self._zip is not None:
@@ -483,13 +483,6 @@ class SiqPackage:
             # Invalidate the XML parse cache and nav cache — the zip content changes after this.
             self._xml_cache = None
             self._xml_nav   = None
-
-            # Preserve original file attributes (timestamps, permissions) before writing
-            try:
-                orig_stat = os.stat(self.path)
-                orig_mode = orig_stat.st_mode
-            except Exception:
-                orig_stat = None; orig_mode = None
 
             with zipfile.ZipFile(self.path, 'r') as zin:
                 with zipfile.ZipFile(tmp, 'w') as zout:

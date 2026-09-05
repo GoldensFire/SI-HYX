@@ -36,11 +36,11 @@ from PyQt6.QtGui import QColor, QIcon, QPixmap, QValidator, QFont
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget,
-    QListWidgetItem, QFileDialog, QMessageBox, QScrollArea, QGroupBox,
+    QListWidgetItem, QFileDialog, QScrollArea, QGroupBox,
     QDialog, QCheckBox, QDialogButtonBox, QFrame, QStyledItemDelegate,
     QStyleOptionViewItem, QStyle, QApplication,
 )
-from msgbox import msgbox_critical, msgbox_warning, msgbox_information, msgbox_question
+from msgbox import msgbox_critical, msgbox_warning, msgbox_information
 
 try:
     from config import get_icon, APP_NAME, APP_VERSION
@@ -88,7 +88,7 @@ try:
         ORDERS, DEFAULT_BASE_URL, CONTENT_ANIME, CONTENT_MANGA,
         kinds_for, statuses_for, kind_label, status_label, views_from_card,
         index_base_from_card, index_components_from_card,
-        age_years as _age_years, index_factors as _index_factors,
+        index_factors as _index_factors,
         popularity_index as _popularity_index,
         genre_group, GENRE_GROUP_LABELS, GENRE_GROUP_ORDER,
     )
@@ -147,7 +147,7 @@ ORDER_LABELS = {
 # Сама формула «индекса популярности» (возраст → свежесть, оценка, веса
 # статусов) живёт в shikimori_api — оттуда её берёт и генератор аниме-паков,
 # чтобы цены вопросов считались ровно по тому же правилу, что и сортировка
-# здесь. Имена _age_years/_index_factors/_popularity_index импортированы выше.
+# здесь. Имена _index_factors/_popularity_index импортированы выше.
 
 # Размер обложки в списке (постер 7:10). Покрупнее — постеры хорошо видно.
 _THUMB_W, _THUMB_H = 96, 136

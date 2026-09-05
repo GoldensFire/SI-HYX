@@ -1556,10 +1556,6 @@ class ProcessWorker(QThread):
         значение метрики пробы, при неудаче — причина отказа."""
         t_start = time.time()
         search_preset = max(int(preset), self._SEARCH_PRESET_FLOOR)
-        try:
-            dur, *_ = get_media_info(path)
-        except Exception:
-            dur = 0.0
         sample_path, sample_tmp = self._short_sample(path)
 
         def _cleanup_sample():

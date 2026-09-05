@@ -194,17 +194,6 @@ def make_question(title: str, plot: str, client, *, mode: str = "title",
     return question, answers
 
 
-def episode_hint(page: str) -> str:
-    """Подпись к вопросу по серии — «Серия 12» («» — номера в названии нет).
-
-    Название страницы на вики бывает и «Episode 12», и «Naruto Episode 12», и
-    «Серия 12»; в вопросе полезно назвать номер, чтобы игрок понимал, что речь
-    о конкретной серии."""
-    m = re.search(r"(?:episode|серия|эпизод)\s*(\d+)", str(page or ""),
-                  re.IGNORECASE)
-    return f"Серия {m.group(1)}" if m else ""
-
-
 def pick_plot(fandom, names, rng, *, log: Optional[Any] = None) -> dict:
     """Пересказ для одного тайтла: {"text", "page", "wiki"} или {}.
 

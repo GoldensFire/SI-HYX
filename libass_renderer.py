@@ -18,7 +18,7 @@
 import os
 import sys
 import ctypes
-from ctypes import (c_int, c_uint, c_uint32, c_double, c_void_p, c_char_p,
+from ctypes import (c_int, c_uint32, c_double, c_void_p, c_char_p,
                     c_size_t, c_longlong, c_ubyte, POINTER, Structure, byref)
 
 try:

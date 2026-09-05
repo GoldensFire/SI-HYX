@@ -719,7 +719,6 @@ class ResultPage(QWidget):
                 rh.addWidget(excl_btn)
                 # ── Round comment button ──────────────────────────────
                 cur_comment = siq_rnd.get("comment","")
-                _comm_lbl = "▪" if cur_comment else "▪"
                 rnd_comm_btn = QPushButton()
                 rnd_comm_btn.setText("Комм")
                 rnd_comm_btn.setFixedSize(36, 22)
@@ -1091,11 +1090,7 @@ class ResultPage(QWidget):
             q_obj = next((q for q in src_qs if q["price"] == price), None)
             if q_obj is None: return
 
-            # Find the old position BEFORE removing (needed for tile reorder calc)
-            old_ds_idx = src_qs.index(q_obj)
-
             src_qs.remove(q_obj)
-            _pre_dst_price = None   # price displaced at target column (cross-theme)
             if same_theme:
                 # insert_idx from drop is the gap position in the layout, which
                 # equals the desired final position in the tile list (0-based).
@@ -1107,18 +1102,12 @@ class ResultPage(QWidget):
                 src_qs.insert(ds_clamped, q_obj)
             else:
                 ds_clamped = max(0, min(insert_idx if insert_idx >= 0 else len(dst_qs), len(dst_qs)))
-                # Capture the price of the tile currently at this column position
-                # in the destination theme BEFORE inserting (it will be displaced).
-                # This is the most reliable signal in 2-theme packages.
-                _pre_dst_price = (dst_qs[ds_clamped]["price"]
-                                  if ds_clamped < len(dst_qs) else None)
                 dst_qs.insert(ds_clamped, q_obj)
 
             # ── Auto-price: reprice entire dst theme by column ───────────
             # After reorder, every tile in the destination theme gets the
             # majority price for its column position (from all OTHER themes).
             # This prevents duplicates and keeps the grid consistent.
-            new_price = price   # fallback: unchanged
             _price_remap = {}   # old_price -> new_price for XML/siq update
             dst_themes = self.ds["rounds"][dst_r]["themes"]
             dst_qs_final = self.ds["rounds"][dst_r]["themes"][dst_t]["questions"]
@@ -1139,11 +1128,6 @@ class ResultPage(QWidget):
                     if old_p != canon:
                         _price_remap[old_p] = canon
                         tile_q["price"] = canon
-                        if tile_q is q_obj:
-                            new_price = canon
-                else:
-                    if tile_q is q_obj:
-                        new_price = tile_q["price"]
         except Exception as e:
             _logger.warning(f"[move_tile ds] {e}"); return
 

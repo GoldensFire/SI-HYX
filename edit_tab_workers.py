@@ -109,7 +109,6 @@ class ShareDeleteIODevice(QIODevice):
     def close(self):
         try:
             if self._h:
-                import ctypes
                 from ctypes import wintypes
                 self._k32.CloseHandle(wintypes.HANDLE(self._h))
         except Exception:
@@ -512,8 +511,6 @@ class SmartCutWorker(QThread):
             # Опорные кадры строго ВНУТРИ отрезка (с зазором, чтобы участки не
             # вырождались в ноль).
             inner = [t for t in kfs if self.in_s + 0.10 < t < self.out_s - 0.10]
-            kf_before_in = max([t for t in kfs if t <= self.in_s + 0.001], default=0.0)
-
             # Условия применимости умной обрезки: знаем кодек и есть ХОТЯ БЫ ДВА
             # опорных кадра внутри (нужны старт И конец copy-середины). При одном
             # kf_start==kf_end → copy «-ss X -to X» падает («-to value smaller than
@@ -1499,9 +1496,8 @@ class AudioWaveformLoader(QThread):
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace",
             creationflags=CREATE_NO_WINDOW)
-        feeder = None
         if feed_path:
-            feeder = start_share_delete_feeder(
+            start_share_delete_feeder(
                 feed_path, self.proc.stdin, stop_flag=lambda: self._stopped)
         last_pct = -1
         try:

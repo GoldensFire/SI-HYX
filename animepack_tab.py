@@ -82,13 +82,6 @@ C = {
 SOURCE_SHORT = {"myanimelist": "MAL", "shikimori": "Shiki", "anilist": "AniList"}
 
 
-def _kind_word(kind: str) -> str:
-    """Название типа вопроса для строки-подсказки: «опенинг», «кадр», но OST —
-    как есть: аббревиатуру строчными писать нельзя."""
-    title = KIND_TITLES.get(kind, kind)
-    return title if title.isupper() else title.lower()
-
-
 def _no_wheel(widget):
     """Отучает поле менять значение колёсиком мыши.
 
@@ -998,7 +991,7 @@ class AnimePackTab(QWidget):
             self.table)
         self.lbl_table_hint.setWordWrap(True)
         self.lbl_table_hint.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            Qt.AlignmentFlag.AlignCenter)
         self.lbl_table_hint.setStyleSheet(
             f"background:{C['bg']}; color:{C['text2']}; font-size:13px; "
             "padding: 0 12px;")

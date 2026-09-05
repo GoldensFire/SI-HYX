@@ -15,8 +15,6 @@ import sys
 import os
 
 
-import base64
-
 
 import traceback
 
@@ -24,25 +22,13 @@ import traceback
 import subprocess
 
 
-import threading
-
-
-import uuid
 
 
 import tempfile
 
 
-import urllib.parse
 
 
-import io
-
-
-import time
-
-
-import re
 
 
 import shutil
@@ -50,8 +36,6 @@ import shutil
 
 import json
 
-
-import random
 
 
 import functools
@@ -62,8 +46,6 @@ import functools
 
 from pathlib import Path
 
-
-from collections import deque
 
 
 # Аппаратное декодирование видео в QtMultimedia (бэкенд ffmpeg) настраивается
@@ -86,10 +68,9 @@ try:
         QFileDialog, QSpinBox, QDoubleSpinBox, QCheckBox, QProgressBar,
         QMessageBox, QTextEdit, QPlainTextEdit, QSlider, QGroupBox, QFormLayout, QComboBox,
         QLineEdit, QMenu, QScrollArea, QAbstractSpinBox, QAbstractItemView,
-        QTreeWidgetItemIterator, QHeaderView, QToolButton, QDialog,
-        QStyledItemDelegate, QStyle, QSplashScreen, QToolTip, QFrame,
-        QInputDialog, QKeySequenceEdit, QListWidget, QListWidgetItem,
-        QStackedWidget
+        QHeaderView, QToolButton, QDialog,
+        QStyledItemDelegate, QStyle, QFrame,
+        QInputDialog, QKeySequenceEdit, QListWidget, QListWidgetItem
     )
     from PyQt6.QtCore import (
         Qt, QThread, pyqtSignal, QSize, QRect, QRectF, QPoint, QPointF,
@@ -559,12 +540,6 @@ FORMAT_OPTIONS = {
 
 
 MERGE_OPTIONS = ["mp4", "mkv", "webm"]
-
-
-SUB_OPTIONS = ["Выкл", "all", "en", "ru", "es", "fr", "de"]
-
-
-AUDIO_OPTIONS = ["Original", "en", "ru", "es", "fr", "de"]
 
 
 AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160", "192", "256"]

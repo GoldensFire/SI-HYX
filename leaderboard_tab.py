@@ -18,13 +18,13 @@ import json
 import os
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QFont, QKeySequence, QShortcut
+from PyQt6.QtGui import QColor, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QLineEdit, QCheckBox, QTreeWidget, QTreeWidgetItem, QFileDialog,
     QMessageBox, QMenu, QAbstractItemView, QHeaderView, QApplication,
 )
-from msgbox import msgbox_critical, msgbox_warning, msgbox_information, msgbox_question
+from msgbox import msgbox_warning, msgbox_question
 
 try:
     from config import get_icon

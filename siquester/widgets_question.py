@@ -145,15 +145,12 @@ class QuestionViewer(QWidget):
         md = ev.mimeData()
         if md.hasFormat(_MIME_BLOCK) or (md.hasUrls() and self._current_price):
             # Highlight whichever section received the dragEnter
-            w = ev.source() if hasattr(ev, 'source') else None
-            # Find which inner widget got this event by checking sender
             # We re-use existing dropEvent — just highlight visually
             ev.acceptProposedAction()
             # Use the widget the event was installed on
             for section_w in (self._q_inner, self._a_inner):
                 rect = section_w.rect()
                 tl = section_w.mapToGlobal(rect.topLeft())
-                br = section_w.mapToGlobal(rect.bottomRight())
                 gp = section_w.mapFromGlobal(ev.position().toPoint() if hasattr(ev, 'position') else tl)
                 if rect.contains(gp):
                     section_w.setStyleSheet("background:rgba(137,180,250,0.08);border:1px solid rgba(137,180,250,0.3);border-radius:4px;")
@@ -794,13 +791,7 @@ class QuestionViewer(QWidget):
         is_simul_media = (is_join_next and not is_text
                           and it.get("placement","") != "background"
                           and param_name != 'background')
-        simul_tag = ""   # no text suffix - visual is handled by the frame
         _drag_source = None
-
-        # ── Timer duration from XML ───────────────────────────────
-        # Parse duration="HH:MM:SS" or "MM:SS" into seconds
-        dur_attr = it.get("xml_duration", "")   # stored separately from computed dur
-        dur_sec_override: float | None = _parse_hms(dur_attr) if dur_attr else None
 
         if is_replic:
             # Oral text: 💬 icon + italic text

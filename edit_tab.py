@@ -7019,7 +7019,6 @@ class EditTab(QWidget):
 
         dur_cut = out_s - in_s
         in_str  = s_to_time(in_s)
-        out_str = s_to_time(out_s)
         dur_str = s_to_time(dur_cut)
 
         # Внешняя озвучка (отдельный аудиофайл): подмешиваем её вторым входом и

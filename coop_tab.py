@@ -25,13 +25,13 @@ import urllib.parse
 import urllib.request
 
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QFileSystemWatcher, QTimer
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
-    QCheckBox, QTreeWidget, QTreeWidgetItem, QFileDialog, QMessageBox,
+    QCheckBox, QTreeWidget, QTreeWidgetItem, QFileDialog,
     QHeaderView, QAbstractItemView,
 )
-from msgbox import msgbox_critical, msgbox_warning, msgbox_information, msgbox_question
+from msgbox import msgbox_information
 
 try:
     from config import get_icon, APP_VERSION, COOP_SYNC_URL

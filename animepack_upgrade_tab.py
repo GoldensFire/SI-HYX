@@ -26,7 +26,7 @@ from PyQt6.QtCore import (Qt, QObject, QRunnable, QThreadPool, QSize, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QGroupBox, QScrollArea,
-    QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog,
     QAbstractItemView, QStackedWidget,
 )
 

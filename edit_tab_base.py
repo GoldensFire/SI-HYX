@@ -23,19 +23,8 @@ import math
 import subprocess
 
 # Бэкенды Qt нужно выбрать ДО создания QMediaPlayer/QVideoWidget. Модуль
-# импортируется в main.py до создания QApplication, поэтому setdefault здесь
+# импортируется в main.py до создания QApplication, поэтому setdefault ниже
 # срабатывает вовремя и не перетирает значения, заданные пользователем извне.
-from config import SETTINGS_FILE as _SETTINGS_FILE
-
-
-def _read_bool_setting(key, default=False):
-    """Читает булев флаг прямо из settings.json (нужно ДО создания QApplication)."""
-    try:
-        with open(_SETTINGS_FILE, encoding="utf-8") as _f:
-            return bool(json.load(_f).get(key, default))
-    except Exception:
-        return default
-
 
 # Графический бэкенд сцены Qt Quick (на нём работает холст видео «Монтажа» —
 # см. VideoCanvas). Программный рендер отключён всегда (настройка убрана из UI),
@@ -624,6 +613,5 @@ def _save_subtitle_presets(presets):
 # тем же эффектом с теми же блоками пользуется генератор аниме-паков (вопрос-
 # кадр, который проявляется). Здесь — только привычные имена, чтобы вкладка
 # «Монтаж» и её диалоги импортировали их как раньше.
-from pixelize import (MIN_BLOCK as _PIXELIZE_MIN_BLOCK,
-                      block_sequence as _pixelize_block_sequence,
+from pixelize import (block_sequence as _pixelize_block_sequence,
                       pixelize_filter as _pixelize_filter)
