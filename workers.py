@@ -2667,34 +2667,70 @@ class ProcessWorker(QThread):
                 cand = [16, 24, 32, 48, 64, 128, 256]
                 sizes = [(s, s) for s in cand if s <= side] or [(side, side)]
                 im.save(out_path, format='ICO', sizes=sizes)
-            elif ext == 'jpg':
-                if limit_kb > 0:
-                    def _save_jpg(q):
-                        t = os.path.join(TEMP_DIR, f"jpg_{uuid.uuid4().hex}.jpg")
-                        im.save(t, format='JPEG', quality=q, optimize=True)
-                        return t
-                    chosen = self._search_quality_under_limit(
-                        _save_jpg, limit_kb, av.get('fit_passes', 4), q_lo=10, q_hi=95,
-                        on_pass=_on_pass)
-                    im.save(out_path, format='JPEG', quality=chosen, optimize=True)
+            elif ext in ('jpg', 'webp', 'png'):
+                # Лимит размера: сначала подбор качества, а если даже минимальное
+                # качество не влезает — ужимаем разрешение и подбираем снова
+                # (в AVIF-ветке это давно есть, а здесь раньше не было, и лимит
+                # на jpg/webp/png по факту не соблюдался). PNG без потерь —
+                # для него единственный рычаг именно разрешение.
+                def _mk_tmp(img, q, _ext=ext):
+                    t = os.path.join(TEMP_DIR, f"{_ext}_{uuid.uuid4().hex}.{_ext}")
+                    if _ext == 'jpg':
+                        img.save(t, format='JPEG', quality=q, optimize=True)
+                    elif _ext == 'webp':
+                        img.save(t, format='WEBP', quality=q, method=6)
+                    else:
+                        img.save(t, format='PNG', optimize=True)
+                    return t
+
+                def _final_save(img, q, _ext=ext):
+                    if _ext == 'jpg':
+                        img.save(out_path, format='JPEG', quality=q, optimize=True)
+                    elif _ext == 'webp':
+                        img.save(out_path, format='WEBP', quality=q, method=6)
+                    else:
+                        img.save(out_path, format='PNG', optimize=True)
+
+                if limit_kb <= 0:
+                    _final_save(im, {'jpg': 92, 'webp': 90}.get(ext, 0))
                 else:
-                    im.save(out_path, format='JPEG', quality=92, optimize=True)
-            elif ext == 'webp':
-                # method=6 обязателен: с method по умолчанию libwebp нестабилен
-                # при сохранении RGBA из рабочего потока.
-                if limit_kb > 0:
-                    def _save_webp(q):
-                        t = os.path.join(TEMP_DIR, f"webp_{uuid.uuid4().hex}.webp")
-                        im.save(t, format='WEBP', quality=q, method=6)
-                        return t
-                    chosen = self._search_quality_under_limit(
-                        _save_webp, limit_kb, av.get('fit_passes', 4), q_lo=10, q_hi=95,
-                        on_pass=_on_pass)
-                    im.save(out_path, format='WEBP', quality=chosen, method=6)
-                else:
-                    im.save(out_path, format='WEBP', quality=90, method=6)
-            else:  # png
-                im.save(out_path, format='PNG', optimize=True)
+                    q_lo, q_hi = 10, 95
+                    passes = av.get('fit_passes', 4)
+                    cur = im
+                    saved = False
+                    for attempt in range(6):
+                        if ext == 'png':
+                            chosen = 0
+                        else:
+                            chosen = self._search_quality_under_limit(
+                                lambda q, _im=cur: _mk_tmp(_im, q), limit_kb, passes,
+                                q_lo=q_lo, q_hi=q_hi,
+                                on_pass=_on_pass if attempt == 0 else None)
+                        t = _mk_tmp(cur, chosen)
+                        try:
+                            size_kb = max(1, os.path.getsize(t) // 1024)
+                        finally:
+                            try: os.remove(t)
+                            except Exception: pass
+                        if size_kb <= limit_kb:
+                            _final_save(cur, chosen)
+                            saved = True
+                            break
+                        # Не влезли даже на минимальном качестве → уменьшаем сторону.
+                        if attempt == 0:
+                            side = self._avif_downscale_side(cur.width, cur.height,
+                                                             size_kb, limit_kb)
+                        else:
+                            side = int(max(cur.width, cur.height) * 0.85)
+                        side = max(16, min(side, max(cur.width, cur.height) - 1))
+                        sc = side / max(cur.width, cur.height)
+                        cur = cur.resize((max(1, int(cur.width * sc)),
+                                          max(1, int(cur.height * sc))), Image.LANCZOS)
+                        self.log.emit(
+                            f"{ext.upper()}: лимит {limit_kb} КБ не достигнут "
+                            f"({size_kb} КБ) → уменьшаю до {cur.width}x{cur.height}")
+                    if not saved:
+                        _final_save(cur, q_lo if ext != 'png' else 0)
 
         cb(100, "Конвертация картинки")
         try:
