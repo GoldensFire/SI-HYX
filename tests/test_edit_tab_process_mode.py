@@ -39,6 +39,9 @@ def _stub(tmp_path, mode=4, **over):
         _video_crop_filter=lambda: None,
         has_image_overlays=lambda: False,
         _subs_present_in_range=lambda *a: True,
+        _process_tab_encodes_video=lambda: True,
+        _burn_subs_spec=lambda src, in_s: {'vf': "subtitles='a.ass'",
+                                           'src_in': float(in_s)},
         main=None,
         log_label=SimpleNamespace(setText=lambda *a: None,
                                   setStyleSheet=lambda *a: None),
@@ -91,3 +94,56 @@ def test_other_modes_untouched(tmp_path):
     EditTab.start_cut(st)
     assert calls['process'] == []
     assert len(calls['cut']) == 1 and calls['cut'][0][0][2] == 1
+
+
+def test_closing_dialog_cancels_instead_of_encoding(tmp_path, monkeypatch):
+    """Крестик и Esc — ОТМЕНА. Раньше «всё, что не Да» считалось за «Нет», и
+    закрытое окно молча запускало полную перекодировку."""
+    st, calls = _stub(tmp_path, _video_crop_filter=lambda: "crop=100:100:0:0")
+    monkeypatch.setattr(edit_tab, "msgbox_question",
+                        lambda *a, **k: edit_tab.QMessageBox.StandardButton.NoButton)
+    EditTab.start_cut(st)
+    assert calls['cut'] == [] and calls['process'] == []
+
+
+def test_cancel_button_cancels(tmp_path, monkeypatch):
+    st, calls = _stub(tmp_path, _pixelize_active=True)
+    monkeypatch.setattr(edit_tab, "msgbox_question",
+                        lambda *a, **k: edit_tab.QMessageBox.StandardButton.Cancel)
+    EditTab.start_cut(st)
+    assert calls['cut'] == [] and calls['process'] == []
+
+
+def test_burn_subs_no_longer_blocks_processing_mode(tmp_path, monkeypatch):
+    """Вшивание субтитров этот путь теперь умеет — вопроса быть не должно, а
+    само вшивание обязано уехать в «Обработку»."""
+    st, calls = _stub(
+        tmp_path,
+        chk_burn_subs=SimpleNamespace(isChecked=lambda: True),
+        cmb_subs=SimpleNamespace(currentIndex=lambda: 1))
+    asked = []
+    monkeypatch.setattr(edit_tab, "msgbox_question",
+                        lambda *a, **k: (asked.append(a),
+                                         edit_tab.QMessageBox.StandardButton.Yes)[1])
+    EditTab.start_cut(st)
+    assert asked == []
+    assert len(calls['process']) == 1
+    assert calls['process'][0][1].get('burn_subs') is True
+
+
+def test_burn_subs_still_asks_when_video_is_copied(tmp_path, monkeypatch):
+    """С выключенной «Перекодировать видео» поток копируется — фильтры к копии
+    неприменимы, и об этом по-прежнему спрашиваем."""
+    st, calls = _stub(
+        tmp_path,
+        chk_burn_subs=SimpleNamespace(isChecked=lambda: True),
+        cmb_subs=SimpleNamespace(currentIndex=lambda: 1),
+        _process_tab_encodes_video=lambda: False)
+    asked = []
+    monkeypatch.setattr(edit_tab, "msgbox_question",
+                        lambda *a, **k: (asked.append(a[2]),
+                                         edit_tab.QMessageBox.StandardButton.Yes)[1])
+    EditTab.start_cut(st)
+    assert asked and "вшивание субтитров" in asked[0]
+    assert len(calls['process']) == 1
+    assert calls['process'][0][1].get('burn_subs') is False

@@ -31,7 +31,7 @@ def clip(tmp_path_factory):
     path = str(tmp_path_factory.mktemp("frames") / "clip.mp4")
     subprocess.run(
         [config.FFMPEG, "-y", "-f", "lavfi",
-         "-i", f"testsrc2=size=320x180:rate=24000/1001:duration=5",
+         "-i", "testsrc2=size=320x180:rate=24000/1001:duration=5",
          "-c:v", "libx264", "-g", "120", "-keyint_min", "120",
          "-sc_threshold", "0", "-pix_fmt", "yuv420p", path],
         capture_output=True, creationflags=config.CREATE_NO_WINDOW, timeout=120)

@@ -1,0 +1,25 @@
+{
+ "playalong": [
+  ["amq:k6a790.mp3", "55ilT6bbeGE", "guren drum"],
+  ["amq:8f21w2.mp3", "avFKcXKgJFM", "again drum"],
+  ["amq:1uhrww.mp3", "EgLYkIApSyk", "gurenge drum"],
+  ["amq:qi299l.mp3", "coEFuFNq3oc", "tank drum"],
+  ["amq:0dn9b5.mp3", "p8Lelh4c2Yk", "torikago drum"],
+  ["yt:woFU8DGg1UI", "0u9hFfBYNuk", "byebye guitar (zhaloba)"],
+  ["yt:QGEL60_apIc", "7iW-Z5yYnOk", "renai guitar (zhaloba)"]
+ ],
+ "genuine": [
+  ["amq:1uhrww.mp3", "xKcNwL64S0M", "gurenge fingerstyle"],
+  ["amq:1uhrww.mp3", "NQMmZ4Psb7w", "gurenge piano"],
+  ["amq:1uhrww.mp3", "KqRl5OAFYCQ", "gurenge band"],
+  ["amq:1uhrww.mp3", "I0IsG9qBJko", "gurenge vocal"],
+  ["amq:k6a790.mp3", "68gdfv0Vm7s", "guren piano"],
+  ["amq:k6a790.mp3", "QlnjE5ZVDAI", "guren utaite"],
+  ["amq:8f21w2.mp3", "-2EKBhqbT-k", "again fingerstyle"],
+  ["amq:8f21w2.mp3", "Kt_JePg86b8", "again piano"],
+  ["amq:qi299l.mp3", "7zm8G0rKw3U", "tank guitar+TABs"],
+  ["amq:qi299l.mp3", "bQ47mPDG7Pg", "tank jazz ensemble"],
+  ["amq:0dn9b5.mp3", "gu41qWtbdM0", "torikago band"],
+  ["amq:0dn9b5.mp3", "WT0HiDQ75fA", "torikago piano"]
+ ]
+}

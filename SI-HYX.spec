@@ -16,10 +16,13 @@
 #                   код). Код находит их рядом с .exe (см. _resolve_model в
 #                   lama_inpaint.py / rmbg_bg.py).
 import os
+from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_submodules, collect_all
 
-datas = [('icon.ico', '.')]
+datas = [('icon.ico', '.'), ('open-file.svg', '.')]
+# Standalone source for the isolated ML interpreter; torch stays excluded.
+datas += [(str(p), 'chiptune') for p in Path('chiptune').glob('*.py')]
 binaries = []
 # numpy/lxml тянутся лениво (волны/LUFS/разбор .siq), siquester — внутри try/except,
 # поэтому пакет включаем целиком. soundfile несёт нативный libsndfile (collect_all).
@@ -31,7 +34,18 @@ hiddenimports += collect_submodules('siquester')
 # QML-модуль QtMultimedia. Импорт в коде стоит внутри try/except — перечисляем
 # явно, чтобы анализатор не решил, что модули необязательные.
 hiddenimports += ['PyQt6.QtQml', 'PyQt6.QtQuick', 'PyQt6.QtQuickWidgets']
-for _pkg in ('soundfile', 'qtawesome'):
+# Каверы опенингов (docs/anime-covers.md) подключаются ЛЕНИВО — импортом внутри
+# функции загрузчика звука и внутри кнопки «Проверить каверы…». Перечисляем
+# явно, чтобы анализатор не решил, что модули необязательные.
+hiddenimports += ['cover_audio', 'cover_cache', 'cover_fingerprint',
+                  'cover_match', 'cover_meta',
+                  'cover_meta_rules', 'cover_search', 'cover_select',
+                  'cover_service',
+                  'si_hyx_parts.animepack.cover_processing',
+                  'si_hyx_parts.animepack_tab.cover_controls',
+                  'si_hyx_parts.animepack_tab.cover_lang_controls',
+                  'si_hyx_parts.animepack_tab.cover_preview']
+for _pkg in ('soundfile', 'qtawesome', 'tzdata'):
     _d, _b, _h = collect_all(_pkg)
     datas += _d; binaries += _b; hiddenimports += _h
 

@@ -120,3 +120,38 @@ def test_nothing_to_share_with_is_said_out_loud():
     gen._share_out_dead(quotas, Counter(), Counter())
     assert quotas[PLOT_KIND] == 0
     assert any("переложить их не на кого" in line for line in lines)
+
+
+def test_a_dead_only_kind_is_closed_once_despite_inflight_workers():
+    lines = []
+    gen = _gen(pct_songs=0, pack_plot=True, pct_plot=100, gemini_key="k",
+               rounds=1, themes=1, questions=96)
+    gen._log = lines.append
+    quotas = gen.s.question_quotas
+    counts, inflight = Counter(), Counter({PLOT_KIND: 7})
+    gen._drop_kind(PLOT_KIND)
+    gen._share_out_dead(quotas, counts, inflight)
+    inflight[PLOT_KIND] = 6
+    gen._share_out_dead(quotas, counts, inflight)
+    assert quotas[PLOT_KIND] == 0
+    notices = [line for line in lines if "переложить их не на кого" in line]
+    assert len(notices) == 1 and "96 шт." in notices[0]
+
+
+# ── своя средняя сложности у сюжета ──────────────────────────────────────────
+def test_a_plot_only_pack_has_its_own_level_bucket():
+    """Пак из одних сюжетных вопросов падал с KeyError: 'plot'.
+
+    Корзина «сюжет» появилась в level_avg.py, а список набранных уровней в
+    генераторе так и остался перечислением «арты и книги» — и первый же
+    кандидат ронял отбор. Здесь проверяется реестр целиком: у КАЖДОЙ корзины
+    со своей средней есть свой список."""
+    gen = _gen(pct_songs=0, pct_plot=100, pack_plot=True, plot_level_avg=2,
+               composition_enabled=["plot"])
+    assert set(animepack.LEVEL_BUCKETS) <= set(gen._bucket_levels)
+    cand = SongCandidate(song={}, anime=make_anime(), kind=PLOT_KIND)
+    # Трёх набранных хватает, чтобы средняя заработала, — до правки на этом
+    # месте и падало.
+    for level in (1, 1, 1):
+        gen._bucket_levels[animepack.PLOT_BUCKET].append(level)
+    assert gen._level_fits(cand, [], PLOT_KIND) in (True, False)

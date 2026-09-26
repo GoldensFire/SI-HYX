@@ -48,19 +48,37 @@ def _catch_sleep(client, monkeypatch) -> list:
 
 
 # ── модели ───────────────────────────────────────────────────────────────────
-def test_model_list_is_two_useful_choices():
-    """Только рабочая лошадка и «подумать получше». Промежуточные версии не
-    предлагаем: каждая строго уступает одной из этих двух."""
-    assert gemini_api.MODELS == ("gemini-3.5-flash-lite", "gemini-3.6-flash")
+def test_model_list_contains_new_flash_choices():
+    assert gemini_api.MODELS == (
+        "gemini-3.5-flash-lite", "gemini-3.6-flash",
+        "gemini-3.7-flash", "gemini-3.8-flash")
     assert gemini_api.DEFAULT_MODEL == "gemini-3.5-flash-lite"
 
 
+def test_model_discovery_adds_only_stable_general_flash(fake_response):
+    class Session:
+        def get(self, url, **kwargs):
+            assert kwargs["headers"] == {"x-goog-api-key": "secret"}
+            assert "secret" not in url
+            return fake_response(json_data={"models": [
+                {"name": "models/gemini-3.9-flash"},
+                {"name": "models/gemini-4-flash-preview"},
+                {"name": "models/gemini-4-flash-image"},
+                {"name": "models/gemini-4-pro"},
+            ]})
+
+    models = gemini_api.discover_models("secret", session=Session())
+    assert "gemini-3.9-flash" in models
+    assert not any("preview" in model or "image" in model for model in models)
+    assert "gemini-4-pro" not in models
+
+
 def test_rpm_follows_the_model():
-    """У Flash потолок бесплатного тарифа вдвое ниже, чем у Flash-Lite: общий
-    интервал загонял бы её в 429 на каждой пачке."""
+    """Обычный Flash не должен превысить показанный Google предел 5 RPM."""
     lite = GeminiClient("k", model="gemini-3.5-flash-lite")
     flash = GeminiClient("k", model="gemini-3.6-flash")
     assert flash._interval > lite._interval
+    assert flash._interval == 12.0
     assert GeminiClient("k", model="gemini-3.5-flash-lite", rpm=60)._interval == 1.0
 
 
@@ -113,6 +131,21 @@ def test_request_shape(fake_session, fake_response):
     assert body["generation_config"]["thinking_level"] == gemini_api.THINKING_LEVEL
 
 
+def test_thinking_level_is_chosen_by_the_user(fake_session, fake_response):
+    """Уровень рассуждения выбирается на вкладке и уходит в запрос как есть."""
+    s = fake_session([("interactions",
+                       fake_response(200, json_data=_ok_body({"ok": True})))])
+    _client(s, thinking="high").generate_json("вопрос", SCHEMA)
+    assert s.calls[0][2]["json"]["generation_config"]["thinking_level"] == "high"
+
+
+def test_unknown_thinking_level_falls_back_to_the_default():
+    assert GeminiClient("k", thinking="ВЫСОКИЙ").thinking == gemini_api.THINKING_LEVEL
+    assert GeminiClient("k", thinking="").thinking == gemini_api.THINKING_LEVEL
+    assert GeminiClient("k", thinking="LOW").thinking == "low"
+    assert gemini_api.THINKING_LEVELS[0] == gemini_api.THINKING_LEVEL
+
+
 # ── ключ и квота ─────────────────────────────────────────────────────────────
 def test_no_key_never_touches_network(fake_session):
     s = fake_session([])
@@ -142,7 +175,51 @@ def test_quota_exhausted_raises_quota_error(fake_session, fake_response,
     monkeypatch.setattr(c, "_sleep", lambda _s: None)
     with pytest.raises(GeminiQuotaError):
         c.generate_json("привет", SCHEMA)
-    assert len(s.calls) == 2
+    from gemini_api import MODELS
+    # Один исчерпанный ответ на модель: повторять 429 значит самому раздувать
+    # суточный счётчик (именно так раньше получалось 23 / 20).
+    assert len(s.calls) == len(MODELS)
+    assert [call[2]["json"]["model"] for call in s.calls] == list(MODELS)
+
+
+def test_quota_falls_back_to_previous_model(fake_session, fake_response,
+                                           monkeypatch):
+    err = json.dumps({"error": {"code": 429, "message": "Quota exceeded",
+                                "status": "RESOURCE_EXHAUSTED"}})
+    replies = iter([fake_response(429, text=err),
+                    fake_response(json_data=_ok_body({"ok": True}))])
+    session = fake_session([("interactions", lambda _url, **_kw: next(replies))])
+    client = _client(session, model="gemini-3.6-flash", max_retries=1)
+    monkeypatch.setattr(client, "_sleep", lambda _s: None)
+    assert client.generate_json("привет", SCHEMA) == {"ok": True}
+    assert [call[2]["json"]["model"] for call in session.calls] == [
+        "gemini-3.6-flash", "gemini-3.5-flash-lite"]
+
+
+def test_model_specific_quota_skips_useless_retries(fake_session, fake_response,
+                                                    monkeypatch):
+    err = json.dumps({"error": {"code": 429, "message":
+                      "Quota exceeded for metric requests, limit: 20, "
+                      "model: gemini-3.6-flash"}})
+    replies = iter([fake_response(429, text=err),
+                    fake_response(json_data=_ok_body({"ok": True}))])
+    session = fake_session([("interactions", lambda _url, **_kw: next(replies))])
+    client = _client(session, model="gemini-3.6-flash", max_retries=4)
+    monkeypatch.setattr(client, "_sleep", lambda _s: None)
+    assert client.generate_json("привет", SCHEMA) == {"ok": True}
+    assert len(session.calls) == 2
+
+
+def test_queued_request_for_exhausted_model_never_reaches_network(
+        fake_session, fake_response):
+    session = fake_session([("interactions",
+                             fake_response(json_data=_ok_body({"ok": True})))])
+    client = _client(session, model="gemini-3.8-flash")
+    with client._model_lock:
+        client.model = "gemini-3.7-flash"
+    with pytest.raises(gemini_api._ModelChanged):
+        client._post({"model": "gemini-3.8-flash", "input": "старое"})
+    assert session.calls == []
 
 
 def test_429_then_success(fake_session, fake_response, monkeypatch):
@@ -219,3 +296,24 @@ def test_sleep_is_interruptible():
     started = time.monotonic()
     c._sleep(30)
     assert time.monotonic() - started < 1.0
+
+
+# ── Уровень рассуждения зависит от модели ────────────────────────────────────
+def test_only_lite_knows_the_minimal_thinking_level():
+    """Обычный Flash отвергает «минимальный» ответом 400 — уровня у него нет."""
+    import gemini_api
+
+    assert "minimal" in gemini_api.model_thinking_levels("gemini-3.5-flash-lite")
+    assert "minimal" not in gemini_api.model_thinking_levels("gemini-3.6-flash")
+    assert gemini_api.model_thinking_levels("gemini-3.6-flash")[0] == "low"
+
+
+def test_an_unavailable_level_is_raised_to_the_nearest_one():
+    import gemini_api
+
+    assert gemini_api.thinking_level("minimal", "gemini-3.6-flash") == "low"
+    assert gemini_api.thinking_level("high", "gemini-3.6-flash") == "high"
+    assert gemini_api.thinking_level("minimal", "gemini-3.5-flash-lite") == "minimal"
+    # Клиент чинит уровень сам — запрос с недоступным уровнем не уходит.
+    assert GeminiClient("k", model="gemini-3.6-flash",
+                        thinking="minimal").thinking == "low"

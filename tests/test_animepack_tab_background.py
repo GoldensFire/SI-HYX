@@ -30,10 +30,10 @@ def _spin(msec: int):
 def test_наружу_из_тестов_не_пускают(network_attempts):
     import socket
     with pytest.raises(NetworkBlocked):
-        socket.getaddrinfo("shikimori.one", 443)
+        socket.getaddrinfo("shikimori.io", 443)
     with pytest.raises(NetworkBlocked):
-        socket.create_connection(("shikimori.one", 443), timeout=1)
-    assert [host for host, _port in network_attempts] == ["shikimori.one"] * 2
+        socket.create_connection(("shikimori.io", 443), timeout=1)
+    assert [host for host, _port in network_attempts] == ["shikimori.io"] * 2
 
 
 def test_петля_остаётся_разрешённой(network_attempts):

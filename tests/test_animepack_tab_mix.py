@@ -107,7 +107,6 @@ def test_manga_share_shows_its_settings(tab):
     s = tab.collect()
     assert s.pack_manga is True
     assert s.pct_manga == 50 and s.question_quotas[MANGA_KIND] > 0
-    assert s.manga_question == "character"
     # Снятая галочка убирает мангу с полосы, а её доля возвращается песням.
     tab.chk_manga.setChecked(False)
     assert tab.mix.percents() == (100, 0, 0, 0, 0)
@@ -217,8 +216,8 @@ def test_refresh_db_button_belongs_to_the_shikimori_base(tab):
     assert not tab.btn_refresh_db.isVisibleTo(tab)
 
 
-def test_refresh_db_button_turns_into_a_stop_button(tab):
-    """Каталог берётся целиком, а это долго: бросить можно той же кнопкой."""
+def test_refresh_db_can_be_stopped_midway(tab):
+    """Каталог берётся целиком, а это долго: бросить можно в любой момент."""
     class _FakeTask:
         stopped = False
 
@@ -230,7 +229,8 @@ def test_refresh_db_button_turns_into_a_stop_button(tab):
     assert _FakeTask.stopped
     tab._finish_db_ui()
     assert tab.btn_refresh_db.isEnabled()
-    assert tab.btn_refresh_db.text() == "Обновить базу Shikimori"
+    assert tab.btn_refresh_db.text() == "Обновить базу"
+    assert tab._db_parts == ()
 
 
 def test_anagram_length_limit_survives_save_and_load(tab):
@@ -248,8 +248,11 @@ def test_anagram_length_limit_survives_save_and_load(tab):
     assert not tab.sp_anagram_max.isVisibleTo(tab)
 
 
-def test_table_has_a_column_for_character_difficulty(tab):
-    assert tab.TABLE_HEADERS[-1] == "Перс."
+def test_table_has_no_separate_character_level_column(tab):
+    # Уровень вопроса-персонажа равен уровню тайтла — колонка «Перс.» только
+    # дублировала «Ур.» и убрана (просьба пользователя).
+    assert "Перс." not in tab.TABLE_HEADERS
+    assert tab.TABLE_HEADERS[-1] == "Ур."
     assert tab.table.columnCount() == len(tab.TABLE_HEADERS)
 
 
@@ -345,7 +348,7 @@ def test_counts_line_mentions_the_new_kinds(tab):
     tab.chk_plot.setChecked(True)
     tab._recount()
     text = tab.lbl_left.text()
-    for word in ("Пикселей", "Анаграмм", "По сюжету"):
+    for word in ("Кадров с эффектами", "Анаграмм", "По сюжету"):
         assert word in text
 
 
@@ -359,3 +362,176 @@ def test_pixel_hint_shows_the_same_blocks_as_the_effect(tab):
     for block in block_sequence(64, 6)[:-1]:
         assert f"{block}px" in text
     assert "чётко" in text
+
+
+def test_an_empty_composition_says_so_instead_of_a_lone_dot(tab):
+    """Снятый целиком состав давал строку из одной точки (просьба
+    пользователя: «почему-то стоит точка сверху»)."""
+    for chk in tab.composition_checks.values():
+        chk.setChecked(False)
+    tab._recount()
+    text = tab.lbl_left.text()
+    assert text != "." and "ничего не выбрано" in text
+
+
+def test_an_empty_composition_survives_a_restart(tab, qapp):
+    """Пустой состав не должен сам собой включать «Песни» после перезапуска.
+
+    Список включённых родов по умолчанию None, и общая ветка чтения настроек
+    пыталась сделать NoneType(список): состав молча не применялся, а нулевые
+    доли читались как «настроек нет» — то есть песни на весь пак."""
+    for chk in tab.composition_checks.values():
+        chk.setChecked(False)
+    data = tab.get_settings()
+    assert data["composition_enabled"] == []
+    assert PackSettings.from_dict(data).composition_enabled == []
+    again = animepack_tab.AnimePackTab(settings=data)
+    try:
+        assert not any(chk.isChecked()
+                       for chk in again.composition_checks.values())
+        assert not any(again.collect().question_quotas.values())
+    finally:
+        again.cleanup()
+
+
+def test_the_song_type_hint_is_always_on(tab):
+    """Галочки «Подсказка: тип песни» больше нет — подсказка есть всегда."""
+    assert not hasattr(tab, "chk_hint")
+    assert tab.collect().hint is True
+    # Сохранённое «выключено» из старых настроек её тоже не гасит.
+    data = tab.get_settings()
+    data["hint"] = False
+    tab.apply_settings(data)
+    assert tab.collect().hint is True
+
+
+def test_the_table_opens_in_its_own_window(tab, qapp):
+    """Кнопка открывает отдельное окно и не сжимает панель настроек."""
+    tab.resize(1600, 900)
+    tab.show()
+    qapp.processEvents()
+    assert not tab.table_box.isVisible()
+    wide = tab.scroll_settings.width()
+    columns = tab.settings_columns._columns
+    assert columns > 1
+    tab.table.setRowCount(1)
+    tab.btn_table.setEnabled(True)
+    tab._toggle_table()
+    qapp.processEvents()
+    assert not tab.table_box.isVisible()
+    assert tab._table_dialog.isVisible()
+    assert tab._table_dialog.table.rowCount() == 1
+    assert tab.scroll_settings.width() == wide
+    assert tab.settings_columns._columns == columns
+
+
+def test_the_pack_group_stays_put_next_to_the_buttons(tab, qapp):
+    """«Пак» и полоса запуска — одна неподвижная колонка справа.
+
+    Раньше «Пак» ехал вместе с остальными настройками и уезжал за край при
+    прокрутке, а кнопки стояли отдельно под ними (просьба пользователя)."""
+    tab.resize(1600, 900)
+    tab.show()
+    qapp.processEvents()
+    assert tab.pack_box.parentWidget() is tab.right_col
+    assert tab.btn_start.window() is tab.window()
+    assert tab.pack_box not in tab.settings_columns._groups
+    # Ни в каком окне прокрутки колонка не лежит — уехать ей некуда.
+    assert tab.scroll_settings.widget() is not tab.right_col
+    assert not tab.right_col.isAncestorOf(tab.scroll_settings)
+    fixed = tab.right_col.width()
+    tab._toggle_table()
+    qapp.processEvents()
+    assert tab.right_col.width() == fixed
+
+
+def test_pack_actions_follow_pack_without_a_vertical_gap(tab):
+    """Правая колонка читается одним блоком, а не двумя островками."""
+    layout = tab.right_col.layout()
+    pack_index = layout.indexOf(tab.pack_box)
+    actions_index = layout.indexOf(tab.actions_box)
+    assert actions_index == pack_index + 1
+    assert layout.itemAt(actions_index + 1).spacerItem() is not None
+
+
+def test_pack_counters_form_one_aligned_row(tab, qapp):
+    """Счётчики не разъезжаются и следующая подпись на них не налезает."""
+    tab.resize(1200, 760)
+    tab.show()
+    qapp.processEvents()
+    fields = (tab.sp_rounds, tab.sp_themes, tab.sp_quest)
+    tops = [field.mapTo(tab.pack_box, field.rect().topLeft()).y()
+            for field in fields]
+    widths = [field.width() for field in fields]
+    assert len(set(tops)) == 1
+    assert max(widths) - min(widths) <= 1
+    assert all(left.x() < right.x() for left, right in zip(fields, fields[1:]))
+    fields_bottom = max(
+        field.mapTo(tab.pack_box, field.rect().bottomLeft()).y()
+        for field in fields)
+    next_label_top = tab.lbl_theme_title.mapTo(
+        tab.pack_box, tab.lbl_theme_title.rect().topLeft()).y()
+    assert fields_bottom < next_label_top
+
+
+def test_both_repeat_filters_have_a_full_pack_list(tab, qapp, tmp_path):
+    first = str(tmp_path / "franchises.siq")
+    second = str(tmp_path / "questions.siq")
+    tab._exclude_siq = [first]
+    tab._exclude_exact_siq = [second]
+    tab._refresh_exclude_label()
+    tab._refresh_exact_label()
+    assert tab.btn_excl_list.isEnabled()
+    assert tab.btn_exact_list.isEnabled()
+
+    tab._show_exclude_siq(False)
+    tab._show_exclude_siq(True)
+    qapp.processEvents()
+    assert tab._franchise_list_dialog.list.count() == 1
+    assert tab._exact_list_dialog.list.count() == 1
+    assert "franchises.siq" in tab._franchise_list_dialog.list.item(0).text()
+    assert "questions.siq" in tab._exact_list_dialog.list.item(0).text()
+
+
+def test_repeat_pack_lists_can_be_edited(tab, qapp, tmp_path):
+    first = str(tmp_path / "first.siq")
+    second = str(tmp_path / "second.siq")
+    tab._exclude_siq = [first]
+    tab._refresh_exclude_label()
+    tab._show_exclude_siq(False)
+    dialog = tab._franchise_list_dialog
+    dialog.add_paths([first, second])
+    assert tab._exclude_siq == [first, second]
+    dialog.list.item(0).setSelected(True)
+    dialog._remove_selected()
+    assert tab._exclude_siq == [second]
+    assert dialog.label.text() == "Включено пакетов: 1"
+
+
+def test_repeat_pack_picker_uses_the_generation_folder(tab, monkeypatch):
+    monkeypatch.setattr("utils.default_download_dir", lambda: "C:/packs")
+    tab._out_dir = ""
+    assert tab._pack_picker_start() == "C:/packs"
+    tab._out_dir = "D:/chosen"
+    assert tab._pack_picker_start() == "D:/chosen"
+
+
+def test_enabling_songs_reflows_before_the_next_question_types(tab, qapp):
+    tab.resize(1480, 900)
+    tab.show()
+    for checkbox in tab.composition_checks.values():
+        checkbox.setChecked(False)
+    tab.chk_songs.setChecked(True)
+    qapp.processEvents()
+    song_bottom = tab.box_song_opts.mapTo(
+        tab, tab.box_song_opts.rect().bottomLeft()).y()
+    frames_top = tab.chk_frames.mapTo(tab, tab.chk_frames.rect().topLeft()).y()
+    assert song_bottom < frames_top
+
+
+def test_compress_audio_sits_next_to_compress_images(tab):
+    """«Сжимать аудио» переехало в «Прочее», к «Сжимать картинки»."""
+    assert (tab.chk_compress_audio.parentWidget()
+            is tab.chk_compress_images.parentWidget())
+    tab.chk_compress_audio.setChecked(False)
+    assert tab.collect().compress_audio is False

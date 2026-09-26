@@ -39,7 +39,7 @@ POSTER_CACHE_DIR = os.path.join(CONFIG_DIR, "animepack_posters")
 # мегабайт — это несколько сотен тайтлов; вылезли за потолок — выбрасываем самые
 # давние по времени последнего ОБРАЩЕНИЯ (не скачивания): часто нужные обложки
 # так остаются, а разовые уходят.
-POSTER_CACHE_MB = 200
+POSTER_CACHE_MB = 5120
 
 _LOCK = threading.Lock()
 _EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif")
@@ -204,6 +204,30 @@ def stats() -> tuple[int, int]:
     """(сколько обложек, сколько байт) — для подписи в настройках."""
     rows = _rows()
     return len(rows), sum(size for _p, size, _t in rows)
+
+
+def entries() -> list[dict]:
+    """Файлы для окна управления кэшем, без чтения самих изображений."""
+    return [{"path": path, "name": os.path.basename(path), "size": size,
+             "modified": used}
+            for path, size, used in _rows()]
+
+
+def remove(path: str) -> bool:
+    """Удалить одну обложку только внутри этой кладовой."""
+    root = os.path.abspath(POSTER_CACHE_DIR)
+    target = os.path.abspath(str(path or ""))
+    try:
+        if os.path.commonpath((root, target)) != root:
+            return False
+    except (OSError, ValueError):
+        return False
+    with _LOCK:
+        try:
+            os.remove(target)
+        except OSError:
+            return False
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────

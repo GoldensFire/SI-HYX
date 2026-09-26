@@ -124,6 +124,10 @@ def isolate_settings(tmp_path, monkeypatch):
     защищать, если имя начнёт импортировать ещё какой-то модуль. Никогда не
     пишем в реальный %APPDATA% пользователя."""
     fake = str(tmp_path / "settings.json")
+    # config импортируем САМИ, а не ищем в sys.modules: gemini_usage приходит к
+    # нему лениво, уже во время теста, и до этой правки счёт запросов к Gemini
+    # с тестовым ключом ложился в настоящий %APPDATA% пользователя.
+    import config  # noqa: F401 — нужен именно факт импорта до подмены
     for mod_name in ("config", "utils", "workers", "tabs", "widgets"):
         mod = sys.modules.get(mod_name)
         if mod is not None and hasattr(mod, "SETTINGS_FILE"):
@@ -145,6 +149,20 @@ def isolate_settings(tmp_path, monkeypatch):
     if pcache is not None:
         monkeypatch.setattr(pcache, "POSTER_CACHE_DIR",
                             str(tmp_path / "animepack_posters"), raising=True)
+    # Исходники песен/кадров и готовые AVIF также не должны переживать тест
+    # или попадать в пользовательский 5-гигабайтный кэш.
+    mcache = sys.modules.get("media_cache")
+    if mcache is not None:
+        monkeypatch.setattr(mcache, "MEDIA_CACHE_DIR",
+                            str(tmp_path / "animepack_media"), raising=True)
+        monkeypatch.setattr(mcache, "_SIZE", None, raising=True)
+    # Кладовая каверов (находки, вердикты звука и хрома эталонов) — тоже рядом
+    # с настройками: без подмены тесты записали бы туда выдуманные ролики, и
+    # следующий пак пользователя взял бы кавер, которого не существует.
+    ccache = sys.modules.get("cover_cache")
+    if ccache is not None:
+        monkeypatch.setattr(ccache, "CACHE_DIR",
+                            str(tmp_path / "animepack_covers"), raising=True)
     # Кэш миниатюр ленты «последние файлы» — тоже рядом с настройками.
     wdg = sys.modules.get("widgets")
     if wdg is not None and hasattr(wdg, "_THUMB_CACHE_DIR"):

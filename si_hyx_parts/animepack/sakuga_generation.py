@@ -1,0 +1,177 @@
+# -*- coding: utf-8 -*-
+# SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
+# See LICENSE and the public module for attribution and API.
+"""Вопрос-сакуга: вырезка анимации с Sakugabooru. Namespace: animepack."""
+from __future__ import annotations
+
+import os
+import tempfile
+
+import animepack as _api
+
+
+# Столько тайтлов подряд может не найтись на Sakugabooru, прежде чем род
+# вопросов снимается с прогона. Там лежит хорошо если каждый десятый тайтл
+# каталога Shikimori, поэтому прежний порог 10 регулярно отключал живую
+# категорию. 80 совпадает с запасом карточек на одну сакугу (catalog_want.py)
+# и всё ещё ограничивает бесплодный поиск по действительно пустой выборке.
+MISS_GIVE_UP = 80
+
+
+def init_sakuga_service(self, client=None):
+    """Клиент Sakugabooru — только при доле сакуги в паке."""
+    self.sakuga = client
+    if client is None and self.s.mix_shares.get(_api.SAKUGA_KIND):
+        self.sakuga = _api.SakugaApi(
+            self.session,
+            safe_only=bool(getattr(self.s, "sakuga_safe_only", True)),
+            rng=self.rng)
+    self._sakuga_misses = 0
+
+
+def download_sakuga(self, cand) -> bool:
+    """Режет вырезку анимации в ролик пака («ложь» — не вышло).
+
+    Звук не пишем вовсе: у вырезок его чаще всего и нет, а где есть — это
+    голоса и музыка, которые выдали бы тайтл мимо самой анимации."""
+    if self.stopped():
+        return False
+    if _api.SAKUGA_KIND in self._dead_kinds or self.sakuga is None:
+        cand.rejected = True
+        self._drop_kind(_api.SAKUGA_KIND)
+        return False
+    try:
+        # Выбор отрывка и его резервирование — под одним замком: иначе два
+        # рабочих потока взяли бы одну и ту же вырезку.
+        with self._sakuga_lock:
+            with self._frames_lock:
+                excluded = set(self._frames_used)
+            clip = self.sakuga.clip(cand.anime, excluded)
+            if clip:
+                # Это счётчик именно ПОДРЯД не найденных клипов, а не успешно
+                # закодированных. Кодирование сериализовано отдельным замком и
+                # может ждать минуты; при восьми потоках быстрые промахи раньше
+                # успевали добить лимит, пока уже найденные клипы стояли в
+                # очереди на ffmpeg.
+                self._sakuga_misses = 0
+                with self._frames_lock:
+                    self._frames_used.add(_api.frame_url_key(clip["url"]))
+                misses = 0
+            else:
+                # Увеличиваем счётчик под ТЕМ ЖЕ замком, что и выбор клипа.
+                # Иначе поток со старым промахом мог проснуться уже после
+                # найденного клипа и превратить его в первый промах новой
+                # серии, хотя фактический порядок поиска был обратным.
+                self._sakuga_misses += 1
+                misses = self._sakuga_misses
+    except _api.AnimePackApiError as e:
+        self._log_rare("Сакуга", f"Sakugabooru «{cand.title_ru}»: {e}")
+        return False
+    if not clip:
+        return _miss(self, cand, misses)
+    if self.stopped():
+        return False
+    if not _encode(self, cand, clip):
+        return False
+    cand.sakuga = dict(clip)
+    cand.frame_url = clip["url"]
+    # Страница поста, а не файла: на ней видно, из какой сцены вырезка и кто
+    # её анимировал (просьба пользователя — ссылка на источник в ответе).
+    cand.source_link = _api.sakuga_post_link(clip.get("id"))
+    cand.has_video = True
+    return True
+
+
+# Потолок на кодирование одной вырезки. Кодируется уже скачанный файл, так
+# что это чистое время ЦП: при медленном пресете и восьми потоках десять
+# секунд 720p у libsvtav1 идут минутами.
+ENCODE_TIMEOUT = 900
+
+
+def _download(self, clip: dict) -> str:
+    """Скачивает вырезку во временный файл и возвращает путь («» — не вышло).
+
+    Раньше ffmpeg читал вырезку прямо с сайта, и под сетевым замком шло всё
+    кодирование целиком: при пресете 3 одна вырезка держала замок минутами,
+    остальные сакуги стояли в очереди, а зависшее чтение ffmpeg обрывал только
+    таймаут в 600 с — и так трижды, с повторами. На 140 из 144 пак стоял
+    сорок минут, а журнал молчал: одинаковая ошибка у сакуги уже была
+    «приглушена» (_log_rare). Теперь под замком только загрузка — requests с
+    таймаутом чтения, — а кодирование идёт параллельно с остальными."""
+    with self._sakuga_net_lock:
+        data = self._get_bytes(clip["url"], timeout=(10, 60))
+    if not data:
+        return ""
+    ext = str(clip.get("ext") or "mp4").strip(".") or "mp4"
+    handle, path = tempfile.mkstemp(prefix="sihyx_sakuga_", suffix="." + ext)
+    with os.fdopen(handle, "wb") as stream:
+        stream.write(data)
+    return path
+
+
+def _encode(self, cand, clip: dict) -> bool:
+    """Кодирует отрывок в ролик пака тем же libsvtav1, что и все видео.
+
+    Режем с начала: вырезку выложили ровно ради этой сцены, и первые кадры в
+    ней — не заставка студии, а сама анимация."""
+    final = _api.os.path.join(self.folder, "Video", cand.video_out)
+    # Потолок в двадцать секунд стоит и здесь, и в настройках (просьба
+    # пользователя): вырезка длиннее перестаёт быть загадкой по рисовке.
+    duration = max(2, min(_api.SAKUGA_MAX_CUT,
+                          int(getattr(self.s, "sakuga_cut", _api.SAKUGA_CUT))))
+    # Скорость кодирования у сакуги своя (просьба пользователя): вырезок в
+    # паке бывает два десятка, и пресет для них выбирается отдельно от
+    # вопросов-роликов. Всё остальное — те же флаги libsvtav1.
+    preset = getattr(self.s, "sakuga_preset", None)
+    try:
+        source = _download(self, clip)
+    except (_api.AnimePackError, OSError) as exc:
+        if not self.stopped():
+            self._log_rare("Сакуга", f"Отрывок «{cand.title_ru}» не "
+                                     f"скачался: {str(exc)[:160]}")
+        return False
+    if not source:
+        return False
+    cmd = ([_api.FFMPEG, "-y", "-loglevel", "error", "-i", source,
+            "-t", str(duration), "-an"]
+           + self.video_encode_args(preset)
+           + ["-movflags", "+faststart", final])
+    try:
+        if self.stopped():
+            return False
+        # Файл уже на диске: сбой ffmpeg здесь не случайность сети, и
+        # повторять то же кодирование незачем.
+        code, err = self._run_killable(cmd, timeout=ENCODE_TIMEOUT)
+    finally:
+        try:
+            os.remove(source)
+        except OSError:
+            pass
+    size = _api.os.path.getsize(final) if _api.os.path.exists(final) else 0
+    if code == 0 and size >= _api.MIN_VIDEO_BYTES:
+        return True
+    try:
+        if _api.os.path.exists(final):
+            _api.os.remove(final)
+    except OSError:
+        pass
+    if not self.stopped():
+        self._log_rare("Сакуга",
+                       f"Отрывок «{cand.title_ru}» не собрался: "
+                       f"{(err or 'пустой файл').strip()[:160]}")
+    return False
+
+
+def _miss(self, cand, misses: int) -> bool:
+    """Тайтла на Sakugabooru нет — считаем промахи и вовремя сдаёмся."""
+    self._log_rare("Сакуга",
+                   f"«{cand.title_ru}»: вырезок на Sakugabooru нет — беру "
+                   "следующий тайтл")
+    if misses == MISS_GIVE_UP:
+        self.log(f"Сакуга: подряд не нашлось {misses} тайтлов — категорию "
+                 "пропускаю, её места отдам остальным родам вопросов. На "
+                 "Sakugabooru лежат в основном заметные ТВ-сериалы и фильмы.")
+        self._drop_kind(_api.SAKUGA_KIND)
+    if misses >= MISS_GIVE_UP:
+        cand.rejected = True
+    return False

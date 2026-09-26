@@ -72,6 +72,10 @@ def _stub(pos=10_000, playing=False, fps=25.0, duration=100.0):
         _preroll_target_ms=None,
         _preroll_gen=1,
         _preroll_prev_muted=False,
+        _preroll_unmute_pending=False,
+        _preroll_unmute_gen=0,
+        _frame_seek_deferred_ms=None,
+        _frame_seek_last_at=0.0,
         video_widget=None,
         pinned=[],
         released=0,
@@ -79,6 +83,19 @@ def _stub(pos=10_000, playing=False, fps=25.0, duration=100.0):
     )
     st._show_exact_frame = lambda idx=None, direction=1: st.pinned.append(idx)
     st._dispatch_frame_seek = lambda ms: EditTab._dispatch_frame_seek(st, ms)
+    st._send_frame_seek = lambda ms: EditTab._send_frame_seek(st, ms)
+    st._flush_frame_seek = lambda: EditTab._flush_frame_seek(st)
+
+    def _restore_mute(delay_ms=None):
+        """Возврат звука после разбега отложен на _PREROLL_UNMUTE_MS (хвост
+        очереди аудиоустройства). В тестах Qt-таймеров нет, поэтому сразу же
+        доводим отложенный возврат до конца — сам факт откладывания проверяет
+        test_unmute_is_deferred_after_pause."""
+        EditTab._restore_preroll_mute(st, delay_ms)
+        EditTab._finish_preroll_unmute(st, st._preroll_unmute_gen)
+
+    st._restore_preroll_mute = _restore_mute
+    st._flush_preroll_mute = lambda: EditTab._flush_preroll_mute(st)
     st._ext_audio_seek = lambda ms: None
     st._release_frame_lock = lambda: setattr(st, 'released', st.released + 1)
     st._current_frame_index = lambda: EditTab._current_frame_index(st)
@@ -95,6 +112,7 @@ def _stub(pos=10_000, playing=False, fps=25.0, duration=100.0):
     st.on_playback_changed = lambda *a: None
     for name in ("_PREROLL_SNAP_MS", "_PREROLL_GUARD_MS", "_PREROLL_HANDOFF_MS",
                  "_PREROLL_POLL_MS", "_PREROLL_LEAD_MS", "_PREROLL_MIN_LEAD_MS",
+                 "_PREROLL_UNMUTE_MS", "_SCRUB_SEEK_MS",
                  "_SCRUB_BLIP_MIN_S", "_SCRUB_BLIP_MAX_S"):
         setattr(st, name, getattr(EditTab, name))
     return st

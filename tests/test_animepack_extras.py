@@ -8,8 +8,9 @@
 """
 from collections import Counter
 
-from animepack import (CHAR_KIND, FRAME_KIND, MANGA_KIND, AnimePackGenerator,
-                       PackSettings, SongCandidate, UserList, filter_anime)
+from animepack import (ART_BUCKET, CHAR_KIND, FRAME_KIND, MANGA_KIND,
+                       PIXIV_ART_KIND, AnimePackGenerator, PackSettings,
+                       SongCandidate, UserList, filter_anime)
 from test_animepack import make_anime, make_candidate
 
 
@@ -143,6 +144,61 @@ def test_level_avg_gives_up_instead_of_starving_the_pack():
 def test_level_avg_must_fit_the_range():
     assert any("Средняя сложность" in p for p in
                PackSettings(level_min=5, level_max=8, level_avg=2).validate())
+
+
+# ── Своя средняя у артов и книг ─────────────────────────────────────────────
+def _of_kind(count, kind):
+    cand = _cand_with_level(count)
+    cand.kind = kind
+    return cand
+
+
+def test_art_average_is_counted_apart_from_the_pack_one():
+    """Арты держат свою середину: общая средняя пака им не указ."""
+    gen = _gen(PackSettings(level_avg=4, art_level_avg=8))
+    easy, hard = _cand_with_level(900000), _cand_with_level(3)
+    # Общая средняя уехала вверх — но арты её не сторожат вовсе.
+    assert gen._level_fits(hard, [9, 9, 9], PIXIV_ART_KIND) is True
+    # Набранные арты, наоборот, оказались лёгкими — дальше лёгкие не проходят.
+    for _ in range(3):
+        gen._remember_level(_of_kind(900000, PIXIV_ART_KIND), [])
+    assert gen._level_fits(easy, [], PIXIV_ART_KIND) is False
+    assert gen._level_fits(hard, [], PIXIV_ART_KIND) is True
+
+
+def test_own_average_keeps_arts_out_of_the_common_count():
+    gen = _gen(PackSettings(level_avg=4, art_level_avg=8))
+    levels = []
+    art, frame = _of_kind(900000, PIXIV_ART_KIND), _of_kind(3, FRAME_KIND)
+    gen._remember_level(art, levels)
+    gen._remember_level(frame, levels)
+    assert levels == [frame.level]
+    assert gen._bucket_levels[ART_BUCKET] == [art.level]
+
+
+def test_without_its_own_average_an_art_goes_to_the_common_one():
+    """Ноль («любая») оставляет всё как было: арт считается вместе со всеми."""
+    gen = _gen(PackSettings(level_avg=4))
+    levels = []
+    art = _of_kind(900000, PIXIV_ART_KIND)
+    gen._remember_level(art, levels)
+    assert levels == [art.level] and gen._bucket_levels[ART_BUCKET] == []
+    # И проверяется он тоже общей средней.
+    assert gen._level_fits(art, [1, 1, 1], PIXIV_ART_KIND) is False
+
+
+def test_manga_average_must_fit_the_manga_range():
+    problems = PackSettings(pack_manga=True, pct_manga=50, pct_songs=50,
+                            manga_level_min=5, manga_level_max=8,
+                            manga_level_avg=2).validate()
+    assert any("Средняя сложность манги" in p for p in problems)
+
+
+def test_art_average_must_fit_the_art_range():
+    problems = PackSettings(pack_pixiv_art=True, pct_pixiv_art=50, pct_songs=50,
+                            art_level_min=1, art_level_max=3,
+                            art_level_avg=9).validate()
+    assert any("Средняя сложность артов" in p for p in problems)
     assert not any("Средняя сложность" in p for p in
                    PackSettings(level_min=1, level_max=10, level_avg=4).validate())
 
@@ -269,6 +325,25 @@ def test_character_answer_keeps_the_title_when_nothing_earlier():
     assert cand.mal_id == 1535
 
 
+def test_character_answer_prefers_a_full_tv_series_over_earlier_promos():
+    gen = _gen(PackSettings())
+    cand = make_candidate(anime={"malId": 999, "id": 999,
+                                 "russian": "Поздний сезон"})
+    cand.kind = CHAR_KIND
+    cand.character = {"id": 17, "name": "Герой"}
+    gen.shikimori.character_titles = lambda cid: {
+        "animes": [
+            {"id": 1, "kind": "pv", "aired_on": "2010-01-01"},
+            {"id": 2, "kind": "special", "aired_on": "2011-01-01"},
+            {"id": 3, "kind": "tv", "aired_on": "2015-01-01"},
+        ], "mangas": []}
+    gen.shikimori.animes_by_ids = lambda ids: [
+        make_anime(malId=3, id=3, russian="Полноценный сериал")]
+    gen._use_first_title(cand)
+    assert cand.mal_id == 3
+    assert cand.main_answer.startswith("Полноценный сериал (")
+
+
 # ── Время по этапам и мелочи настроек ───────────────────────────────────────
 def test_stage_times_are_logged():
     lines = []
@@ -334,9 +409,28 @@ def test_streams_are_merged_by_their_weights():
     """Аниме и манга идут вперемешку, а не «сначала одно, потом другое»."""
     a = iter(["a"] * 10)
     m = iter(["m"] * 10)
-    out = list(AnimePackGenerator._merge_streams([(a, 3), (m, 1)]))[:8]
+    out = list(AnimePackGenerator._merge_streams(
+        [("anime", a, 3), (MANGA_KIND, m, 1)]))[:8]
     assert out.count("a") == 6 and out.count("m") == 2
     # Иссякший поток просто выпадает из очереди.
-    out = list(AnimePackGenerator._merge_streams([(iter(["a"]), 1),
-                                                 (iter(["m", "m"]), 1)]))
+    out = list(AnimePackGenerator._merge_streams(
+        [("anime", iter(["a"]), 1), (MANGA_KIND, iter(["m", "m"]), 1)]))
     assert out.count("m") == 2 and out.count("a") == 1
+
+
+def test_a_closed_stream_is_not_asked_for_candidates():
+    """Набранная книжная доля закрывает поток книг: их карточки перестают
+    приезжать с Shikimori, а не приезжают, чтобы тут же быть выброшенными."""
+    closed = set()
+    books = iter(["m"] * 100)
+    out = []
+    for cand in AnimePackGenerator._merge_streams(
+            [("anime", iter(["a"] * 3), 1), (MANGA_KIND, books, 1)], closed):
+        out.append(cand)
+        if cand == "m":
+            closed.add(MANGA_KIND)
+    # После закрытия книги больше не спрашиваются, а когда кончилось и аниме,
+    # кандидаты кончаются — вместо того чтобы вычерпывать каталог книг.
+    assert out.count("m") == 1
+    assert out.count("a") == 3
+    assert len(list(books)) == 99

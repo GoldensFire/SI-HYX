@@ -434,7 +434,6 @@ def test_tab_holds_a_single_anime_page(upgrade_tab):
     убрали — осталась одна страница без видимой полосы вкладок."""
     assert list(upgrade_tab.pages) == ["anime"]
     assert upgrade_tab.pages["anime"].collect().profile == "anime"
-    assert upgrade_tab.current_profile == "anime"
     assert upgrade_tab.current_page is upgrade_tab.pages["anime"]
 
 

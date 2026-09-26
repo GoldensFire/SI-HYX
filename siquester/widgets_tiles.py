@@ -235,45 +235,6 @@ class _TileDropArea(QWidget):
 
         return press, move, release, dbl
 
-    def reorder_tile(self, price: int, new_idx: int):
-        """Move tile widget to new_idx in-place — no widget teardown.
-
-        new_idx is a tiles-list index (0-based, gap/plus/stretch not counted).
-        We need to translate it to the actual layout position for insertWidget().
-        """
-        tile = self._price_to_tile.get(price)
-        if tile is None: return
-        try:
-            old_idx = self._tiles.index(tile)
-        except ValueError:
-            return
-        if old_idx == new_idx: return
-
-        # Update _tiles list first
-        self._tiles.pop(old_idx)
-        clamped = max(0, min(new_idx, len(self._tiles)))
-        self._tiles.insert(clamped, tile)
-
-        # Rebuild layout order to match _tiles exactly.
-        # This is safer than computing an absolute layout position because
-        # the gap widget and plus/stretch items can be anywhere.
-        self._layout.removeWidget(tile)
-        # Find the layout position of _tiles[clamped+1] (next tile) and insert before it.
-        # If clamped is at the end, append before plus_tile/stretch.
-        if clamped < len(self._tiles) - 1:
-            next_tile = self._tiles[clamped + 1]
-            next_pos = self._layout.indexOf(next_tile)
-            self._layout.insertWidget(next_pos, tile)
-        else:
-            # Insert before plus_tile if present, else before stretch
-            if self._plus_tile is not None:
-                plus_pos = self._layout.indexOf(self._plus_tile)
-                self._layout.insertWidget(plus_pos, tile)
-            else:
-                # Before stretch (last item)
-                count = self._layout.count()
-                self._layout.insertWidget(max(0, count - 1), tile)
-
     def repopulate(self, questions: list, has_siq: bool):
         """Replace tiles with new question data — cheaper than full _rebuild_content.
         The drop-area stays at the same (r_idx, t_idx) position so _drop_area_index

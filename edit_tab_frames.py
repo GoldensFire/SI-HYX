@@ -21,9 +21,7 @@
 # никаких новых зависимостей, см. SI-HYX.spec: PyAV намеренно исключён).
 # Плеер остаётся ровно тем, чем он хорош: непрерывным воспроизведением.
 
-import array
 import subprocess
-import sys
 import threading
 from collections import OrderedDict
 
@@ -173,7 +171,16 @@ class FramePrefetcher(QThread):
     # Сколько памяти отдаём под кэш кадров. 1080p RGB — ~6 МБ на кадр, так что
     # это ~20 кадров FullHD или ~5 кадров 4K.
     BUDGET_BYTES = 128 * 1024 * 1024
-    MAX_WINDOW = 12                      # кадров за один запуск ffmpeg
+    MAX_WINDOW = 24                      # кадров за один ЗАКАЗ (см. request)
+    # Верхний предел одного запуска ffmpeg. Запуск не заканчивается на окне
+    # заказа: пока пользователь идёт кадрами ВПЕРЁД, тот же процесс просто
+    # продолжает отдавать следующие кадры (см. _decode_run) — один seek и одна
+    # раскрутка GOP на всю серию удержания вместо новых каждые MAX_WINDOW
+    # кадров. Предел нужен, чтобы забытый процесс не декодировал весь фильм.
+    MAX_RUN = 600
+    # Насколько далеко впереди плейхеда держим декодированный запас. Больше
+    # этого убегать незачем: кадры всё равно вытеснит _trim_cache.
+    RUN_LEAD = 24
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -323,12 +330,19 @@ class FramePrefetcher(QThread):
             return
         # Больше, чем влезает в бюджет памяти, декодировать бессмысленно —
         # хвост окна вытеснил бы его же начало.
-        count = max(1, min(int(count), max(3, self.BUDGET_BYTES // max(1, w * h * 3))))
+        budget = max(3, self.BUDGET_BYTES // max(1, w * h * 3))
+        count = max(1, min(int(count), budget))
+        # Процесс запускаем с ЗАПАСОМ по кадрам, а останавливаем по делу (см.
+        # цикл ниже): пока пользователь держит стрелку вправо, тот же ffmpeg
+        # продолжает отдавать следующие кадры — без нового seek'а и без новой
+        # раскрутки GOP, которая на длинных GOP (аниме-BDRip, 250+ кадров
+        # между ключевыми) и стоила всю задержку.
+        run_cap = max(count, min(self.MAX_RUN, budget + self.RUN_LEAD))
         ss = max(0.0, (first - 0.25) / fps)
         cmd = [FFMPEG, "-nostdin", "-loglevel", "error",
                "-probesize", "8M", "-analyzeduration", "2M",
                "-ss", f"{ss:.4f}", "-i", str(src),
-               "-frames:v", str(int(count)), "-an", "-sn",
+               "-frames:v", str(int(run_cap)), "-an", "-sn",
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
         frame_bytes = w * h * 3
         try:
@@ -338,11 +352,30 @@ class FramePrefetcher(QThread):
         except Exception:
             return
         self._proc = proc
+        end = first + count
         with self._cond:
-            self._running = (first, first + count)
+            self._running = (first, end)
         try:
             idx = first
             while not self._stop and gen == self._gen:
+                if idx >= end:
+                    # Заказ выполнен. Если плейхед всё это время ШЁЛ ВПЕРЁД
+                    # (ушёл от начала окна) и уже подобрался к его концу — не
+                    # бросаем процесс, а продлеваем: следующие кадры достаются
+                    # даром. Если плейхед стоит на месте (одиночный шаг) —
+                    # заканчиваем, лишнего не декодируем.
+                    center = self._center
+                    if not (first < center < idx + self.RUN_LEAD
+                            and idx - center < self.RUN_LEAD
+                            and idx < first + run_cap):
+                        break
+                    end = min(first + run_cap, center + self.RUN_LEAD)
+                    with self._cond:
+                        # Пока окно живёт, request() не должен его перебивать
+                        # (см. проверку _running там же).
+                        self._running = (first, end)
+                    if idx >= end:
+                        break
                 buf = proc.stdout.read(frame_bytes)
                 if not buf or len(buf) < frame_bytes:
                     break
@@ -371,216 +404,9 @@ class FramePrefetcher(QThread):
             if self._proc is proc:
                 self._proc = None
             with self._cond:
-                if self._running == (first, first + count):
+                if self._running is not None and self._running[0] == first:
                     self._running = None
 
-
-# ── Звук покадрового шага ────────────────────────────────────────────────────
-class AudioScrubber(QThread):
-    """Короткий звук покадрового шага — ровно с pts кадра, как в монтажках.
-
-    Почему не отдельным QMediaPlayer, как было раньше. Замерено на живом файле
-    щупом QAudioBufferOutput:
-      • первый аудиобуфер после его перемотки приходит через 140–160 мс — звук
-        отставал от картинки на восьмую долю секунды;
-      • перематывается он по границе аудиопакета (у AAC это ~21 мс), а кадр при
-        60 fps — 16.7 мс: шаг на ОДИН кадр звук вообще не двигал, звучал тот же
-        самый кусок;
-      • оборвать его вовремя нечем: за 400 мс «блипа» плеер успевал проиграть
-        БОЛЬШЕ СЕКУНДЫ исходника, и следующий шаг начинал звук заметно раньше
-        того места, до которого доиграл предыдущий, — то самое «звук уезжает
-        вперёд, а потом пятится назад».
-
-    Поэтому звук берём сами: окно PCM вокруг плейхеда декодирует фоновый ffmpeg
-    (8 секунд — 80 мс работы, замерено), а шаг играет из него ТОЧНЫЙ срез через
-    QAudioSink (звук идёт через 1–9 мс после записи в устройство). Точность
-    среза даёт input `-ss`: для PCM он сэмпл-точен — проверено побайтовым
-    сравнением перекрывающихся окон.
-    """
-
-    ready = pyqtSignal()             # окно PCM готово (можно играть)
-
-    WINDOW_S = 8.0                   # длина окна PCM
-    LEAD_S = 2.5                     # сколько окна лежит ДО плейхеда
-    MARGIN_S = 0.75                  # ближе этого к краю окна — пора перекачивать
-    MAX_FAILS = 2                    # столько пустых декодов = «звука нет»
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._cond = threading.Condition()
-        self._lock = threading.Lock()
-        self._src = None
-        self._stream = "a:0"         # -map 0:<это>: «a:0» или абсолютный индекс
-        self._rate = 48000
-        self._channels = 2
-        self._sample_bytes = 2
-        self._fmt = "s16le"
-        self._want = None            # заказанное начало окна (с)
-        self._busy = None            # окно, которое декодируется прямо сейчас
-        self._win = None             # (начало_с, PCM-байты)
-        self._fails = 0              # подряд неудачных декодов (нет дорожки?)
-        self._stop = False
-        self._proc = None
-
-    # ── публичный API (главный поток) ────────────────────────────────────────
-    def configure(self, rate, channels, sample_bytes):
-        """Формат PCM. Обязан совпадать с форматом QAudioSink — иначе звук
-        поедет по скорости и тону."""
-        with self._cond:
-            self._rate = max(8000, int(rate or 48000))
-            self._channels = max(1, int(channels or 2))
-            self._sample_bytes = 4 if int(sample_bytes or 2) == 4 else 2
-            self._fmt = "f32le" if self._sample_bytes == 4 else "s16le"
-        with self._lock:
-            self._win = None
-
-    def set_source(self, path, stream="a:0"):
-        with self._lock:
-            self._win = None
-        with self._cond:
-            self._src = str(path) if path else None
-            self._stream = str(stream or "a:0")
-            self._want = None
-            self._busy = None
-            self._fails = 0
-        self._kill_proc()
-
-    def source(self):
-        with self._cond:
-            return (self._src, self._stream)
-
-    def frame_bytes(self):
-        return self._sample_bytes * self._channels
-
-    def request(self, t_s):
-        """Заказать окно PCM вокруг t_s, если текущего не хватает."""
-        t_s = max(0.0, float(t_s or 0.0))
-        with self._lock:
-            win = self._win
-        if win is not None:
-            start, buf = win
-            end = start + len(buf) / float(self.frame_bytes() * self._rate)
-            if (t_s >= start or start <= 0.0) and t_s <= end - self.MARGIN_S:
-                return
-        want = max(0.0, t_s - self.LEAD_S)
-        with self._cond:
-            if self._src is None or self._fails >= self.MAX_FAILS:
-                return           # у файла просто нет звука — не гоняем ffmpeg
-            if self._busy is not None and abs(self._busy - want) < 0.05:
-                return           # ровно это окно уже декодируется
-            self._want = want
-            self._cond.notify()
-
-    def slice_at(self, t_s, dur_s, fade_s=0.003):
-        """PCM-срез [t_s, t_s+dur_s) из готового окна (None — окна ещё нет).
-        Края приглушены: без этого на стыке срезов слышен щелчок."""
-        with self._lock:
-            win = self._win
-        if win is None:
-            return None
-        start, buf = win
-        fb = self.frame_bytes()
-        off = int(round((float(t_s) - start) * self._rate)) * fb
-        if off < 0 or off >= len(buf):
-            return None
-        n = max(fb, int(round(max(0.0, float(dur_s)) * self._rate)) * fb)
-        chunk = buf[off:off + n]
-        if len(chunk) < fb * 8:
-            return None
-        return self._faded(chunk, fade_s)
-
-    def stop(self):
-        with self._cond:
-            self._stop = True
-            self._want = None
-            self._cond.notify()
-        self._kill_proc()
-
-    # ── внутреннее ───────────────────────────────────────────────────────────
-    def _faded(self, data, fade_s):
-        code = "f" if self._sample_bytes == 4 else "h"
-        try:
-            a = array.array(code)
-            a.frombytes(data)
-        except Exception:
-            return data
-        if sys.byteorder == "big":
-            a.byteswap()             # ffmpeg отдаёт little-endian
-        ch = max(1, self._channels)
-        total = len(a) // ch
-        n = min(int(max(0.0, fade_s) * self._rate), total // 2)
-        if n <= 0:
-            return data
-        is_int = (code == "h")
-        for i in range(n):
-            g = (i + 1) / float(n + 1)
-            for c in range(ch):
-                k = i * ch + c
-                j = (total - 1 - i) * ch + c
-                if is_int:
-                    a[k] = int(a[k] * g)
-                    a[j] = int(a[j] * g)
-                else:
-                    a[k] = a[k] * g
-                    a[j] = a[j] * g
-        if sys.byteorder == "big":
-            a.byteswap()
-        return a.tobytes()
-
-    def _kill_proc(self):
-        p = self._proc
-        if p is not None:
-            try:
-                p.kill()
-            except Exception:
-                pass
-
-    def run(self):
-        while True:
-            with self._cond:
-                while self._want is None and not self._stop:
-                    self._cond.wait()
-                if self._stop:
-                    return
-                want = self._want
-                self._want = None
-                src, stream = self._src, self._stream
-                rate, ch, fmt = self._rate, self._channels, self._fmt
-                self._busy = want
-            data = self._decode(src, stream, want, rate, ch, fmt) if src else None
-            with self._cond:
-                self._busy = None
-                # Пусто — скорее всего у файла нет звуковой дорожки (картинка,
-                # немое видео). Пара попыток, и перестаём звать ffmpeg на каждый
-                # шаг: иначе удержание клавиши запускало бы его без конца.
-                self._fails = 0 if data else (self._fails + 1)
-            if data:
-                with self._lock:
-                    self._win = (want, data)
-                self.ready.emit()
-
-    def _decode(self, src, stream, start, rate, ch, fmt):
-        cmd = [FFMPEG, "-nostdin", "-loglevel", "error",
-               "-ss", f"{start:.6f}", "-i", str(src),
-               "-t", f"{self.WINDOW_S:.3f}",
-               "-vn", "-sn", "-map", f"0:{stream}",
-               "-f", fmt, "-ar", str(rate), "-ac", str(ch), "-"]
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL,
-                                    creationflags=CREATE_NO_WINDOW)
-        except Exception:
-            return None
-        self._proc = proc
-        try:
-            out, _ = proc.communicate(timeout=25)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            out = None
-        finally:
-            if self._proc is proc:
-                self._proc = None
-        return out or None
+# Звук покадрового шага живёт отдельным файлом (см. edit_tab_audio_scrub.py);
+# здесь он только реэкспортируется, чтобы прежние импорты не менялись.
+from edit_tab_audio_scrub import AudioScrubber      # noqa: E402,F401

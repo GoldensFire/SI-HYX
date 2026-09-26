@@ -117,22 +117,37 @@ def test_clear_frame_resets_frame_clock(canvas):
 
 
 # ── _clock_pos_s: время интерфейса на паузе ──────────────────────────────────
-def _stub_tab(canvas, pos_ms):
+def _stub_tab(canvas, pos_ms, grid=None, frame_idx=None):
     from PyQt6.QtMultimedia import QMediaPlayer
     return SimpleNamespace(
         player=SimpleNamespace(
             position=lambda: pos_ms,
             playbackState=lambda: QMediaPlayer.PlaybackState.PausedState),
         video_widget=canvas,
-        video_stream_index=0)
+        video_stream_index=0,
+        _grid=grid,
+        _frame_idx=frame_idx)
 
 
 def test_clock_falls_back_to_player_when_pin_has_no_frame(canvas):
     """Тот самый баг: после клика по волне плеер УЖЕ на 115 c, а интерфейс брал
-    pts кадра прошлого файла (350 c) — полоска улетала в конец волны."""
+    pts кадра прошлого файла (350 c) — полоска улетала в конец волны.
+    Сетки кадров нет (аудио/битые метаданные) → ведём время по плееру."""
     canvas.set_exact_frame(_frame_img(), (0, 10 ** 12), 350_000_000)
     canvas.arm_frame_pin((115_000_000, 115_100_000))
     st = _stub_tab(canvas, 115_040)
+    assert EditTab._clock_pos_s(st) == pytest.approx(115.04)
+
+
+def test_clock_uses_frame_index_on_pause_before_exact_frame(canvas):
+    """Точный кадр ещё едет из предекодера, а плеер на паузе живёт по аудио-
+    часам и отличается от показанного кадра. Истина на паузе — номер кадра:
+    иначе жёлтая полоса после остановки прыгала бы вперёд (позиция плеера), а
+    потом назад (приехавший кадр)."""
+    canvas.set_exact_frame(_frame_img(), (0, 10 ** 12), 350_000_000)
+    canvas.arm_frame_pin((115_000_000, 115_100_000))
+    grid = edit_tab.FrameGrid(25.0, 200.0)
+    st = _stub_tab(canvas, 115_090, grid=grid, frame_idx=grid.index_at(115.04))
     assert EditTab._clock_pos_s(st) == pytest.approx(115.04)
 
 

@@ -8,7 +8,16 @@ dist/
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Внешние бинарники (большие, кладутся в релиз-архив, не в репозиторий)
 bin/
@@ -45,3 +54,19 @@ GRAPH_REPORT.md
 
 # Временные файлы сторонних утилит (ab-av1 и т.п.)
 .ab-av1-*/
+
+# Локальные настройки и рабочие копии ИИ-агентов (Claude Code и др.)
+.claude/
+
+# Временные папки ручных проверок (.tmp_pixiv_live_check и т.п.)
+.tmp*/
+*.tmp
+*.bak
+
+# Редакторы и ОС
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

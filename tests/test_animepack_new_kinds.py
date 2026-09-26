@@ -198,8 +198,8 @@ def test_pixel_filter_walks_blocks_down_over_the_clip():
     vf = gen.pixel_filter()
     assert vf.startswith(f"scale=-2:{animepack.PIXEL_HEIGHT},")
     # Три ступени: два блочных окна по две секунды и «чётко» в конце.
-    assert "pixelize=w=32:h=32:enable='between(t,0.000,2.000)'" in vf
-    assert "pixelize=w=6:h=6:enable='between(t,2.000,4.000)'" in vf
+    assert "pixelize=w=32:h=32:enable='between(t,0.000,1.950)'" in vf
+    assert "pixelize=w=6:h=6:enable='between(t,1.950,3.950)'" in vf
     assert "between(t,4.000,6.000)" not in vf
 
 
@@ -213,6 +213,8 @@ def test_pixel_question_is_a_video_item():
     ns = {"s": animepack.SIQ_NS}
     item = root.find(".//s:param[@name='question']/s:item", ns)
     assert item.get("type") == "video" and item.get("isRef") == "True"
+    # Добавочных секунд после ролика нет (просьба пользователя): вопрос длится
+    # ровно столько же, сколько сам файл.
     assert item.get("duration") == "00:00:08"
     assert item.text == cand.video_out
 
@@ -272,122 +274,6 @@ def test_strip_wikitext_leaves_sentences_and_headings():
     assert "Infobox" not in out and "ref" not in out and "File:" not in out
     assert "==Summary==" in out
     assert "Герой встречает врага." in out
-
-
-# ── Сюжет: вопрос от модели ──────────────────────────────────────────────────
-class FakeGemini:
-    """Заглушка GeminiClient: отдаёт заранее заданный ответ."""
-
-    def __init__(self, answer):
-        self.answer = answer
-        self.prompts = []
-
-    def generate_json(self, prompt, schema, temperature=0.0):
-        self.prompts.append(prompt)
-        return self.answer
-
-
-def test_plot_question_hides_the_title_from_the_text():
-    client = FakeGemini({"ok": True,
-                         "question": "В «Death Note» герой находит тетрадь, "
-                                     "убивающую любого, чьё имя в неё вписано"})
-    text, answers = plot.make_question(
-        "Тетрадь смерти", "Пересказ серии " * 30, client,
-        names=["Death Note", "Тетрадь смерти"])
-    assert "Death Note" not in text and "Тетрадь" not in text
-    assert "герой находит" in text
-    assert answers == []          # отвечают названием тайтла
-
-
-def test_plot_detail_mode_returns_its_own_answers():
-    client = FakeGemini({"ok": True, "question": "Как зовут синигами?",
-                         "answer": "Рюк", "alt": ["Ryuk"]})
-    text, answers = plot.make_question("Тетрадь смерти", "Пересказ " * 60,
-                                       client, mode="detail")
-    assert text == "Как зовут синигами?" and answers == ["Рюк", "Ryuk"]
-    # Тайтл в таком вопросе называть можно — его не вычищают.
-    assert "Тетрадь смерти" in client.prompts[0]
-
-
-def test_plot_question_refuses_short_retellings():
-    client = FakeGemini({"ok": True, "question": "Что-то"})
-    assert plot.make_question("Тайтл", "Две строки.", client) == ("", [])
-    assert client.prompts == []          # запрос впустую не тратится
-
-
-def test_plot_question_honours_model_refusal():
-    client = FakeGemini({"ok": False, "question": ""})
-    assert plot.make_question("Тайтл", "Пересказ " * 60, client) == ("", [])
-
-
-class FakeFandom:
-    """Вики, у которой одна серия с пересказом и одна пустая заготовка."""
-
-    PAGES = {"Серия 1": "==Summary==\n" + "Герой идёт в поход. " * 20,
-             "Серия 2": "==Trivia==\nМелочь."}
-
-    def __init__(self):
-        self.asked = []
-
-    def find_wiki(self, names):
-        self.asked.append(list(names))
-        return "test.fandom.com"
-
-    def episode_pages(self, host):
-        return ["Серия 2", "Серия 1"]
-
-    def search(self, host, query, limit=0):
-        return []
-
-    def page_text(self, host, page):
-        return self.PAGES.get(page, "")
-
-    def plot_section(self, text):
-        return api.plot_section(text, api.FandomApi.PLOT_HEADINGS)
-
-
-def test_pick_plot_skips_pages_without_a_retelling():
-    got = plot.pick_plot(FakeFandom(), ["Test"], random.Random(0))
-    assert got["page"] == "Серия 1" and got["wiki"] == "test.fandom.com"
-    assert "Герой идёт в поход." in got["text"]
-
-
-def test_plot_question_lands_in_xml_without_a_spoken_answer():
-    """У вопроса по сюжету в ответе НЕТ устного текста (просьба пользователя):
-    ни адреса вики, ни названия тайтла ведущий не зачитывает."""
-    s = PackSettings(pct_songs=0, pack_plot=True, pct_plot=100,
-                     gemini_key="k", rounds=1, themes=1, questions=1)
-    cand = SongCandidate(song={}, anime=make_anime(), kind=PLOT_KIND)
-    cand.plot_question = "Герой находит тетрадь"
-    cand.plot_source = "deathnote.fandom.com, Episode 1"
-    root = ET.fromstring(build_content_xml([cand], s))
-    ns = {"s": animepack.SIQ_NS}
-    items = root.findall(".//s:param[@name='question']/s:item", ns)
-    assert [i.text for i in items] == [animepack.PLOT_TASK_TEXT,
-                                       "Герой находит тетрадь"]
-    spoken = [i.text or "" for i in
-              root.findall(".//s:param[@name='answer']/s:item", ns)
-              if i.get("placement") == "replic"]
-    assert spoken == []
-
-
-def test_plot_detail_answers_replace_the_title_in_xml():
-    s = PackSettings(pct_songs=0, pack_plot=True, pct_plot=100,
-                     plot_mode="detail", gemini_key="k",
-                     rounds=1, themes=1, questions=1)
-    cand = SongCandidate(song={}, anime=make_anime(), kind=PLOT_KIND)
-    cand.plot_question = "Как зовут синигами?"
-    cand.plot_answers = ["Рюк", "Ryuk"]
-    root = ET.fromstring(build_content_xml([cand], s))
-    ns = {"s": animepack.SIQ_NS}
-    assert [a.text for a in root.findall(".//s:right/s:answer", ns)] == ["Рюк",
-                                                                        "Ryuk"]
-    # Устного текста в ответе у вопросов по сюжету нет вовсе — ни названия
-    # тайтла, ни ссылки на вики (просьба пользователя).
-    spoken = [i.text or "" for i in
-              root.findall(".//s:param[@name='answer']/s:item", ns)
-              if i.get("placement") == "replic"]
-    assert spoken == []
 
 
 # ── Доли, квоты и проверки настроек ──────────────────────────────────────────
@@ -529,7 +415,7 @@ def test_anagram_and_pixel_pack_end_to_end(tmp_path, monkeypatch):
                                                ["completed"])])
     # Названия нарочно РАЗНЫЕ: тайтлы с общим корнем имени генератор считает
     # частями одной серии и в один пак не пускает.
-    animes = [make_anime(malId=i, id=i, franchise=f"fr{i}", russian=title,
+    animes = [make_anime(malId=i, id=i, franchise=f"fr{i}", russian=title, related=[],
                          english=title, name=title)
               for i, title in ((1, "Тетрадь смерти"), (2, "Стальной алхимик"))]
     gen = _pack_generator(s, animes, tmp_path)

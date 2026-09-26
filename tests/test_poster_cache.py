@@ -41,6 +41,16 @@ def test_no_key_no_cache():
     assert poster_cache.put("", b"x") == "" and poster_cache.find("") == (b"", "")
 
 
+def test_cache_lists_and_removes_one_poster(tmp_path):
+    path = poster_cache.put(poster_cache.anime_key(42), b"image", ".jpg")
+    rows = poster_cache.entries()
+    assert [row["path"] for row in rows] == [path]
+    assert rows[0]["name"] == "anime_42.jpg"
+    assert poster_cache.remove(str(tmp_path / "outside.jpg")) is False
+    assert poster_cache.remove(path) is True
+    assert poster_cache.stats() == (0, 0)
+
+
 def test_prune_drops_the_oldest_first():
     for num in range(1, 6):
         poster_cache.put(poster_cache.anime_key(num), b"x" * 300_000, ".jpg")

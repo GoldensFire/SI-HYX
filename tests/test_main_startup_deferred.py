@@ -84,3 +84,70 @@ class TestReadonlySettings:
         w._save_timer.timeout.connect(lambda: fired.append(1))
         main.UnifiedWindow._save_settings_soon(w)
         assert w._save_timer.isActive() and fired == []
+
+
+class TestConsoleGap:
+    """Логи нового прогона отбиваются от прошлых пятью пустыми строками."""
+
+    def _console(self, qapp):
+        from PyQt6.QtWidgets import QTextEdit
+
+        class Window:
+            log = main.UnifiedWindow.log
+            log_gap = main.UnifiedWindow.log_gap
+
+        window = Window()
+        window.txt_log = QTextEdit()
+        return window
+
+    def test_gap_separates_two_runs(self, qapp):
+        window = self._console(qapp)
+        window.log("прошлый прогон")
+        window.log_gap()
+        window.log("новый прогон")
+        head, tail = window.txt_log.toPlainText().split("прошлый прогон")
+        assert tail.startswith("\n" * 6)          # свой перевод строки + пять
+
+    def test_an_empty_console_is_not_padded(self, qapp):
+        window = self._console(qapp)
+        window.log_gap()
+        assert window.txt_log.toPlainText() == ""
+
+    def test_the_gap_scrolls_the_console_to_the_bottom(self, qapp):
+        """Иначе окно выглядит пустым, пока его не прокрутят руками."""
+        window = self._console(qapp)
+        window.txt_log.resize(300, 60)
+        for i in range(80):
+            window.log(f"строка {i}")
+        window.log_gap()
+        window.log("новый прогон")
+        bar = window.txt_log.verticalScrollBar()
+        assert bar.value() == bar.maximum()
+
+
+class TestGlobalResult:
+    def test_result_button_tracks_a_created_file(self, qapp, tmp_path):
+        from PyQt6.QtWidgets import QProgressBar, QToolButton
+
+        result = tmp_path / "ready.mp4"
+        result.write_bytes(b"video")
+        bar = QProgressBar()
+        bar.resize(300, 22)
+        button = QToolButton(bar)
+        button.setText("")
+        button.setFixedSize(20, 20)
+        window = _FakeWindow(btn_open_progress=button,
+                             pbar=bar, _global_result_path="")
+        main.UnifiedWindow._position_progress_button(window)
+        assert button.parent() is bar
+        assert button.text() == ""
+        assert button.pos().x() == 279
+        assert button.pos().y() == 1
+
+        main.UnifiedWindow.set_global_result(window, str(result))
+        assert button.isEnabled()
+        assert window._global_result_path == str(result.resolve())
+        assert str(result.resolve()) in button.toolTip()
+
+        main.UnifiedWindow.set_global_result(window, "")
+        assert not button.isEnabled()

@@ -8,7 +8,7 @@
 # tools/check_hygiene.py — быстрые проверки, которые тесты поймать не могут.
 # Гоняется в CI (.github/workflows/tests.yml) и локально: python tools/check_hygiene.py
 #
-# Проверок три, и каждая закрывает проблему, которая уже случалась в этом
+# Проверки закрывают проблемы, которые уже случались в этом
 # проекте — это не абстрактные правила стиля:
 #
 #   1) star-импорты. Пока в модуле есть `from X import *`, pyflakes не может
@@ -22,14 +22,19 @@
 #
 #   3) голые except. Ловят KeyboardInterrupt и SystemExit — из-за этого разбор
 #      тяжёлого .siq нельзя было прервать.
+#   4) большие файлы. Предел 600 строк / 40 КиБ удерживает стоимость контекста
+#      для локальной правки; новые каталоги и ещё не добавленные в git файлы включены.
 import ast
-import glob
 import os
 import subprocess
 import sys
 
+if __package__:
+    from .check_file_sizes import check_file_sizes, source_files
+else:
+    from check_file_sizes import check_file_sizes, source_files
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PATTERNS = ("*.py", "siquester/*.py", "tests/*.py", "tools/*.py")
 
 # Функции, у которых текстовый режим тянет кодировку из локали.
 _TEXT_CALLS = ("subprocess.run", "subprocess.Popen", "subprocess.check_output",
@@ -37,14 +42,25 @@ _TEXT_CALLS = ("subprocess.run", "subprocess.Popen", "subprocess.check_output",
 
 
 def _sources():
-    files = set()
-    for p in PATTERNS:
-        files |= set(glob.glob(os.path.join(ROOT, p)))
-    return sorted(files)
+    return [str(path) for path in source_files(ROOT) if path.suffix == '.py']
 
 
 def _rel(p):
     return os.path.relpath(p, ROOT).replace("\\", "/")
+
+
+def _chunks(paths, limit=20000):
+    """Пачки путей для одного вызова: командная строка Windows не длиннее
+    32 767 символов, а файлов в проекте набралось больше, чем в неё влезает."""
+    chunk, size = [], 0
+    for path in paths:
+        if chunk and size + len(path) + 1 > limit:
+            yield chunk
+            chunk, size = [], 0
+        chunk.append(path)
+        size += len(path) + 1
+    if chunk:
+        yield chunk
 
 
 def check_imports(files):
@@ -52,9 +68,11 @@ def check_imports(files):
     неиспользуемые локальные переменные проверку НЕ валят — это шум."""
     # Пути относительные и cwd=ROOT — чтобы вывод pyflakes выглядел так же,
     # как у остальных проверок, а не абсолютными путями с чужой машины.
-    out = subprocess.run([sys.executable, "-m", "pyflakes", *(_rel(f) for f in files)],
-                         cwd=ROOT, capture_output=True, text=True,
-                         encoding="utf-8", errors="replace").stdout
+    out = ""
+    for chunk in _chunks([_rel(f) for f in files]):
+        out += subprocess.run([sys.executable, "-m", "pyflakes", *chunk],
+                              cwd=ROOT, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace").stdout
     return [ln for ln in out.splitlines()
             if "undefined name" in ln or "star imports" in ln
             or "unable to detect undefined names" in ln]
@@ -112,7 +130,8 @@ def main():
     failed = False
     for title, fn in (("Импорты (pyflakes)", check_imports),
                       ("Явная кодировка", check_encoding),
-                      ("Голые except", check_bare_except)):
+                      ("Голые except", check_bare_except),
+                      ("Размер файлов", lambda _: check_file_sizes(source_files(ROOT)))):
         problems = fn(files)
         if problems:
             failed = True
