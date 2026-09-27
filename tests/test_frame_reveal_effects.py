@@ -8,7 +8,6 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageStat
 from frame_reveal import ANIMATED_EFFECTS, EFFECT_LABELS, LEGACY_EFFECTS, RevealRenderer
 
 NEW = [k for k in EFFECT_LABELS if k not in LEGACY_EFFECTS]
-MASKS = ("holes", "spots", "blots")
 
 
 @pytest.fixture
@@ -62,28 +61,6 @@ def test_more_strength_hides_more(picture, effect):
     light = RevealRenderer(picture, effect, strength=10, seed=3).render(0)
     hard = RevealRenderer(picture, effect, strength=100, seed=3).render(0)
     assert shape_error(picture, hard) > shape_error(picture, light)
-
-
-@pytest.mark.parametrize("effect", MASKS)
-@pytest.mark.parametrize("seed", [1, 2, 10])
-def test_mask_openings_never_close(picture, effect, seed):
-    original = picture.tobytes()
-    previous = None
-    for frame in stages(picture, effect, seed=seed):
-        data = frame.tobytes()
-        visible = {i for i in range(0, len(data), 3) if data[i:i + 3] == original[i:i + 3]}
-        if previous is not None:
-            assert previous < visible
-        previous = visible
-    assert len(previous) == picture.width * picture.height
-
-
-@pytest.mark.parametrize("effect", MASKS)
-def test_masks_start_almost_closed(effect):
-    picture = Image.new("RGB", (640, 360), "white")
-    frame = RevealRenderer(picture, effect, seed=4).render(0)
-    white = frame.convert("L").histogram()[255] / (640 * 360)
-    assert 0.02 < white < 0.12
 
 
 def _pieces_home(renderer, picture, progress):

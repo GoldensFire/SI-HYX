@@ -102,6 +102,8 @@ def __init__(self, settings: _api.PackSettings, *,
                 self.gemini_manga = _client(
                     str(getattr(settings, "manga_gemini_model", "") or "")
                     or settings.gemini_model, "minimal")
+    from .visual_batch import initialize as initialize_visual_batches
+    initialize_visual_batches(self)
     self.jimaku = jimaku
     if settings.mix_shares.get(_api.DIALOGUE_KIND) and self.jimaku is None:
         key = str(getattr(settings, "jimaku_key", "") or "").strip()

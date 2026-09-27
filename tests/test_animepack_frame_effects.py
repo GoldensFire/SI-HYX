@@ -12,6 +12,16 @@ from frame_reveal import EFFECT_LABELS, LEGACY_EFFECTS
 NEW = [k for k in EFFECT_LABELS if k not in LEGACY_EFFECTS]
 
 
+@pytest.mark.parametrize("effect", ["holes", "spots", "blots"])
+def test_removed_dot_effects_are_migrated_out_of_saved_settings(effect):
+    assert effect not in EFFECT_LABELS
+    settings = PackSettings.from_dict({"frame_effect": effect,
+                                      "frame_effects": [effect, "tiles"],
+                                      "frame_effects_known": list(EFFECT_LABELS)})
+    assert settings.frame_effect == "pixelize"
+    assert settings.frame_effects == ["tiles"]
+
+
 @pytest.fixture
 def tab(qapp):
     from animepack_tab import AnimePackTab

@@ -23,9 +23,6 @@ EFFECT_LABELS = {
     "thumbnail": "Миниатюра",
     "puzzle": "Пазл — вразнобой",
     "puzzle_center": "Пазл — от центра",
-    "holes": "Появление точек",
-    "spots": "Расширение точек",
-    "blots": "Чёрные пятна",
     "dvd": "DVD-заставка",
 }
 EFFECT_HINTS = {
@@ -42,9 +39,6 @@ EFFECT_HINTS = {
     "thumbnail": "Крошечная миниатюра посреди чёрного экрана растёт до полного кадра.",
     "puzzle": "Куски кадра перемешаны и встают на место в случайном порядке.",
     "puzzle_center": "Куски кадра перемешаны и встают на место от центра к краям.",
-    "holes": "Чёрный экран: одно за другим появляются круглые отверстия в кадр.",
-    "spots": "Видны лишь маленькие круглые участки; они растут и сливаются.",
-    "blots": "Кадр закрыт чёрными кляксами; они сжимаются и исчезают.",
     "dvd": ("Чёрный экран, по нему летает прямоугольник, как логотип на "
             "заставке DVD, и расчищает кадр там, где пролетел; к концу "
             "времени улетает за край, необлетённое остаётся чёрным. Движется плавно, 30 или 60 кадров в секунду. Можно указать "
@@ -62,9 +56,6 @@ _EXTERNAL = {
     "thumbnail": ("frame_reveal_layout", "ThumbnailReveal"),
     "puzzle": ("frame_reveal_layout", "PuzzleReveal"),
     "puzzle_center": ("frame_reveal_layout", "PuzzleReveal"),
-    "holes": ("frame_reveal_masks", "HolesReveal"),
-    "spots": ("frame_reveal_masks", "SpotsReveal"),
-    "blots": ("frame_reveal_masks", "BlotsReveal"),
     "dvd": ("frame_reveal_dvd", "DvdReveal"),
 }
 # Эффекты, которые кодируются покадровой анимацией (30/60 к/с), а не
@@ -76,7 +67,8 @@ LEGACY_EFFECTS = ("pixelize", "tiles", "window", "zoom")
 # Эффекты, которые убраны по просьбе пользователя (не понравились). Старые
 # настройки с ними читаются: одиночный выбор уходит в пикселизацию, а из
 # списка случайного выбора они просто выпадают.
-REMOVED_EFFECTS = ("sketch", "blur", "palette", "noise", "stretch")
+REMOVED_EFFECTS = ("sketch", "blur", "palette", "noise", "stretch",
+                   "holes", "spots", "blots")
 
 
 def clean_effects(value) -> list[str]:

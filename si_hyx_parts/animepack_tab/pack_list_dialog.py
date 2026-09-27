@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import os
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QLineEdit, QPlainTextEdit, QPushButton, QVBoxLayout,
+    QListWidgetItem, QLineEdit, QMenu, QPlainTextEdit, QPushButton, QVBoxLayout,
 )
 
 from utils import reveal_in_explorer
@@ -29,7 +30,8 @@ class IncludedPacksDialog(QDialog):
         self.list = QListWidget()
         self.list.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.list.itemDoubleClicked.connect(self._reveal)
+        self.list.itemDoubleClicked.connect(self._open)
+        self._install_menu(self.list)
         self.list.itemSelectionChanged.connect(self._refresh_buttons)
         layout.addWidget(self.list, 1)
         if self._search_questions:
@@ -42,7 +44,8 @@ class IncludedPacksDialog(QDialog):
             layout.addWidget(self.search_label)
             self.results = QListWidget()
             self.results.currentItemChanged.connect(self._show_result)
-            self.results.itemDoubleClicked.connect(self._reveal_result)
+            self.results.itemDoubleClicked.connect(self._open)
+            self._install_menu(self.results)
             layout.addWidget(self.results, 1)
             self.details = QPlainTextEdit()
             self.details.setReadOnly(True)
@@ -54,12 +57,15 @@ class IncludedPacksDialog(QDialog):
         self.add_btn.clicked.connect(self._choose_files)
         self.remove_btn = QPushButton("Убрать выбранные")
         self.remove_btn.clicked.connect(self._remove_selected)
+        self.open_btn = QPushButton("Открыть пак")
+        self.open_btn.clicked.connect(lambda: self._open(self.list.currentItem()))
         self.reveal_btn = QPushButton("Показать в папке")
         self.reveal_btn.clicked.connect(self._reveal_selected)
         close = QPushButton("Закрыть")
         close.clicked.connect(self.close)
         row.addWidget(self.add_btn)
         row.addWidget(self.remove_btn)
+        row.addWidget(self.open_btn)
         row.addWidget(self.reveal_btn)
         row.addStretch(1)
         row.addWidget(close)
@@ -119,15 +125,48 @@ class IncludedPacksDialog(QDialog):
         selected = bool(self.list.selectedItems())
         self.remove_btn.setEnabled(selected)
         self.reveal_btn.setEnabled(selected)
+        self.open_btn.setEnabled(os.path.isfile(self._item_path(self.list.currentItem())))
+
+    @staticmethod
+    def _item_path(item) -> str:
+        value = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return str(value.get("path") or "") if isinstance(value, dict) else str(value or "")
+
+    def _open(self, item):
+        path = self._item_path(item)
+        if not os.path.isfile(path):
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.abspath(path))):
+            from msgbox import msgbox_warning
+            msgbox_warning(self, "Открыть пак",
+                           "Не удалось открыть пак. Назначьте приложение для файлов .siq.")
+
+    def _install_menu(self, view):
+        view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        view.customContextMenuRequested.connect(
+            lambda pos: self._context_menu(view, pos))
+
+    def _item_menu(self, view, item):
+        menu = QMenu(view)
+        action = menu.addAction("Открыть пак", lambda: self._open(item))
+        action.setEnabled(os.path.isfile(self._item_path(item)))
+        menu.addAction("Показать в папке", lambda: self._reveal(item))
+        return menu
+
+    def _context_menu(self, view, pos):
+        item = view.itemAt(pos)
+        if item is None:
+            return
+        menu = self._item_menu(view, item)
+        menu.exec(view.viewport().mapToGlobal(pos))
+        menu.deleteLater()
 
     def _reveal_selected(self):
         self._reveal(self.list.currentItem())
 
-    @staticmethod
-    def _reveal(item):
-        if item is None:
-            return
-        path = str(item.data(Qt.ItemDataRole.UserRole) or "")
+    @classmethod
+    def _reveal(cls, item):
+        path = cls._item_path(item)
         if path:
             reveal_in_explorer(path)
 
@@ -168,12 +207,6 @@ class IncludedPacksDialog(QDialog):
         lines.append("Использовано: " + (", ".join(row["used"]) or "текст"))
         lines.append("Ответы: " + ("; ".join(row["answers"]) or "не указаны"))
         self.details.setPlainText("\n".join(lines))
-
-    @staticmethod
-    def _reveal_result(item):
-        row = item.data(Qt.ItemDataRole.UserRole) if item else None
-        if isinstance(row, dict) and row.get("path"):
-            reveal_in_explorer(row["path"])
 
 
 def show_included_packs(parent, title: str, paths: list[str], start_dir: str,

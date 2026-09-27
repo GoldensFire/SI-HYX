@@ -426,17 +426,15 @@ def test_the_table_opens_in_its_own_window(tab, qapp):
 
 
 def test_the_pack_group_stays_put_next_to_the_buttons(tab, qapp):
-    """«Пак» и полоса запуска — одна неподвижная колонка справа.
-
-    Раньше «Пак» ехал вместе с остальными настройками и уезжал за край при
-    прокрутке, а кнопки стояли отдельно под ними (просьба пользователя)."""
+    """«Пак» и кнопки — одна колонка со своей прокруткой справа."""
     tab.resize(1600, 900)
     tab.show()
     qapp.processEvents()
     assert tab.pack_box.parentWidget() is tab.right_col
     assert tab.btn_start.window() is tab.window()
     assert tab.pack_box not in tab.settings_columns._groups
-    # Ни в каком окне прокрутки колонка не лежит — уехать ей некуда.
+    assert tab.scroll_pack.widget() is tab.right_col
+    # Левая и правая панели прокручиваются независимо.
     assert tab.scroll_settings.widget() is not tab.right_col
     assert not tab.right_col.isAncestorOf(tab.scroll_settings)
     fixed = tab.right_col.width()
@@ -454,9 +452,14 @@ def test_pack_actions_follow_pack_without_a_vertical_gap(tab):
     assert layout.itemAt(actions_index + 1).spacerItem() is not None
 
 
-def test_pack_counters_form_one_aligned_row(tab, qapp):
+@pytest.mark.parametrize("with_app_style", [False, True])
+@pytest.mark.parametrize("height", [600, 760])
+def test_pack_counters_form_one_aligned_row(tab, qapp, with_app_style, height):
     """Счётчики не разъезжаются и следующая подпись на них не налезает."""
-    tab.resize(1200, 760)
+    if with_app_style:
+        from config import STYLESHEET
+        tab.setStyleSheet(STYLESHEET + tab.styleSheet())
+    tab.resize(1200, height)
     tab.show()
     qapp.processEvents()
     fields = (tab.sp_rounds, tab.sp_themes, tab.sp_quest)
@@ -466,12 +469,39 @@ def test_pack_counters_form_one_aligned_row(tab, qapp):
     assert len(set(tops)) == 1
     assert max(widths) - min(widths) <= 1
     assert all(left.x() < right.x() for left, right in zip(fields, fields[1:]))
+    assert all(field.height() >= field.minimumSizeHint().height()
+               for field in fields)
+    for label in tab.pack_box.findChildren(animepack_tab.QLabel):
+        assert label.height() >= label.sizeHint().height()
+        assert all(not field.geometry().intersects(label.geometry())
+                   for field in fields)
     fields_bottom = max(
         field.mapTo(tab.pack_box, field.rect().bottomLeft()).y()
         for field in fields)
     next_label_top = tab.lbl_theme_title.mapTo(
         tab.pack_box, tab.lbl_theme_title.rect().topLeft()).y()
     assert fields_bottom < next_label_top
+
+
+def test_short_window_scrolls_to_the_bottom_of_the_pack_panel(tab, qapp):
+    """Низкое окно не сжимает настройки, до нижних кнопок можно прокрутить."""
+    from config import STYLESHEET
+    tab.setStyleSheet(STYLESHEET + tab.styleSheet())
+    tab.resize(1200, 420)
+    tab.show()
+    for _ in range(3):
+        qapp.processEvents()
+    assert tab.height() == 420
+    scroll = tab.scroll_pack
+    bar = scroll.verticalScrollBar()
+    assert bar.isVisible() and bar.maximum() > 0
+    assert scroll.horizontalScrollBar().maximum() == 0
+    assert tab.pack_box.geometry().bottom() < tab.actions_box.y()
+    bar.setValue(bar.maximum())
+    qapp.processEvents()
+    bottom = tab.lbl_credit.mapTo(scroll.viewport(),
+                                 tab.lbl_credit.rect().bottomRight())
+    assert scroll.viewport().rect().contains(bottom)
 
 
 def test_both_repeat_filters_have_a_full_pack_list(tab, qapp, tmp_path):

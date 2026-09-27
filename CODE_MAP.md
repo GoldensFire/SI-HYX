@@ -14,7 +14,7 @@ rg -n "^def process_media" si_hyx_parts/workers
 Раскрытие кадров аниме-пака: [frame_reveal.py](frame_reveal.py) — список эффектов и ступени;
 отдельные эффекты на numpy — [tone](frame_reveal_tone.py) (темнота, пересвет),
 [warp](frame_reveal_warp.py) (волны, полосы, спираль),
-[layout](frame_reveal_layout.py) (миниатюра, пазл), [masks](frame_reveal_masks.py) (точки, пятна);
+[layout](frame_reveal_layout.py) (миниатюра, пазл);
 [encode_reveal](si_hyx_parts/animepack/anime_pack_generator_encode_reveal.py) — кодирование;
 [frame_effect_controls](si_hyx_parts/animepack_tab/frame_effect_controls.py) — панель выбора.
 «DVD-заставка» — не ступени, а покадровая анимация 30 или 60 к/с:
@@ -30,6 +30,10 @@ Ctrl+F в консоли — [console_find_bar.py](si_hyx_parts/main/console_fin
 Ключ категории `pixel` и прежние настройки `pixel_*` сохранены для совместимости.
 
 ИИ-арты: [инструкция и карта модулей](docs/anime-ai-art.md).
+
+Проверки картинок Gemini: [visual_batch](si_hyx_parts/animepack/visual_batch.py)
+собирает до четырёх параллельных проверок Pixiv и манги с одинаковой моделью
+в один запрос; каждый вердикт сопоставляется со своей картинкой по id.
 
 Арты Pixiv: [pixiv_art_api.py](pixiv_art_api.py) — клиент и отбор;
 [pixiv_art_search.py](pixiv_art_search.py) — три источника выдачи;

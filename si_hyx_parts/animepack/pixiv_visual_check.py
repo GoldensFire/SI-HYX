@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import hashlib
 
+from .visual_batch import request
+
 
 SCHEMA = {
     "type": "object",
@@ -50,13 +52,14 @@ def check(generator, cand, data: bytes, ext: str, illust=None):
           "не раскрывающий название, допустимы. Оцени само изображение, а "
           "метки используй как дополнительное доказательство. Причину напиши "
           "кратко по-русски.")
-    mime = _mime(ext)
+    from .manga_visual_check import _prepare
+    mime, payload = _prepare(data, ext)
     parts = [
         {"type": "text", "text": prompt},
         {"type": "image", "mime_type": mime,
-         "data": base64.b64encode(data).decode("ascii")},
+         "data": base64.b64encode(payload).decode("ascii")},
     ]
-    verdict = client.generate_json(parts, SCHEMA, temperature=0.0)
+    verdict = request(generator, client, parts, SCHEMA)
     if not isinstance(verdict, dict):
         verdict = {"accept": False, "reason": "Gemini не вернула вердикт"}
     accept = (bool(verdict.get("accept"))

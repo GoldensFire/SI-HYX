@@ -35,10 +35,35 @@ def _fit_pack_column(self) -> int:
     pack = getattr(self, "right_col", None)
     if pack is None:
         return 0
+    group = getattr(self, "pack_box", None)
+    if group is not None:
+        from .settings_box import needed_height
+        # Стили добавляют полям padding и min-height уже после создания.
+        # Обычный минимум QGroupBox этого не учитывает целиком и позволяет
+        # низкому окну обрезать счётчики. Берём полную высоту после стилей.
+        group.ensurePolished()
+        group.setMinimumHeight(0)
+        group.layout().invalidate()
+        group.layout().activate()
+        group.setMinimumHeight(needed_height(group))
     want = max(self.PACK_MIN_W,
                min(self.PACK_MAX_W, int(pack.sizeHint().width())))
-    if pack.maximumWidth() != want:
-        pack.setFixedWidth(want)
+    scroll = getattr(self, "scroll_pack", None)
+    reserved = scroll.verticalScrollBar().sizeHint().width() if scroll else 0
+    content_width = max(1, want - reserved)
+    if pack.maximumWidth() != content_width:
+        pack.setFixedWidth(content_width)
+    # Содержимое не должно сжиматься по высоте: недостающее место отдаётся
+    # прокрутке. Учитываем и действия с переносимой подписью под кнопками.
+    from .settings_box import needed_height
+    boxes = (self.templates_box, self.pack_box, self.actions_box)
+    pack.setMinimumHeight(sum(needed_height(box) for box in boxes)
+                          + 2 * pack.layout().spacing())
+    if scroll is None:
+        return want
+    # Полоса помещается внутри прежней ширины правой панели: соседние
+    # настройки не теряют целую колонку из-за нескольких новых пикселей.
+    scroll.setFixedWidth(want)
     return want
 
 
@@ -49,6 +74,8 @@ def _fit_settings_width(self):
     if panel is None:
         return
     pack = _fit_pack_column(self)
+    margins = self.layout().contentsMargins()
+    available = self.width() - margins.left() - margins.right()
     if not self._table_shown():
         # Таблица спрятана — настройки забирают всю оставшуюся ширину вкладки
         # и сами раскладываются в несколько колонок (settings_columns).
@@ -57,7 +84,7 @@ def _fit_settings_width(self):
         panel.setMinimumWidth(0)
         scroll.setMinimumWidth(self.SETTINGS_MIN_W)
         scroll.setMaximumWidth(_api.QWIDGETSIZE_MAX)
-        _fit_columns(self, scroll, self.width() - 24 - pack - BODY_SPACING)
+        _fit_columns(self, scroll, available - pack - BODY_SPACING)
         return
     need = max(480, self.SETTINGS_MIN_W)
     # Панель не даём сжимать ниже её собственной ширины: тогда в совсем
@@ -69,7 +96,7 @@ def _fit_settings_width(self):
     want = need + sb + 2 * scroll.frameWidth() + 4
     # Поля root-раскладки плюс две неподвижные соседки: таблица слева и
     # колонка «Пак» справа.
-    avail = self.width() - 24 - self.TABLE_MIN_W - pack - 2 * BODY_SPACING
+    avail = available - self.TABLE_MIN_W - pack - 2 * BODY_SPACING
     if avail > 0:
         want = min(want, max(self.SETTINGS_MIN_W, avail))
     if want != scroll.width() or scroll.maximumWidth() != want:
@@ -127,14 +154,16 @@ def _group_pack(self) -> _api.QGroupBox:
     for column, (caption, field) in enumerate((
             ("Раунды", self.sp_rounds),
             ("Темы", self.sp_themes),
-            ("Вопросов в теме", self.sp_quest))):
+            ("Вопросов\nв теме", self.sp_quest))):
         label = self._lab(caption)
-        # Длинная третья подпись переносится внутри своей трети, но не
-        # расширяет её за счёт двух соседних колонок.
+        # Явный перенос даёт строке постоянную высоту и убирает
+        # heightForWidth, из-за которого Qt мог сжать соседние поля.
+        label.setWordWrap(False)
         label.setSizePolicy(
             _api.QSizePolicy.Policy.Ignored,
             _api.QSizePolicy.Policy.Preferred)
-        label.setAlignment(_api.Qt.AlignmentFlag.AlignHCenter)
+        label.setAlignment(_api.Qt.AlignmentFlag.AlignHCenter
+                           | _api.Qt.AlignmentFlag.AlignBottom)
         g.addWidget(label, r, column)
         field.setSizePolicy(
             _api.QSizePolicy.Policy.Expanding,
@@ -149,6 +178,11 @@ def _group_pack(self) -> _api.QGroupBox:
     r += 1
     self.lbl_total = self._hint("")
     g.addWidget(self.lbl_total, r, 0, 1, 3)
+    # Все подписи здесь короткие или имеют явный перенос. Даже одна
+    # оставшаяся wordWrap-подпись включает heightForWidth у всей группы:
+    # тогда при низком окне Qt снова сжимает счётчики ниже их полной высоты.
+    for label in grp.findChildren(_api.QLabel):
+        label.setWordWrap(False)
     return grp
 
 # ── группа «Списки» ───────────────────────────────────────────────────

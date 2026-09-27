@@ -72,7 +72,8 @@ def build_controls(tab):
     tab.chk_pixiv_gemini.setChecked(True)
     tab.chk_pixiv_gemini.setToolTip(
         "Перед добавлением Gemini смотрит сам арт. Работа пропускается, если "
-        "на ней видно название аниме или персонажей из других тайтлов.")
+        "на ней видно название аниме или персонажей из других тайтлов. "
+        "До четырёх картинок с одинаковой моделью проверяются одним запросом.")
     layout.addWidget(tab.chk_pixiv_gemini, 5, 0, 1, 2)
     tab.cb_pixiv_gemini_model = _api.QComboBox()
     for model in _api.GEMINI_MODELS:

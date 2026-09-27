@@ -86,10 +86,8 @@ def _refresh_api_key_buttons(self):
         btn.setText("задан" if has else "не задан — ввести")
 
 def _build_settings_panel(self, body):
-    # Правее настроек — НЕПОДВИЖНАЯ колонка: группа «Пак» и полоса запуска
-    # (просьба пользователя). Ни то, ни другое не прокручивается вместе с
-    # остальными настройками: сколько вопросов собирается и чем запускать —
-    # это надо видеть всегда, что бы ни было открыто слева.
+    # Правая колонка прокручивается отдельно: при низком окне шаблон,
+    # параметры пака и кнопки сохраняют полную высоту и доступны через скролл.
     self.scroll_settings = scroll = _api.QScrollArea()
     scroll.setWidgetResizable(True)
     # Горизонтальная полоса — на самый крайний случай (окно уже, чем панель
@@ -122,6 +120,9 @@ def _build_settings_panel(self, body):
     body.addWidget(scroll, 1)
 
     self.right_col = _api.QWidget()
+    self.right_col.setObjectName("packSettingsPanel")
+    self.right_col.setStyleSheet(
+        f"#packSettingsPanel {{ background: {_api.C['bg']}; }}")
     col = _api.QVBoxLayout(self.right_col)
     col.setContentsMargins(0, 0, 0, 0)
     col.setSpacing(8)
@@ -135,7 +136,15 @@ def _build_settings_panel(self, body):
     self.actions_box = self._build_actions()
     col.addWidget(self.actions_box)
     col.addStretch(1)
-    body.addWidget(self.right_col)
+    self.scroll_pack = _api.QScrollArea()
+    self.scroll_pack.setWidgetResizable(True)
+    self.scroll_pack.setFrameShape(_api.QFrame.Shape.NoFrame)
+    self.scroll_pack.setHorizontalScrollBarPolicy(
+        _api.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    self.scroll_pack.setVerticalScrollBarPolicy(
+        _api.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    self.scroll_pack.setWidget(self.right_col)
+    body.addWidget(self.scroll_pack)
     # Колесо мыши не должно менять счётчики ни в настройках, ни в «Паке».
     self._disable_wheel(panel)
     self._disable_wheel(self.right_col)

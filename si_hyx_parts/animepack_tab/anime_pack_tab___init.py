@@ -65,7 +65,7 @@ def _build_unavailable(self):
 
 def _build_ui(self):
     root = _api.QVBoxLayout(self)
-    root.setContentsMargins(12, 12, 12, 12)
+    root.setContentsMargins(12, 12, 0, 12)
     root.setSpacing(10)
 
     body = _api.QHBoxLayout(); body.setSpacing(12)

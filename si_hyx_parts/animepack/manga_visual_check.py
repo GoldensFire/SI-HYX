@@ -13,6 +13,8 @@ import base64
 import hashlib
 import io
 
+from .visual_batch import request
+
 SCHEMA = {
     "type": "object",
     "properties": {
@@ -54,7 +56,7 @@ def check(generator, cand, data: bytes, ext: str):
         {"type": "image", "mime_type": mime,
          "data": base64.b64encode(payload).decode("ascii")},
     ]
-    verdict = client.generate_json(parts, SCHEMA, temperature=0.0)
+    verdict = request(generator, client, parts, SCHEMA)
     if not isinstance(verdict, dict):
         verdict = {"accept": False, "reason": "Gemini не вернула вердикт"}
     accept = (bool(verdict.get("accept"))

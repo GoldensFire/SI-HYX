@@ -8,6 +8,18 @@ import re
 import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
+from urllib.parse import urlsplit
+
+
+def _host_matches(value: str, domain: str) -> bool:
+    """Домен ссылки, включая поддомены, без совпадений в пути или query."""
+    try:
+        url = urlsplit(str(value or ""))
+        host = (url.hostname or "").casefold().rstrip(".")
+        return (url.scheme in ("http", "https")
+                and (host == domain or host.endswith("." + domain)))
+    except ValueError:
+        return False
 
 
 def _local(tag: str) -> str:
@@ -43,7 +55,7 @@ def _song_key(answer: str) -> tuple | None:
 def _source_keys(answers: list[str]) -> set[tuple]:
     return {("source", text.strip().split("?", 1)[0].casefold())
             for text in answers if str(text or "").startswith(("https://", "http://"))
-            and not any(host in str(text) for host in
+            and not any(_host_matches(text, host) for host in
                         ("youtube.com", "youtu.be", "fandom.com"))}
 
 
@@ -101,7 +113,7 @@ def read_exact_keys(path: str) -> set[tuple]:
                     sources = _source_keys(answers)
                     keys.update(sources)
                     precise = precise or bool(sources)
-                    if any("fandom.com" in value for value in answers):
+                    if any(_host_matches(value, "fandom.com") for value in answers):
                         fact = _fact_key(text, answers[0])
                         if fact:
                             keys.add(fact)
@@ -165,4 +177,4 @@ def candidate_keys(cand, folder: str) -> set[tuple]:
 def pixiv_links(keys) -> set[str]:
     """Страницы работ Pixiv, уже спрошенные в выбранных паках."""
     return {key[1] for key in keys
-            if key[0] == "source" and "pixiv.net/" in key[1]}
+            if key[0] == "source" and _host_matches(key[1], "pixiv.net")}
