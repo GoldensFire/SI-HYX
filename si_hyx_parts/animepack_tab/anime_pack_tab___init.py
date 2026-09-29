@@ -11,6 +11,8 @@ def __init__(self, main_window=None, settings: _api.Optional[dict] = None):
     self.main = main_window
     self._pool = _api.QThreadPool.globalInstance()
     self._task = None
+    self._queue = []                  # снимки настроек ожидающих паков
+    self._active_settings = None
     self._genres_task = None
     self._genres_timer = None          # отложенная загрузка списка жанров
     self._db_task = None               # обновление базы Shikimori
@@ -26,6 +28,7 @@ def __init__(self, main_window=None, settings: _api.Optional[dict] = None):
     self._exclude_exact_siq: list = [] # паки, чьи вопросы не повторяем
     self._out_dir = ""
     self._pack_number = 0              # сколько паков уже собрано (для «№ N»)
+    self._test_pack_number = 0
     self._last_pack = ""
     self._started_at = 0.0             # для оценки времени на прогресс-баре
     self._closing = False              # после cleanup() новых задач не заводим

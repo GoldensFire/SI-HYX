@@ -74,6 +74,23 @@ def own_bucket(settings, kind) -> _api.Optional[str]:
     return bucket
 
 
+def short_pack_average_error(settings, songs) -> str:
+    """Не выдавать маленький полный пак за попадание в заданную среднюю."""
+    if len(songs) != settings.total_questions or len(songs) > 3:
+        return ""
+    groups: dict[str | None, list[int]] = {}
+    for cand in songs:
+        groups.setdefault(own_bucket(settings, cand.kind), []).append(int(cand.level))
+    for bucket, values in groups.items():
+        target = level_avg_target(settings, bucket)
+        if target and sum(values) != target * len(values):
+            where = BUCKET_TITLES[bucket] if bucket else "пака"
+            actual = sum(values) / len(values)
+            return (f"Средняя сложность {where}: {actual:.1f}, просили {target}. "
+                    "Подходящих вопросов не нашлось; пакет не создан.")
+    return ""
+
+
 level_bucket.__module__ = _api.__name__
 level_avg_target.__module__ = _api.__name__
 own_bucket.__module__ = _api.__name__

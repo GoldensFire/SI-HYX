@@ -35,7 +35,8 @@ def select_songs(self) -> list:
     candidates = checked_candidates(self, self.iter_candidates())
     exhausted = False
     over_budget = False
-    workers = max(1, min(16, int(self.s.parallel)))
+    from .generation_priority import parallel_limit, apply_thread_priority
+    workers = parallel_limit(self.s)
     pending: dict = {}
     # Кандидат, которому место в паке есть, но прямо сейчас оно занято
     # ЗАГРУЗКОЙ. Такого не выбрасываем: дождёмся свободного потока и возьмём
@@ -48,7 +49,9 @@ def select_songs(self) -> list:
     # загрузок, и «Стоп» отзывался бы только через десятки секунд. Здесь
     # очередь сбрасывается, а работающие ffmpeg убиваются сразу.
     pool = _api.ThreadPoolExecutor(max_workers=workers,
-                              thread_name_prefix="animepack")
+                              thread_name_prefix="animepack",
+                              initializer=apply_thread_priority,
+                              initargs=(self.s,))
     try:
         try:
             while not self.stopped():
@@ -95,7 +98,7 @@ def select_songs(self) -> list:
                             # Следом за книгами — отложенные ради средней
                             # сложности: недобранный пак хуже промаха по
                             # середине (см. _take_level_bench).
-                            bench = self._take_level_bench()
+                            bench = self._take_level_bench(levels, pending.values())
                         if bench:
                             candidates = iter(bench)
                             continue
@@ -391,12 +394,19 @@ def mark_list_owners(self, songs: list) -> None:
 # ── шаг 5: упаковка ───────────────────────────────────────────────────
 def write_package(self, songs: list, out_path: _api.Optional[str] = None) -> str:
     from pathlib import Path
+    from .popular_franchise_title import popular_franchise_title
+    known_parts = getattr(self, "_fr_parts", {})
+    for cand in songs:
+        franchise = str(cand.anime.get("franchise") or "").strip()
+        cand.popular_franchise_title = popular_franchise_title(
+            cand.anime, known_parts.get(franchise, ()))
     xml = _api.build_content_xml(songs, self.s)
     with open(_api.os.path.join(self.folder, "content.xml"), "wb") as f:
         f.write(xml)
 
     used_audio = {c.audio_out for c in songs
-                  if not c.is_silent and not c.has_video}
+                  if (not c.is_silent or c.kind == _api.DESCRIPTION_AUDIO_KIND)
+                  and not c.has_video}
     # Ролик — и с AnimeThemes, и собранный из кадра (вопрос-пиксели).
     used_video = {c.video_out for c in songs if c.has_video}
     used_images = {c.poster_file for c in songs if c.has_poster}
@@ -418,8 +428,10 @@ def write_package(self, songs: list, out_path: _api.Optional[str] = None) -> str
         # Имя файла — то же, что название внутри пака (номер и средняя
         # сложность): иначе соседние паки различались бы только «(1)», «(2)».
         from .pack_summary import pack_title
-        name = pack_title(self.s.title, getattr(self.s, "pack_number", 0),
-                          songs)
+        name = pack_title(
+            self.s.title, getattr(self.s, "pack_number", 0), songs,
+            test_number=getattr(self.s, "test_pack_number", 0),
+            ignore_test_packs=getattr(self.s, "ignore_test_packs", False))
         target = Path(out_dir) / f"{_api.safe_filename(name, 'Аниме пак')}.siq"
     target.parent.mkdir(parents=True, exist_ok=True)
     target = _api.unique_path(target)

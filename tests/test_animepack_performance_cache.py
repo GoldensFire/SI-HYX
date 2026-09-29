@@ -41,15 +41,15 @@ def _generator(tmp_path, **clients):
     return ap.AnimePackGenerator(ap.PackSettings(), db_cache=cache, **clients)
 
 
-def test_repeated_source_download_hits_disk_cache(cache_dir, tmp_path):
+def test_repeated_song_download_is_not_cached(cache_dir, tmp_path):
     session = _Session()
     gen = _generator(tmp_path, session=session)
     url = "https://cdn.example/song.mp3"
 
     assert gen._cached_bytes(url, "amq-audio") == b"source-bytes"
     assert gen._cached_bytes(url, "amq-audio") == b"source-bytes"
-    assert session.calls == 1
-    assert gen._media_cache_hits["исходники"] == 1
+    assert session.calls == 2
+    assert media_cache.stats() == (0, 0)
 
 
 def test_disabled_disk_cache_does_not_capture_sources(cache_dir, tmp_path):

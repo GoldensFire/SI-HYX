@@ -164,6 +164,7 @@ class CoverService:
 
     def __init__(self, run, ffmpeg, ytdlp, *, stopped=lambda: False,
                  log=lambda text: None, workers: int = 6,
+                 thread_initializer=None,
                  cache_enabled: bool = True,
                  rate_limit_cooldown: float = RATE_LIMIT_COOLDOWN,
                  rate_limit_retries: int = RATE_LIMIT_RETRIES,
@@ -172,12 +173,14 @@ class CoverService:
         self.ytdlp = list(ytdlp or [])
         self.stopped, self.log = stopped, log
         self.workers = max(1, int(workers))
+        self.thread_initializer = thread_initializer
         self.cache_enabled = bool(cache_enabled)
         self.seen_types: dict[str, int] = {}
         self.rate_limit_cooldown = max(0.0, float(rate_limit_cooldown))
         self.rate_limit_retries = max(0, int(rate_limit_retries))
         self._pool = None
         self._lock = threading.Lock()
+        self._reference_data = {}  # только на время этой генерации
         self.net_limit = max(1, min(int(net_limit), self.workers))
         self._net = threading.Semaphore(self.net_limit)
 
@@ -188,7 +191,8 @@ class CoverService:
         with self._lock:
             if self._pool is None:
                 self._pool = futures.ThreadPoolExecutor(
-                    max_workers=self.workers, thread_name_prefix="cover")
+                    max_workers=self.workers, thread_name_prefix="cover",
+                    initializer=self.thread_initializer)
             return self._pool
 
     def net_run(self, command, timeout):
@@ -322,14 +326,11 @@ class CoverService:
         return self.features(source, work)[0]
 
     def reference(self, song_id, fetch_bytes, work):
-        """Хрома эталона: из кладовой или посчитанная один раз навсегда.
-
-        Заодно кладёт рядом созвездие пиков эталона. Когда хрома есть, а
-        созвездия нет (кладовая от прежней версии), эталон разбирается заново:
-        без созвездия «внутри играет оригинал» проверить нечем."""
-        ready = cache.ref_chroma(song_id)
-        if ready is not None and cache.ref_marks(song_id) is not None:
-            return ready
+        """Хрома песни живёт только в памяти текущей генерации."""
+        with self._lock:
+            ready = self._reference_data.get(song_id)
+        if ready is not None:
+            return ready[0]
         data = fetch_bytes()
         if not data:
             raise RuntimeError("эталон не скачался")
@@ -343,8 +344,8 @@ class CoverService:
                 os.remove(source)
             except OSError:
                 pass
-        cache.put_ref_chroma(song_id, chroma)
-        cache.put_ref_marks(song_id, points)
+        with self._lock:
+            self._reference_data[song_id] = (chroma, points)
         return chroma
 
     # ── пул подтверждённых ───────────────────────────────────────────────
@@ -455,8 +456,9 @@ class CoverService:
         # Внутри записи может играть сам оригинал — гитарист или барабанщик
         # поверх мастера. Хрома такого не видит вовсе (у точного band-кавера
         # выравнивание такое же), поэтому считаем отдельный признак.
-        played, score = fingerprint.inside(
-            cache.ref_marks(song_id), points, frames)
+        with self._lock:
+            reference_marks = self._reference_data.get(song_id, (None, None))[1]
+        played, score = fingerprint.inside(reference_marks, points, frames)
         verdict = dict(verdict, inside=score)
         if played:
             verdict = dict(verdict, ok=False, reason="original_inside")

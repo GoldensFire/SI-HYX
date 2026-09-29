@@ -25,7 +25,8 @@ def rebuild(tab, group):
         setattr(tab, "chk_" + key, chk)
         chk.toggled.connect(lambda value, k=key: toggle(tab, k, value))
         tab.composition_checks[key] = chk
-    for key in ("video", "manga", "pixel", "anagram", "dialogue", "plot", "ai_art",
+    for key in ("video", "manga", "pixel", "anagram", "dialogue", "plot",
+                "description_audio", "ai_art",
                 "pixiv_art", "sakuga", "studio"):
         tab.composition_checks[key] = getattr(tab, "chk_" + key)
     grid.addWidget(tab.mix, 0, 0, 1, 4)
@@ -85,6 +86,7 @@ _OPTIONS = {
     "anagram": ("box_anagram",),
     "dialogue": ("box_dialogue",),
     "plot": ("box_plot",),
+    "description_audio": ("box_description_audio",),
     # Под последней загадкой по названию — своя модель Gemini для них
     # (просьба пользователя) и общий для всех текстовых вопросов показ текста.
     "definitions": ("box_gemini_titles", "box_text_cps"),
@@ -141,7 +143,8 @@ def toggle(tab, key, value):
 def refresh_gemini(tab):
     titles = any(getattr(tab, "chk_" + key).isChecked()
                  for key in GEMINI_TITLE_KINDS)
-    enabled = tab.chk_plot.isChecked() or tab.chk_dialogue.isChecked() or titles
+    enabled = (tab.chk_plot.isChecked() or tab.chk_dialogue.isChecked()
+               or tab.chk_description_audio.isChecked() or titles)
     tab.box_plot.setVisible(enabled)
     # Своя модель загадок по названию нужна только при включённых загадках.
     box = getattr(tab, "box_gemini_titles", None)

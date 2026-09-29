@@ -25,6 +25,7 @@ class AnimePackGenerator:
     from si_hyx_parts.animepack.manga_panel import download_manga_panel
     from si_hyx_parts.animepack.sakuga_generation import download_sakuga
     from si_hyx_parts.animepack.dialogue_generation import make_dialogue_question
+    from si_hyx_parts.animepack.description_question import make_description_audio
 
     # Сколько раз подряд можно повторить в логе одну и ту же жалобу.
     WARN_REPEATS = 3

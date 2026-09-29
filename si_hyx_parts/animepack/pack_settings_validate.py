@@ -67,12 +67,24 @@ def validate(self) -> list[str]:
     subdl = str(getattr(self, "subdl_key", "") or "").strip()
     # Диалог выбирает Gemini при любом источнике: он читает серию целиком и
     # берёт узнаваемое (dialogue_gemini.py), а у Jimaku ещё и переводит.
-    gemini_kinds = ((_api.PLOT_KIND, _api.DIALOGUE_KIND)
+    gemini_kinds = ((_api.PLOT_KIND, _api.DIALOGUE_KIND,
+                     _api.DESCRIPTION_AUDIO_KIND)
                     + _api.GEMINI_TITLE_KINDS)
     if any(self.mix_shares.get(k) for k in gemini_kinds) and not str(self.gemini_key or "").strip():
         problems.append(
-            "Для сюжета, диалогов и преобразований названий нужен ключ Gemini. "
+            "Для сюжета, диалогов, описаний и названий нужен ключ Gemini. "
             "Введите ключ или отключите эти части пака (шифр работает без Gemini).")
+    if self.mix_shares.get(_api.DESCRIPTION_AUDIO_KIND):
+        from .description_question import LANGUAGE_NAMES
+        languages = self.description_languages or [self.description_language]
+        if not languages or any(code not in LANGUAGE_NAMES for code in languages):
+            problems.append("Для вопросов по описанию выбран неизвестный язык.")
+        if self.description_tts_first not in ("elevenlabs", "google", "gemini"):
+            problems.append("Для описаний выбран неизвестный сервис озвучки.")
+        if self.description_voice_enabled:
+            from .description_gemini_tts import TTS_MODELS
+            if self.description_gemini_tts_model not in TTS_MODELS:
+                problems.append("Для описаний выбрана неизвестная модель Gemini TTS.")
     if (self.mix_shares.get(_api.DIALOGUE_KIND) and not subdl
             and not str(getattr(self, "jimaku_key", "") or "").strip()):
         problems.append(

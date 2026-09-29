@@ -56,7 +56,11 @@ def build(songs) -> str:
 def _append_card(rows: list, seen: set, card: dict) -> None:
     if not isinstance(card, dict):
         return
-    franchise = str(card.get("franchise") or "").strip()
+    if card.get("franchise"):
+        import animepack as ap
+        franchise = ap.franchise_key(card)
+    else:
+        franchise = ""
     root = _root(card)
     try:
         shiki = int(card.get("id") or 0)

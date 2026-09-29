@@ -90,6 +90,7 @@ class ShikimoriApi:
         user_anime_ids,
         animes_by_ids,
     )
+    from si_hyx_parts.animepack_api.shikimori_api_description import anime_description
 
     # ── Поиск тайтла по названию ─────────────────────────────────────────
     # Нужен вкладке «Апгрейд пака»: у неё на руках только строка ответа

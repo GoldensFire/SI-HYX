@@ -179,3 +179,36 @@ def test_oversized_input_is_rejected_without_spending_a_request(monkeypatch):
     with pytest.raises(GeminiError, match="слишком большое"):
         batcher.check(_parts(0), PIXIV_SCHEMA)
     assert not client.calls
+
+
+def _unavailable():
+    from gemini_api import GeminiUnavailableError
+    return GeminiUnavailableError("Gemini 503: high demand")
+
+
+def test_server_silent_twice_in_a_row_stops_asking_until_the_end_of_the_run():
+    from gemini_api import GeminiDownError, GeminiUnavailableError
+    client = _Client(response=_unavailable())
+    batcher = batch.VisualCheckBatcher(client, collect_seconds=0)
+    with pytest.raises(GeminiUnavailableError):
+        batcher.check(_parts(0), PIXIV_SCHEMA)
+    # Второй подряд — предохранитель: и этот, и все следующие получают
+    # GeminiDownError, а сеть больше не трогается.
+    with pytest.raises(GeminiDownError):
+        batcher.check(_parts(1), PIXIV_SCHEMA)
+    with pytest.raises(GeminiDownError):
+        batcher.check(_parts(2), MANGA_SCHEMA)
+    assert len(client.calls) == batch.DOWN_AFTER
+
+
+def test_an_answer_between_silences_resets_the_count():
+    from gemini_api import GeminiUnavailableError
+    client = _Client(response=_unavailable())
+    batcher = batch.VisualCheckBatcher(client, collect_seconds=0)
+    for _ in range(3):
+        client.response = _unavailable()
+        with pytest.raises(GeminiUnavailableError):
+            batcher.check(_parts(0), PIXIV_SCHEMA)
+        client.response = None
+        assert batcher.check(_parts(0), PIXIV_SCHEMA)["accept"] is True
+    assert not batcher.down

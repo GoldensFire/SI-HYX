@@ -39,6 +39,8 @@ Ctrl+F в консоли — [console_find_bar.py](si_hyx_parts/main/console_fin
 [pixiv_art_search.py](pixiv_art_search.py) — три источника выдачи;
 [pixiv_titles.py](pixiv_titles.py) — названия тайтлов в виде, сравнимом с
 метками (по ним отсеиваются сборки сразу по нескольким сериалам);
+[pixiv_art_match.py](pixiv_art_match.py) — локальное исключение артов с метками
+чужих франшиз при совпадении неоднозначного названия;
 [pixiv_art_tags.py](pixiv_art_tags.py) и [pixiv_tag_rules.py](pixiv_tag_rules.py) —
 метки-исключения.
 
@@ -172,7 +174,13 @@ Ctrl+F в консоли — [console_find_bar.py](si_hyx_parts/main/console_fin
 какой род вопросов какую рамку слушает;
 [level_panel.py](si_hyx_parts/animepack_tab/level_panel.py) — все рамки одной
 колонкой в группе «Аниме»; сами виджеты заводит
-[level_controls.py](si_hyx_parts/animepack_tab/level_controls.py).
+[level_controls.py](si_hyx_parts/animepack_tab/level_controls.py). Полоса с
+границами и средней — [difficulty_range.py](si_hyx_parts/animepack_tab/difficulty_range.py),
+очередь снимков настроек — [generation_queue.py](si_hyx_parts/animepack_tab/generation_queue.py).
+Низкий приоритет ограничивает параллелизм и понижает приоритет рабочих потоков
+и ffmpeg — [generation_priority.py](si_hyx_parts/animepack/generation_priority.py).
+Старые одноразовые песни и кадры из медиа-кэша убирает
+[one_use_cache.py](si_hyx_parts/animepack/one_use_cache.py).
 
 Панель настроек аниме-пака: коробки настроек — это
 [SettingsBox](si_hyx_parts/animepack_tab/settings_box.py), а не голый QWidget.
@@ -181,8 +189,8 @@ Ctrl+F в консоли — [console_find_bar.py](si_hyx_parts/main/console_fin
 раскрытый Chiptune из-за этого рисовался поверх соседних галочек.
 
 Вопрос-СТУДИЯ (кадры подряд, а называют студию) —
-[studio_question.py](si_hyx_parts/animepack/studio_question.py): кадры берутся
-из той же кладовой, что и у обычного вопроса-кадра, и внутри одного вопроса
+[studio_question.py](si_hyx_parts/animepack/studio_question.py): кадры скачиваются
+без медиа-кэша, как и у обычного вопроса-кадра, и внутри одного вопроса
 не повторяются ни кадры, ни франшизы. Надпись «Назовите студию» стоит ПЕРЕД
 КАЖДЫМ кадром с
 `waitForFinish="False"`: SIGame показывает разом только те элементы, что идут
@@ -200,6 +208,16 @@ Shikimori (`studios` в `ANIME_FIELDS`); у карточек из старой �
 [описание и карта модулей](docs/anime-pack-sources.md). Реестр родов вопросов
 (имена, подписи, семьи «картинка / ролик / текст») —
 [question_kinds.py](si_hyx_parts/animepack/question_kinds.py).
+Вопросы по описанию: [description_question.py](si_hyx_parts/animepack/description_question.py)
+берёт описание Shikimori и перевод Gemini, затем оставляет текст или озвучивает;
+[description_batch.py](si_hyx_parts/animepack/description_batch.py) собирает
+переводы ожидающих вопросов в один запрос; [description_audio_encode.py](si_hyx_parts/animepack/description_audio_encode.py)
+приводит речь к Opus и общей громкости;
+[description_tts.py](si_hyx_parts/animepack/description_tts.py) переключает
+провайдеры, [description_gemini_tts.py](si_hyx_parts/animepack/description_gemini_tts.py)
+обрабатывает модели Gemini TTS. Порог тестового пака и чтение его из SIQ —
+[test_packs.py](si_hyx_parts/animepack/test_packs.py). Настройки —
+[description_controls.py](si_hyx_parts/animepack_tab/description_controls.py).
 
 | Публичный модуль | Реализация | Частей | Строк было → стало |
 |---|---|---:|---:|
@@ -307,8 +325,9 @@ URL держало замок минутами и при медленном пр
 на вкладке и `level_bounds` / `level_avg.py` в отборе. Уровень рассуждения
 Gemini зависит от модели: «минимальный» умеет только Flash-Lite
 (`gemini_api.model_thinking_levels`). Вопрос по сюжету просит у Gemini до трёх вариантов за один запрос
-(`animepack/plot_variants.py`): отказ одного варианта больше не стоит нового
-запроса из суточных двадцати. Итог расхода с расшифровкой по сюжету —
+(`animepack/plot_variants.py`); [plot_batch.py](si_hyx_parts/animepack/plot_batch.py)
+объединяет до трёх параллельных сюжетных страниц в один запрос с отдельным id
+для каждой. Итог расхода с расшифровкой по сюжету —
 `log_gemini_spent`. База Shikimori читается и пишется порциями
 (`animepack/db_json.py`), чтобы окно не вставало на двухстах мегабайтах JSON.
 Пакетное преобразование названий через Gemini:
@@ -391,8 +410,8 @@ recall 0.813 при НУЛЕ ложных, у каждого принятого 
 
 Кладовая и выбор: [cover_cache.py](cover_cache.py) — файл на КОМПОЗИЦИЮ
 (annSongId) рядом с настройками: сырые находки поиска, вердикты звука со
-списком годных окон, история использования, хрома эталона (`.npy`, 0.8 с и не
-меняется) и его созвездие пиков (`.marks.npy`). Гейт и пороги там НЕ заморожены
+списком годных окон и история использования. Хрома эталона и созвездие пиков
+живут только в памяти текущей генерации; старые `.npy` удаляются. Гейт и пороги там НЕ заморожены
 — заголовки, сырой счёт хромы и сырое число совпавших пар отпечатка хранятся
 как есть, а решение пересчитывается при чтении, поэтому правка словаря правил
 или порога не стоит повторной загрузки. Способ СЧИТАТЬ признаки обесценивает

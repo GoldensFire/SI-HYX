@@ -208,6 +208,17 @@ def _open_settings_dialog(self, section=None):
     add_row(sec_api, grp_gemini,
             "gemini гемини google ключ api нейросеть повторы сюжет аниме aistudio")
 
+    grp_elevenlabs = _api.QGroupBox("ElevenLabs — озвучка описаний")
+    ve = _api.QVBoxLayout(grp_elevenlabs)
+    _key_row(ve,
+             '<a href="https://elevenlabs.io/app/settings/api-keys" '
+             'style="color:#89b4fa;">Ключи API ElevenLabs</a>',
+             "Ключ ElevenLabs", "elevenlabs",
+             "Озвучивает вопросы по описанию. Когда квота заканчивается, "
+             "генератор переключается на Google. Ключ в пак не сохраняется.")
+    add_row(sec_api, grp_elevenlabs,
+            "elevenlabs озвучка описание голос текст речь ключ api")
+
     grp_subdl = _api.QGroupBox("SubDL — русские субтитры")
     vs = _api.QVBoxLayout(grp_subdl)
     _key_row(vs,

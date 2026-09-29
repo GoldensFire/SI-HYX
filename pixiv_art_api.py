@@ -87,6 +87,7 @@ def _value(obj, name, default=None):
 
 
 from pixiv_titles import MIN_TITLE_TAG, card_titles, norm_title
+from pixiv_art_match import conflicting_series
 
 def _art_link(illust) -> str:
     """Страница работы на Pixiv («» — id неизвестен)."""
@@ -423,18 +424,20 @@ class PixivArtClient:
                 return (bool(url) and url.split("?")[0] not in blocked
                         and (not skip or _art_link(row) not in skip)
                         and self._safe(row)
+                        and not conflicting_series(self._tag_names(row), own)
                         and not self._foreign_title(row, own))
 
-            rows, card = [], anime
+            rows, matched_cards = [], {}
             for source, word in self._titles(anime, *also):
                 found = self._search_word(word, keep)
+                for row in found:
+                    matched_cards.setdefault(self._url(row), source)
                 rows = self._merge(rows, found)
                 # Любой безопасный арт ещё не означает, что тег пригоден.
                 # Продолжаем варианты названия, пока хотя бы одна работа не
                 # прошла строгую планку закладок и размера. Раньше одна слабая
                 # работа по первому тегу обрывала поиск всех остальных имён.
                 if any(self._good_enough(row) for row in found):
-                    card = source
                     break
             rows.sort(key=lambda row: int(_value(row, "total_bookmarks", 0) or 0),
                       reverse=True)
@@ -460,8 +463,8 @@ class PixivArtClient:
             # «Магической битве 2» подписан названием первого сезона, и
             # спрашивать по нему надо тоже первый сезон (просьба
             # пользователя). Читается сразу после fetch, под тем же замком.
-            self.last_card = card
             row, url = self.rng.choice(choices)
+            self.last_card = matched_cards.get(url, anime)
             # Адрес самой работы уходит в ответ вопроса (просьба пользователя):
             # ведущему видно, откуда взят арт и чей он.
             self.last_link = _art_link(row)

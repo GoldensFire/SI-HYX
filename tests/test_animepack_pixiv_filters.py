@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 from animepack import PIXIV_ART_KIND, SongCandidate
 from pixiv_art_api import PixivArtClient
+from pixiv_art_api import PixivArtError
+import pytest
 from si_hyx_parts.animepack.pixiv_art_generation import _is_clip
 from test_animepack_new_kinds import make_anime
 
@@ -51,7 +53,7 @@ def test_work_without_a_character_is_skipped():
 
 def test_the_pick_is_random_across_the_whole_pool():
     """Выбирается случайная работа, а не одна и та же самая закладочная."""
-    rows = [art(id=i, total_bookmarks=1000 - i,
+    rows = [art("Death Note", id=i, total_bookmarks=1000 - i,
                 image_urls=SimpleNamespace(original=f"https://i.pximg.net/{i}.png"))
             for i in range(30)]
 
@@ -76,6 +78,25 @@ def test_the_pick_is_random_across_the_whole_pool():
             url = client.last_link
         picked.add(url)
     assert len(picked) > 3
+
+
+@pytest.mark.parametrize("title,tags", [
+    ("Monster", ("モンスター", "MonsterHunter", "モンハン")),
+    ("Kumo no Ito", ("蜘蛛の糸", "CHUNITHM")),
+    ("Akira", ("Akira", "BlueArchive", "ブルーアーカイブ")),
+])
+def test_foreign_franchise_tags_are_rejected_without_gemini(title, tags):
+    """Pixiv title tags may name a game character or a generic monster."""
+    class Api:
+        def auth(self, refresh_token):
+            pass
+
+        def search_illust(self, word, **kwargs):
+            return SimpleNamespace(illusts=[art(*tags)])
+
+    client = PixivArtClient("token", api=Api())
+    with pytest.raises(PixivArtError):
+        client.fetch({"name": title, "japanese": tags[0]})
 
 
 def test_the_art_link_is_the_last_answer_variant():

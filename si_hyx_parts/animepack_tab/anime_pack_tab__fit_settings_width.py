@@ -437,6 +437,8 @@ def _on_db_failed(self, err: str):
 
 def _finish_db_ui(self):
     self._db_task = None
+    if getattr(self, "_queue", None):
+        _api.QTimer.singleShot(0, self._start_next)
     self._db_parts = ()
     self.btn_refresh_db.setEnabled(True)
     self.btn_refresh_db.setIcon(_api.get_icon('fa5s.database'))

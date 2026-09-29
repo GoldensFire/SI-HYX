@@ -184,6 +184,22 @@ def _group_other(self) -> _api.QGroupBox:
     self.lbl_exact_siq = self._hint("")
     g.addWidget(self.lbl_exact_siq, r, 0, 1, 4)
     r += 1
+    self.chk_auto_add_exclusions = _api.QCheckBox(
+        "Добавлять готовые паки в «не повторять»")
+    self.chk_auto_add_exclusions.setChecked(True)
+    self.chk_auto_add_exclusions.setToolTip(
+        "После сохранения пака добавить его в оба списка выше: запрет "
+        "франшиз и запрет тех же вопросов. Выключено — списки меняются "
+        "только вручную. Для запущенного пака действует выбор на момент запуска.")
+    g.addWidget(self.chk_auto_add_exclusions, r, 0, 1, 4)
+    r += 1
+    self.chk_ignore_test_packs = _api.QCheckBox("Не считать тестовые паки")
+    self.chk_ignore_test_packs.setToolTip(
+        "Паки меньше 96 вопросов получают отдельное имя «Тестовый № …», "
+        "не занимают обычный номер и не исключают франшизы и вопросы "
+        "из следующих паков.")
+    g.addWidget(self.chk_ignore_test_packs, r, 0, 1, 4)
+    r += 1
     self.btn_out_dir = _api.QPushButton("Папка для пака…")
     self.btn_out_dir.setIcon(_api.get_icon('fa5s.folder'))
     self.btn_out_dir.clicked.connect(self._choose_out_dir)

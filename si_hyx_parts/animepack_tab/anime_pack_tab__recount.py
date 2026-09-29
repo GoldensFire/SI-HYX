@@ -146,6 +146,7 @@ def collect(self) -> '_api.PackSettings':
     # Сколько паков уже собрано: следующий получит номер на единицу больше
     # (см. start и pack_summary.numbered_title).
     s.pack_number = int(getattr(self, "_pack_number", 0) or 0)
+    s.test_pack_number = int(getattr(self, "_test_pack_number", 0) or 0)
     s.random_mode = (self.chk_random.isChecked()
                      or self.chk_random_shiki.isChecked())
     s.random_source = ("shikimori" if self.chk_random_shiki.isChecked()
@@ -157,6 +158,8 @@ def collect(self) -> '_api.PackSettings':
     s.saved_users = list(self._saved_users)
     s.exclude_siq = list(self._exclude_siq)
     s.exclude_exact_siq = list(self._exclude_exact_siq)
+    s.auto_add_to_exclusions = self.chk_auto_add_exclusions.isChecked()
+    s.ignore_test_packs = self.chk_ignore_test_packs.isChecked()
     s.similar_count = self.sp_similar.value()
     from .composition_controls import collect
     collect(self, s)
@@ -166,6 +169,8 @@ def collect(self) -> '_api.PackSettings':
     s.pct_pixel = shares["pixel"]
     s.pct_anagram = shares["anagram"]
     s.pct_plot = shares["plot"]
+    from .description_controls import collect as collect_description
+    collect_description(self, s)
     from .dialogue_controls import collect as collect_dialogue
     collect_dialogue(self, s)
     s.pct_ai_art = shares["ai_art"]
@@ -283,6 +288,7 @@ def collect(self) -> '_api.PackSettings':
     s.shuffle_questions = self.chk_shuffle.isChecked()
     s.audio_cut = self.sp_cut.value()
     s.parallel = self.sp_parallel.value()
+    s.generation_priority = self.cb_generation_priority.currentData() or "normal"
     s.out_dir = self._out_dir
     return s
 
@@ -294,7 +300,7 @@ def get_settings(self) -> dict:
     # Ключи API хранятся в общих настройках программы (Настройки → «Ключи
     # API»), а не здесь: иначе стёртый там ключ возвращался бы из этой
     # копии при следующем запуске.
-    for k in ("gemini_key", "jimaku_key", "subdl_key", "tmdb_key",
+    for k in ("gemini_key", "elevenlabs_key", "jimaku_key", "subdl_key", "tmdb_key",
               "cloudflare_token",
               "cloudflare_account_id", "pixiv_refresh_token"):
         data.pop(k, None)

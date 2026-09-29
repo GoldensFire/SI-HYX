@@ -4,6 +4,7 @@
 """AnimePackTab: apply_settings. Public namespace: animepack_tab."""
 from __future__ import annotations
 import animepack_tab as _api
+from si_hyx_parts.animepack.test_packs import TEST_LIMIT
 
 
 def apply_settings(self, data: dict):
@@ -14,6 +15,7 @@ def apply_settings(self, data: dict):
     self.ed_theme.setText(s.theme_title)
     # Сколько паков уже собрано: следующий получит номер на единицу больше.
     self._pack_number = max(0, int(getattr(s, "pack_number", 0) or 0))
+    self._test_pack_number = max(0, int(getattr(s, "test_pack_number", 0) or 0))
     self.sp_rounds.setValue(s.rounds)
     self.sp_themes.setValue(s.themes)
     self.sp_quest.setValue(s.questions)
@@ -31,6 +33,8 @@ def apply_settings(self, data: dict):
     self._refresh_exclude_label()
     self._exclude_exact_siq = list(getattr(s, "exclude_exact_siq", []))
     self._refresh_exact_label()
+    self.chk_auto_add_exclusions.setChecked(s.auto_add_to_exclusions)
+    self.chk_ignore_test_packs.setChecked(s.ignore_test_packs)
     self.sp_similar.setValue(max(1, int(s.similar_count)))
     self.chk_mark_owners.blockSignals(True)
     self.chk_mark_owners.setChecked(bool(s.mark_owners))
@@ -47,6 +51,8 @@ def apply_settings(self, data: dict):
     self.mix.set_anagram(s.pack_anagram)
     self.chk_plot.setChecked(s.pack_plot)
     self.mix.set_plot(s.pack_plot)
+    from .description_controls import apply as apply_description
+    apply_description(self, s)
     from .dialogue_controls import apply as apply_dialogue
     apply_dialogue(self, s)
     self.chk_ai_art.setChecked(s.pack_ai_art)
@@ -68,6 +74,7 @@ def apply_settings(self, data: dict):
         "pixel": shares.get(_api.PIXEL_KIND, 0),
         "anagram": shares.get(_api.ANAGRAM_KIND, 0),
         "plot": shares.get(_api.PLOT_KIND, 0),
+        "description_audio": shares.get(_api.DESCRIPTION_AUDIO_KIND, 0),
         "dialogue": shares.get(_api.DIALOGUE_KIND, 0),
         "ai_art": shares.get(_api.AI_ART_KIND, 0),
         "pixiv_art": shares.get(_api.PIXIV_ART_KIND, 0),
@@ -203,6 +210,9 @@ def apply_settings(self, data: dict):
     self.chk_shuffle.setChecked(s.shuffle_questions)
     self.sp_cut.setValue(int(s.audio_cut))
     self.sp_parallel.setValue(int(s.parallel))
+    priority_index = self.cb_generation_priority.findData(s.generation_priority)
+    self.cb_generation_priority.setCurrentIndex(
+        priority_index if priority_index >= 0 else 1)
     self._out_dir = s.out_dir or ""
     self._refresh_out_dir_label()
     # Доли списков: галочка включается сама, если в настройках они заданы.
@@ -263,9 +273,7 @@ def _log_gap(self, lines: int = 5):
         pass
 
 def start(self):
-    if self._task is not None:
-        return
-    if self._db_task is not None:
+    if self._db_task is not None and self._task is None:
         _api.msgbox_information(self, "Секунду",
                            "Сейчас обновляется база Shikimori — дождитесь "
                            "конца или остановите сбор той же кнопкой, иначе "
@@ -276,6 +284,18 @@ def start(self):
     if problems:
         _api.msgbox_warning(self, "Так не получится", "\n\n".join(problems))
         return
+    if self._task is not None or self._queue:
+        self._queue.append(settings)
+        self._refresh_queue()
+        self.log(f"Добавлен в очередь: «{settings.title}» "
+                 f"({settings.total_questions} вопросов).")
+        if self._task is None:
+            self._start_next()
+        return
+    self._launch_generation(settings)
+
+
+def _launch_generation(self, settings):
     # Каждый новый пак — следующий номер в названии (просьба пользователя).
     # Считаем ЗДЕСЬ, а не в генераторе: имя файла и название внутри пака должны
     # совпасть, а известны они генератору с самого начала. Сохраняем сразу —
@@ -284,8 +304,12 @@ def start(self):
     # ОТМЕНЁННАЯ генерация номер возвращает (см. _release_pack_number): пак,
     # который бросили на середине, — не пак, и следующий не должен через него
     # перешагивать.
-    self._pack_number = int(getattr(self, "_pack_number", 0) or 0) + 1
-    settings.pack_number = self._pack_number
+    settings.test_pack_number = self._test_pack_number + 1
+    if settings.ignore_test_packs and settings.total_questions < TEST_LIMIT:
+        settings.pack_number = 0
+    else:
+        self._pack_number = int(getattr(self, "_pack_number", 0) or 0) + 1
+        settings.pack_number = self._pack_number
     saver = getattr(self.main, "_save_settings_soon", None)
     if saver is not None:
         try:
@@ -301,7 +325,6 @@ def start(self):
     self.btn_table.setText("Показать таблицу")
     self._last_pack = ""
     self.btn_open.setEnabled(False)
-    self.btn_start.setEnabled(False)
     self.btn_stop.setEnabled(True)
     self._started_at = _api.time.monotonic()
     self._progress(0, "Подготовка…")
@@ -317,9 +340,13 @@ def start(self):
     task.signals.finished.connect(self._on_finished)
     task.signals.failed.connect(self._on_failed)
     self._task = task
+    self._active_settings = settings
+    self._refresh_queue()
     self._pool.start(task)
 
 def stop(self):
+    self._queue.clear()
+    self._refresh_queue()
     if self._task is not None:
         self._task.stop()
         self._progress(0, "Останавливаюсь…")
@@ -367,8 +394,10 @@ def _eta(self, done: int, total: int) -> str:
 
 def _finish_ui(self):
     self._task = None
+    self._active_settings = None
     self.btn_start.setEnabled(True)
     self.btn_stop.setEnabled(False)
+    self._refresh_queue()
 
 def _release_pack_number(self, number) -> None:
     """Возвращает номер, выданный в start(), — пака под ним не вышло.
@@ -393,19 +422,34 @@ def _release_pack_number(self, number) -> None:
             pass
 
 def _on_failed(self, err: str):
-    self._release_pack_number(getattr(self, "_pack_number", 0))
+    self._release_pack_number(getattr(self._active_settings, "pack_number", 0))
     self._finish_ui()
     self._progress(0, "Не получилось")
     self.log(f"Ошибка: {err}")
     _api.msgbox_critical(self, "Генерация не удалась", err)
+    self._finish_queue()
 
 def _on_finished(self, result):
+    settings = self._active_settings
+    auto_add = getattr(settings, "auto_add_to_exclusions",
+                       self.chk_auto_add_exclusions.isChecked())
+    is_test = (bool(getattr(settings, "ignore_test_packs", False))
+               and bool(result.path) and len(result.songs) < TEST_LIMIT)
+    if is_test:
+        self._release_pack_number(getattr(result, "pack_number", 0))
+        self._test_pack_number = max(self._test_pack_number,
+                                     int(getattr(settings, "test_pack_number", 0)))
+        saver = getattr(self.main, "_save_settings_soon", None)
+        if saver is not None:
+            saver()
     self._finish_ui()
     self._fill_table(result.songs)
     spent = _api.fmt_elapsed(getattr(result, "elapsed", 0.0))
     if result.cancelled:
         self._release_pack_number(getattr(result, "pack_number", 0))
         if result.path:
+            if auto_add and not is_test:
+                self._remember_generated(result.path)
             self._last_pack = result.path
             self.btn_open.setEnabled(True)
             if self.main is not None and hasattr(self.main, "set_global_result"):
@@ -416,7 +460,10 @@ def _on_finished(self, result):
         else:
             self._progress(0, "Остановлено")
             self.log("Генерация остановлена до первого готового вопроса.")
+        self._finish_queue()
         return
+    if auto_add and not is_test:
+        self._remember_generated(result.path)
     self._last_pack = result.path
     self.btn_open.setEnabled(bool(result.path))
     if self.main is not None and hasattr(self.main, "set_global_result"):
@@ -429,3 +476,4 @@ def _on_finished(self, result):
     if len(result.songs) < result.requested:
         self.log(f"Вопросов получилось {len(result.songs)} из "
                  f"{result.requested} — кандидатов не хватило.")
+    self._finish_queue()

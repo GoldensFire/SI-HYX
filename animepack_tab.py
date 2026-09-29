@@ -48,7 +48,7 @@ try:
                            AI_ART_KIND, ANAGRAM_KIND, ANAGRAM_LANG_LABELS, ANAGRAM_LANGS,
                            ANAGRAM_MAX_CHARS, ANAGRAM_MIN_SECONDS,
                            ANIME_KINDS, ANSWER_IMAGE_MAX, CATEGORY_LABELS,
-                           CHAR_KIND, CHAR_ROLES, DIALOGUE_KIND,
+                           CHAR_KIND, CHAR_ROLES, DESCRIPTION_AUDIO_KIND, DIALOGUE_KIND,
                            CHAR_ROLE_LABELS, FRAME_KIND,
                            KIND_LABELS, KIND_TITLES, MANGA_KIND,
                            MANGA_LANG_LABELS, MANGA_LANGS,

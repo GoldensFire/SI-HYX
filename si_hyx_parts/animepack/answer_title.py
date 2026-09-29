@@ -48,6 +48,10 @@ def franchise_key(anime: dict) -> str:
     """Ключ франшизы. Пустая франшиза у Shikimori значит «одиночный тайтл» —
     такие нельзя схлопывать между собой, поэтому ключ делаем уникальным."""
     fr = str(anime.get("franchise") or "").strip()
+    if fr == "science_adventure":
+        branch = _api.franchise_branch_key(anime)
+        if branch:
+            return f"{fr}:{branch}"
     return fr or f"#{anime.get('malId') or anime.get('id')}"
 
 franchise_key.__module__ = _api.__name__

@@ -73,7 +73,8 @@ def encode_dvd(self, source: str, output: str, seed: int):
             "-force_key_frames", f"{still_at:.9f}"]
            + self.pixel_encode_args("setsar=1")
            + ["-movflags", "+faststart", output])
-    kw = {"creationflags": _api.CREATE_NO_WINDOW} if _api.os.name == "nt" else {}
+    from .generation_priority import creation_flags
+    kw = {"creationflags": _api.CREATE_NO_WINDOW | creation_flags(self.s)} if _api.os.name == "nt" else {}
     # stderr — во временный файл, а не в PIPE: недочитанная труба ошибок
     # подвешивает ffmpeg (см. память про proxy-stderr).
     with tempfile.TemporaryFile() as errors:

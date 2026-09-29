@@ -48,6 +48,10 @@ def run(self, out_path: _api.Optional[str] = None) -> _api.PackResult:
             raise _api.AnimePackError(
                 "Не набралось ни одного вопроса. Проверьте ошибки в журнале "
                 "или ослабьте фильтры (сложность, жанры, годы, типы аниме).")
+        from .level_avg import short_pack_average_error
+        average_error = short_pack_average_error(self.s, songs)
+        if average_error:
+            raise _api.AnimePackError(average_error)
         if len(songs) < self.s.total_questions:
             self.log(f"Внимание: вопросов будет {len(songs)}, а не "
                      f"{self.s.total_questions} — кандидаты кончились.")

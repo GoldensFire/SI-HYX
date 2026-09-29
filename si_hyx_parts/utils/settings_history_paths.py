@@ -142,7 +142,7 @@ def _snapshot_settings_history(current_text: str):
 _snapshot_settings_history.__module__ = _api.__name__
 _api._snapshot_settings_history = _snapshot_settings_history
 
-def save_settings(settings: dict):
+def save_settings(settings: dict) -> bool:
     # Атомарная запись: пишем во временный файл (с fsync), проверяем, что он
     # читается обратно, сохраняем предыдущую версию в .bak и только тогда
     # подменяем основной через os.replace. Иначе жёсткое завершение процесса
@@ -152,16 +152,16 @@ def save_settings(settings: dict):
     # уже сохранённые настройки (иначе разовая ошибка сборки настроек сбрасывала
     # бы папки и прочее к значениям по умолчанию).
     if not isinstance(settings, dict):
-        return
+        return False
     if not settings and _api.settings_files_exist():
-        return
+        return False
 
     # Что лежит на диске сейчас. Читаем ДО записи: если ничего не изменилось,
     # диск вообще не трогаем (сохранение висит на каждом поле — при протяжке
     # ползунка это были десятки лишних перезаписей подряд).
     current, current_status = _api._read_settings_file(_api.SETTINGS_FILE, retries=2)
     if current_status == "ok" and current == settings:
-        return
+        return True
 
     # Временный файл — СВОЙ у каждого процесса. Общее имя settings.json.tmp
     # означало, что два одновременно запущенных экземпляра программы пишут в
@@ -188,7 +188,7 @@ def save_settings(settings: dict):
             _api.os.remove(tmp)
         except Exception:
             pass
-        return
+        return False
 
     if current_status == "ok":
         # В .bak (и в историю) уходит только валидный прежний файл.
@@ -202,6 +202,8 @@ def save_settings(settings: dict):
             _api.os.remove(tmp)          # не оставляем мусор рядом с настройками
         except Exception:
             pass
+        return False
+    return True
 
 save_settings.__module__ = _api.__name__
 _api.save_settings = save_settings

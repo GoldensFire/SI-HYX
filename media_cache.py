@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
-"""Bounded on-disk cache for reusable anime-pack media.
+"""Bounded on-disk cache for reusable anime-pack posters.
 
-Only immutable inputs and deterministic derived files belong here. Random
-Pixiv/MangaDex/Sakugabooru choices deliberately stay out: the frame
-history prevents their reuse, so caching them would mostly waste disk space.
+Songs, anime frames, and character portraits are one-use media and are never
+stored here by the generator. The old namespaces are purged on generation.
 """
 from __future__ import annotations
 

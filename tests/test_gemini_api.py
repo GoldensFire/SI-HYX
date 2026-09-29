@@ -50,7 +50,7 @@ def _catch_sleep(client, monkeypatch) -> list:
 # ── модели ───────────────────────────────────────────────────────────────────
 def test_model_list_contains_new_flash_choices():
     assert gemini_api.MODELS == (
-        "gemini-3.5-flash-lite", "gemini-3.6-flash",
+        "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.6-flash",
         "gemini-3.7-flash", "gemini-3.8-flash")
     assert gemini_api.DEFAULT_MODEL == "gemini-3.5-flash-lite"
 
@@ -133,10 +133,16 @@ def test_request_shape(fake_session, fake_response):
 
 def test_thinking_level_is_chosen_by_the_user(fake_session, fake_response):
     """Уровень рассуждения выбирается на вкладке и уходит в запрос как есть."""
-    s = fake_session([("interactions",
-                       fake_response(200, json_data=_ok_body({"ok": True})))])
+    response = {"candidates": [{"content": {"parts": [{"text": '{"ok":true}'}]}}]}
+    s = fake_session([("generateContent",
+                       fake_response(200, json_data=response))])
     _client(s, thinking="high").generate_json("вопрос", SCHEMA)
-    assert s.calls[0][2]["json"]["generation_config"]["thinking_level"] == "high"
+    _method, url, kwargs = s.calls[0]
+    assert url.endswith("/gemini-3.5-flash-lite:generateContent")
+    body = kwargs["json"]
+    assert body["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "HIGH"
+    assert body["generationConfig"]["responseSchema"] == SCHEMA
+    assert body["contents"][0]["parts"][0]["text"] == "вопрос"
 
 
 def test_unknown_thinking_level_falls_back_to_the_default():
@@ -179,7 +185,9 @@ def test_quota_exhausted_raises_quota_error(fake_session, fake_response,
     # Один исчерпанный ответ на модель: повторять 429 значит самому раздувать
     # суточный счётчик (именно так раньше получалось 23 / 20).
     assert len(s.calls) == len(MODELS)
-    assert [call[2]["json"]["model"] for call in s.calls] == list(MODELS)
+    assert [call[2]["json"]["model"] for call in s.calls] == [
+        "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+        "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"]
 
 
 def test_quota_falls_back_to_previous_model(fake_session, fake_response,
@@ -254,6 +262,19 @@ def test_server_error_is_retried(fake_session, fake_response, monkeypatch):
     monkeypatch.setattr(c, "_sleep", lambda _s: None)
     assert c.generate_json("привет", SCHEMA) == {"ok": True}
     assert len(s.calls) == 2
+
+
+def test_server_busy_after_all_retries_is_unavailable_not_quota(
+        fake_session, fake_response, monkeypatch):
+    """503 «high demand» до конца ретраев — отдельный тип: по нему пачка
+    проверок картинок решает, что сервер лежит (visual_batch.DOWN_AFTER)."""
+    s = fake_session([("interactions",
+                       lambda url, **kw: fake_response(503, text="high demand"))])
+    c = _client(s)
+    monkeypatch.setattr(c, "_sleep", lambda _s: None)
+    with pytest.raises(gemini_api.GeminiUnavailableError):
+        c.generate_json("привет", SCHEMA)
+    assert len(s.calls) == c.max_retries
 
 
 # ── троттлинг и отмена ───────────────────────────────────────────────────────

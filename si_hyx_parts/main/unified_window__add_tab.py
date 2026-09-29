@@ -25,6 +25,9 @@ def _add_tab(self, widget, key):
     # с фирменным попапом-подсказкой вместо системного тултипа.
     try:
         badge = _api.info_badge(tip)
+        # За подсказку значка вкладки отвечает фильтр QTabBar. Сам QLabel и
+        # общий фильтр приложения не должны показывать её повторно.
+        badge.setProperty("tabTipManaged", True)
         badge.setStyleSheet("#infoBadge{color:#89b4fa;}")
         # Бейдж ⓘ (16×16, значок 13px по центру) визуально садится на ~1px
         # ниже центра текста вкладки. Нижний отступ сдвигает значок вверх,
@@ -32,6 +35,7 @@ def _add_tab(self, widget, key):
         badge.setContentsMargins(0, 0, 0, 2)
         self.tabs.tabBar().setTabButton(
             idx, _api.QTabBar.ButtonPosition.RightSide, badge)
+        badge.installEventFilter(self)
     except Exception:
         self.tabs.setTabToolTip(idx, tip)
     return idx

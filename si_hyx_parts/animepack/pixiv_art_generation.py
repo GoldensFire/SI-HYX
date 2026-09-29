@@ -177,7 +177,9 @@ def _visual_ok(self, cand, data, ext, illust):
         approved, reason = check(self, cand, data, ext, illust)
     except Exception as exc:  # noqa: BLE001 — типы gemini_api
         name = type(exc).__name__
-        if name in ("GeminiAuthError", "GeminiQuotaError"):
+        # GeminiDownError — сервер подряд не отвечает (visual_batch): ждать
+        # его на каждом арте значит держать рабочие потоки минутами.
+        if name in ("GeminiAuthError", "GeminiQuotaError", "GeminiDownError"):
             self.gemini_pixiv = None
             self._drop_kind(_api.PIXIV_ART_KIND)
             cand.rejected = True

@@ -170,6 +170,7 @@ def __init__(self):
     # показываем фирменный попап сами — отслеживаем движение мыши над
     # таббаром и проверяем, под каким бейджем курсор.
     self._tab_tip_idx = -1
+    self._tab_tip_badge = None
     try:
         bar = self.tabs.tabBar()
         bar.setMouseTracking(True)

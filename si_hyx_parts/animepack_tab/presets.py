@@ -5,7 +5,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-from PyQt6.QtWidgets import QInputDialog, QMessageBox
+from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import QInputDialog, QLabel, QMessageBox
 
 import animepack_tab as _api
 
@@ -14,9 +15,10 @@ META_TEMPLATES = "_templates"
 META_ACTIVE = "_active_template"
 META_DELETED = "_deleted_templates"
 _PRESERVE = {
-    "title", "theme_title", "pack_number", "users", "saved_users",
-    "exclude_siq", "exclude_exact_siq", "out_dir",
-    "gemini_key", "jimaku_key", "subdl_key", "tmdb_key", "cloudflare_token",
+    "title", "theme_title", "pack_number", "test_pack_number",
+    "users", "saved_users",
+    "exclude_siq", "exclude_exact_siq", "auto_add_to_exclusions", "out_dir",
+    "gemini_key", "elevenlabs_key", "jimaku_key", "subdl_key", "tmdb_key", "cloudflare_token",
     "cloudflare_account_id", "pixiv_refresh_token",
 }
 
@@ -66,28 +68,46 @@ def load_templates(self, settings: dict) -> None:
 def _build_templates(self):
     box = _api.QGroupBox("Шаблон")
     layout = _api.QVBoxLayout(box)
+    title_row = _api.QHBoxLayout()
     self.cb_template = _api.QComboBox()
     self.cb_template.addItems(list(self._templates))
     self.cb_template.setCurrentText(self._active_template)
-    self.cb_template.currentTextChanged.connect(self._template_selected)
-    layout.addWidget(self.cb_template)
+    self.cb_template.setEditable(True)
+    self.cb_template.setInsertPolicy(_api.QComboBox.InsertPolicy.NoInsert)
+    self.cb_template.setToolTip("Выберите шаблон или нажмите на название, чтобы переименовать")
+    self.cb_template.currentIndexChanged.connect(self._template_selected)
+    self.cb_template.lineEdit().editingFinished.connect(self._rename_template)
+    title_row.addWidget(self.cb_template, 1)
+    self.btn_delete_template = _api.QToolButton()
+    self.btn_delete_template.setIcon(_api.get_icon("fa5s.trash-alt"))
+    self.btn_delete_template.setFixedWidth(34)
+    self.btn_delete_template.setToolTip("Удалить выбранный шаблон")
+    self.btn_delete_template.clicked.connect(self._delete_template)
+    title_row.addWidget(self.btn_delete_template)
+    layout.addLayout(title_row)
     row = _api.QHBoxLayout()
     update_btn = _api.QPushButton("Обновить")
+    update_btn.setFixedWidth(116)
     update_btn.setToolTip("Заменить выбранный шаблон текущими настройками")
     update_btn.clicked.connect(self._update_template)
     row.addWidget(update_btn)
-    self.btn_edit_template = _api.QPushButton("Редактировать")
-    self.btn_edit_template.setToolTip("Переименовать или удалить шаблон")
-    self.btn_edit_template.clicked.connect(self._edit_template)
-    row.addWidget(self.btn_edit_template)
-    layout.addLayout(row)
-    save_btn = _api.QPushButton("Сохранить как…")
+    save_btn = _api.QPushButton("Сохранить…")
+    save_btn.setToolTip("Сохранить текущие настройки как новый шаблон")
     save_btn.clicked.connect(self._save_template_as)
-    layout.addWidget(save_btn)
+    row.addWidget(save_btn, 1)
+    layout.addLayout(row)
+    self.template_notice = QLabel("Шаблон обновлён и сохранён")
+    self.template_notice.setStyleSheet("color: #399b68; font-size: 11px;")
+    self.template_notice.hide()
+    layout.addWidget(self.template_notice)
+    self._template_notice_timer = QTimer(self)
+    self._template_notice_timer.setSingleShot(True)
+    self._template_notice_timer.timeout.connect(self.template_notice.hide)
     return box
 
 
-def _template_selected(self, name: str) -> None:
+def _template_selected(self, _index: int) -> None:
+    name = self.cb_template.itemText(self.cb_template.currentIndex())
     if name in self._templates:
         self._apply_template()
 
@@ -112,11 +132,20 @@ def _editable_settings(self) -> dict:
 
 
 def _update_template(self) -> None:
-    name = self.cb_template.currentText()
+    name = self.cb_template.itemText(self.cb_template.currentIndex())
     if name:
         self._templates[name] = self._editable_settings()
         self._active_template = name
-        _save_soon(self)
+        saver = getattr(getattr(self, "main", None), "_save_settings_now", None)
+        if saver is None:
+            _save_soon(self)
+            saved = True
+        else:
+            saved = saver()
+        if saved:
+            self.template_notice.setText(f"Шаблон «{name}» обновлён и сохранён")
+            self.template_notice.show()
+            self._template_notice_timer.start(3500)
 
 
 def _save_template_as(self) -> None:
@@ -132,40 +161,30 @@ def _save_template_as(self) -> None:
     _save_soon(self)
 
 
-def _edit_template(self) -> None:
-    if not self.cb_template.currentText():
-        return
-    menu = _api.QMenu(self.btn_edit_template)
-    menu.addAction("Переименовать", self._rename_template)
-    menu.addAction("Удалить", self._delete_template)
-    menu.exec(self.btn_edit_template.mapToGlobal(
-        self.btn_edit_template.rect().bottomLeft()))
-
-
 def _rename_template(self) -> None:
-    old = self.cb_template.currentText()
+    index = self.cb_template.currentIndex()
+    old = self.cb_template.itemText(index)
     if old not in self._templates:
         return
-    name, ok = QInputDialog.getText(self, "Переименовать шаблон",
-                                    "Новое название:", text=old)
-    name = str(name or "").strip()
-    if not ok or not name or name == old:
+    name = self.cb_template.lineEdit().text().strip()
+    if not name or name == old:
+        self.cb_template.setCurrentText(old)
         return
     if name in self._templates:
         QMessageBox.warning(self, "Шаблон уже существует",
                             f"Шаблон «{name}» уже существует.")
+        self.cb_template.setCurrentText(old)
         return
     self._templates[name] = self._templates.pop(old)
     self._deleted_templates.add(old)
     self._deleted_templates.discard(name)
-    index = self.cb_template.currentIndex()
     self.cb_template.setItemText(index, name)
     self._active_template = name
     _save_soon(self)
 
 
 def _delete_template(self) -> None:
-    name = self.cb_template.currentText()
+    name = self.cb_template.itemText(self.cb_template.currentIndex())
     if name not in self._templates:
         return
     answer = QMessageBox.question(

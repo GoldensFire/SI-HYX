@@ -150,7 +150,8 @@ def _media_size(self, cand: _api.SongCandidate) -> int:
     names = []
     if cand.has_video:
         names.append(_api.os.path.join("Video", cand.video_out))
-    elif not cand.is_silent:
+    elif not cand.is_silent or (cand.kind == _api.DESCRIPTION_AUDIO_KIND
+                                and cand.description_audio_ext):
         names.append(_api.os.path.join("Audio", cand.audio_out))
     for flag, name in ((cand.has_poster, cand.poster_file),
                        (cand.has_collage, cand.collage_file),
@@ -179,11 +180,15 @@ def load_exclusions(self) -> None:
     self._excluded_franchises = set()
     self._excluded_studios = set()
     self._exact_keys = set()
+    from .test_packs import is_test_pack
+    skip_tests = bool(getattr(self.s, "ignore_test_packs", False))
     if getattr(self.s, "exclude_exact_siq", None):
         from .exact_repeat import read_exact_keys
         for path in self.s.exclude_exact_siq:
             if self.stopped():
                 return
+            if skip_tests and is_test_pack(path):
+                continue
             found = read_exact_keys(path)
             self._exact_keys.update(found)
             if not found:
@@ -195,6 +200,8 @@ def load_exclusions(self) -> None:
     for path in (self.s.exclude_siq or []):
         if self.stopped():
             return
+        if skip_tests and is_test_pack(path):
+            continue
         # Пак, собранный этой же программой, носит список спрошенного при себе
         # (см. pack_manifest). Он точнее разбора ответов: у «детали сюжета»,
         # персонажа и загадки по названию в ответе стоит не тайтл, и прежним
@@ -220,7 +227,7 @@ def load_exclusions(self) -> None:
     for target in ("anime", "manga"):
         sig = _api.shiki_cache_signature(self.s, target == "manga")
         for card in cached_catalog(self.db_cache, target, sig)[0]:
-            key = str(card.get("franchise") or "").strip()
+            key = (_api.franchise_key(card) if card.get("franchise") else "")
             if not key or key in self._excluded_franchises:
                 continue
             if self._root_excluded(card):
@@ -238,8 +245,11 @@ def _root_excluded(self, anime: dict) -> bool:
     """Спрашивали ли этот тайтл (или его франшизу) в чужих паках."""
     if not self._excluded_roots and not self._excluded_franchises:
         return False
-    key = str((anime or {}).get("franchise") or "").strip()
-    if key and key in self._excluded_franchises:
+    key = (_api.franchise_key(anime) if (anime or {}).get("franchise")
+           else "")
+    legacy_key = str((anime or {}).get("franchise") or "").strip()
+    if (key and key in self._excluded_franchises
+            or legacy_key and legacy_key in self._excluded_franchises):
         return True
     for name in ((anime or {}).get("russian"), (anime or {}).get("name"),
                  (anime or {}).get("english")):

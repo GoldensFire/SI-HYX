@@ -14,7 +14,7 @@ class _MixSlider(PercentageSliders, _api._ShareBar):
     """Individual sliders sharing 100%, with the historical public API."""
 
     KEYS = ("songs", "video", "frames", "chars", "manga", "pixel", "anagram",
-            "dialogue", "plot", "ai_art", "pixiv_art", "sakuga",
+            "dialogue", "plot", "description_audio", "ai_art", "pixiv_art", "sakuga",
             "studio") + TITLE_KINDS
     # Первые пять — «историческая» пятёрка percents(): её ждут и сохранённые
     # настройки, и PackSettings.percents.
@@ -22,7 +22,8 @@ class _MixSlider(PercentageSliders, _api._ShareBar):
     LABELS = {"songs": "Песни", "video": "Ролики", "frames": "Кадры",
               "chars": "Персонажи", "manga": "Манга", "pixel": "Кадры с эффектами",
               "anagram": "Анаграммы", "dialogue": "Диалоги",
-              "plot": "Сюжет", "ai_art": "ИИ-арты",
+              "plot": "Сюжет", "description_audio": "Описание",
+              "ai_art": "ИИ-арты",
               "pixiv_art": "Арты Pixiv",
               "sakuga": "Сакуга", "studio": "Студия",
               "synonyms": "Синонимы",
@@ -30,6 +31,7 @@ class _MixSlider(PercentageSliders, _api._ShareBar):
     COLORS = {"songs": "accent", "video": "accent2", "frames": "green",
               "chars": "yellow", "manga": "red", "pixel": "text2",
               "anagram": "accent2", "dialogue": "yellow", "plot": "green",
+              "description_audio": "accent2",
               "ai_art": "accent2",
               "pixiv_art": "yellow", "sakuga": "red",
               "studio": "accent"}
@@ -174,6 +176,8 @@ class _GenTask(_api.QRunnable):
     def run(self):
         gen = None
         try:
+            from si_hyx_parts.animepack.generation_priority import apply_thread_priority
+            apply_thread_priority(self.settings)
             gen = self._gen = _api.AnimePackGenerator(
                 self.settings,
                 log=self.signals.log.emit,

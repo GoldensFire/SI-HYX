@@ -82,9 +82,9 @@ def _save_image(self, data: bytes, base: str, src_ext: str = ".jpg") -> str:
     return name
 
 def _save_reusable_image(self, data: bytes, base: str,
-                         src_ext: str = ".jpg") -> str:
+                         src_ext: str = ".jpg", *, reuse: bool = True) -> str:
     """Save an image and reuse its deterministic AVIF on later packs."""
-    enabled = (self.s.compress_images
+    enabled = (reuse and self.s.compress_images
                and bool(getattr(self.s, "poster_cache", True)))
     if not enabled:
         return self._save_image(data, base, src_ext)
@@ -93,7 +93,7 @@ def _save_reusable_image(self, data: bytes, base: str,
         _api.IMAGE_FIT_PASSES, _api.IMAGE_MAX_SIDE)
     name = f"{base}.avif"
     out = _api.os.path.join(self.folder, "Images", name)
-    ready = _api.media_cache.read("avif", key, ".avif")
+    ready = _api.media_cache.read("poster-avif", key, ".avif")
     if ready is not None:
         try:
             with open(out, "wb") as stream:
@@ -107,7 +107,7 @@ def _save_reusable_image(self, data: bytes, base: str,
     if name:
         try:
             with open(_api.os.path.join(self.folder, "Images", name), "rb") as stream:
-                _api.media_cache.put("avif", key, stream.read(), ".avif")
+                _api.media_cache.put("poster-avif", key, stream.read(), ".avif")
         except OSError:
             pass
     return name
@@ -271,14 +271,15 @@ def _download_character(self, cand: _api.SongCandidate) -> None:
     # Портрет тоже лежит в общей кладовой: один и тот же герой попадается в
     # паках раз за разом, а картинка у него не меняется.
     key = _api.poster_cache.character_key(row.get("id"))
-    use_cache = bool(getattr(self.s, "poster_cache", True)) and bool(key)
+    use_cache = False  # портрет вопроса тоже должен быть одноразовым
     data, ext = (_api.poster_cache.find(key) if use_cache else (b"", ""))
     try:
         if not data:
             data, ext = self._cached_bytes(url, "anime-frame"), self._url_ext(url)
             if use_cache:
                 _api.poster_cache.put(key, data, ext)
-        name = self._save_reusable_image(data, f"{cand.file_base}_frame", ext)
+        name = self._save_reusable_image(data, f"{cand.file_base}_frame", ext,
+                                         reuse=False)
         cand.frame_name = name or cand.frame_name
         cand.has_frame = bool(name)
     except Exception as e:  # noqa: BLE001

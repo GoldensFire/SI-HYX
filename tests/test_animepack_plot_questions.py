@@ -229,13 +229,15 @@ def test_plot_detail_answers_replace_the_title_in_xml():
     assert items == ["Как зовут синигами?"]
 
 
-def test_plot_explanation_is_immediately_before_the_fandom_link():
+def test_plot_explanation_is_first_and_names_the_short_answer():
     cand = SongCandidate(song={}, anime=make_anime(), kind=PLOT_KIND)
     cand.plot_answers = ["Тайник"]
     cand.plot_explanation = "В тайнике лежала улика, изменившая расследование."
     cand.source_link = "https://example.fandom.com/wiki/Episode_7"
-    assert cand.answer_variants()[-2:] == [cand.plot_explanation,
-                                           cand.source_link]
+    answers = cand.answer_variants()
+    assert answers[0].startswith("Тайник — ")
+    assert cand.plot_explanation in answers[0]
+    assert answers[1:] == ["Тайник", cand.source_link]
 
 
 def test_answer_does_not_say_the_plot_episode_out_loud():

@@ -51,7 +51,15 @@ def build_cells(rows, build) -> tuple[list, list, list]:
         line = tuple(str(text) for text, _value in cells)
         texts.append(line)
         sorts.append(tuple(value for _text, value in cells))
-        hay.append("\n".join(line).casefold())
+        card = row.get("card") or getattr(row.get("candidate"), "anime", {})
+        names = []
+        if isinstance(card, dict):
+            names = [card.get(key) for key in
+                     ("russian", "name", "english", "japanese",
+                      "licenseNameRu")]
+            names.extend(card.get("synonyms") or [])
+        hay.append("\n".join((*line, *(str(name) for name in names if name)))
+                   .casefold())
     return texts, sorts, hay
 
 

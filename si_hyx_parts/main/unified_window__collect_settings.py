@@ -102,7 +102,7 @@ def _save_settings_now(self):
         # Настройки не прочитались при старте — см. _load_settings.
         self.log("save settings: настройки не прочитались при запуске — "
                  "сохранение отключено до перезапуска (файл не затёрт)")
-        return
+        return False
     try:
         data = self._collect_settings()
         # _collect_settings возвращает {} при любой ошибке (напр. после
@@ -111,10 +111,14 @@ def _save_settings_now(self):
         # запуске папка загрузчика и прочие настройки сбрасываются к дефолту.
         if not data:
             self.log("save settings: пустой результат сборки — пропуск (файл не затёрт)")
-            return
-        _api.save_settings(data)
+            return False
+        if _api.save_settings(data):
+            return True
+        self.log("save settings: файл не был обновлён")
+        return False
     except Exception as e:
         self.log(f"save settings error: {e}")
+        return False
 
 def _save_settings_soon(self, *_args):
     """Отложенное сохранение (400 мс без изменений). Сохранение висит на
@@ -277,12 +281,15 @@ def eventFilter(self, obj, event):
     bar = self.tabs.tabBar() if getattr(self, "tabs", None) is not None else None
     if bar is not None and obj is bar:
         et = event.type()
-        if et == _api.QEvent.Type.MouseMove:
-            try: self._update_tab_tip(event.position().toPoint())
-            except Exception: pass
+        if et == _api.QEvent.Type.ToolTip:
+            return True
         elif et in (_api.QEvent.Type.Leave, _api.QEvent.Type.Hide,
                     _api.QEvent.Type.WindowDeactivate):
             self._hide_tab_tip()
+        elif et in (_api.QEvent.Type.LayoutRequest, _api.QEvent.Type.Resize,
+                    _api.QEvent.Type.Move, _api.QEvent.Type.ChildRemoved):
+            try: _api.QApplication.instance()._hover_tip_mgr._queue_hover_tip()
+            except Exception: pass
         elif et == _api.QEvent.Type.DragEnter:
             if self._tab_drag_has_files(event):
                 event.acceptProposedAction(); return True
@@ -303,5 +310,8 @@ def eventFilter(self, obj, event):
                 event.acceptProposedAction(); return True
         elif et == _api.QEvent.Type.Wheel:
             self._tab_wheel_scroll(event)
+            return True
+    elif bar is not None and obj.property("tabTipManaged"):
+        if event.type() == _api.QEvent.Type.ToolTip:
             return True
     return super(_api.UnifiedWindow, self).eventFilter(obj, event)

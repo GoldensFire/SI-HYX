@@ -5,6 +5,12 @@
 Отдельного потока нет: один из ожидающих работников отправляет пачку,
 остальные получают свои вердикты по id. Одиночная проверка не ждёт других
 бесконечно; ошибка пачки не запускает дорогие одиночные повторы.
+
+Предохранитель: когда сервер DOWN_AFTER запросов подряд не отвечает (503 «high
+demand» после всех повторов или таймаут), проверки до конца прогона сразу
+получают GeminiDownError, не трогая сеть. Иначе каждая пачка ждала бы минуты,
+а пока все рабочие потоки стоят в очереди к Gemini, другие роды вопросов не
+качаются вовсе: живой прогон собрал 4 вопроса из 144 за 14 минут.
 """
 from __future__ import annotations
 
@@ -12,11 +18,18 @@ import threading
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 
-from gemini_api import GeminiError
+from gemini_api import GeminiDownError, GeminiError, GeminiUnavailableError
 
 MAX_IMAGES = 4
 MAX_INPUT = 16_000_000  # запас до ограничения 20 МБ с учётом JSON
 COLLECT_SECONDS = 0.25
+# Столько запросов подряд без ответа — и Gemini для картинок до конца прогона
+# считается недоступным. Каждый такой запрос — это уже пять попыток 503 или
+# полный таймаут, так что двух хватает с запасом.
+DOWN_AFTER = 2
+# Ответа на проверку картинки ждём меньше, чем на пересказ сюжета: рассуждение
+# здесь минимальное, и минута без ответа значит перегруженный сервер.
+READ_TIMEOUT = 60.0
 
 
 @dataclass(eq=False)
@@ -41,6 +54,8 @@ class VisualCheckBatcher:
         self._condition = threading.Condition()
         self._pending: list[_Job] = []
         self._sending = False
+        self._misses = 0
+        self.down = ""
 
     def check(self, parts, schema):
         job = _Job(parts, schema)
@@ -90,21 +105,39 @@ class VisualCheckBatcher:
         try:
             if self.stopped():
                 raise GeminiError("Отменено")
+            if self.down:
+                raise GeminiDownError(self.down)
             if len(batch) == 1:
                 job = batch[0]
                 verdict = self.client.generate_json(
                     job.parts, job.schema, temperature=0.0)
                 job.future.set_result(verdict)
-                return
-            parts, schema = _request(batch)
-            response = self.client.generate_json(parts, schema, temperature=0.0)
-            verdicts = _verdicts(response, batch)
-            for index, job in enumerate(batch):
-                job.future.set_result(verdicts[index])
+            else:
+                parts, schema = _request(batch)
+                response = self.client.generate_json(parts, schema,
+                                                     temperature=0.0)
+                verdicts = _verdicts(response, batch)
+                for index, job in enumerate(batch):
+                    job.future.set_result(verdicts[index])
         except Exception as error:  # noqa: BLE001 — передаём отказ всем ожидающим
+            error = self._note_failure(error)
             for job in batch:
                 if not job.future.done():
                     job.future.set_exception(error)
+        else:
+            self._misses = 0
+
+    def _note_failure(self, error):
+        """Считает запросы подряд без ответа; на пороге — GeminiDownError."""
+        if not isinstance(error, GeminiUnavailableError):
+            if not isinstance(error, GeminiDownError):
+                self._misses = 0    # сервер ответил — пусть и неудачно
+            return error
+        self._misses += 1
+        if self._misses >= DOWN_AFTER and not self.down:
+            self.down = (f"{self._misses} запроса подряд без ответа, "
+                         f"последний: {error}")
+        return GeminiDownError(self.down) if self.down else error
 
 
 def _request(batch):

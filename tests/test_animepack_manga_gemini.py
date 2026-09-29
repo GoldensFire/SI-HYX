@@ -130,6 +130,19 @@ def test_exhausted_quota_turns_the_check_off_not_the_manga(generator):
     assert MANGA_KIND not in gen._dead_kinds
 
 
+def test_silent_server_turns_the_check_off_not_the_manga(generator):
+    # Gemini перегружен (503/таймауты подряд) — ждать его на каждой странице
+    # значит держать рабочие потоки минутами; страницы идут без проверки.
+    from gemini_api import GeminiDownError
+    gen = generator
+    _pages(gen)
+    gen.gemini_manga = _Gemini([GeminiDownError("2 запроса подряд без ответа")])
+    cand = SongCandidate({}, make_anime(malId=656), kind=MANGA_KIND, media="manga")
+    assert gen._fetch_media(cand) is True
+    assert gen.gemini_manga is None
+    assert MANGA_KIND not in gen._dead_kinds
+
+
 def test_settings_need_a_gemini_key_only_when_the_check_is_on():
     base = dict(pct_songs=0, pack_manga=True, pct_manga=100)
     on = PackSettings(**base)

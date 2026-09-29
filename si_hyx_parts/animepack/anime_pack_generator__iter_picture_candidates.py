@@ -171,10 +171,16 @@ def _accept_anime(self, anime: dict, mal: int, used_anime: set,
     if not (low <= probe.level <= high):
         self._skips[note] += 1
         return False
+    with self._studio_lock:
+        # Пока считали сложность, фоновый вопрос-студия мог занять одну из
+        # франшиз своих дополнительных кадров.
+        if not self.s.dup_franchise and any(m in used_franchise for m in marks):
+            self._skips["франшиза уже в паке"] += 1
+            return False
+        used_anime.add(mal)
+        used_franchise.update(marks)
     self._good_titles += 1
     self._good_by_media["manga" if manga else "anime"] += 1
-    used_anime.add(mal)
-    used_franchise.update(marks)
     # Что именно забронировано под этого кандидата: цикл отбора вернёт
     # франшизу в оборот, если вопросом кандидат так и не станет (см.
     # _release_candidate). Между этой строкой и созданием карточки кандидата
@@ -199,8 +205,8 @@ def _franchise_marks(anime: dict, adapted: _api.Optional[dict] = None) -> tuple:
     for card, own in ((anime, True), (adapted or {}, False)):
         if not card:
             continue
-        key = (_api.franchise_key(card) if own
-               else str(card.get("franchise") or "").strip())
+        key = (_api.franchise_key(card) if own or card.get("franchise")
+               else "")
         root = _api.title_root(card.get("russian") or card.get("name"))
         for mark in (key, root):
             if mark and mark not in out:
@@ -226,6 +232,9 @@ def _release_candidate(self, cand) -> None:
         cand._studio_reserved = ""
         with self._studio_lock:
             self._used_studios.discard(studio)
+            for mark in getattr(cand, "_studio_reserved_franchises", ()):
+                self._used_franchise.discard(mark)
+            cand._studio_reserved_franchises = ()
     keys = getattr(cand, "_reserved", None)
     if not keys:
         return
@@ -233,9 +242,10 @@ def _release_candidate(self, cand) -> None:
     # Ключи не забываем: отложенный кандидат ещё может вернуться со скамейки,
     # и тогда франшизу надо занять заново (см. _rebook_candidate).
     cand._bench_keys = keys
-    for key in keys:
-        if key:
-            self._used_franchise.discard(key)
+    with self._studio_lock:
+        for key in keys:
+            if key:
+                self._used_franchise.discard(key)
 
 def _trim_start(self, song: dict) -> int:
     """Случайная точка старта отрезка. Короткую песню берём с начала —
@@ -273,7 +283,9 @@ def _get_bytes(self, url: str, timeout=(10, 90)) -> bytes:
 
 
 def _cached_bytes(self, url: str, namespace: str, minimum: int = 1) -> bytes:
-    """Immutable source bytes shared by subsequent pack generations."""
+    """Повторяем только обложки; песни и кадры скачиваем для одного пака."""
+    if namespace in ("amq-audio", "anime-frame", "cover-audio"):
+        return self._get_bytes(url)
     if not bool(getattr(self.s, "poster_cache", True)):
         return self._get_bytes(url)
     data, hit = _api.media_cache.get_or_load(
@@ -327,7 +339,8 @@ def _run_killable(self, cmd, timeout: float = 180.0) -> tuple[int, str]:
 def _run_capture(self, cmd, timeout: float = 180.0) -> tuple[int, str, str]:
     """То же самое, но с выводом процесса: ffprobe отвечает в stdout, а
         ffmpeg — в stderr, реестр процессов и «Стоп» им нужны одинаково."""
-    kw = {"creationflags": _api.CREATE_NO_WINDOW} if _api.os.name == "nt" else {}
+    from .generation_priority import creation_flags
+    kw = {"creationflags": _api.CREATE_NO_WINDOW | creation_flags(self.s)} if _api.os.name == "nt" else {}
     try:
         proc = _api.subprocess.Popen(cmd, stdout=_api.subprocess.PIPE,
                                 stderr=_api.subprocess.PIPE, **kw)

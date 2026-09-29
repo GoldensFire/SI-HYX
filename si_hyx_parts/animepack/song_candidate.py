@@ -125,6 +125,10 @@ class SongCandidate:
     # вопроса-кадра, — так его видят и память повторов, и подсчёт размера.
     extra_frames: list[str] = _api.field(default_factory=list)
     extra_frame_urls: list[str] = _api.field(default_factory=list)
+    description_audio_ext: str = ""     # mp3 (Eleven/Chirp) или wav (Gemini TTS)
+    description_language: str = ""
+    description_text: str = ""
+    popular_franchise_title: str = ""
 
     @property
     def base_kind(self) -> str:
@@ -183,6 +187,8 @@ class SongCandidate:
 
     @property
     def question_text(self) -> str:
+        if self.kind == _api.DESCRIPTION_AUDIO_KIND:
+            return self.description_text
         if self.kind == _api.ANAGRAM_KIND:
             return self.anagram
         if self.kind == _api.DIALOGUE_KIND:
@@ -292,6 +298,8 @@ class SongCandidate:
     def audio_out(self) -> str:
         """Имя дорожки ВНУТРИ пака. Со сжатием это opus, без — тот же файл, что
         приехал с CDN (mp3), просто обрезанный."""
+        if self.kind == _api.DESCRIPTION_AUDIO_KIND:
+            return f"{self.file_base}_description.{self.description_audio_ext or 'mp3'}"
         if self.music_effect == "chiptune":
             return f"{self.file_base}_chiptune" + (".mp3" if self.compress_audio else ".wav")
         if self.music_effect == "cover":

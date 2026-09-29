@@ -120,7 +120,8 @@ def _fetch_page(self, cand, url: str):
 def _visual_ok(self, cand, data: bytes, ext: str) -> bool:
     """Можно ли брать страницу: на ней не видно названия манги.
 
-    Кончилась квота или ключ не принят — проверка выключается до конца
+    Кончилась квота, ключ не принят или сервер перестал отвечать
+    (GeminiDownError, см. visual_batch) — проверка выключается до конца
     прогона, и страницы идут как раньше, без неё: из середины главы название
     попадается редко, а терять из-за этого все вопросы по манге жалко."""
     if getattr(self, "gemini_manga", None) is None:
@@ -129,7 +130,8 @@ def _visual_ok(self, cand, data: bytes, ext: str) -> bool:
     try:
         approved, reason = check(self, cand, data, ext)
     except Exception as exc:  # noqa: BLE001 — типы gemini_api
-        if type(exc).__name__ in ("GeminiAuthError", "GeminiQuotaError"):
+        if type(exc).__name__ in ("GeminiAuthError", "GeminiQuotaError",
+                                  "GeminiDownError"):
             self.gemini_manga = None
             self.log("Проверка страниц манги через Gemini выключена до конца "
                      f"прогона ({exc}) — страницы берутся без неё.")

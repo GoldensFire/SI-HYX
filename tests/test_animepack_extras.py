@@ -7,6 +7,7 @@
 вопроса-персонажа и раскладка времени по этапам.
 """
 from collections import Counter
+from types import SimpleNamespace
 
 from animepack import (ART_BUCKET, CHAR_KIND, FRAME_KIND, MANGA_KIND,
                        PIXIV_ART_KIND, AnimePackGenerator, PackSettings,
@@ -144,6 +145,36 @@ def test_level_avg_gives_up_instead_of_starving_the_pack():
 def test_level_avg_must_fit_the_range():
     assert any("Средняя сложность" in p for p in
                PackSettings(level_min=5, level_max=8, level_avg=2).validate())
+
+
+def test_two_question_pack_keeps_requested_average_with_pending_media():
+    settings = PackSettings(rounds=1, themes=1, questions=2,
+                            pct_songs=0, pct_frames=100, level_avg=4)
+    gen = _gen(settings)
+
+    def frame(level):
+        return SimpleNamespace(kind=FRAME_KIND, level=level)
+
+    assert not gen._level_fits(frame(8), [], FRAME_KIND)
+    assert gen._level_fits(frame(7), [], FRAME_KIND)
+    assert not gen._level_fits(frame(4), [], FRAME_KIND, [frame(7)])
+    assert gen._level_fits(frame(1), [], FRAME_KIND, [frame(7)])
+    assert not gen._level_fits(frame(6), [7], FRAME_KIND)
+    assert gen._level_fits(frame(1), [7], FRAME_KIND)
+
+
+def test_small_pack_with_wrong_average_is_not_published():
+    from si_hyx_parts.animepack.level_avg import short_pack_average_error
+
+    settings = PackSettings(rounds=1, themes=1, questions=2,
+                            pct_songs=0, pct_frames=100, level_avg=4)
+    assert short_pack_average_error(settings, [
+        SimpleNamespace(kind=FRAME_KIND, level=7),
+        SimpleNamespace(kind=FRAME_KIND, level=1)]) == ""
+    error = short_pack_average_error(settings, [
+        SimpleNamespace(kind=FRAME_KIND, level=7),
+        SimpleNamespace(kind=FRAME_KIND, level=8)])
+    assert "7.5" in error and "пакет не создан" in error
 
 
 # ── Своя средняя у артов и книг ─────────────────────────────────────────────

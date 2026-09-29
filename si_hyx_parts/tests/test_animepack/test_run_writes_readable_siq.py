@@ -103,8 +103,8 @@ def test_frame_pick_is_random_and_unique_within_pack():
     cand = _api._frame_cand()
     picked = [gen._pick_frame_url(cand) for _ in range(6)]
     assert len(set(picked)) == 6          # шесть скриншотов — шесть разных
-    # Кадры кончились, но памяти о прошлых паках нет — берём по кругу.
-    assert gen._pick_frame_url(cand)
+    # Использованные кадры не идут по кругу даже при нехватке материала.
+    assert gen._pick_frame_url(cand) == ""
 
 test_frame_pick_is_random_and_unique_within_pack.__module__ = _api.__name__
 _api.test_frame_pick_is_random_and_unique_within_pack = test_frame_pick_is_random_and_unique_within_pack
@@ -156,7 +156,8 @@ def test_save_frames_history_appends_used_only(tmp_path):
     assert _api.load_frame_history(path) == ["https://shiki/3.jpg"]  # ?query отброшен
 
     # Без галочки история не пишется вовсе.
-    s2 = _api.PackSettings(pct_songs=0, pct_frames=100)
+    s2 = _api.PackSettings(pct_songs=0, pct_frames=100,
+                           frames_no_repeat=False)
     gen2 = _api._generator(s2, [], [], frames_history_path=str(tmp_path / "no.json"))
     gen2.save_frames_history([used])
     assert _api.load_frame_history(str(tmp_path / "no.json")) == []

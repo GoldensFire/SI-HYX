@@ -282,3 +282,16 @@ def test_joint_works_of_several_studios_are_not_used(generator):
     cand = SongCandidate({}, joint, kind=STUDIO_KIND)
     assert studio_question.download_frames(generator, cand) is False
     assert any("несколько студий" in line for line in said)
+
+
+def test_studio_extra_franchises_block_regular_questions(generator):
+    cards = [_studio_card(i) for i in (1, 2, 3)]
+    cand = SongCandidate({}, cards[0], kind=STUDIO_KIND)
+    assert studio_question._reserve(generator, cand, "Madhouse", cards)
+    assert "anime_2" in generator._used_franchise
+    assert "anime_3" in generator._used_franchise
+    assert not generator._accept_anime(cards[1], cards[1]["malId"],
+                                       set(), generator._used_franchise)
+    generator._release_candidate(cand)
+    assert "anime_2" not in generator._used_franchise
+    assert "anime_3" not in generator._used_franchise

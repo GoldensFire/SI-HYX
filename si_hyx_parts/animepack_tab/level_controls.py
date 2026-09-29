@@ -50,21 +50,17 @@ AVG_TIP = ("Куда должна выйти СЕРЕДИНА этой част�
 
 
 def _avg(tab, tip):
-    """Ползунок средней сложности: 0 — «любая»."""
-    from .difficulty_slider import DifficultySlider
-    box = DifficultySlider(0, _api.MAX_LEVEL, 0)
-    box.setSpecialValueText("любая")
-    box.setMinimumWidth(120)
-    box.setToolTip(tip)
-    return box
+    """Прежний интерфейс значения теперь принадлежит общей полосе."""
+    return tab._new_level_bar.avg_control
 
 
 def _range(tip, low=1, high=None):
     from .difficulty_range import DifficultyRange
     high = _api.MAX_LEVEL if high is None else high
-    bar = DifficultyRange(low, high, minimum=1, maximum=_api.MAX_LEVEL)
+    bar = DifficultyRange(low, high, minimum=1, maximum=_api.MAX_LEVEL,
+                          average=True)
     bar.setMinimumWidth(240)
-    bar.setToolTip(tip)
+    bar.setToolTip(tip + "\n" + AVG_TIP)
     return bar
 
 
@@ -89,6 +85,7 @@ STUDIO_TIP = ("Насколько узнаваемы тайтлы в вопро�
 def build_song(tab):
     """Рамка узнаваемости аниме у песенных вопросов и роликов."""
     tab.song_level_range = _range(SONG_TIP)
+    tab._new_level_bar = tab.song_level_range
     tab.sp_song_level_from = tab.song_level_range.low_control
     tab.sp_song_level_to = tab.song_level_range.high_control
     tab.sp_song_level_avg = _avg(tab, AVG_TIP)
@@ -97,6 +94,7 @@ def build_song(tab):
 def build_studio(tab):
     """Своя рамка узнаваемости вопросов на студию."""
     tab.studio_level_range = _range(STUDIO_TIP)
+    tab._new_level_bar = tab.studio_level_range
     tab.sp_studio_level_from = tab.studio_level_range.low_control
     tab.sp_studio_level_to = tab.studio_level_range.high_control
     tab.sp_studio_level_avg = _avg(tab, AVG_TIP)
@@ -105,6 +103,7 @@ def build_studio(tab):
 def build_art(tab):
     """Рамка сложности для артов — рядом с общей «Сложностью пака»."""
     tab.art_level_range = _range(ART_TIP)
+    tab._new_level_bar = tab.art_level_range
     tab.sp_art_level_from = tab.art_level_range.low_control
     tab.sp_art_level_to = tab.art_level_range.high_control
     tab.sp_art_level_avg = _avg(tab, AVG_TIP)
@@ -119,6 +118,7 @@ def refresh_art(tab):
 def build_plot(tab):
     """Рамка сложности вопросов по сюжету — внутри их же настроек."""
     tab.plot_level_range = _range(PLOT_TIP)
+    tab._new_level_bar = tab.plot_level_range
     tab.sp_plot_level_from = tab.plot_level_range.low_control
     tab.sp_plot_level_to = tab.plot_level_range.high_control
     tab.sp_plot_level_avg = _avg(tab, AVG_TIP)
@@ -139,6 +139,7 @@ CHAR_TIP = ("Сложность тайтлов, из которых берутс
 def build_char(tab):
     """Своя рамка и средняя сложность вопросов-ПЕРСОНАЖЕЙ."""
     tab.char_level_range = _range(CHAR_TIP)
+    tab._new_level_bar = tab.char_level_range
     tab.sp_char_level_from = tab.char_level_range.low_control
     tab.sp_char_level_to = tab.char_level_range.high_control
     tab.sp_char_avg = _avg(tab, AVG_TIP)
@@ -147,6 +148,7 @@ def build_char(tab):
 def build_manga(tab):
     """Рамка сложности книг и доли внутри книжной части."""
     tab.manga_level_range = _range(MANGA_TIP)
+    tab._new_level_bar = tab.manga_level_range
     tab.sp_manga_level_from = tab.manga_level_range.low_control
     tab.sp_manga_level_to = tab.manga_level_range.high_control
     tab.sp_manga_level_avg = _avg(tab, AVG_TIP)

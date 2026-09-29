@@ -27,10 +27,6 @@ def check(generator, cand, data: bytes, ext: str, illust=None):
         raise RuntimeError("клиент Gemini для Pixiv не создан")
     model = str(getattr(client, "model", "") or "default")
     digest = hashlib.sha256(data).hexdigest()
-    key = f"{model}:{digest}"
-    cached = generator.db_cache.memo("pixiv_visual_v1", key)
-    if isinstance(cached, dict) and "accept" in cached:
-        return bool(cached["accept"]), str(cached.get("reason") or "")
 
     anime = cand.anime or {}
     titles = []
@@ -49,9 +45,15 @@ def check(generator, cand, data: bytes, ext: str, illust=None):
           "Также верни accept=false и mixed_anime=true, если изображены "
           "узнаваемые персонажи, логотипы или названия любого другого аниме "
           "либо смешаны несколько тайтлов. Обычные подписи автора и текст, "
-          "не раскрывающий название, допустимы. Оцени само изображение, а "
-          "метки используй как дополнительное доказательство. Причину напиши "
+          "не раскрывающий название, допустимы. Если метки явно называют "
+          "другое исходное произведение, в том числе игру, верни accept=false "
+          "даже при совпадении общей метки названия. Оцени само изображение, "
+          "а метки используй как дополнительное доказательство. Причину напиши "
           "кратко по-русски.")
+    key = f"{model}:{digest}:{hashlib.sha256(prompt.encode()).hexdigest()}"
+    cached = generator.db_cache.memo("pixiv_visual_v2", key)
+    if isinstance(cached, dict) and "accept" in cached:
+        return bool(cached["accept"]), str(cached.get("reason") or "")
     from .manga_visual_check import _prepare
     mime, payload = _prepare(data, ext)
     parts = [
@@ -69,7 +71,7 @@ def check(generator, cand, data: bytes, ext: str, illust=None):
              "has_title_text": bool(verdict.get("has_title_text")),
              "mixed_anime": bool(verdict.get("mixed_anime")),
              "reason": str(verdict.get("reason") or "")}
-    generator.db_cache.remember_memo("pixiv_visual_v1", key, saved)
+    generator.db_cache.remember_memo("pixiv_visual_v2", key, saved)
     return accept, saved["reason"]
 
 

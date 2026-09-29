@@ -17,6 +17,8 @@
 """
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
+
 from . import level_controls
 
 # Ключ блока, подпись и виджеты (рамка, средняя). Порядок — порядок на панели.
@@ -53,16 +55,14 @@ def place(tab, grid, row: int) -> int:
         bar = getattr(tab, range_name)
         avg = getattr(tab, avg_name)
         label = tab._lab(title)
-        label_avg = tab._lab(f"{title} в среднем")
-        grid.addWidget(label, row, 0)
+        label.setContentsMargins(0, 5, 0, 0)
+        grid.addWidget(label, row, 0,
+                       alignment=Qt.AlignmentFlag.AlignTop)
         grid.addWidget(bar, row, 1, 1, 3)
-        row += 1
-        grid.addWidget(label_avg, row, 0)
-        grid.addWidget(avg, row, 1)
         row += 1
         if key == "song":
             row = _place_amq(tab, grid, row)
-        tab._level_blocks[key] = (label, bar, label_avg, avg)
+        tab._level_blocks[key] = (label, bar)
     refresh(tab)
     return row
 

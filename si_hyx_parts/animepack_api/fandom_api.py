@@ -120,7 +120,15 @@ class FandomApi:
         if isinstance(names, str):
             names = [names]
         for name in names or ():
-            slugs = _api.wiki_slugs(name)
+            # Продолжения живут на вики всей франшизы: адреса с "Season 3"
+            # обычно нет, а базовое название часто сразу переадресует туда.
+            base = _api.re.sub(
+                r"\s*(?:[:—-]\s*)?(?:(?:\d+(?:st|nd|rd|th)?\s+)?season\s*\d*|"
+                r"\d+(?:st|nd|rd|th)\s+season|s\d{1,2}|\d{1,2}(?:-й)?\s+сезон|"
+                r"\d{1,2})\s*$", "", str(name).strip(), flags=_api.re.IGNORECASE)
+            variants = [base, name] if base and base != name else [name]
+            slugs = list(dict.fromkeys(slug for variant in variants
+                                       for slug in _api.wiki_slugs(variant)))
             # Адрес-одиночка идёт в списке последним и только третьим: первые
             # два собраны из ПОЛНОГО названия, и проверять их незачем.
             lone = len(slugs) - 1 if len(slugs) > 2 else -1
@@ -132,6 +140,23 @@ class FandomApi:
                     continue
                 return host
         return ""
+
+    def season_episode_pages(self, host: str, names, season: int) -> list[str]:
+        """Серии из указателя сезона, если вики ведёт такой указатель."""
+        if season <= 1:
+            return []
+        for name in names:
+            if not _api.re.search(r"[a-z]", name, _api.re.IGNORECASE):
+                continue
+            page = f"List of {name} episodes/Season {season}"
+            raw = self.page_source(host, page)
+            if not raw:
+                continue
+            pages = _api.re.findall(r"(?im)^\s*\|\s*Page\s*=\s*([^\n|}]+)", raw)
+            pages = list(dict.fromkeys(p.strip() for p in pages if p.strip()))
+            if pages:
+                return pages
+        return []
 
     # Сколько букв слова значимы при сверке названия со статьями вики.
     WORD_MIN = 4

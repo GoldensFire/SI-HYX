@@ -104,7 +104,8 @@ def download_frames(generator, cand) -> bool:
         return False
     for studio in choices:
         cards = _cards_for_studio(generator, cand, studio)
-        if len(cards) < _api.STUDIO_FRAMES or not _reserve(generator, cand, studio):
+        if (len(cards) < _api.STUDIO_FRAMES
+                or not _reserve(generator, cand, studio, cards)):
             continue
         assets = []
         for card in cards:
@@ -189,6 +190,12 @@ def _franchise_marks(card: dict) -> set[str]:
     return {root or key} if root or key else set()
 
 
+def _pack_marks(card: dict) -> set[str]:
+    """Use the same franchise and title-root keys as ordinary pack questions."""
+    from .anime_pack_generator__iter_picture_candidates import _franchise_marks
+    return set(_franchise_marks(card))
+
+
 def _cards_for_studio(generator, cand, studio: str) -> list[dict]:
     """Основной тайтл и разные франшизы той же студии в случайном порядке."""
     primary = cand.anime or {}
@@ -214,6 +221,9 @@ def _cards_for_studio(generator, cand, studio: str) -> list[dict]:
             continue
         marks = _franchise_marks(card)
         if marks & seen_franchises:
+            continue
+        if (card is not primary and not generator.s.dup_franchise
+                and _pack_marks(card) & generator._used_franchise):
             continue
         if card is not primary and generator._root_excluded(card):
             continue
@@ -246,12 +256,19 @@ def _studio_id(card: dict, wanted: str) -> int:
     return 0
 
 
-def _reserve(generator, cand, studio: str) -> bool:
+def _reserve(generator, cand, studio: str, cards: list[dict]) -> bool:
     key = studio.casefold()
     with generator._studio_lock:
         if key in generator._used_studios or key in generator._excluded_studios:
             return False
+        primary = set(getattr(cand, "_reserved", ()) or ())
+        extra = set().union(*(_pack_marks(card) for card in cards[1:]))
+        if (not generator.s.dup_franchise
+                and extra & (generator._used_franchise - primary)):
+            return False
         generator._used_studios.add(key)
+        generator._used_franchise.update(extra)
+        cand._studio_reserved_franchises = tuple(extra)
         cand._studio_reserved = key
     return True
 
@@ -263,6 +280,9 @@ def _unreserve(generator, cand) -> None:
     cand._studio_reserved = ""
     with generator._studio_lock:
         generator._used_studios.discard(key)
+        for mark in getattr(cand, "_studio_reserved_franchises", ()):
+            generator._used_franchise.discard(mark)
+        cand._studio_reserved_franchises = ()
 
 
 def _forget_frame(generator, url: str) -> None:
@@ -292,7 +312,8 @@ def _download_one(generator, cand, card: dict, number: int):
     try:
         frame = generator._cached_bytes(url, "anime-frame")
         name = generator._save_reusable_image(
-            frame, f"{cand.file_base}_studio{number}", generator._url_ext(url))
+            frame, f"{cand.file_base}_studio{number}", generator._url_ext(url),
+            reuse=False)
     except Exception as exc:  # noqa: BLE001
         _forget_frame(generator, url)
         generator.log(f"Кадр «{probe.title_ru}» не скачался: {exc}")

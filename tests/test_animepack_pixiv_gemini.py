@@ -62,6 +62,19 @@ def test_title_text_or_another_anime_rejects_and_is_cached():
     assert len(gen.gemini_pixiv.calls) == 1
 
 
+def test_visual_cache_depends_on_expected_title_and_tags():
+    gen = _Generator({"accept": True, "has_title_text": False,
+                      "mixed_anime": False, "reason": "подходит"})
+    first = _Candidate()
+    second = _Candidate()
+    second.anime = {"name": "Different Anime"}
+    image = b"same image"
+    check(gen, first, image, ".png", {"tags": [{"name": "first"}]})
+    check(gen, second, image, ".png", {"tags": [{"name": "first"}]})
+    check(gen, second, image, ".png", {"tags": [{"name": "other"}]})
+    assert len(gen.gemini_pixiv.calls) == 3
+
+
 # ── Отказ Gemini — повод взять другой арт того же тайтла ─────────────────────
 class _SeqPixiv:
     """Отдаёт арты по очереди и помнит, какие адреса ему запретили."""

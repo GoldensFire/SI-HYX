@@ -312,6 +312,8 @@ def _group_songs(self) -> _api.QGroupBox:
     build_controls(self)
     from si_hyx_parts.animepack_tab.dialogue_controls import build_controls
     build_controls(self)
+    from si_hyx_parts.animepack_tab.description_controls import build_controls
+    build_controls(self)
     from si_hyx_parts.animepack_tab.ai_art_controls import build_controls
     build_controls(self)
     from si_hyx_parts.animepack_tab.pixiv_art_controls import build_controls

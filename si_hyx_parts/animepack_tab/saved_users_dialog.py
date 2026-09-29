@@ -182,7 +182,6 @@ class AnimePackTab(_api.QWidget):
         _editable_settings,
         _update_template,
         _save_template_as,
-        _edit_template,
         _rename_template,
         _delete_template,
         templates_to_settings as _templates_to_settings,
@@ -275,6 +274,7 @@ class AnimePackTab(_api.QWidget):
     COUNT_ORDER = (_api.FRAME_KIND, "opening", "ending", "insert", _api.CHAR_KIND,
                    _api.VIDEO_KIND, _api.MANGA_KIND, _api.PIXEL_KIND,
                    _api.ANAGRAM_KIND, _api.DIALOGUE_KIND, _api.PLOT_KIND,
+                   _api.DESCRIPTION_AUDIO_KIND,
                    _api.AI_ART_KIND,
                    _api.PIXIV_ART_KIND, _api.SAKUGA_KIND,
                    _api.STUDIO_KIND)
@@ -285,6 +285,7 @@ class AnimePackTab(_api.QWidget):
                     _api.ANAGRAM_KIND: "Анаграмм",
                     _api.DIALOGUE_KIND: "Диалогов",
                     _api.PLOT_KIND: "По сюжету",
+                    _api.DESCRIPTION_AUDIO_KIND: "Описание",
                     _api.AI_ART_KIND: "ИИ-артов",
                     _api.PIXIV_ART_KIND: "Артов Pixiv",
                     _api.SAKUGA_KIND: "Сакуги",
@@ -310,6 +311,7 @@ class AnimePackTab(_api.QWidget):
         log,
         _log_gap,
         start,
+        _launch_generation,
         stop,
         _progress,
         _on_progress,
@@ -318,6 +320,14 @@ class AnimePackTab(_api.QWidget):
         _release_pack_number,
         _on_failed,
         _on_finished,
+    )
+
+    from si_hyx_parts.animepack_tab.generation_queue import (
+        refresh_queue as _refresh_queue,
+        remove_queued as _remove_queued,
+        start_next as _start_next,
+        remember_generated as _remember_generated,
+        finish_queue as _finish_queue,
     )
 
     from si_hyx_parts.animepack_tab.anime_pack_tab__fill_table import (

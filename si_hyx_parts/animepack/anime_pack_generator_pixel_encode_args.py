@@ -190,9 +190,10 @@ def make_plot_question(self, cand: _api.SongCandidate) -> bool:
     hide = names + list(cand.anime.get("synonyms") or [])
     try:
         with self._timed("сюжет"):
+            from .plot_batch import client_for
             question, answers, explanation = _api.make_question_with_explanation(
                 plot_title or (names[0] if names else ""),
-                got["text"], gemini, mode=mode,
+                got["text"], client_for(self, gemini), mode=mode,
                 page=str(got.get("page") or ""), names=hide,
                 episode=display_episode)
     except Exception as e:  # noqa: BLE001 — тип зависит от gemini_api
@@ -287,6 +288,8 @@ def _fetch_media(self, cand: _api.SongCandidate) -> bool:
     if cand.kind == _api.PLOT_KIND and not self.make_plot_question(cand):
         return False
     if cand.kind == _api.DIALOGUE_KIND and not self.make_dialogue_question(cand):
+        return False
+    if cand.kind == _api.DESCRIPTION_AUDIO_KIND and not self.make_description_audio(cand):
         return False
     if cand.kind == _api.AI_ART_KIND:
         with self._timed("ИИ-арты"):

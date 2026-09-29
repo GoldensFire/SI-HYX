@@ -239,6 +239,21 @@ def test_the_average_is_still_guarded_while_candidates_last(
     assert gen._level_fits(easy, [1, 1, 1], FRAME_KIND) is True
 
 
+def test_two_question_pack_selects_titles_with_average_four(tmp_path, monkeypatch):
+    gen = _generator(tmp_path, monkeypatch, [], [], questions=2,
+                     pct_songs=0, pct_frames=100, level_avg=4)
+    counts = (30, 7000, 700000)  # levels 14, 7, 1
+    candidates = [SongCandidate({}, make_anime(i, statusesStats=[
+        {"status": "completed", "count": count}]), kind=FRAME_KIND)
+        for i, count in enumerate(counts, 1)]
+    assert [candidate.level for candidate in candidates] == [14, 7, 1]
+    monkeypatch.setattr(gen, "iter_candidates", lambda: iter(candidates))
+    monkeypatch.setattr(gen, "_fetch_media", lambda _candidate: True)
+    picked = gen.select_songs()
+    assert len(picked) == 2
+    assert sorted(candidate.level for candidate in picked) == [1, 7]
+
+
 def test_a_full_pack_is_collected_when_candidates_suffice(
         tmp_path, monkeypatch):
     """Кандидатов вдоволь — набирается ровно total_questions, не меньше."""

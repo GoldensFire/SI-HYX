@@ -74,10 +74,16 @@ def answer_variants(self) -> list[str]:
         # прямо, а угадывают саму деталь — её написания и засчитываем.
         # Страница вики, с которой взят пересказ, идёт последней строкой:
         # ведущему видно, откуда вопрос, и спорный ответ можно свериться.
-        return _api._dedup_answers(list(self.plot_answers)
-                                   + [self.plot_explanation,
-                                      self.source_link])
-    variants = [self.main_answer]
+        short = self.plot_answers[0]
+        expanded = _expanded_plot_answer(short, self.plot_explanation)
+        return _api._dedup_answers([expanded] + list(self.plot_answers)
+                                   + [self.source_link])
+    if self.kind == _api.PLOT_KIND:
+        variants = ([_expanded_plot_answer(self.title_ru,
+                                           self.plot_explanation)]
+                    if self.plot_explanation else []) + [self.main_answer]
+    else:
+        variants = [self.main_answer]
     if self.is_studio:
         # Засчитывается имя ЛЮБОЙ из студий тайтла: у совместных работ их
         # две-три, и «Студия Пьеро» там не вернее «A-1 Pictures». Названия
@@ -105,6 +111,8 @@ def answer_variants(self) -> list[str]:
     for syn in (self.anime.get("synonyms") or []):
         variants.append(syn)
     variants.append(self.anime.get("licenseNameRu"))   # «Лицензировано в РФ»
+    if not self.is_character and not self.is_studio:
+        variants.append(self.popular_franchise_title)
     for row in self.song_alternates:
         card = row.get("anime") or {}
         variants.extend([card.get("russian"), card.get("name"),
@@ -130,14 +138,26 @@ def answer_variants(self) -> list[str]:
         # То же самое для кавера: последней строкой — адрес ролика, из
         # которого взято исполнение (просьба пользователя).
         variants.append(self.cover_link)
-    if self.kind == _api.PLOT_KIND and self.plot_explanation:
-        variants.append(self.plot_explanation)
     if self.source_link:
         # И для остальных вопросов «откуда картинка»: глава на MangaDex,
         # пост на Sakugabooru, страница вики с
         # пересказом (просьба пользователя).
         variants.append(self.source_link)
     return _api._dedup_answers(variants)
+
+
+def _expanded_plot_answer(keyword: str, explanation: str) -> str:
+    """Первый ответ объясняет факт и явно называет то, что засчитывается."""
+    keyword = str(keyword or "").strip()
+    explanation = str(explanation or "").strip()
+    if not explanation:
+        return keyword
+    exact = (keyword and _api.re.search(
+        rf"(?<!\w){_api.re.escape(keyword)}(?!\w)", explanation,
+        _api.re.IGNORECASE))
+    if keyword and not exact:
+        return f"{keyword} — {explanation}"
+    return explanation
 
 
 def _placement_title(card: dict, song: dict) -> str:

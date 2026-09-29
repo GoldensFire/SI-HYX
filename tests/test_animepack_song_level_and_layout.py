@@ -68,12 +68,12 @@ def test_studio_level_has_an_independent_band_and_average(tab):
     assert settings.studio_level_min is None
     assert settings.level_range(ap.STUDIO_KIND) == (3, 7)
     tab.chk_studio.setChecked(True)
-    tab.studio_level_range.set_range(5, 9)
+    tab.studio_level_range.set_range(5, 8)
     tab.sp_studio_level_avg.setValue(7)
     saved = tab.get_settings()
     tab.apply_settings(saved)
     collected = tab.collect()
-    assert collected.level_range(ap.STUDIO_KIND) == (5, 9)
+    assert collected.level_range(ap.STUDIO_KIND) == (5, 8)
     assert collected.studio_level_avg == 7
     assert ap.level_bucket(ap.STUDIO_KIND) == "studio"
     assert ap.own_bucket(collected, ap.STUDIO_KIND) == "studio"
@@ -84,9 +84,9 @@ def test_every_level_band_lives_in_the_anime_group(tab):
     anime_group = tab.settings_columns._groups[2]
     assert anime_group.title() == "Аниме"
     for key in ("song", "studio", "chars", "art", "manga", "plot"):
-        _label, bar, _label_avg, avg = tab._level_blocks[key]
+        _label, bar = tab._level_blocks[key]
         assert bar.parent() is anime_group
-        assert avg.parent() is anime_group
+        assert bar.avg_control.parent() is bar
 
     # AMQ-рамки теперь тоже здесь, непосредственно под песнями.
     assert tab.song_diff_range.parent() is anime_group
@@ -124,7 +124,7 @@ def test_numeric_fields_stay_compact_across_the_tab(tab):
 
 
 def test_level_band_shows_up_with_its_question_kind(tab):
-    _label, bar, _label_avg, _avg = tab._level_blocks["manga"]
+    _label, bar = tab._level_blocks["manga"]
     assert not bar.isVisibleTo(tab)
     tab.chk_manga.setChecked(True)
     assert bar.isVisibleTo(tab)

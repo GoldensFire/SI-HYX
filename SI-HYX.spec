@@ -27,6 +27,8 @@ binaries = []
 # numpy/lxml тянутся лениво (волны/LUFS/разбор .siq), siquester — внутри try/except,
 # поэтому пакет включаем целиком. soundfile несёт нативный libsndfile (collect_all).
 hiddenimports = ['numpy', 'lxml.etree']
+hiddenimports += ['google.auth', 'google.auth.transport.requests',
+                  'google.oauth2.service_account']
 hiddenimports += collect_submodules('siquester')
 # Холст видео «Монтажа» выводит кадр через QML VideoOutput (см. VideoCanvas в
 # edit_tab_widgets.py), поэтому в сборку обязаны попасть Qt Quick/Qml вместе с

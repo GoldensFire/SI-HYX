@@ -214,6 +214,7 @@ def _refresh_pixel_hint(self, *_):
 def _group_anime(self) -> _api.QGroupBox:
     grp = _api.QGroupBox("Аниме")
     g = _api.QGridLayout(grp); g.setHorizontalSpacing(6); g.setVerticalSpacing(8)
+    g.setContentsMargins(16, 18, 16, 14)
     self.sp_score_from = _api.QDoubleSpinBox(); self.sp_score_from.setRange(0, 10)
     self.sp_score_from.setSingleStep(0.5); self.sp_score_from.setDecimals(1)
     self.sp_score_to = _api.QDoubleSpinBox(); self.sp_score_to.setRange(0, 10)
@@ -229,8 +230,9 @@ def _group_anime(self) -> _api.QGroupBox:
         sp.setMinimumWidth(50)
 
     from .difficulty_range import DifficultyRange
-    self.level_range = DifficultyRange(
-        1, _api.MAX_LEVEL, minimum=1, maximum=_api.MAX_LEVEL)
+    self.level_range = DifficultyRange(1, _api.MAX_LEVEL, minimum=1,
+                                       maximum=_api.MAX_LEVEL,
+                                       average=True)
     self.sp_level_from = self.level_range.low_control
     self.sp_level_to = self.level_range.high_control
     self.level_range.setMinimumWidth(240)
@@ -246,10 +248,7 @@ def _group_anime(self) -> _api.QGroupBox:
     self.level_range.setToolTip(tip)
     # Средняя сложность — поверх рамок «от … до»: они говорят, что вообще
     # пускать, а это — на что должна выйти середина пака.
-    from .difficulty_slider import DifficultySlider
-    self.sp_level_avg = DifficultySlider(0, _api.MAX_LEVEL, 0)
-    self.sp_level_avg.setMinimumWidth(120)
-    self.sp_level_avg.setSpecialValueText("любая")
+    self.sp_level_avg = self.level_range.avg_control
     self.sp_level_avg.setToolTip(
         "Куда должна выйти СРЕДНЯЯ сложность пака (просьба пользователя): "
         "«от 1 до 15, в среднем 4» — это пак, где крайности редки, а "
@@ -264,11 +263,10 @@ def _group_anime(self) -> _api.QGroupBox:
     level_panel.build(self)
 
     r = 0
-    g.addWidget(self._lab("Сложность"), r, 0)
+    level_label = self._lab("Сложность")
+    level_label.setContentsMargins(0, 5, 0, 0)
+    g.addWidget(level_label, r, 0, alignment=_api.Qt.AlignmentFlag.AlignTop)
     g.addWidget(self.level_range, r, 1, 1, 3)
-    r += 1
-    g.addWidget(self._lab("В среднем"), r, 0)
-    g.addWidget(self.sp_level_avg, r, 1)
     r += 1
     # Рамки сложности КАЖДОГО рода вопросов — здесь же, сразу под общей
     # (просьба пользователя): песни, персонажи, арты, книги, сюжет. Показана

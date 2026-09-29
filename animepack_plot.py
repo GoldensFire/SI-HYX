@@ -117,7 +117,9 @@ _RULES_COMMON = """Ты составляешь вопросы для игры «
 4г. Если дан номер серии, естественно вплети его в вопрос («В 7-й серии…»),
 а не добавляй отдельную служебную фразу. В explanation номер серии не пиши.
 4д. explanation — ровно одно развёрнутое предложение, которое объясняет,
-почему ответ верен, без ссылок, номера серии и повторения самого вопроса."""
+почему ответ верен, без ссылок, номера серии и повторения самого вопроса.
+Обязательно назови в нём сам правильный ответ: название произведения для
+вопроса о тайтле или ключевые слова короткого answer для вопроса о детали."""
 
 _RULES_TITLE = """
 Вопрос должен описывать ЗАПОМИНАЮЩИЙСЯ эпизод сюжета так, чтобы смотревший узнал произведение, а не смотревший — нет.
@@ -232,6 +234,9 @@ def season_title(title: str, *alternatives: str) -> str:
 
 def _title_without_season(title: str) -> str:
     text = str(title or "").strip()
+    text = re.sub(r"\s*[—:-]?\s*(?:(?:\d+(?:st|nd|rd|th)\s+)?season\s*\d+|"
+                  r"\d+(?:st|nd|rd|th)\s+season|s\d{1,2})$", "", text,
+                  flags=re.IGNORECASE)
     text = re.sub(r"\s*[—:-]?\s*\d{1,2}\s*[- ]?(?:й|я|е|го|м)\s+сезон$",
                   "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+(?:\d{1,2}|I{1,3}|IV|V|VI)$", "", text,
@@ -260,6 +265,16 @@ def source_page_ok(page: str, body: str, title: str, year: int = 0) -> bool:
                  r"манга|том|глава|игра)\b", name, re.IGNORECASE):
         return False
     season = season_number(title)
+    from si_hyx_parts.animepack.plot_season import season_of_page
+    stated_season = season_of_page(body)
+    if stated_season and stated_season != season:
+        # Некоторые каталоги называют часть второго сезона «2», а инфобокс
+        # вики считает весь сериал и пишет «3». Дата выхода карточки
+        # подтверждает такую страницу точнее, чем несовпавший номер.
+        from si_hyx_parts.animepack.plot_air_date import air_date_of_page
+        aired = air_date_of_page(body)
+        if not (year and aired and aired[0] == int(year)):
+            return False
     page_seasons = _explicit_seasons(name)
     # Страница второго сезона не годится для карточки первого — именно так у
     # «Арифурэты» вопрос S2 получил название и постер S1. Обратное тоже верно.
@@ -271,8 +286,8 @@ def source_page_ok(page: str, body: str, title: str, year: int = 0) -> bool:
                              "", name, flags=re.IGNORECASE)
         roman = {2: "II", 3: "III", 4: "IV", 5: "V", 6: "VI"}.get(season, "")
         markers = [rf"\b{season}\b", rf"\b{roman}\b" if roman else r"(?!)"]
-        if not any(re.search(mark, season_name, re.IGNORECASE)
-                   for mark in markers):
+        if not stated_season and not any(
+                re.search(mark, season_name, re.IGNORECASE) for mark in markers):
             # Некоторые вики нумеруют всю арку подряд и не пишут сезон в
             # заголовке: ``Sword Art Online Alicization Episode 47``. Такая
             # страница подтверждает нужную часть датой показа в инфобоксе;
@@ -503,10 +518,17 @@ def pick_plot(fandom, names, rng, *, log: Optional[Any] = None,
     тогда берём статью самого тайтла и её раздел «Сюжет».
     """
     names = [str(n or "").strip() for n in (names or ()) if str(n or "").strip()]
-    wiki = fandom.find_wiki(names)
+    bases = list(dict.fromkeys(_title_without_season(name) for name in names))
+    wiki = fandom.find_wiki(bases + names)
     if not wiki:
         return {}
-    pages = [] if movie else list(fandom.episode_pages(wiki))
+    season = season_number(title)
+    season_pages = getattr(fandom, "season_episode_pages", None)
+    pages = (list(season_pages(wiki, bases, season))
+             if not movie and season > 1 and season_pages else [])
+    indexed_season = bool(pages)
+    if not pages and not movie:
+        pages = list(fandom.episode_pages(wiki))
     rng.shuffle(pages)
     pages = pages[:EPISODE_TRIES]
     # Хвост подстрахует, если разделов с пересказом у серий не окажется (или
@@ -514,7 +536,7 @@ def pick_plot(fandom, names, rng, *, log: Optional[Any] = None,
     # есть всегда, и раздел «Сюжет» в ней тоже. Перемешиваем и его: у вики без
     # страниц серий хвост решает всё, а в прежнем порядке он был один и тот же
     # от прогона к прогону — отсюда и одинаковые вопросы по одному тайтлу.
-    if names:
+    if names and not indexed_season:
         tail = [p for p in fandom.search(wiki, names[0], limit=3)
                 if p not in pages]
         if title and not movie:

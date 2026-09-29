@@ -99,7 +99,7 @@ def _tab_drag_drop(self, bar, event):
     except Exception:
         pass
 
-def _update_tab_tip(self, pos):
+def _update_tab_tip(self, pos=None):
     """Показывает попап-подсказку, если курсор над значком ⓘ вкладки.
 
         Текст берём не из значка, а из _tab_info по стабильному ключу вкладки
@@ -107,29 +107,45 @@ def _update_tab_tip(self, pos):
         обычный QLabel, потеряв питоновский атрибут _tip, поэтому полагаться на
         сам объект значка нельзя."""
     from widgets import _InfoTipPopup
+    from PyQt6.QtGui import QCursor
     bar = self.tabs.tabBar()
-    idx = bar.tabAt(pos)
-    if idx < 0:
-        self._hide_tab_tip(); return
-    badge = bar.tabButton(idx, _api.QTabBar.ButtonPosition.RightSide)
-    page = self.tabs.widget(idx)
-    on = page.objectName() if page is not None else ""
-    tip = self._tab_info.get(on[5:], ("", "", ""))[2] if on.startswith("tab::") else ""
-    if badge is not None and tip and badge.geometry().contains(pos):
-        if self._tab_tip_idx != idx:
+    cursor = QCursor.pos()
+    # Событие может прийти с опозданием, а соседний значок уже под курсором.
+    # childAt учитывает перекрытие и обрезку при прокрутке QTabBar, тогда как
+    # перебор прямоугольников может выбрать невидимый значок первой вкладки.
+    hovered = bar.childAt(bar.mapFromGlobal(cursor))
+    for idx in range(bar.count()):
+        badge = bar.tabButton(idx, _api.QTabBar.ButtonPosition.RightSide)
+        if badge is None or badge is not hovered:
+            continue
+        page = self.tabs.widget(idx)
+        on = page.objectName() if page is not None else ""
+        tip = self._tab_info.get(on[5:], ("", "", ""))[2] if on.startswith("tab::") else ""
+        if tip:
             _InfoTipPopup.instance().show_for(badge, tip)
             self._tab_tip_idx = idx
-    else:
-        self._hide_tab_tip()
+            self._tab_tip_badge = badge
+            return
+    self._hide_tab_tip()
 
 def _hide_tab_tip(self):
-    if getattr(self, "_tab_tip_idx", -1) != -1:
-        try:
-            from widgets import _InfoTipPopup
-            _InfoTipPopup.instance().hide()
-        except Exception:
-            pass
-        self._tab_tip_idx = -1
+    badge = getattr(self, "_tab_tip_badge", None)
+    try:
+        from widgets import _InfoTipPopup
+        popup = _InfoTipPopup.instance()
+        if badge is None:
+            bar = self.tabs.tabBar()
+            for index in range(bar.count()):
+                candidate = bar.tabButton(index, _api.QTabBar.ButtonPosition.RightSide)
+                if candidate is not None and popup._anchor == id(candidate):
+                    badge = candidate
+                    break
+        if badge is not None:
+            popup.hide_for(badge)
+    except Exception:
+        pass
+    self._tab_tip_badge = None
+    self._tab_tip_idx = -1
 
 def _reposition_console_btn(self):
     btn = getattr(self, "btn_open_console", None)

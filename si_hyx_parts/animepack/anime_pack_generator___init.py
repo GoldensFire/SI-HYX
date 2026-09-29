@@ -49,7 +49,8 @@ def __init__(self, settings: _api.PackSettings, *,
     self.gemini_titles = gemini
     self.gemini_pixiv = gemini
     needs_general = any(settings.mix_shares.get(k)
-                        for k in (_api.PLOT_KIND, _api.DIALOGUE_KIND))
+                        for k in (_api.PLOT_KIND, _api.DIALOGUE_KIND,
+                                  _api.DESCRIPTION_AUDIO_KIND))
     needs_titles = any(settings.mix_shares.get(k)
                        for k in _api.GEMINI_TITLE_KINDS)
     needs_pixiv = bool(settings.mix_shares.get(_api.PIXIV_ART_KIND)
@@ -75,10 +76,10 @@ def __init__(self, settings: _api.PackSettings, *,
             self.gemini_board = QuotaBoard(
                 key, dict(getattr(settings, "gemini_daily_limits", {}) or {}))
 
-            def _client(model, thinking):
+            def _client(model, thinking, **extra):
                 return GeminiClient(
                     key, model=(model or DEFAULT_MODEL),
-                    thinking=str(thinking or ""),
+                    thinking=str(thinking or ""), **extra,
                     log=lambda msg: self.log(msg),
                     stopped=lambda: self.stopped(),
                     board=self.gemini_board)
@@ -86,6 +87,8 @@ def __init__(self, settings: _api.PackSettings, *,
             think = str(getattr(settings, "gemini_thinking", "") or "")
             if needs_general and self.gemini is None:
                 self.gemini = _client(settings.gemini_model, think)
+                self.log(f"Gemini: модель {self.gemini.model}, "
+                         f"уровень рассуждения {self.gemini.thinking}")
             if needs_titles and self.gemini_titles is None:
                 # Пустая своя модель значит «как у сюжета»: так открываются
                 # настройки, сохранённые до появления второго выбора.
@@ -94,16 +97,23 @@ def __init__(self, settings: _api.PackSettings, *,
                     or settings.gemini_model,
                     str(getattr(settings, "gemini_title_thinking", "") or "")
                     or think)
+            # Проверке картинки хватает минуты: дольше отвечает только
+            # перегруженный сервер (см. visual_batch.READ_TIMEOUT).
+            from .visual_batch import READ_TIMEOUT as visual_timeout
             if needs_pixiv and self.gemini_pixiv is None:
                 self.gemini_pixiv = _client(
                     str(getattr(settings, "pixiv_gemini_model", "") or "")
-                    or settings.gemini_model, "minimal")
+                    or settings.gemini_model, "minimal",
+                    timeout=visual_timeout)
             if needs_manga and self.gemini_manga is None:
                 self.gemini_manga = _client(
                     str(getattr(settings, "manga_gemini_model", "") or "")
-                    or settings.gemini_model, "minimal")
+                    or settings.gemini_model, "minimal",
+                    timeout=visual_timeout)
     from .visual_batch import initialize as initialize_visual_batches
     initialize_visual_batches(self)
+    from .plot_batch import initialize as initialize_plot_batches
+    initialize_plot_batches(self)
     self.jimaku = jimaku
     if settings.mix_shares.get(_api.DIALOGUE_KIND) and self.jimaku is None:
         key = str(getattr(settings, "jimaku_key", "") or "").strip()
@@ -134,6 +144,14 @@ def __init__(self, settings: _api.PackSettings, *,
     # ключ Gemini и т.п.): их места отдаются оставшимся, а не жгут
     # кандидатов впустую — см. _drop_kind и select_songs.
     self._dead_kinds: set[str] = set()
+    from .description_tts import DescriptionSpeech
+    self.description_tts = DescriptionSpeech(
+        settings, self.session, self.log, self.stopped)
+    from .description_batch import DescriptionBatcher
+    from .generation_priority import parallel_limit
+    self.description_batch = (DescriptionBatcher(
+        self.gemini, min(32, parallel_limit(settings)), self.stopped)
+        if self.gemini is not None else None)
     # Роды вопросов, у которых кончились КАНДИДАТЫ, а не сама возможность:
     # каталог манги свой и куда меньше аниме, и когда он вычерпан, вопросов
     # по манге больше не будет. Отличается от _dead_kinds тем, что загрузки
@@ -166,6 +184,8 @@ def __init__(self, settings: _api.PackSettings, *,
     # повторный прогон именно кэш, а не случайно быстрая сеть.
     self._media_cache_hits: _api.Counter = _api.Counter()
     self._media_cache_lock = _api.threading.Lock()
+    from .one_use_cache import purge as purge_one_use_cache
+    purge_one_use_cache()
     self.folder: str = ""
     self._failed_media = 0
     # Карточки каталога и части франшиз, пережившие перезапуск программы.

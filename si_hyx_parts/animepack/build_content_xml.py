@@ -14,8 +14,10 @@ def build_content_xml(songs: list, s: _api.PackSettings,
     pkg = _api.ET.Element("package", {
         # Номер и средняя сложность приписываются к названию, чтобы собранные
         # подряд паки различались (просьба пользователя).
-        "name": (pack_summary.pack_title(s.title, getattr(s, "pack_number", 0),
-                                         songs)
+        "name": (pack_summary.pack_title(
+            s.title, getattr(s, "pack_number", 0), songs,
+            test_number=getattr(s, "test_pack_number", 0),
+            ignore_test_packs=getattr(s, "ignore_test_packs", False))
                  or "Generated Songs Anime Pack"),
         "version": "5",
         "id": str(_api.uuid.uuid4()),
@@ -61,7 +63,14 @@ def _append_question(questions_el, cand: _api.SongCandidate, s: _api.PackSetting
 
     # ── Вопрос: текст, кадр, ролик ЛИБО аудио (фоном) с коллажем и подсказкой ─
     q_param = _api.ET.SubElement(params, "param", {"name": "question", "type": "content"})
-    if cand.is_text:
+    if cand.kind == _api.DESCRIPTION_AUDIO_KIND:
+        if cand.description_audio_ext:
+            audio = _api.ET.SubElement(q_param, "item", {
+                "type": "audio", "isRef": "True", "placement": "background"})
+            audio.text = cand.audio_out
+        else:
+            _api.ET.SubElement(q_param, "item").text = cand.description_text
+    elif cand.is_text:
         # Вопрос из одного текста — анаграмма или пересказ сюжета. У пересказа
         # задание идёт ПЕРЕД текстом и с waitForFinish="False", как у портрета
         # персонажа: без него это просто рассказ, и непонятно, что называть.

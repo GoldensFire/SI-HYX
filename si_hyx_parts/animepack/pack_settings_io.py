@@ -74,6 +74,8 @@ def from_dict(cls, d: dict) -> '_api.PackSettings':
             s.composition_enabled = [str(k) for k in (value or []) if k]
         elif key == "exclude_siq":
             s.exclude_siq = [str(p) for p in (value or []) if p]
+        elif key == "description_languages":
+            s.description_languages = [str(code) for code in (value or [])]
         elif key == "frame_effects":
             s.frame_effects = clean_effects(value)
             # Удалённые жалюзи не должны оставлять старый случайный
@@ -155,6 +157,9 @@ def from_dict(cls, d: dict) -> '_api.PackSettings':
     # переехать на нынешнюю модель, а не ломать валидацию.
     if "flux-1-schnell" in str(s.cloudflare_model or "").lower():
         s.cloudflare_model = ART_DEFAULT_MODEL
+    if s.description_gemini_tts_model == "gemini-2.5-pro-preview-tts":
+        # Удалённую платную модель в старых настройках заменяем доступной.
+        s.description_gemini_tts_model = cls().description_gemini_tts_model
     # Вид кавера «Живьём» убран: концертные записи не берутся вовсе. Оставить
     # его в списке значило бы отбирать по виду, которого больше не бывает, —
     # песни молча остались бы без каверов.

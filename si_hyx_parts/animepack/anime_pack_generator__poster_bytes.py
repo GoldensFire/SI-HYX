@@ -116,7 +116,8 @@ def download_images(self, cand: _api.SongCandidate) -> None:
             self.log(f"Постеры одинаковой песни не склеились: {e}")
 
     shots = list(cand.anime.get("screenshots") or [])
-    if cand.is_text or cand.kind in (_api.AI_ART_KIND, _api.PIXIV_ART_KIND,
+    if cand.is_text or cand.kind in (_api.DESCRIPTION_AUDIO_KIND,
+                                     _api.AI_ART_KIND, _api.PIXIV_ART_KIND,
                                      _api.MANGA_KIND,
                                      _api.SAKUGA_KIND):
         # Анаграмме и вопросу по сюжету картинка не нужна вовсе: весь вопрос
@@ -143,7 +144,7 @@ def download_images(self, cand: _api.SongCandidate) -> None:
         try:
             name = self._save_reusable_image(
                 self._cached_bytes(url, "anime-frame"),
-                f"{cand.file_base}_frame", self._url_ext(url))
+                f"{cand.file_base}_frame", self._url_ext(url), reuse=False)
             cand.frame_name = name or cand.frame_name
             cand.has_frame = bool(name)
         except Exception as e:  # noqa: BLE001

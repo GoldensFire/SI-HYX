@@ -20,9 +20,9 @@ def test_removed_controls_are_gone(qapp):
         for name in ("sp_max_mb", "chk_frames_new", "sp_gemini_daily"):
             assert not hasattr(tab, name), name
         settings = tab.collect()
-        # Потолок веса остался значением по умолчанию, память о кадрах — выкл.
+        # Память о кадрах включена по умолчанию: повторов между паками нет.
         assert settings.max_pack_mb == ap.MAX_PACK_MB
-        assert settings.frames_no_repeat is False
+        assert settings.frames_no_repeat is True
     finally:
         tab.cleanup()
 
@@ -53,9 +53,9 @@ def test_character_difficulty_lives_under_its_own_checkbox(qapp):
     россыпью по панели. Показывается она только при включённых персонажах."""
     tab = _tab(qapp)
     try:
-        label, bar, label_avg, avg = tab._level_blocks["chars"]
+        label, bar = tab._level_blocks["chars"]
         assert bar is tab.char_level_range
-        assert avg is tab.sp_char_avg
+        assert bar.avg_control is tab.sp_char_avg
         assert bar.parent() is tab.settings_columns._groups[2]
         assert tab.sp_char_level_from.parent() is tab.char_level_range
         assert tab.sp_char_level_to.parent() is tab.char_level_range

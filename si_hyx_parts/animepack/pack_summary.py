@@ -18,6 +18,8 @@ from __future__ import annotations
 import re
 from collections import Counter
 
+from .test_packs import TEST_LIMIT
+
 
 def numbered_title(title: str, number) -> str:
     """«Сгенерировано в SI-HYX» + номер → «Сгенерировано в SI-HYX № 3».
@@ -54,12 +56,15 @@ def average_level(songs) -> float:
     return round(sum(levels) / len(levels) + 1e-9, 1)
 
 
-def pack_title(title: str, number, songs) -> str:
+def pack_title(title: str, number, songs, *, test_number=0,
+               ignore_test_packs=False) -> str:
     """«Сгенерировано в SI-HYX № 56 (Ур. 4.3)» — и внутри пака, и в имени файла.
 
     Средняя сложность приписывается в конце (просьба пользователя): по списку
     паков сразу видно, какой из них лёгкий, а какой трудный. Прежняя приписка
     при пересборке заменяется, а не копится."""
+    if ignore_test_packs and len(songs or ()) < TEST_LIMIT:
+        return numbered_title("Тестовый", test_number)
     name = numbered_title(_LEVEL_TAIL.sub("", str(title or "")), number)
     level = average_level(songs)
     return f"{name} (Ур. {level:.1f})" if name and level else name

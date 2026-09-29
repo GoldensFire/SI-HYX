@@ -190,10 +190,11 @@ def test_reference_chroma_is_computed_once_and_kept(tmp_path):
         calls.append(1)
         return b"amq-mp3"
 
-    first = service(tmp_path).reference("7", fetch, tmp_path)
-    again = service(tmp_path).reference("7", fetch, tmp_path)
+    current = service(tmp_path)
+    first = current.reference("7", fetch, tmp_path)
+    again = current.reference("7", fetch, tmp_path)
     assert calls == [1] and np.array_equal(first, again)
-    assert cache.ref_chroma("7") is not None
+    assert cache.ref_chroma("7") is None
 
 
 def test_a_candidate_that_does_not_download_is_remembered_as_failed(tmp_path):
@@ -234,9 +235,10 @@ def test_a_recording_with_the_original_inside_is_not_confirmed(tmp_path):
     её от очень точного кавера может только отпечаток самой записи
     (cover_fingerprint). Сырое число остаётся в кладовой, чтобы правка порога
     не стоила повторной загрузки."""
-    ref = service(tmp_path).reference("7", lambda: b"amq", tmp_path)
+    current = service(tmp_path, same_record=True)
+    ref = current.reference("7", lambda: b"amq", tmp_path)
     cache.remember_search("7", found("v0"))
-    rows = service(tmp_path, same_record=True).ensure(
+    rows = current.ensure(
         song_ref(), ref, tmp_path, want=1, seconds=5)
     assert rows == []
     pool, _bad = cache.screened(cache.load("7"), song_ref())

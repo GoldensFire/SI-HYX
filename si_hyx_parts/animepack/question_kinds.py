@@ -51,6 +51,7 @@ ANAGRAM_KIND = "anagram"
 # вопрос (см. animepack_plot.py). Ответом служит либо сам тайтл, либо деталь
 # сюжета — решает настройка plot_mode.
 PLOT_KIND = "plot"
+DESCRIPTION_AUDIO_KIND = "description_audio"
 # Вопрос-ДИАЛОГ: настоящие субтитры серии с Jimaku, переведённые Gemini.
 # Модель только переводит уже найденные реплики; сочинять сам диалог ей нельзя.
 # Подписи-задания у диалога нет (просьба пользователя): реплики говорят сами
@@ -82,6 +83,7 @@ KIND_TITLES = dict(SONG_KIND_LABELS,
                       VIDEO_KIND: "Ролик", MANGA_KIND: "Манга",
                       PIXEL_KIND: "Кадры с эффектами", ANAGRAM_KIND: "Анаграмма",
                       PLOT_KIND: "Сюжет", DIALOGUE_KIND: "Диалог",
+                      DESCRIPTION_AUDIO_KIND: "Описание",
                       AI_ART_KIND: "ИИ-арт",
                       PIXIV_ART_KIND: "Pixiv-арт",
                       SAKUGA_KIND: "Сакуга", STUDIO_KIND: "Студия"})
@@ -113,7 +115,7 @@ KIND_TITLES.update({"synonyms": "Синонимы", "antonyms": "Антоним�
 TEXT_KINDS = (ANAGRAM_KIND, PLOT_KIND, DIALOGUE_KIND) + TITLE_KINDS
 # Всё, чему не нужна песня. Для квот и ползунка состава это такие же «роды
 # вопросов», как опенинг или ролик.
-SILENT_KINDS = IMAGE_KINDS + CLIP_KINDS + TEXT_KINDS
+SILENT_KINDS = IMAGE_KINDS + CLIP_KINDS + TEXT_KINDS + (DESCRIPTION_AUDIO_KIND,)
 SONG_CATEGORIES = ("standard", "instrumental", "chanting", "character")
 CATEGORY_LABELS = {"standard": "Обычные", "instrumental": "Инструментал",
                    "chanting": "Речитатив", "character": "От персонажа"}

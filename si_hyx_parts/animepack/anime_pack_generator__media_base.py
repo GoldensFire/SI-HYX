@@ -154,7 +154,24 @@ def _level_fits(self, cand: _api.SongCandidate, levels: list,
                 else self._bucket_levels.setdefault(bucket, []))
     seen += [int(c.level) for c in flying
              if _api.own_bucket(self.s, c.kind) == bucket]
+    # В паке из одного-двух вопросов прежний порог «первые три пропустить»
+    # вообще отключал цель. Проверяем, можно ли ещё получить точную сумму
+    # уровней с оставшимися местами. Клапан ниже здесь не применяем: каталог
+    # большой, а отложенные кандидаты доступны при его исчерпании.
     if len(seen) < 3:
+        quotas = self.s.question_quotas
+        slots = sum(int(count) for question_kind, count in quotas.items()
+                    if _api.own_bucket(self.s, question_kind) == bucket)
+        if 0 < slots <= 3 and len(seen) < slots:
+            remaining = slots - len(seen) - 1
+            ranges = [self.s.level_range(question_kind)
+                      for question_kind, count in quotas.items()
+                      if count and _api.own_bucket(self.s, question_kind) == bucket]
+            low = min(bound[0] for bound in ranges)
+            high = max(bound[1] for bound in ranges)
+            points = sum(seen) + int(cand.level)
+            return (points + remaining * low <= target * slots
+                    <= points + remaining * high)
         return True
     if self._level_skips[bucket] >= self.LEVEL_AVG_GIVE_UP:
         if bucket not in self._level_warned:
@@ -202,7 +219,7 @@ def _bench_candidate(self, cand) -> None:
     self._release_candidate(cand)
 
 
-def _take_level_bench(self) -> list:
+def _take_level_bench(self, levels=(), flying=()) -> list:
     """Отложенные ради средней — и дальше середина не сторожится.
 
         Зовётся, когда основной поток кандидатов иссяк, а мест в паке ещё
@@ -213,9 +230,16 @@ def _take_level_bench(self) -> list:
     bench, self._level_bench = self._level_bench, []
     self._level_relaxed = True
     self._level_reused = len(bench)
-    target = int(getattr(self.s, "level_avg", 0) or 0)
-    if target:
-        bench.sort(key=lambda c: abs(c.level - target))
+    def distance(cand):
+        bucket = _api.own_bucket(self.s, cand.kind)
+        target = _api.level_avg_target(self.s, bucket)
+        seen = (levels if bucket is None else self._bucket_levels.get(bucket, ()))
+        current = sum(seen) + sum(int(c.level) for c in flying
+                                  if _api.own_bucket(self.s, c.kind) == bucket)
+        return abs(current + int(cand.level) - target * (len(seen) +
+                   sum(_api.own_bucket(self.s, c.kind) == bucket for c in flying) + 1))
+
+    bench.sort(key=distance)
     self.log(f"Кандидаты кончились, а пак не набран — беру отложенных ради "
              f"средней сложности ({len(bench)} шт.): полный пак важнее "
              "точной середины.")
@@ -232,9 +256,10 @@ def _rebook_candidate(self, cand) -> bool:
     if not keys:
         return True
     cand._bench_keys = None
-    if not self.s.dup_franchise and any(k in self._used_franchise
-                                        for k in keys if k):
-        return False
-    self._used_franchise.update(k for k in keys if k)
+    with self._studio_lock:
+        if not self.s.dup_franchise and any(k in self._used_franchise
+                                            for k in keys if k):
+            return False
+        self._used_franchise.update(k for k in keys if k)
     cand._reserved = keys
     return True

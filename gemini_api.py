@@ -13,10 +13,11 @@
 # ещё один источник поломок сборки ради двух HTTP-запросов. requests в
 # зависимостях уже есть, SI-HYX.spec трогать не нужно.
 #
-# Используется НОВЫЙ Interactions API (/v1beta/interactions), а не устаревающий
-# models/{model}:generateContent: только через него доступны модели 3.x. Форма
-# ответа у него другая (steps → content → text), поэтому текст достаём
-# терпимо — см. _extract_text, там же разобран и старый формат.
+# Обычные запросы идут через Interactions API. Текстовые запросы с уровнем
+# high идут через поддерживаемый models/{model}:generateContent: на выбранной
+# Flash-Lite простой запрос через Interactions висел до таймаута, а тот же
+# запрос через generateContent ответил за несколько секунд. Оба формата ответа
+# разбирает _extract_text.
 #
 # Рассчитан на БЕСПЛАТНЫЙ тариф, и это определяет всё поведение:
 #   • модель по умолчанию — Flash-Lite: у неё самые высокие бесплатные лимиты
@@ -50,6 +51,16 @@ from gemini_quota import QuotaBoard, error_message, is_quota, retry_after
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 INTERACTIONS_URL = f"{API_ROOT}/interactions"
 
+
+def _generate_schema(value):
+    """GenerateContent accepts the schema fields we use, without JSON Schema extras."""
+    if isinstance(value, dict):
+        return {key: _generate_schema(item) for key, item in value.items()
+                if key != "additionalProperties"}
+    if isinstance(value, list):
+        return [_generate_schema(item) for item in value]
+    return value
+
 # Модель по умолчанию. Flash-Lite — не «похуже», а «для потока»: наша задача
 # (разложить готовый список ответов по франшизам) — классификация, а не
 # рассуждение, и упирается она в лимит ЗАПРОСОВ, а не в интеллект модели.
@@ -58,6 +69,7 @@ DEFAULT_MODEL = "gemini-3.5-flash-lite"
 # добавляет из API новые стабильные Gemini Flash. Lite остаётся рабочей
 # лошадкой; preview/image/tts и прочие специальные варианты не показываем.
 MODELS = (
+    "gemini-3.1-flash-lite",
     "gemini-3.5-flash-lite",
     "gemini-3.6-flash",
     "gemini-3.7-flash",
@@ -68,6 +80,7 @@ MODELS = (
 # ниже её 15 RPM, чтобы граница минутного окна не превращалась в случайный 429.
 FREE_RPM = 12
 MODEL_RPM = {
+    "gemini-3.1-flash-lite": 12,
     "gemini-3.5-flash-lite": 12,
     "gemini-3.6-flash": 5,
     "gemini-3.7-flash": 5,
@@ -121,6 +134,7 @@ def fallback_models(model: str) -> tuple[str, ...]:
 
 
 _STABLE_FLASH_MODEL = re.compile(r"^gemini-\d+(?:\.\d+)*-flash$")
+_STABLE_FLASH_LITE_MODEL = re.compile(r"^gemini-\d+(?:\.\d+)*-flash-lite$")
 # Соединение ждём коротко, ответ — долго: на уровне «high» модель думает над
 # пересказом серии минуты, а оборванный по таймауту запрос всё равно уже
 # посчитан Google. Лучше один терпеливый заход, чем четыре торопливых.
@@ -138,6 +152,14 @@ class GeminiAuthError(GeminiError):
 
 class GeminiQuotaError(GeminiError):
     """Кончилась квота бесплатного тарифа (429 после всех ретраев)."""
+
+
+class GeminiUnavailableError(GeminiError):
+    """Сервер не ответил: 5xx после всех повторов, таймаут или нет сети."""
+
+
+class GeminiDownError(GeminiError):
+    """Gemini не отвечал несколько запросов подряд — до конца прогона не ждём."""
 
 
 class GeminiBlockedError(GeminiError):
@@ -195,7 +217,8 @@ def discover_models(api_key: str, session=None, timeout: float = 15.0) -> tuple[
             if not isinstance(row, dict):
                 continue
             name = str(row.get("name") or "").removeprefix("models/")
-            if _STABLE_FLASH_MODEL.fullmatch(name):
+            if (_STABLE_FLASH_MODEL.fullmatch(name)
+                    or _STABLE_FLASH_LITE_MODEL.fullmatch(name)):
                 found.add(name)
         token = str(data.get("nextPageToken") or "")
         if not token:
@@ -410,6 +433,19 @@ class GeminiClient:
                     "thinking_level": thinking,
                 },
             }
+            if thinking == "high" and isinstance(prompt, str):
+                # Interactions held even a trivial high-thinking request until
+                # the read timeout. The supported GenerateContent endpoint
+                # answered the same model/level in seconds in a live probe.
+                body = {
+                    "model": model,
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "thinkingConfig": {"thinkingLevel": "HIGH"},
+                        "responseMimeType": "application/json",
+                        "responseSchema": _generate_schema(schema),
+                    },
+                }
             try:
                 return _json_from_text(_extract_text(self._post(body)))
             except _ModelChanged:
@@ -444,6 +480,11 @@ class GeminiClient:
         delay = 2.0
         last = ""
         model = str(body.get("model") or self.model)
+        if "contents" in body:
+            url = f"{API_ROOT}/models/{model}:generateContent"
+            payload = {key: value for key, value in body.items() if key != "model"}
+        else:
+            url, payload = INTERACTIONS_URL, body
         for attempt in range(self.max_retries):
             if self.stopped():
                 raise GeminiError("Отменено")
@@ -460,7 +501,7 @@ class GeminiClient:
                     raise _ModelChanged()
             try:
                 resp = self.session.post(
-                    INTERACTIONS_URL, headers=headers, json=body,
+                    url, headers=headers, json=payload,
                     timeout=(CONNECT_TIMEOUT, self.timeout))
             except Exception as e:  # noqa: BLE001 — сеть отвалилась, пробуем ещё
                 if _answered(e):
@@ -471,7 +512,7 @@ class GeminiClient:
                     self.spent[model] += 1
                     self.requests_made += 1
                     self.board.spend(model)
-                    raise GeminiError(
+                    raise GeminiUnavailableError(
                         f"Gemini не ответил за {self.timeout:.0f} с "
                         "(запрос всё равно засчитан в суточный лимит)") from e
                 last = str(e)
@@ -534,4 +575,4 @@ class GeminiClient:
         # сказать пользователю не «ошибка», а «на сегодня хватит».
         if "429" in last or "RESOURCE_EXHAUSTED" in last or "quota" in last.lower():
             raise GeminiQuotaError(last or "Gemini: исчерпана квота")
-        raise GeminiError(last or "Gemini не ответил")
+        raise GeminiUnavailableError(last or "Gemini не ответил")

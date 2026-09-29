@@ -12,6 +12,7 @@ class _InfoBadge(_api.QLabel):
     def __init__(self, tip: str):
         super().__init__()
         self._tip = tip
+        self.setProperty("infoTipText", tip)
         self.setObjectName("infoBadge")
         self.setCursor(_api.Qt.CursorShape.WhatsThisCursor)
         self.setFixedSize(16, 16)
@@ -24,19 +25,15 @@ class _InfoBadge(_api.QLabel):
 
     def enterEvent(self, e):
         self.setPixmap(self._pm_hover)
-        try: _api._InfoTipPopup.instance().show_for(self, self._tip)
-        except Exception: pass
         super().enterEvent(e)
 
     def leaveEvent(self, e):
         self.setPixmap(self._pm_normal)
-        try: _api._InfoTipPopup.instance().hide()
+        try: _api._InfoTipPopup.instance().hide_for(self)
         except Exception: pass
         super().leaveEvent(e)
 
     def mousePressEvent(self, e):
-        try: _api._InfoTipPopup.instance().show_for(self, self._tip)
-        except Exception: pass
         super().mousePressEvent(e)
 
 _InfoBadge.__module__ = _api.__name__

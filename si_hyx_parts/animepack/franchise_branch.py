@@ -16,6 +16,25 @@ import re
 import animepack as _api
 
 
+def _science_adventure_branch(card: dict) -> str:
+    """Отдельные серии Science Adventure, склеенные ключом Shikimori."""
+    if str((card or {}).get("franchise") or "") != "science_adventure":
+        return ""
+    names = " ".join(str((card or {}).get(field) or "").casefold()
+                     for field in ("russian", "name", "english"))
+    branches = {
+        "steins_gate": ("врата штейна", "steins;gate", "steins gate"),
+        "robotics_notes": ("записки о робототехнике", "robotics;notes",
+                           "robotics notes"),
+        "chaos_head": ("вершина хаоса", "chaos;head", "chaos head"),
+        "chaos_child": ("дитя хаоса", "chaos;child", "chaos child"),
+        "occultic_nine": ("оккультная девятка", "occultic;nine",
+                           "occultic nine"),
+    }
+    return next((key for key, forms in branches.items()
+                 if any(form in names for form in forms)), "")
+
+
 def _roots(card: dict) -> set[str]:
     roots = set()
     for field in ("russian", "name", "english"):
@@ -37,6 +56,10 @@ def _roots(card: dict) -> set[str]:
 def franchise_branch_parts(card: dict, parts) -> list[dict]:
     """Части собственной ветки карточки; при сомнении возвращает все."""
     rows = [row for row in (parts or []) if isinstance(row, dict)]
+    branch = _science_adventure_branch(card)
+    if branch:
+        return [row for row in rows if _science_adventure_branch(
+            dict(row, franchise="science_adventure")) == branch]
     roots = _roots(card or {})
     if not roots or len(rows) < 4:
         return rows
@@ -59,6 +82,9 @@ def franchise_branch_parts(card: dict, parts) -> list[dict]:
 
 def franchise_branch_key(card: dict, parts=None) -> str:
     """Стабильный ключ ветки; пусто, если франшиза разделения не требует."""
+    special = _science_adventure_branch(card)
+    if special:
+        return special
     rows = [row for row in (parts or []) if isinstance(row, dict)]
     scoped = franchise_branch_parts(card, rows)
     if len(scoped) >= len(rows):

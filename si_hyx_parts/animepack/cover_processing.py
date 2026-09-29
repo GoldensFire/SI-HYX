@@ -21,6 +21,7 @@ import cover_meta
 from cover_meta_rules import cover_language
 from cover_search import fatal_reason
 from cover_service import CoverService, ytdlp_command
+from .generation_priority import apply_thread_priority, parallel_limit
 
 try:
     from config import ytdlp_base_cmd
@@ -41,9 +42,10 @@ def cover_service(generator):
             return generator._run_capture(command, timeout)
         service = CoverService(run, _api.FFMPEG, ytdlp_command(ytdlp_base_cmd()),
                                stopped=generator.stopped, log=generator.log,
-                               workers=max(1, min(16, int(generator.s.parallel))),
-                               cache_enabled=bool(getattr(
-                                   generator.s, "poster_cache", True)),
+                               workers=parallel_limit(generator.s),
+                               thread_initializer=lambda: apply_thread_priority(
+                                   generator.s),
+                               cache_enabled=False,
                                # Даже без процентного фильтра звук проверяется:
                                # сетевой поток остаётся один, чтобы YouTube не
                                # закрыл IP всплеском параллельных загрузок.
