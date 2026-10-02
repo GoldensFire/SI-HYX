@@ -29,22 +29,11 @@ def random_mangas(self, page: int = 1, *, limit: int = 50,
 
         Про order — см. random_animes: обход каталога целиком идёт с `order: id`,
         случайная выборка — с `random`."""
-    args = [f"page: {max(1, int(page))}", f"limit: {max(1, min(50, int(limit)))}",
-            f"order: {self._RE_ARG.sub('', str(order or 'random')) or 'random'}",
-            "censored: true"]
-    if season:
-        args.append(f'season: "{self._RE_ARG.sub("", str(season))}"')
-    kinds = [self._RE_ARG.sub("", str(k)) for k in kinds]
-    kinds = [k for k in kinds if k]
-    if kinds:
-        args.append(f'kind: "{",".join(kinds)}"')
-    if score and int(score) > 0:
-        args.append(f"score: {int(score)}")
-    gen = [str(int(g)) for g in genres]
-    gen += [f"!{int(g)}" for g in genres_exclude]
-    if gen:
-        args.append(f'genre: "{",".join(gen)}"')
-    query = ("query {\n  mangas(" + ", ".join(args) + ") {"
+    from .shikimori_catalog import catalog_args
+    args = catalog_args(self._RE_ARG, page, limit=limit, season=season,
+                        kinds=kinds, score=score, genres=genres,
+                        genres_exclude=genres_exclude, order=order)
+    query = ("query {\n  mangas(" + args + ") {"
              + self.MANGA_FIELDS + "}\n}")
     self.limiter.acquire()
     try:

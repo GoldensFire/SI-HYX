@@ -55,7 +55,7 @@ try:
                            MAX_PACK_MB, PIXIV_ART_KIND, PIXEL_BLOCK, PIXEL_FPS, PIXEL_KIND,
                            PIXEL_SECONDS, PIXEL_STEPS,
                            PIXIV_MIN_LIKES, PLOT_KIND, PLOT_MODES,
-                           PLOT_MODE_LABELS, SAKUGA_CUT, SAKUGA_KIND,
+                           PLOT_MODE_LABELS, SAKUGA_CUT, SAKUGA_KIND, EPISODE_KIND,
                            SAKUGA_MAX_CUT, MAX_LEVEL,
                            STUDIO_FRAMES,
                            STUDIO_FRAME_SECONDS, STUDIO_KIND,

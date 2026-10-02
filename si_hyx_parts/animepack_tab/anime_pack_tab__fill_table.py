@@ -42,6 +42,9 @@ def _fill_table(self, songs: list):
             if cand.kind == _api.VIDEO_KIND and not cand.has_video:
                 # Ролика для этой песни не нашлось — вопрос вышел обычным.
                 kind_text = _api.KIND_TITLES.get(cand.base_kind, kind_text)
+            if cand.entrance_effect:
+                from image_entrance import EFFECT_LABELS as ENTRANCE_LABELS
+                kind_text += " · " + ENTRANCE_LABELS[cand.entrance_effect]
             cells = [
                 _api._NumItem(str(row + 1), row + 1),
                 _api._NumItem(str(round_no + 1), round_no + 1),
@@ -122,6 +125,13 @@ def _detach(task):
 
 def cleanup(self):
     self._closing = True
+    timer = getattr(self, "_template_notice_timer", None)
+    if timer is not None:
+        timer.stop()
+        self.template_notice.hide()
+    preview = getattr(self, "entrance_preview", None)
+    if preview is not None:
+        preview.timer.stop()
     if getattr(self, "_gemini_quota_timer", None) is not None:
         self._gemini_quota_timer.stop()
     if getattr(self, "_ai_quota_timer", None) is not None:

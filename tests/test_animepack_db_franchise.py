@@ -122,7 +122,7 @@ def test_row_tip_follows_the_mouse_without_waiting_for_a_pause(qapp, cache):
     """Пока подсказка показана, переход на соседнюю строку сразу меняет её
     текст: раньше чужой разбор висел до следующей паузы курсора (~0,7 с)."""
     from PyQt6.QtCore import QEvent, QPointF, Qt
-    from PyQt6.QtGui import QHelpEvent, QMouseEvent
+    from PyQt6.QtGui import QCursor, QHelpEvent, QMouseEvent
     from PyQt6.QtWidgets import QApplication
     from widgets import _InfoTipPopup
 
@@ -131,6 +131,7 @@ def test_row_tip_follows_the_mouse_without_waiting_for_a_pause(qapp, cache):
         dialog.resize(900, 500)
         dialog.show()
         dialog.flush()
+        qapp.processEvents()
         page = dialog.anime
         calls = []
         explain = page._explain
@@ -139,11 +140,13 @@ def test_row_tip_follows_the_mouse_without_waiting_for_a_pause(qapp, cache):
         viewport = page.table.viewport()
         first = page.row_rect(0).center()
         second = page.row_rect(1).center()
+        QCursor.setPos(viewport.mapToGlobal(first))
         QApplication.sendEvent(viewport, QHelpEvent(
             QEvent.Type.ToolTip, first, viewport.mapToGlobal(first)))
         popup = _InfoTipPopup.instance()
         assert popup.isVisible()
         shown = popup.text()
+        QCursor.setPos(viewport.mapToGlobal(second))
         move = QMouseEvent(QEvent.Type.MouseMove, QPointF(second),
                            QPointF(viewport.mapToGlobal(second)),
                            Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,
@@ -151,6 +154,7 @@ def test_row_tip_follows_the_mouse_without_waiting_for_a_pause(qapp, cache):
         QApplication.sendEvent(viewport, move)
         assert popup.isVisible() and popup.text() != shown
         # Возврат на первую строку берёт разбор из памяти, а не считает заново.
+        QCursor.setPos(viewport.mapToGlobal(first))
         back = QMouseEvent(QEvent.Type.MouseMove, QPointF(first),
                            QPointF(viewport.mapToGlobal(first)),
                            Qt.MouseButton.NoButton, Qt.MouseButton.NoButton,

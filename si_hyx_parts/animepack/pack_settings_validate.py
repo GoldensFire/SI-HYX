@@ -16,6 +16,8 @@ from frame_reveal import EFFECT_LABELS, clean_effects
 def validate(self) -> list[str]:
     """Список проблем, из-за которых генерацию запускать бессмысленно."""
     problems: list[str] = []
+    from image_entrance import validate as validate_entrance
+    problems.extend(validate_entrance(self))
     from music_effects import validate as validate_music
     problems.extend(validate_music(self))
     if self.total_questions <= 0:
@@ -61,7 +63,7 @@ def validate(self) -> list[str]:
     if self.manga_percent and not any(self.manga_kinds.get(k)
                                       for k in _api.MANGA_KINDS):
         problems.append("В паке есть доля манги, но не выбран ни один её "
-                        "тип: включите мангу, манхву или ранобэ.")
+                        "тип: задайте долю манги, манхвы или маньхуа.")
     if not any(self.mix_shares.values()):
         problems.append("Выберите хотя бы одну часть пака.")
     subdl = str(getattr(self, "subdl_key", "") or "").strip()
@@ -98,6 +100,8 @@ def validate(self) -> list[str]:
                                          self.cloudflare_model))
     if self.mix_shares.get(_api.PIXIV_ART_KIND):
         problems.extend(validate_pixiv_settings(self.pixiv_refresh_token))
+        if self.pixiv_title_check_mode not in ("gemini", "local"):
+            problems.append("Неизвестный способ проверки названия артов Pixiv.")
         if (getattr(self, "pixiv_gemini_check", True)
                 and not str(self.gemini_key or "").strip()):
             problems.append(
@@ -108,16 +112,39 @@ def validate(self) -> list[str]:
                         "нечего.")
     if self.mix_shares.get(_api.MANGA_KIND) and self.manga_lang not in _api.MANGA_LANGS:
         problems.append("Для страниц манги выбран неизвестный язык глав.")
+    if self.mix_shares.get(_api.MANGA_KIND):
+        from .ru_popularity_math import RuPopularityConfig
+        try:
+            RuPopularityConfig(**self.ru_popularity)
+        except (ValueError, TypeError, OverflowError):
+            problems.append("Некорректная конфигурация RU popularity.")
+        from si_hyx_parts.animepack_api.manga_reader_base import clean_sources
+        sources = clean_sources(self.manga_sources)
+        if not any(sources.values()):
+            problems.append("Выберите хотя бы один источник страниц манги.")
+        elif (self.manga_lang and not sources["mangadex"]
+              and not sources["mangafire"] and self.manga_lang != "en"
+              and not ((sources["remanga"] or sources["mangalib"])
+                       and self.manga_lang == "ru")):
+            problems.append("Comix.to и WeebCentral дают страницы на английском. "
+                            "Выберите английский или любой язык глав.")
+    if self.mix_shares.get(_api.MANGA_KIND) and self.manga_title_check_mode not in ("gemini", "local"):
+        problems.append("Неизвестный способ проверки названия страниц манги.")
     if (self.mix_shares.get(_api.MANGA_KIND)
-            and getattr(self, "manga_gemini_check", True)
+            and (getattr(self, "manga_character_crop", True)
+                 or (getattr(self, "manga_gemini_check", True)
+                     and self.manga_title_check_mode == "gemini"))
             and not str(self.gemini_key or "").strip()):
         problems.append(
-            "Для проверки страниц манги нужен ключ Gemini. Введите ключ или "
-            "отключите проверку в настройках манги.")
+            "Для выбора сцен и проверки страниц манги нужен ключ Gemini. "
+            "Введите ключ или отключите выбор сцен через Gemini и проверку "
+            "через Gemini в настройках манги.")
     if self.mix_shares.get(_api.PIXEL_KIND) and int(self.pixel_seconds or 0) < 2:
         problems.append("Ролик-проявление короче двух секунд — проявляться "
                         "в нём нечему.")
     if self.mix_shares.get(_api.PIXEL_KIND):
+        if not 0 <= self.frame_preset <= 13:
+            problems.append("Пресет кадров с эффектами должен быть от 0 до 13.")
         if self.frame_effect not in (*EFFECT_LABELS, "random"):
             problems.append("Выбран неизвестный эффект раскрытия кадра.")
         if self.frame_effect == "random" and not clean_effects(self.frame_effects):
@@ -128,7 +155,7 @@ def validate(self) -> list[str]:
         if not live:
             problems.append(
                 "В паке есть доля манги, а списков манги нет: переключите "
-                "хотя бы один список на «Манга/ранобэ» либо уведите долю "
+                "хотя бы один список на «Манга/манхва/маньхуа» либо уведите долю "
                 "манги в ноль.")
     if self.difficulty_min > self.difficulty_max:
         problems.append("Сложность AMQ опенингов/эндингов: «от» больше, чем «до».")
@@ -150,7 +177,7 @@ def validate(self) -> list[str]:
                 f"«от {self.manga_level_min} до {self.manga_level_max}».")
         if int(self.manga_pct_manhwa or 0) + int(self.manga_pct_manhua or 0) > 100:
             problems.append("Доли манхвы и маньхуа в сумме больше сотни — "
-                            "на японскую мангу и ранобэ мест не остаётся.")
+                            "на японскую мангу мест не остаётся.")
         for key, label in (("manhwa", "манхвы"), ("manhua", "маньхуа")):
             if (int(getattr(self, "manga_pct_" + key) or 0)
                     and not self.manga_kinds.get(key)):

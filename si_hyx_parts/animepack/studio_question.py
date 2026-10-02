@@ -4,11 +4,8 @@
 """Вопрос-СТУДИЯ: три франшизы одной студии.
 
 Вопрос показывает ровно три кадра из трёх разных франшиз, которые
-нарисовала одна студия. Надпись «Назовите
-студию» идёт ПЕРЕД каждым кадром с waitForFinish="False" — так она показывается
-одновременно с ним (просьба пользователя). Повторять её приходится у каждого
-кадра: SIGame показывает разом только те элементы, что идут подряд до первого
-ждущего, а кадр как раз ждущий (см. QuestionEngine.PlayNext в исходниках SI).
+нарисовала одна студия. Надпись «Назовите студию» показывается одновременно
+с каждым кадром или его видео появления в течение четырёх секунд.
 
 Ответ — только имя студии. Картинка ответа — склеенные слева направо
 постеры этих же трёх аниме, в порядке кадров. Одна студия в одном паке
@@ -105,19 +102,26 @@ def download_frames(generator, cand) -> bool:
     for studio in choices:
         cards = _cards_for_studio(generator, cand, studio)
         if (len(cards) < _api.STUDIO_FRAMES
-                or not _reserve(generator, cand, studio, cards)):
+                or not _reserve(generator, cand, studio, cards[:1])):
             continue
         assets = []
         for card in cards:
             if generator.stopped() or len(assets) >= _api.STUDIO_FRAMES:
                 break
+            from .studio_reservations import reserve_card, release_card
+            if not reserve_card(generator, cand, card):
+                continue
             got = _download_one(generator, cand, card, len(assets) + 1)
             if got:
                 assets.append((card, *got))
+            else:
+                release_card(generator, cand, card)
         if len(assets) == _api.STUDIO_FRAMES and _save_poster_strip(
                 generator, cand, [row[3] for row in assets]):
             cand.studios = [studio]
             cand.studio_cards = [row[0] for row in assets]
+            from .studio_reservations import retain_cards
+            retain_cards(generator, cand, cand.studio_cards)
             cand.studio_levels = [_card_level(generator, row[0])
                                   for row in assets]
             names, urls = [row[1] for row in assets], [row[2] for row in assets]
@@ -355,24 +359,18 @@ def _save_poster_strip(generator, cand, posters) -> bool:
 
 
 def frame_seconds(settings) -> int:
-    """По сколько секунд висит каждый кадр вопроса-студии."""
-    try:
-        value = int(getattr(settings, "studio_seconds",
-                            _api.STUDIO_FRAME_SECONDS))
-    except (TypeError, ValueError):
-        value = _api.STUDIO_FRAME_SECONDS
-    return max(1, min(_api.STUDIO_SECONDS_MAX, value))
+    """Каждый кадр студии показывается ровно четыре секунды."""
+    return _api.STUDIO_FRAME_SECONDS
 
 
 def append_items(q_param, cand, settings) -> None:
     """Кадры вопроса и надпись над каждым из них — в <param name="question">."""
-    seconds = _api.fmt_duration(frame_seconds(settings))
+    seconds = frame_seconds(settings)
+    from .entrance_content import append_image
     for name in cand.question_frames:
         task = _api.ET.SubElement(q_param, "item", {"waitForFinish": "False"})
         task.text = _api.STUDIO_TASK_TEXT
-        frame = _api.ET.SubElement(q_param, "item", {
-            "type": "image", "isRef": "True", "duration": seconds})
-        frame.text = name
+        append_image(q_param, cand, name, seconds)
 
 
 studio_names.__module__ = _api.__name__

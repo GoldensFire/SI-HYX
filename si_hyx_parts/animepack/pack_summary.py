@@ -93,7 +93,7 @@ def composition_text(songs, settings, kind_titles: dict,
                            + f"AMQ - от {_number(min(amq))} "
                              f"до {_number(max(amq))}")
         suffix = f" ({detail})" if detail else ""
-        lines.append(f"  • {kind_titles.get(kind, kind)}: {count}{suffix}")
+        lines.append(f"{kind_titles.get(kind, kind)}: {count}{suffix}")
     levels = [int(getattr(cand, "level", 0) or 0) for cand in rows]
     levels = [value for value in levels if value > 0]
     if levels:
@@ -120,11 +120,11 @@ def _number(value: float) -> str:
 
 
 def _average_text(values: list[float]) -> str:
-    """«4.7 сложность в ср.» — разброс «от… до…» пользователю не нужен."""
+    """Компактная средняя сложность рода вопросов: «4.7🎯в ср.»."""
     if not values:
         return ""
     average = sum(values) / len(values)
-    return f"{average:.1f} сложность в ср."
+    return f"{average:.1f}🎯в ср."
 
 
 def _kind(cand, video_kind: str) -> str:

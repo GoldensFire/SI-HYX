@@ -26,11 +26,8 @@ def title_rows(cache, target: str = "anime", kinds=None) -> list[dict]:
     таблица показывала бы одно, а вопросы стоили бы по другому. Узнаваемость
     франшизы тоже берётся из кэша: у сиквела она и решает и индекс, и цену.
 
-    kinds — какие роды изданий показывать (None — все). Нужно каталогу книг:
-    в базе месяцами лежат мешки, набранные со старыми галочками, и выключенные
-    ранобэ так и висели в таблице, хотя в пак попасть уже не могут (просьба
-    пользователя). Франшиз и «в избранном» это не касается — там карточка
-    выключенного рода всё ещё полезна."""
+    kinds — собственный фильтр типов в окне базы (None — все). Настройки
+    генерации на содержимое этого окна не влияют."""
     manga = str(target) == "manga"
     favorites = _favorites(cache, manga)
     # Надбавка «в избранном» меряется по соседям по индексу — теми же, что у
@@ -39,6 +36,10 @@ def title_rows(cache, target: str = "anime", kinds=None) -> list[dict]:
     cards = filter_kinds(cache.all_cards(target), kinds)
     fr_index = _franchise_indexes(cache, cards)
     screens = _adaptation_indexes(cache, cards) if manga else {}
+    ru = None
+    if manga:
+        from si_hyx_parts.animepack.ru_popularity_store import RuPopularityStore
+        ru = RuPopularityStore(cache, {"remanga": None, "mangalib": None}, persist=False)
     rows = []
     for card in cards:
         try:
@@ -59,6 +60,8 @@ def title_rows(cache, target: str = "anime", kinds=None) -> list[dict]:
             kind=ap.MANGA_KIND if manga else ap.FRAME_KIND,
             media="manga" if manga else "anime",
             franchise_index=screen, favorites=fav)
+        if ru is not None:
+            cand.ru_popularity = ru.evaluate(cand, network=False)
         if manga and screen:
             # Для предпросмотра цены важен сам факт экранизации: у такой
             # страницы манги та же надбавка +2, что и в готовом паке.

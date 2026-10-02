@@ -138,7 +138,10 @@ def test_video_question_answer_is_the_same_as_a_song():
     hints = root.findall(
         ".//s:param[@name='question']/s:item[@waitForFinish='False']", ns)
     assert [i.text for i in hints] == ["Опенинг", "Опенинг"]
-    assert [i.get("placement") for i in hints] == [None, "replic"]
+    for q in root.findall(".//s:question", ns):
+        items = q.findall("s:params/s:param[@name='question']/s:item", ns)
+        expected = "replic" if items[1].get("type") == "video" else None
+        assert items[0].get("placement") == expected
     # В ответе обоих — реплика с исполнителем и постер.
     for q in root.findall(".//s:question", ns):
         items = q.findall("s:params/s:param[@name='answer']/s:item", ns)
@@ -150,14 +153,14 @@ test_video_question_answer_is_the_same_as_a_song.__module__ = _api.__name__
 _api.test_video_question_answer_is_the_same_as_a_song = test_video_question_answer_is_the_same_as_a_song
 
 def test_video_price_follows_its_song_type():
-    """Ролик-эндинг стоит как эндинг: надбавка берётся от песни."""
+    """Тип песни не меняет цену вопроса с видеорядом: она как у кадра."""
     s = _api.PackSettings(rounds=1, themes=1, questions=2)
     op = _api.make_candidate(anime={"malId": 1})
     ed = _api.make_candidate(song={"songType": "Ending 1", "annSongId": 2},
                         anime={"malId": 2})
     op.kind = ed.kind = _api.VIDEO_KIND
     _api.arrange_questions([op, ed], s)
-    assert ed.price - op.price == 2
+    assert ed.price == op.price == _api.animepack.price_for_level(op.level)
 
 test_video_price_follows_its_song_type.__module__ = _api.__name__
 _api.test_video_price_follows_its_song_type = test_video_price_follows_its_song_type

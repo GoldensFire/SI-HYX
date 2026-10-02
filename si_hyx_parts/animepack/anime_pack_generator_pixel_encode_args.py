@@ -10,11 +10,9 @@ from pixelize import block_sequence
 
 # ── пиксели: кадр, который проявляется ────────────────────────────────
 def pixel_encode_args(self, vf: str) -> list[str]:
-    """Флаги кодирования ролика-проявления: тот же libsvtav1 и те же
-        crf/пресет, что у вопроса-ролика (video_encode_args) — разница лишь в
-        цепочке фильтров, её собирает вызывающий."""
+    """Флаги раскрытия кадра: свой пресет, общий с роликами CRF."""
     crf = max(0, min(63, int(self.s.video_crf)))
-    preset = max(0, min(13, int(self.s.video_preset)))
+    preset = max(0, min(13, int(self.s.frame_preset)))
     return ["-c:v", "libsvtav1", "-crf", str(crf), "-preset", str(preset),
             "-svtav1-params", f"tune={_api.VIDEO_TUNE}:keyint=-1:scd=1",
             "-pix_fmt", "yuv420p10le", "-vf", vf, "-an"]
@@ -208,7 +206,7 @@ def make_plot_question(self, cand: _api.SongCandidate) -> bool:
                            f"«{cand.title_ru}»: Gemini не берётся за этот "
                            "пересказ — беру следующий тайтл")
             return False
-        if name in ("GeminiAuthError", "GeminiQuotaError"):
+        if name in ("GeminiAuthError", "GeminiQuotaError", "GeminiDownError"):
             self.gemini = None
             self._drop_kind(_api.PLOT_KIND)
             cand.rejected = True
@@ -240,6 +238,9 @@ def make_plot_question(self, cand: _api.SongCandidate) -> bool:
 def _fetch_media(self, cand: _api.SongCandidate) -> bool:
     if self.stopped():
         return False
+    from .early_repeat import reserve as reserve_exact
+    if not reserve_exact(self, cand):
+        return False
     # «В избранном» у тайтла — вторая мера узнаваемости (просьба
     # пользователя). Спрашивается здесь, а не при отборе: число живёт только
     # на странице Shikimori, то есть стоит запроса на тайтл, и платить за
@@ -264,17 +265,14 @@ def _fetch_media(self, cand: _api.SongCandidate) -> bool:
     if cand.kind == _api.CHAR_KIND:
         with self._timed("персонажи"):
             self._pick_character(cand)
-        # Средняя сложность персонажей проверяется ЗДЕСЬ, а не при отборе:
-        # раньше персонажа попросту не существовало. Зато проверка идёт до
-        # загрузки портрета — впустую качается ровно ничего.
-        if cand.character and not self._char_level_fits(cand):
-            cand.rejected = True
-            return False
         if cand.character:
-            # Кандидат остаётся — вот теперь можно потратиться на поиск
-            # самого первого произведения с этим персонажем.
+            # Сложность должна относиться к дебюту героя, а не к случайному
+            # позднему сезону, из которого он был выбран.
             with self._timed("персонажи"):
                 self._use_first_title(cand)
+            if cand.rejected or not self._char_level_fits(cand):
+                cand.rejected = True
+                return False
         if not cand.character:
             if not self.stopped():
                 self.log(f"«{cand.title_ru}» без персонажа — беру "
@@ -290,6 +288,8 @@ def _fetch_media(self, cand: _api.SongCandidate) -> bool:
     if cand.kind == _api.DIALOGUE_KIND and not self.make_dialogue_question(cand):
         return False
     if cand.kind == _api.DESCRIPTION_AUDIO_KIND and not self.make_description_audio(cand):
+        return False
+    if not reserve_exact(self, cand):
         return False
     if cand.kind == _api.AI_ART_KIND:
         with self._timed("ИИ-арты"):
@@ -307,6 +307,10 @@ def _fetch_media(self, cand: _api.SongCandidate) -> bool:
         # Вопрос-сакуга — это сам ролик, и без него вопроса нет.
         with self._timed("сакуга"):
             if not self.download_sakuga(cand):
+                return False
+    if cand.kind == _api.EPISODE_KIND:
+        with self._timed("отрывки серий"):
+            if not self.download_episode(cand):
                 return False
     if cand.kind == _api.STUDIO_KIND:
         # Вопрос-студия: кадров нужно несколько, и качает их свой загрузчик —
@@ -346,7 +350,8 @@ def _fetch_media(self, cand: _api.SongCandidate) -> bool:
             what = "портрета" if cand.is_character else "картинки"
             self.log(f"«{cand.title_ru}» без {what} — беру следующий тайтл")
         return False
-    return True
+    from .entrance_processing import apply as apply_entrance
+    return apply_entrance(self, cand)
 
 def _use_first_title(self, cand: _api.SongCandidate) -> None:
     """Меняет карточку вопроса-персонажа на САМОЕ ПЕРВОЕ произведение, где
@@ -356,9 +361,10 @@ def _use_first_title(self, cand: _api.SongCandidate) -> None:
         запросто третий сезон или спин-офф. Отвечать «Наруто: Ураганные
         хроники» там, где по-человечески ответ «Наруто», неправильно, поэтому
         спрашиваем у Shikimori все его тайтлы и берём самый ранний по дате
-        выхода. Не вышло — остаёмся на прежней карточке."""
+        выхода. Если первое появление проверить не удалось, вопрос пропускаем."""
     char_id = (cand.character or {}).get("id")
     if not char_id:
+        cand.rejected = True
         return
     titles = self.db_cache.memo("character_titles", char_id,
                                 _api.ENRICHMENT_CACHE_TTL)
@@ -368,6 +374,7 @@ def _use_first_title(self, cand: _api.SongCandidate) -> None:
         except _api.AnimePackApiError as e:
             self._log_rare("Где ещё был персонаж",
                            f"Где ещё был «{cand.char_name}»: {e}")
+            cand.rejected = True
             return
         self.db_cache.remember_memo("character_titles", char_id, titles)
     else:
@@ -377,30 +384,12 @@ def _use_first_title(self, cand: _api.SongCandidate) -> None:
     # Анонсы ответом не бывают (просьба пользователя): ни кадра, ни постера у
     # них толком нет, а игроки их не смотрели.
     rows = [row for row in rows if not _api.is_announced(row)]
-    # Явно попросили главных/второстепенных — первым считаем самое раннее
-    # произведение, где у героя ТА ЖЕ роль. Раньше при таком фильтре подмена
-    # не делалась вовсе, и ответом оставался случайный сиквел, из которого
-    # героя вытащили (жалоба пользователя), — а без фильтра по роли главная
-    # героиня «Скет Данса» стала бы второстепенной из «Гинтамы».
-    wanted = {"main": "main", "supporting": "supporting"}.get(
-        str(getattr(self.s, "char_roles", "") or "").lower())
-    if wanted:
-        rows = [row for row in rows if wanted in {
-            str(r).lower() for r in ((row or {}).get("roles")
-                                     or [(row or {}).get("role")])}]
+    # Роль определяет выбор героя, а не дату его дебюта: он мог сначала
+    # появиться второстепенным. Формат тоже не меняет хронологию.
     if not cand.is_manga:
-        # REST Shikimori перечисляет вообще всё: PV, рекламу, музыкальные
-        # ролики, спешлы и полноценные сериалы. Если у героя есть TV-аниме,
-        # отвечаем по самому раннему из них, а не по более старому промо или
-        # мини-аниме. Когда TV нет, оставляем прежний выбор среди настоящих
-        # произведений, но рекламные записи ответом не становятся.
-        dated = [row for row in rows if str((row or {}).get("aired_on") or "")]
-        tv = [row for row in dated
-              if str((row or {}).get("kind") or "").lower() == "tv"]
-        regular = [row for row in dated
-                   if str((row or {}).get("kind") or "").lower()
-                   not in ("pv", "cm", "music")]
-        rows = tv or regular
+        rows = [row for row in rows
+                if str((row or {}).get("kind") or "").lower()
+                not in ("pv", "cm", "music")]
     best, best_date = None, ""
     for row in rows:
         aired = str((row or {}).get("aired_on") or "")
@@ -414,18 +403,27 @@ def _use_first_title(self, cand: _api.SongCandidate) -> None:
             continue
         if best is None or aired < best_date:
             best, best_date = rid, aired
-    if not best or best == cand.mal_id:
+    if not best:
+        cand.rejected = True
+        self._log_rare("Первое появление персонажа не подтверждено",
+                       f"«{cand.char_name}»: нет выпущенного тайтла с датой "
+                       "дебюта — беру другого персонажа")
+        return
+    if best == int(cand.anime.get("id") or cand.mal_id or 0):
         return
     try:
         cards = (self._mangas_by_ids([best]) if cand.is_manga
                  else self._animes_by_ids([best]))
     except _api.AnimePackApiError as e:
         self.log(f"Первый тайтл франшизы не загрузился: {e}")
+        cand.rejected = True
         return
     card = cards[0] if cards else None
-    if not isinstance(card, dict) or not (card.get("poster") or {}).get("originalUrl"):
+    if not isinstance(card, dict) or int(card.get("id") or 0) != best:
+        cand.rejected = True
         return
     # В лог о подмене не пишем: это рабочая мелочь отбора, а не событие, и
     # строчка на каждый вопрос-персонаж только засоряла консоль (просьба
     # пользователя).
     cand.anime = card
+    cand.favorites = self._title_favorites(cand)

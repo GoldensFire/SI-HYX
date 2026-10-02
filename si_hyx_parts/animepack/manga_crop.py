@@ -10,7 +10,9 @@
 и картинка превращается в ниточку (просьба пользователя — сделать страницу
 манхвы «не сильно выше манги»).
 
-Поэтому полоса режется по высоте до книжных пропорций: берём случайное окно
+Режем только длинную вертикальную ленту, а книжные страницы сохраняем целиком,
+даже если их пропорции выше PAGE_MAX_RATIO. Полоса режется до книжных
+пропорций: берём случайное окно
 высотой не больше ширины, умноженной на PAGE_MAX_RATIO. Окно случайное, а не с
 начала: у ленты вверху обычно шапка переводчиков, а в середине — сама сцена.
 """
@@ -21,11 +23,29 @@ import animepack as _api
 # книжного разворота (у манги это примерно 1,4–1,5), так что обрезанная лента
 # смотрится как обычная страница, а не как ниточка.
 PAGE_MAX_RATIO = 1.6
+# Книжная страница, включая вытянутую ёнкому, не считается лентой вебтуна.
+# Порог определения ленты отличается от пропорций уже вырезанного окна.
+STRIP_MIN_RATIO = 3.0
 # Ленту режем не с самого края: вверху шапка с названием и переводчиками, внизу
 # — «продолжение следует» и реклама. Отступ — доля всей высоты.
 EDGE_SKIP = 0.08
 # Ниже этой высоты обрезать нечего: короткая полоса и так читается.
 MIN_KEEP = 200
+
+
+def is_vertical_strip(width: int, height: int) -> bool:
+    """Длинная вертикальная лента; тип издания сам по себе этого не определяет."""
+    return width > 0 and height > width * STRIP_MIN_RATIO
+
+
+def is_long_page(data: bytes) -> bool:
+    """Определяет ленту по размерам исходной картинки, не меняя её байты."""
+    try:
+        from config import Image
+        with Image.open(_api.io.BytesIO(data)) as im:
+            return is_vertical_strip(*im.size)
+    except Exception:  # noqa: BLE001 — повреждённое изображение не режем
+        return False
 
 
 def fit_page(data: bytes, ext: str = ".jpg", max_ratio: float = PAGE_MAX_RATIO,
@@ -41,7 +61,7 @@ def fit_page(data: bytes, ext: str = ".jpg", max_ratio: float = PAGE_MAX_RATIO,
     try:
         with Image.open(_api.io.BytesIO(data)) as im:
             width, height = im.size
-            if not width or not height:
+            if not is_vertical_strip(width, height):
                 return None
             keep = int(round(width * float(max_ratio)))
             if keep < MIN_KEEP or height <= keep:

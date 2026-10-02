@@ -273,31 +273,30 @@ def test_first_title_swap_is_silent():
 test_first_title_swap_is_silent.__module__ = _api.__name__
 _api.test_first_title_swap_is_silent = test_first_title_swap_is_silent
 
-def test_rejected_character_costs_no_extra_requests():
-    """Кандидата, не прошедшего по средней сложности, дальше не разрабатываем.
-
-    «Где ещё был этот персонаж» — ещё один-два запроса к Shikimori, а Shikimori
-    даёт всего 90 запросов в минуту: раньше они тратились на вопросы, которые
-    тут же выбрасывались, и персонажи занимали десятки минут."""
+def test_character_difficulty_checked_after_debut_before_media():
+    """Сложность считаем после проверки дебюта, до скачивания портрета."""
     asked = []
     gen = _api._gen(_api.PackSettings(pct_songs=0, pct_chars=100, char_level_avg=3))
     gen.shikimori.characters_by_anime_ids = lambda ids, target="anime": {
         ids[0]: [{"id": 5, "name": "Персонаж", "names": ["Персонаж"],
                   "poster": "http://x/p.jpg", "main": True}]}
     gen.shikimori.character_favorites = lambda cid: 1
-    gen.shikimori.character_titles = lambda cid: asked.append(cid) or {}
+    gen.shikimori.character_titles = lambda cid: asked.append(cid) or {
+        "animes": [{"id": 42, "aired_on": "2006-01-01"}]}
+    downloaded = []
+    gen.download_images = lambda cand: downloaded.append(cand)
     # Три трудных персонажа уже набраны — четвёртый такой же (безвестный тайтл,
-    # в избранном у одного) не подходит и должен отсеяться ДО поиска первого
-    # тайтла.
+    # в избранном у одного) не подходит после подтверждения первого тайтла.
     gen._char_levels.extend([10, 10, 10])
     cand = _api._char_cand(1, char_id=42, viewers=20)
     cand.character = None
     assert gen._fetch_media(cand) is False
     assert cand.rejected is True
-    assert asked == []
+    assert asked == [5]
+    assert downloaded == []
 
-test_rejected_character_costs_no_extra_requests.__module__ = _api.__name__
-_api.test_rejected_character_costs_no_extra_requests = test_rejected_character_costs_no_extra_requests
+test_character_difficulty_checked_after_debut_before_media.__module__ = _api.__name__
+_api.test_character_difficulty_checked_after_debut_before_media = test_character_difficulty_checked_after_debut_before_media
 
 def test_repeated_complaints_are_hushed():
     """Когда сервер отказывает на каждом вопросе, лог не должен превращаться в

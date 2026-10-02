@@ -37,22 +37,45 @@ class AniListApi:
       }
     }"""
 
-    def __init__(self, session: _api.Optional[_api.requests.Session] = None):
+    def __init__(self, session: _api.Optional[_api.requests.Session] = None,
+                 log=None):
         self.session = session or _api.make_session()
-        self.limiter = _api.RateLimiter(1.2)      # 90/мин с запасом
+        # Ретраи здесь, чтобы каждый повтор учитывался ограничителем, а
+        # необязательные кадры не ждали четыре повтора общего адаптера.
+        if isinstance(self.session, _api.requests.Session):
+            self.session.mount(_api.ANILIST_BASE + "/",
+                               _api.HTTPAdapter(max_retries=0, pool_maxsize=16))
+        self.limiter = _api.RateLimiter(1.2, per_minute=90)
+        self._frames_lock = _api.threading.Lock()
+        self._frames_retry_at = 0.0
+        self._log = log or (lambda message: None)
 
-    def _graphql(self, query: str, variables: dict) -> dict:
-        self.limiter.acquire()
-        try:
-            resp = self.session.post(_api.ANILIST_BASE,
-                                     json={"query": query, "variables": variables},
-                                     timeout=(10, 45))
-            if resp.status_code == 404:
-                return {}
-            resp.raise_for_status()
-            body = resp.json()
-        except Exception as e:
-            raise _api._friendly(e, "AniList") from e
+    def _graphql(self, query: str, variables: dict, *, attempts=2,
+                 timeout=(10, 45)) -> dict:
+        for attempt in range(attempts):
+            self.limiter.acquire()
+            try:
+                resp = self.session.post(
+                    _api.ANILIST_BASE, json={"query": query, "variables": variables},
+                    timeout=timeout)
+                if resp.status_code == 404:
+                    return {}
+                resp.raise_for_status()
+                body = resp.json()
+                break
+            except Exception as e:
+                status = getattr(getattr(e, "response", None), "status_code", 0)
+                transient = (isinstance(e, (_api.requests.Timeout,
+                                           _api.requests.ConnectionError))
+                             or status in (429, 500, 502, 503, 504))
+                if attempt + 1 >= attempts or not transient:
+                    raise _api._friendly(e, "AniList") from e
+                headers = getattr(getattr(e, "response", None), "headers", {})
+                try:
+                    pause = min(60, max(1, float(headers.get("Retry-After", 1))))
+                except (TypeError, ValueError):
+                    pause = 1
+                self.limiter.penalize(pause)
         if isinstance(body, dict) and body.get("errors"):
             first = (body["errors"] or [{}])[0]
             raise _api.AnimePackApiError(f"AniList: {first.get('message') or 'ошибка'}")
@@ -106,9 +129,25 @@ class AniListApi:
     def frames(self, mal_id: int) -> list[str]:
         """Кадры тайтла: превью серий (по одному на серию) + баннер."""
         try:
-            data = self._graphql(self.IMAGES_QUERY, {"idMal": int(mal_id)})
-        except Exception:  # noqa: BLE001 — дополнительный источник, не критичен
+            mal_id = int(mal_id)
+        except (TypeError, ValueError):
             return []
+        # Один пробный запрос вместо очереди из восьми зависших потоков.
+        # При недоступности AniList остальные источники продолжают работать.
+        self._frames_lock.acquire()
+        try:
+            if _api.time.monotonic() < self._frames_retry_at:
+                return []
+            try:
+                data = self._graphql(self.IMAGES_QUERY, {"idMal": mal_id},
+                                     attempts=1, timeout=(5, 15))
+            except _api.AnimePackApiError as e:
+                self._frames_retry_at = _api.time.monotonic() + 60
+                self._log(f"{e} Превью AniList пропускаю на минуту; "
+                          "кадры беру из остальных источников.")
+                return []
+        finally:
+            self._frames_lock.release()
         media = data.get("Media") or {}
         out = [str(ep.get("thumbnail")) for ep in (media.get("streamingEpisodes") or [])
                if isinstance(ep, dict) and ep.get("thumbnail")]

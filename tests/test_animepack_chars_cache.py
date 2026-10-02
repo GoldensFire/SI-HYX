@@ -41,7 +41,7 @@ from si_hyx_parts.tests.test_animepack_chars_cache.gen import (
     test_char_level_returns_when_easier_characters_show_up,
     test_reachable_char_level_still_gives_up_out_loud,
     test_first_title_swap_is_silent,
-    test_rejected_character_costs_no_extra_requests,
+    test_character_difficulty_checked_after_debut_before_media,
     test_repeated_complaints_are_hushed,
     _Clock,
 )

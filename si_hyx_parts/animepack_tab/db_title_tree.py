@@ -80,7 +80,7 @@ def _missing_family_header(key: str, members, parts):
     name = str(lead.get("russian") or lead.get("name") or "").strip()
     if not name:
         name = key.replace("_", " ").strip().title()
-    total = max(len(known), len(members))
+    total = len(known | present)
     # Ссылка группового корня ведёт на реальную ведущую часть франшизы. Раньше
     # id и url намеренно обнулялись, поэтому именно у франшизы кнопки не было.
     header = dict(members[0])

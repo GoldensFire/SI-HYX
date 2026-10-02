@@ -19,6 +19,8 @@ import tempfile
 from PIL import Image, ImageOps
 
 import animepack as _api
+from .generation_diagnostics import operation
+from .generation_runtime import encoding_operation, track_process, untrack_process
 from frame_reveal import stage_frame_counts
 from frame_reveal_dvd import DvdAnimation, dvd_fps
 from frame_reveal_dvd_media import FolderMedia, list_media
@@ -35,17 +37,17 @@ def dvd_media(self, rng, fps: int):
         return None
 
     def track(proc):
-        with self._procs_lock:
-            self._procs.add(proc)
+        track_process(self, proc)
 
     def untrack(proc):
-        with self._procs_lock:
-            self._procs.discard(proc)
+        untrack_process(self, proc)
 
     return FolderMedia(files, rng, _api.FFMPEG, _api.FFPROBE, fps,
                        track, untrack)
 
 
+@encoding_operation
+@operation("подготовка и кодирование DVD")
 def encode_dvd(self, source: str, output: str, seed: int):
     """(код возврата, текст ошибки) — как у _run_killable."""
     fps = dvd_fps(getattr(self.s, "frame_dvd_fps", None))
@@ -85,14 +87,12 @@ def encode_dvd(self, source: str, output: str, seed: int):
         except Exception as e:  # noqa: BLE001
             _close(anim, media)
             return 1, str(e)
-        with self._procs_lock:
-            self._procs.add(proc)
+        track_process(self, proc)
         try:
             code = _feed(self, proc, anim, moving, total)
         finally:
             _close(anim, media)
-            with self._procs_lock:
-                self._procs.discard(proc)
+            untrack_process(self, proc)
         errors.seek(0)
         text = errors.read().decode("utf-8", "replace")
     if code is None:

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Каталог из мешка с фильтрами шире нынешних и бонус «в избранном»."""
 import random
+from types import SimpleNamespace
 
 import pytest
 
@@ -54,7 +55,39 @@ def test_complete_bucket_stops_fetching_even_when_small(tmp_path):
     assert fetched == []
 
 
-def test_narrower_bucket_does_not_serve_wider_filters(tmp_path):
+def test_cached_manga_is_not_topped_up_during_generation(tmp_path):
+    settings = PackSettings(questions=4, rounds=6, themes=6,
+                            pct_songs=0, pack_manga=True, pct_manga=100,
+                            manga_pct_manhwa=50)
+    gen = _gen(tmp_path, settings)
+    sig = ap.shiki_cache_signature(settings, manga=True)
+    gen.db_cache.add_cards("manga", sig, [_card(1, kind="manga")])
+    gen._fetch_random_cards = lambda *a: pytest.fail("cached catalog refetched")
+    gen.shikimori = SimpleNamespace(
+        random_mangas=lambda *a, **k: pytest.fail("edition catalog refetched"))
+    assert gen._random_shikimori_ids(manga=True) == [1]
+
+
+def test_first_manga_catalog_uses_its_question_quota(tmp_path):
+    settings = PackSettings(questions=4, rounds=6, themes=6,
+                            pct_songs=75, pack_manga=True, pct_manga=25)
+    assert settings.total_questions == 144
+    assert settings.question_quotas[ap.MANGA_KIND] == 36
+    gen = _gen(tmp_path, settings)
+    fetched = []
+    gen._fetch_random_cards = lambda manga, want, *a: fetched.append((manga, want))
+    assert gen._random_shikimori_ids(manga=True) == []
+    assert fetched == [(True, 36 * gen.RANDOM_OVERSHOOT_MANGA)]
+
+
+def test_no_manga_quota_does_not_load_its_catalog(tmp_path):
+    gen = _gen(tmp_path, PackSettings(pack_manga=False))
+    gen._fetch_random_cards = lambda *a: pytest.fail("unneeded manga catalog")
+    assert gen._random_shikimori_ids(manga=True) == []
+    assert not gen._manga_cache
+
+
+def test_narrower_bucket_serves_cards_without_claiming_completeness(tmp_path):
     """Мешок с исключённым жанром не выдаётся за полный каталог."""
     narrow = PackSettings(genres_exclude=[130])
     wide = PackSettings()
@@ -62,7 +95,7 @@ def test_narrower_bucket_does_not_serve_wider_filters(tmp_path):
     db.add_cards("anime", ap.shiki_cache_signature(narrow), [_card(1)])
     cards, complete = catalog_superset.cached_catalog(
         db, "anime", ap.shiki_cache_signature(wide))
-    assert cards == [] and complete is False
+    assert [c["malId"] for c in cards] == [1] and complete is False
 
 
 def test_year_score_and_kind_are_filtered_locally():

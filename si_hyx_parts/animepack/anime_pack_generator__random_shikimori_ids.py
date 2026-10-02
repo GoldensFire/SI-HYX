@@ -19,7 +19,10 @@ def _random_shikimori_ids(self, manga: bool = False) -> list[int]:
         # У книг запас свой: карточку манги ничем, кроме вопроса по манге, не
         # заменить, а книжные доли (экранизованные, манхва, маньхуа) отбирают
         # подходящих куда строже, чем рамка сложности.
-        want = max(50, self.s.total_questions * self.RANDOM_OVERSHOOT_MANGA)
+        quota = int(self.s.question_quotas.get(_api.MANGA_KIND, 0) or 0)
+        if not quota:
+            return []
+        want = max(50, quota * self.RANDOM_OVERSHOOT_MANGA)
     else:
         # Запас по РОДАМ ВОПРОСОВ (см. catalog_want.py): у сакуги, артов, мест
         # и загадок по названию отдача в разы ниже, чем у кадров и песен, и
@@ -62,13 +65,18 @@ def _random_shikimori_ids(self, manga: bool = False) -> list[int]:
     if ids:
         self.log(f"Каталог Shikimori: {len(ids)} {what} взято из кэша "
                  "(обновить — кнопкой «Обновить базу»)")
-    if len(ids) < want and not complete:
+    # Сохранённые книги используем как есть: каталог обновляет отдельная
+    # кнопка, а размер нового пака не должен запускать его фоновую загрузку.
+    needs_fetch = not ids if manga else len(ids) < want
+    if needs_fetch and not complete:
+        if manga:
+            self.log(f"Каталог манги пуст: беру запас до {want} карточек "
+                     f"для {quota} вопросов по манге.")
         self._fetch_random_cards(manga, want, sig, take, lambda: len(ids))
-    if manga:
-        # Манхва и маньхуа в общем каталоге почти не попадаются — их доли
-        # добираются отдельным запросом (см. manga_catalog_topup.py).
-        from .manga_catalog_topup import topup_editions
-        topup_editions(self, sig, take)
+        if manga:
+            # При первом заполнении обеспечиваем заданные доли изданий.
+            from .manga_catalog_topup import topup_editions
+            topup_editions(self, sig, take)
     # Порядок случайный и внутри серии тоже (просьба пользователя): какой
     # сезон достанется паку, решает жребий, иначе одна и та же часть франшизы
     # попадалась бы из пака в пак. «Царство» приходило шестым сезоном не
@@ -76,6 +84,9 @@ def _random_shikimori_ids(self, manga: bool = False) -> list[int]:
     # кнопки «Обновить базу» он набирался обрывками (order: random) и целиком
     # не вычерпывался.
     self.rng.shuffle(ids)
+    if manga:
+        from .manga_source_candidates import prefer_reader_matches
+        ids = prefer_reader_matches(self, ids)
     self.log(f"Случайных {what} с Shikimori: {len(ids)}")
     return ids
 
@@ -115,4 +126,5 @@ def _fetch_random_cards(self, manga: bool, want: int, sig: str,
             if fresh == 0:
                 break             # каталог по этим фильтрам кончился
     finally:
-        self.db_cache.save()
+        from .generation_checkpoint import checkpoint
+        checkpoint(self)

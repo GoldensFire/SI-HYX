@@ -207,14 +207,11 @@ def _update_media_buttons(self):
                 b.blockSignals(True); b.setChecked(False); b.blockSignals(False)
             self._sync_pixelize_icon()
         self._clear_image_overlays()
-    # «Удалить исходник» активна при любом загруженном файле (видео/аудио).
-    try:
-        src = getattr(self, "actual_source_file", None)
-        b = getattr(self, "btn_delete_source", None)
-        if b is not None:
-            b.setEnabled(bool(src) and _api.os.path.exists(str(src)))
-    except Exception:
-        pass
+    if getattr(self, "btn_more_actions", None) is not None:
+        self._refresh_more_actions()
+    if getattr(self, "_entrance_running", False):
+        for button in self._montage_side_btns:
+            button.setEnabled(False)
     # Режимы обрезки, неприменимые к аудио, отключаем (см. ниже).
     self._update_mode_combo_for_media(has_video)
     # Иконка полноэкранного режима белая поверх accent-заливки; на сером

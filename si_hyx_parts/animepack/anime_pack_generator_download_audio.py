@@ -4,6 +4,8 @@
 """AnimePackGenerator: download_audio. Public namespace: animepack."""
 from __future__ import annotations
 import animepack as _api
+from .generation_runtime import encoding_operation
+from .generation_diagnostics import operation
 
 
 def download_audio(self, cand: _api.SongCandidate) -> bool:
@@ -113,6 +115,8 @@ def _save_reusable_image(self, data: bytes, base: str,
     return name
 
 
+@encoding_operation
+@operation("обработка картинок")
 def _to_avif(self, data: bytes, out_name: str, src_ext: str = ".jpg") -> bool:
     """Кладёт скачанную картинку в Images/<out_name> как AVIF ≤ лимита.
 
@@ -145,7 +149,9 @@ def _to_avif(self, data: bytes, out_name: str, src_ext: str = ".jpg") -> bool:
                             speed=max(0, min(8, int(self.s.image_speed))),
                             passes=_api.IMAGE_FIT_PASSES,
                             start_cq=start, max_side=_api.IMAGE_MAX_SIDE,
-                            should_stop=self._should_stop)
+                            should_stop=self._should_stop,
+                            runner=lambda command: self._run_capture(
+                                command, timeout=600)[0] == 0)
     finally:
         try:
             if _api.os.path.exists(raw):
@@ -196,6 +202,10 @@ def _pick_character(self, cand: _api.SongCandidate) -> None:
         rows = [r for r in rows if not r.get("main")]
     # Персонажа с иероглифическим именем не спросить: игрок его не наберёт.
     rows = [r for r in rows if not _api.has_cjk(r.get("name"))]
+    from .character_repeat import character_keys
+    with self._exact_lock:
+        previous = self._exact_keys | self._exact_seen
+    rows = [row for row in rows if not character_keys(row) & previous]
     # Одного и того же персонажа два раза в пак не пускаем (Shikimori
     # держит сквозные id — совпадения ловятся даже между сиквелами).
     with self._frames_lock:
@@ -218,9 +228,8 @@ def _pick_character(self, cand: _api.SongCandidate) -> None:
     cand.character = dict(picked)
     cand.char_favorites = -1
 
-    # _use_first_title здесь НЕ зовём: это ещё один-два запроса к Shikimori,
-    # а кандидата вот-вот могут отвергнуть по средней сложности (см.
-    # _fetch_media). Сначала проверка, потом уже поиск первого тайтла.
+    # Карточку дебюта выбирает _fetch_media: после выбора героя, до проверки
+    # его сложности и скачивания портрета.
 
 def _title_favorites(self, cand: _api.SongCandidate) -> int:
     """Сколько человек добавили ТАЙТЛ кандидата в избранное (−1 — не узнали).

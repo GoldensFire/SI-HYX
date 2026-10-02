@@ -118,8 +118,9 @@ _RULES_COMMON = """Ты составляешь вопросы для игры «
 а не добавляй отдельную служебную фразу. В explanation номер серии не пиши.
 4д. explanation — ровно одно развёрнутое предложение, которое объясняет,
 почему ответ верен, без ссылок, номера серии и повторения самого вопроса.
-Обязательно назови в нём сам правильный ответ: название произведения для
-вопроса о тайтле или ключевые слова короткого answer для вопроса о детали."""
+НИКОГДА не называй аниме в explanation: ни русское название, ни перевод,
+ни ромадзи, ни сокращение. Объясняй сам факт сюжета. Для вопроса о детали
+назови ключевые слова короткого answer. Название тайтла хранится отдельно."""
 
 _RULES_TITLE = """
 Вопрос должен описывать ЗАПОМИНАЮЩИЙСЯ эпизод сюжета так, чтобы смотревший узнал произведение, а не смотревший — нет.
@@ -489,6 +490,7 @@ def _make_question(title: str, plot: str, client, *, mode: str, page: str,
     # Несколько вариантов за один запрос: отказ модели или строгого разбора
     # по одному из них больше не стоит нового запроса (см. plot_variants).
     from si_hyx_parts.animepack import plot_variants
+    from si_hyx_parts.animepack.plot_explanation import without_titles
     schema = SCHEMA_DETAIL if mode == "detail" else SCHEMA_TITLE
     data = client.generate_json(
         build_prompt(title, text, mode, page, episode)
@@ -497,6 +499,9 @@ def _make_question(title: str, plot: str, client, *, mode: str, page: str,
     for item in plot_variants.variants(data):
         question, answers, explanation = parse_answer_full(item, mode,
                                                             strict=strict)
+        explanation = without_titles(explanation, [title] + list(names or ()))
+        if strict and not explanation:
+            continue
         if question and mode != "detail":
             question = mask_names(question, names or (title,))
         elif question:

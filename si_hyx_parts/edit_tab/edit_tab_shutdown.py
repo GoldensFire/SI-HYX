@@ -50,7 +50,7 @@ def shutdown(self):
         pass
     # Убиваем все фоновые ffmpeg-процессы, чтобы не остались зомби (баг #3).
     for attr in ('ffmpeg_thread', 'proxy_thread', 'audio_worker',
-                 '_vinp_worker', '_trk_worker'):
+                 '_vinp_worker', '_trk_worker', '_entrance_worker'):
         w = getattr(self, attr, None)
         if w is None:
             continue

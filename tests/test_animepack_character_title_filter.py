@@ -98,10 +98,8 @@ def test_regular_character_price_explains_fixed_role_step():
     assert text.endswith(f"Итого: {cand.price}")
 
 
-def test_explicit_main_role_takes_the_earliest_title_with_that_role():
-    """Фильтр «главные» не отключает первое появление, а сужает его: самое
-    раннее произведение, где герой тоже главный. Второстепенная роль в более
-    старой «Гинтаме» и анонс ответом не становятся."""
+def test_explicit_main_role_does_not_change_the_characters_debut():
+    """Роль выбирает героя; первое появление не зависит от его роли."""
     class Shikimori:
         def character_titles(self, _char_id):
             return {"animes": [
@@ -118,7 +116,7 @@ def test_explicit_main_role_takes_the_earliest_title_with_that_role():
         PackSettings(char_roles="main"), session=object(), amq=object(),
         anisong=object(), mal=object(), shikimori=Shikimori(),
         anilist=object(), kitsu=object(), themes=object(), tmdb=object())
-    first = {"id": 9863, "malId": 9863, "russian": "Скет Данс",
+    first = {"id": 918, "malId": 918, "russian": "Гинтама",
              "poster": {"originalUrl": "https://x/p.jpg"}}
     asked = []
     gen._animes_by_ids = lambda ids: asked.extend(ids) or [first]
@@ -126,5 +124,5 @@ def test_explicit_main_role_takes_the_earliest_title_with_that_role():
     cand = SongCandidate({}, anime, kind=ap.CHAR_KIND,
                          character={"id": 7, "name": "Химэ", "main": True})
     gen._use_first_title(cand)
-    assert asked == [9863]
+    assert asked == [918]
     assert cand.anime is first

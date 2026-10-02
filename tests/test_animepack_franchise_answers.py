@@ -40,10 +40,11 @@ def test_popular_answer_uses_index_within_the_same_series():
     assert "Врата Штейна" in cand.answer_variants()
 
 
-def test_plot_title_explanation_is_first_and_contains_title():
+def test_plot_title_explanation_is_first_without_title():
     cand = ap.SongCandidate({}, _card(9253, "Врата Штейна", 200_000),
                             kind=ap.PLOT_KIND)
     cand.plot_explanation = "Герой отправляет сообщение в прошлое."
     answers = cand.answer_variants()
-    assert answers[0].startswith("Врата Штейна — ")
+    assert answers[0] == cand.plot_explanation
+    assert "Врата Штейна" not in answers[0]
     assert cand.main_answer in answers

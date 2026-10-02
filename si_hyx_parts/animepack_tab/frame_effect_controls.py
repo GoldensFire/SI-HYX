@@ -82,6 +82,15 @@ def build_controls(tab):
         grid.addWidget(control2, row, 3)
     grid.addWidget(tab._lab("Блок, px"), 4, 0)
     grid.addWidget(tab.sp_pixel_block, 4, 1)
+    tab.sp_frame_preset = _api.QSpinBox()
+    tab.sp_frame_preset.setRange(0, 13)
+    tab.sp_frame_preset.setValue(_api.VIDEO_PRESET)
+    tab.sp_frame_preset.setToolTip(
+        "Пресет кодирования кадров с эффектами, включая DVD-заставку.\n"
+        "13 — самый быстрый, 0 — самый медленный. Значение можно вписать.\n"
+        "У песенных роликов и сакуги свои пресеты.")
+    grid.addWidget(tab._lab("Пресет кодирования"), 4, 2)
+    grid.addWidget(tab.sp_frame_preset, 4, 3)
     _build_dvd_folder(tab, grid, 5)
     _build_dvd_fps(tab, grid, 6)
     tab.lbl_pixel_steps = tab._hint("")
@@ -193,6 +202,7 @@ def refresh_controls(tab):
 
 
 def apply_controls(tab, settings):
+    tab.sp_frame_preset.setValue(max(0, min(13, int(settings.frame_preset))))
     index = tab.cb_frame_effect.findData(settings.frame_effect)
     tab.cb_frame_effect.setCurrentIndex(max(0, index))
     selected = clean_effects(settings.frame_effects)

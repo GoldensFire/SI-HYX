@@ -27,7 +27,7 @@ def rebuild(tab, group):
         tab.composition_checks[key] = chk
     for key in ("video", "manga", "pixel", "anagram", "dialogue", "plot",
                 "description_audio", "ai_art",
-                "pixiv_art", "sakuga", "studio"):
+                "pixiv_art", "sakuga", "studio", "episode"):
         tab.composition_checks[key] = getattr(tab, "chk_" + key)
     grid.addWidget(tab.mix, 0, 0, 1, 4)
     grid.addWidget(tab.lbl_left, 1, 0, 1, 4)
@@ -93,6 +93,7 @@ _OPTIONS = {
     "ai_art": ("box_ai_art",),
     "pixiv_art": ("box_pixiv_art",),
     "sakuga": ("box_sakuga",),
+    "episode": ("box_episode",),
     "studio": ("box_studio",),
 }
 
@@ -144,7 +145,8 @@ def refresh_gemini(tab):
     titles = any(getattr(tab, "chk_" + key).isChecked()
                  for key in GEMINI_TITLE_KINDS)
     enabled = (tab.chk_plot.isChecked() or tab.chk_dialogue.isChecked()
-               or tab.chk_description_audio.isChecked() or titles)
+               or tab.chk_description_audio.isChecked() or titles
+               or (tab.chk_episode.isChecked() and tab.chk_episode_ru.isChecked()))
     tab.box_plot.setVisible(enabled)
     # Своя модель загадок по названию нужна только при включённых загадках.
     box = getattr(tab, "box_gemini_titles", None)
@@ -164,24 +166,21 @@ def refresh_text_timing(tab):
 
 
 def refresh_quota(tab):
-    """Сколько запросов модели ушло сегодня — и что мы знаем про её потолок.
-
-    Считаем ОБСЛУЖЕННЫЕ запросы: 429 и 5xx Google отклоняет, и в суточный
-    лимит они не идут. Потолок берётся из ответа самого сервера, когда он его
-    называл («limit: 20»), — гадать за Google мы не беремся."""
+    """Локальная оценка расхода и суточный предел, названный сервером."""
     from gemini_usage import daily_cap, exhausted_today, requests_today
     key, model = tab._api_key("gemini"), tab.cb_gemini_model.currentText()
     count = requests_today(key, model)
     cap = daily_cap(key, model)
     if exhausted_today(key, model):
-        left = " Квота на сегодня исчерпана — модель будет пропускаться."
+        left = " Google сообщил об исчерпании квоты — модель пока пропускается."
     elif cap:
-        left = f" Потолок по словам Google — {cap}, осталось {max(0, cap - count)}."
+        left = (f" Дневной предел Google — {cap}, "
+                f"по этой оценке осталось {max(0, cap - count)}.")
     else:
         left = ""
     tab.lbl_gemini_quota.setText(
-        f"Gemini: сегодня обслужено запросов — {count}.{left} "
-        'Точный остаток квоты: <a href="https://aistudio.google.com/rate-limit">AI Studio</a>.')
+        f"Gemini: возможный расход квоты сегодня — {count} (оценка SI-HYX).{left} "
+        'Показатели квоты: <a href="https://aistudio.google.com/rate-limit">AI Studio</a>.')
 
 
 def change_quota_model(tab):

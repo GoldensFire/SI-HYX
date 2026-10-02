@@ -1,17 +1,10 @@
 # -*- coding: utf-8 -*-
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
-"""Карточки каталога из мешка с фильтрами ШИРЕ нынешних.
+"""Объединение пригодных карточек кэша и отдельная проверка его полноты.
 
-База Shikimori хранит карточки мешками по набору фильтров (год, типы, оценка,
-исключённые жанры — см. `shiki_cache_signature`). Раньше генерация смотрела
-только в мешок ровно своих фильтров: стоило исключить жанр «Исэкай», и пак
-заводил пустой мешок и снова черпал каталог с сервера, хотя полный каталог
-(12 811 аниме) уже лежал рядом и все нужные карточки в нём были (жалоба
-пользователя: «нахуя он набирает каталог, если у меня уже все тайтлы»).
-
-Теперь годится любой мешок, чьи фильтры ПОКРЫВАЮТ нынешние: лишнее из него
-отсеивается здесь же, на месте, по полям самой карточки.
+Более узкая выборка тоже содержит полезные карточки. Она не доказывает,
+что весь текущий запрос вычерпан, но отбрасывать её содержимое нельзя.
 """
 from __future__ import annotations
 
@@ -65,14 +58,14 @@ def card_fits(card: dict, outer: dict, inner: dict) -> bool:
     у карточки может не быть года, и отбрасывать её там, где сервер её отдал
     бы и так, незачем. Карточки чужого рода (манхва и маньхуа, добранные
     отдельным запросом, — manga_catalog_topup) типы мешка не ограничивают."""
-    if inner["years"] != outer["years"]:
+    if not (inner["years"][0] <= outer["years"][0]
+            and inner["years"][1] >= outer["years"][1]):
         year = _card_year(card)
         if year is None or not inner["years"][0] <= year <= inner["years"][1]:
             return False
-    if inner["kinds"] != outer["kinds"]:
-        kind = str(card.get("kind") or "")
-        if kind in outer["kinds"] and kind not in inner["kinds"]:
-            return False
+    kind = str(card.get("kind") or "")
+    if kind and kind not in inner["kinds"]:
+        return False
     if inner["score"] > outer["score"]:
         try:
             if float(card.get("score") or 0) < inner["score"]:
@@ -88,21 +81,28 @@ def card_fits(card: dict, outer: dict, inner: dict) -> bool:
 def cached_catalog(db_cache, target: str, sig: str) -> tuple[list, bool]:
     """(карточки под фильтры sig из всех подходящих мешков, полон ли каталог).
 
-    Свой мешок идёт первым и берётся целиком, как раньше; из мешков с фильтрами
-    шире — только то, что прошло бы нынешние фильтры. «Полон» значит, что хоть
-    один из этих мешков был вычерпан до конца кнопкой «Обновить базу»:
-    тогда сервер ничего нового под эти фильтры не отдаст."""
+    Сначала собственная выборка, затем остальные, без дублей по MAL id.
+    Полнота доказывается отдельно для каждого запрошенного типа: несколько
+    полных выборок манги и манхвы могут вместе покрыть весь запрос."""
     inner = parse_signature(sig)
     cards = list(db_cache.cards(target, sig))
     complete = db_cache.is_complete(target, sig)
     if inner is None:
         return cards, complete
+    seen = {str(c.get("malId") or c.get("id")) for c in cards}
+    covered = set(inner["kinds"]) if complete else set()
     for other, (rows, full) in db_cache.buckets(target).items():
+        outer = parse_signature(other)
+        if outer is None:
+            continue
+        if full:
+            covered.update(kind for kind in inner["kinds"]
+                           if covers(outer, dict(inner, kinds={kind})))
         if other == sig:
             continue
-        outer = parse_signature(other)
-        if outer is None or not covers(outer, inner):
-            continue
-        cards += [c for c in rows if card_fits(c, outer, inner)]
-        complete = complete or full
-    return cards, complete
+        for card in rows:
+            key = str(card.get("malId") or card.get("id") or "")
+            if key and key not in seen and card_fits(card, outer, inner):
+                cards.append(card)
+                seen.add(key)
+    return cards, complete or bool(inner["kinds"] <= covered)

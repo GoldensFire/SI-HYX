@@ -473,6 +473,12 @@ class EditTab(_api.QWidget):
         load_settings,
     )
 
+    from si_hyx_parts.edit_tab.entrance_actions import (
+        _build_more_actions, _entrance_busy, _refresh_more_actions,
+        create_entrance, _cancel_entrance, _finish_entrance,
+        _on_entrance_done, _on_entrance_failed,
+    )
+
     from si_hyx_parts.edit_tab.edit_tab_shutdown import shutdown, closeEvent
 
 EditTab.__module__ = _api.__name__

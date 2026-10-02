@@ -14,10 +14,11 @@ from __future__ import annotations
 import animepack as _api
 
 # Части базы, которые панель показывает и обновляет по отдельности.
-DB_PARTS = ("anime", "manga", "favorites", "franchises", "extras")
+DB_PARTS = ("anime", "manga", "remanga", "mangalib", "favorites", "franchises", "extras")
 
 # Как часть базы называется в журнале вкладки.
 DB_PART_NAMES = {"anime": "каталог аниме", "manga": "каталог манги",
+                 "remanga": "популярность ReManga", "mangalib": "популярность MangaLib",
                  "favorites": "«в избранном»",
                  "franchises": "узнаваемость франшиз",
                  "extras": "хвосты кэша"}
@@ -191,15 +192,15 @@ def _memo_count(memo, groups) -> tuple:
 def db_refresh_parts(parts, settings=None) -> tuple:
     """Какие части обновлять: приводит просьбу панели к набору имён.
 
-    None — прежнее поведение кнопки «Обновить базу»: каталог аниме, каталог
-    манги (если у пака есть книжная доля) и узнаваемость франшиз. «В избранном»
+    None — полный обход: каталог аниме, каталог манги и её внешняя популярность
+    (если у пака есть книжная доля), узнаваемость франшиз. «В избранном»
     и хвосты (персонажи, кадры) в этот набор не входят нарочно: они стоят
     запроса на штуку и живут между генерациями — терять их при каждом
     обновлении каталога незачем, для них в панели свои кнопки."""
     if parts is None:
         want = ["anime", "franchises"]
         if settings is None or getattr(settings, "manga_percent", 0):
-            want.insert(1, "manga")
+            want[1:1] = ["manga", "remanga", "mangalib"]
         return tuple(want)
     if isinstance(parts, str):
         parts = [parts]

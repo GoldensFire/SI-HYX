@@ -6,6 +6,7 @@ from __future__ import annotations
 import animepack as _api
 from cloudflare_art_api import DEFAULT_MODEL as ART_DEFAULT_MODEL
 from frame_reveal import EFFECT_LABELS
+from image_entrance import PACK_EFFECT_LABELS as ENTRANCE_EFFECT_LABELS
 from gemini_api import THINKING_LEVEL as GEMINI_THINKING_LEVEL
 
 
@@ -73,6 +74,8 @@ class PackSettings:
     pixel_block: int = _api.PIXEL_BLOCK
     pixel_seconds: int = _api.PIXEL_SECONDS
     pixel_fps: int = _api.PIXEL_FPS
+    # Собственный пресет кадров с эффектами, включая DVD-заставку.
+    frame_preset: int = _api.VIDEO_PRESET
     # Категория pixel сохраняется в старых настройках, внутри — все эффекты.
     frame_effect: str = "pixelize"       # ключ эффекта или random
     frame_effects: list[str] = _api.field(default_factory=lambda: list(EFFECT_LABELS))
@@ -84,6 +87,15 @@ class PackSettings:
     # Кадров/с «DVD-заставки»: 30 или 60 (своя настройка, общий «Кадров/с»
     # ступенчатых эффектов её не касается).
     frame_dvd_fps: int = 30
+    # Появление — дополнительная подача выбранных составов, без своей квоты.
+    entrance_enabled: bool = False
+    entrance_effect: str = "random"
+    entrance_effects: list[str] = _api.field(default_factory=lambda: list(ENTRANCE_EFFECT_LABELS))
+    entrance_targets: list[str] = _api.field(default_factory=lambda: ["frame"])
+    entrance_seconds: float = 1.2
+    entrance_strength: int = 70
+    entrance_fps: int = 30
+    entrance_preset: int = _api.VIDEO_PRESET
     # Доля вопросов-АНАГРАММ и язык названия, которое перемешивается.
     pack_anagram: bool = False
     pct_anagram: int = 0
@@ -166,6 +178,7 @@ class PackSettings:
     pixiv_refresh_token: str = _api.field(default="", repr=False)
     pixiv_gemini_check: bool = True
     pixiv_gemini_model: str = ""
+    pixiv_title_check_mode: str = "gemini"  # gemini | local
     # Что делать с R-18 и с работами нейросети: exclude | allow | only.
     # «Только их» — просьба пользователя собрать пак ровно из таких артов.
     # Пустая строка означает «как в старых настройках», то есть по галочкам
@@ -228,21 +241,29 @@ class PackSettings:
     # пользователя): память о кадрах включается только правкой настроек.
     frames_no_repeat: bool = True
     char_roles: str = "both"             # main | supporting | both
-    # Язык глав MangaDex, из которых берётся страница ("" — любой).
+    # Язык глав выбранных источников ("" — любой).
     manga_lang: str = ""
+    manga_sources: dict = _api.field(default_factory=lambda: dict.fromkeys(
+        ("mangadex", "mangafire", "comix", "weebcentral", "remanga", "mangalib"), True))
+    # Stored in pack configuration for later calibration against real guesses.
+    ru_popularity: dict = _api.field(default_factory=lambda: {
+        "highest_weight": 0.3, "second_weight": 0.7})
     # Пускать ли главы с меткой erotica. По умолчанию нет, но без неё не
     # найдётся часть сэйнэн-классики: «Берсерк» на MangaDex помечен именно так.
     manga_allow_erotica: bool = False
     # Проверка страницы манги через Gemini: видно название — берётся другая
     # страница той же манги (как у артов Pixiv). Модель "" — как у сюжета.
     manga_gemini_check: bool = True
+    # Выбор сцены применяется только к длинным вертикальным лентам вебтунов.
+    manga_character_crop: bool = True
     manga_gemini_model: str = ""
+    manga_title_check_mode: str = "gemini"  # gemini | local
     # Сколько процентов книжных вопросов должно достаться манге С АНИМЕ-
     # ЭКРАНИЗАЦИЕЙ. Такую книгу узнают по её сериалу, и вопрос выходит куда
     # легче неэкранизованной (просьба пользователя: доли задаются отдельно).
-    manga_adapted_percent: int = 50
+    manga_adapted_percent: int = 50  # -1 — любое соотношение экранизаций
     # Доли манхвы и маньхуа внутри книжной части, в процентах. Остальное —
-    # японская манга и ранобэ. Без отдельной доли корейские и китайские
+    # японская манга. Без отдельной доли корейские и китайские
     # издания тонули: в каталоге Shikimori японской манги на порядок больше.
     manga_pct_manhwa: int = 0
     manga_pct_manhua: int = 0
@@ -259,8 +280,7 @@ class PackSettings:
     manga_level_avg: int = 0
     # Типы изданий (kind у Manga): манга, манхва, манхуа, ранобэ и т.п.
     manga_kinds: dict = _api.field(
-        default_factory=lambda: {k: k in ("manga", "manhwa", "manhua",
-                                          "light_novel")
+        default_factory=lambda: {k: k in ("manga", "manhwa", "manhua")
                                  for k in _api.MANGA_KINDS})
     # ── Видео ────────────────────────────────────────────────────────────
     song_video: bool = False             # включает долю роликов в ползунке
@@ -381,6 +401,11 @@ class PackSettings:
     # ни один режим: «неизвестно» это не «другой язык».
     cover_langs: list[str] = _api.field(default_factory=list)
     cover_lang_mode: str = "allow"
+
+    # Новые поля в конце сохраняют позиции аргументов публичного dataclass.
+    pack_episode: bool = False
+    pct_episode: int = 0
+    episode_ru_subtitles: bool = False
 
     # ── производные ──────────────────────────────────────────────────────
     @property

@@ -9,6 +9,12 @@ import animepack_tab as _api
 def _apply_styles(self):
     self.setStyleSheet(f"""
             QWidget {{ color: {_api.C['text']}; }}
+            QTabWidget::pane {{ border: 1px solid {_api.C['border']}; background: {_api.C['bg']}; }}
+            QTabBar::tab {{
+                background: {_api.C['surface']}; color: {_api.C['text2']};
+                padding: 8px 14px;
+            }}
+            QTabBar::tab:selected {{ background: {_api.C['surface3']}; color: {_api.C['accent']}; }}
             QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
                 background: {_api.C['surface3']}; border: 1px solid {_api.C['border']};
                 border-radius: 5px; padding: 5px 7px; color: {_api.C['text']};

@@ -193,9 +193,13 @@ def request(generator, client, parts, schema):
         return client.generate_json(parts, schema, temperature=0.0)
     # Одинаковые модель, рассуждение и доска квот — один запрос даже для
     # смеси Pixiv и манги. Разные выбранные модели остаются раздельными.
+    # Multi-page selection and multi-crop review use different nested arrays.
+    # Keep these stages separate so their required fields cannot get mixed.
+    properties = schema.get("properties", {})
+    stage = next((name for name in ("candidates", "scenes") if name in properties), "visual")
     key = (id(getattr(client, "board", client)),
            str(getattr(client, "model", "")),
-           str(getattr(client, "thinking", "")))
+           str(getattr(client, "thinking", "")), stage)
     with lock:
         batcher = generator._visual_batches.get(key)
         if batcher is None:

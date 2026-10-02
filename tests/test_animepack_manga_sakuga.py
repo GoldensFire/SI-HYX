@@ -55,7 +55,8 @@ def generator(tmp_path, monkeypatch):
     settings = PackSettings(
         pct_songs=0, rounds=1, themes=1, questions=3, compress_images=False,
         level_min=0, level_max=100, mark_owners=False, parallel=1,
-        pack_manga=True, pct_manga=50, pack_sakuga=True, pct_sakuga=50)
+        pack_manga=True, pct_manga=50, pack_sakuga=True, pct_sakuga=50,
+        manga_character_crop=False)
     gen = animepack.AnimePackGenerator(
         settings, session=object(), amq=object(), anisong=object(),
         shikimori=object(), mal=object(), tmdb=object(),
@@ -99,6 +100,38 @@ def test_manga_without_pages_gives_up_and_frees_its_slots(generator):
                              media="manga")
         assert gen._fetch_media(cand) is False
     assert gen._dead_kinds == {MANGA_KIND}
+
+
+def test_known_reader_catalog_survives_eight_missing_titles(generator):
+    gen = generator
+    gen.mangadex = FakeMangaDex(url="")
+    gen._manga_catalog_matches = 100
+    from si_hyx_parts.animepack.manga_panel import (
+        MISS_GIVE_UP, KNOWN_CATALOG_MISS_LIMIT)
+    for i in range(KNOWN_CATALOG_MISS_LIMIT):
+        cand = SongCandidate({}, make_anime(malId=2000 + i), kind=MANGA_KIND,
+                             media="manga")
+        assert gen._fetch_media(cand) is False
+        if i < MISS_GIVE_UP:
+            assert MANGA_KIND not in gen._dead_kinds
+    assert gen._dead_kinds == {MANGA_KIND}
+
+
+def test_unavailable_image_is_not_reported_as_failed_title_check(generator, monkeypatch):
+    gen = generator
+    gen.s.manga_gemini_check = False
+    messages = []
+    gen._log_rare = lambda category, message: messages.append((category, message))
+
+    def unavailable(*args, **kwargs):
+        raise animepack.AnimePackApiError("HTTP 403")
+
+    monkeypatch.setattr(gen, "_get_bytes", unavailable)
+    cand = SongCandidate({}, make_anime(malId=656), kind=MANGA_KIND, media="manga")
+    assert gen.download_manga_panel(cand) is False
+    assert messages[-1][0] == "Страница манги недоступна"
+    assert not any(category == "Страница манги отклонена проверкой"
+                   for category, _ in messages)
 
 
 # ── Сакуга ───────────────────────────────────────────────────────────────────
@@ -307,7 +340,8 @@ def test_mangadex_is_asked_with_the_manga_card_not_the_anime_one(
     monkeypatch.setattr(animepack, "CONFIG_DIR", str(tmp_path))
     settings = PackSettings(pct_songs=0, rounds=1, themes=1, questions=2,
                             level_min=0, level_max=100, compress_images=False,
-                            random_mode=True, pack_manga=True, pct_manga=100)
+                            random_mode=True, pack_manga=True, pct_manga=100,
+                            manga_character_crop=False)
     gen = animepack.AnimePackGenerator(
         settings, session=object(), amq=object(), anisong=object(),
         shikimori=FakeShiki(), mal=object(), tmdb=object(),

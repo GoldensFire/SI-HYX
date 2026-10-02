@@ -6,9 +6,11 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 import animepack as _api
+from .generation_diagnostics import operation
 from frame_reveal import RevealRenderer, stage_frame_counts
 
 
+@operation("подготовка кадров")
 def encode_reveal(self, source: str, output: str, effect: str, seed: int):
     """PNG существуют лишь во временной папке; в пак попадает один ролик."""
     fps = max(1, min(60, int(self.s.pixel_fps)))

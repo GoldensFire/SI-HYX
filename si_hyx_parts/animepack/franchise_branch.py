@@ -73,6 +73,16 @@ def franchise_branch_parts(card: dict, parts) -> list[dict]:
             matched.append(row)
         else:
             foreign.update(row_roots)
+    if not matched:
+        # Проморолики и кроссоверы могут иметь новое имя и отсутствовать в
+        # минимальной выдаче частей. Тогда основной веткой служит самая
+        # большая устойчивая серия, а не новая «ветка всей франшизы».
+        counts = Counter(root for row in rows for root in _roots(row))
+        root = min(counts, key=lambda value: (-counts[value], value),
+                   default="")
+        matched = [row for row in rows if root and root in _roots(row)]
+        foreign = Counter(other for row in rows if row not in matched
+                          for other in _roots(row))
     # Одиночный спин-офф с иным названием не доказывает ошибочную склейку.
     # Две устойчивые серии по разные стороны — доказывают.
     if len(matched) >= 2 and max(foreign.values(), default=0) >= 2:

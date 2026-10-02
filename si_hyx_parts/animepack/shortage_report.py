@@ -71,6 +71,9 @@ def _fates(gen, got: int) -> None:
     if gen._rejected_media:
         gen.log(f"  • отвергнут по сложности уже при загрузке "
                 f"(«в избранном», персонажи): {gen._rejected_media}")
+    early = getattr(gen, "_early_repeat_attempts", 0)
+    if early:
+        gen.log(f"  • повтор найден при поиске, до подготовки медиа: {early}")
     for reason, num in gen._late.most_common():
         if num:
             gen.log(f"  • вопрос был готов, но не пригодился «{reason}»: {num}")
@@ -87,7 +90,7 @@ def _fates(gen, got: int) -> None:
     if rest > 0:
         gen.log(f"  • остались нерассмотренными (пак уже добран или "
                 f"остановлен): {rest}")
-    lost = tries - got - gen._failed_media - gen._rejected_media - late
+    lost = tries - got - gen._failed_media - gen._rejected_media - late - early
     if lost > 0:
         gen.log(f"  • попытки без объяснения (загрузка ещё шла): {lost}")
     summary = getattr(getattr(gen, "pixiv", None), "summary", None)

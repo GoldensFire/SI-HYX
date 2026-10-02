@@ -9,6 +9,7 @@ qtawesome==1.4.2
 Pillow==12.3.0             # ниже 12.3.0 — 13 CVE (см. dependabot), не откатывать
 pillow-heif==1.3.0
 requests==2.33.1
+httpx[http2]==0.28.1        # MangaLib public API; supported HTTP/2 transport
 google-auth==2.58.1        # OAuth service account / ADC для Google Chirp 3 HD
 PixivPy3==3.7.5           # поиск артов Pixiv по refresh token пользователя
 tzdata==2026.1             # суточная квота Gemini сбрасывается по Pacific Time
@@ -32,6 +33,8 @@ lxml==6.1.1
 # Без них приложение работает, но подвкладка покажет заглушку.
 opencv-python==4.13.0.92
 onnxruntime==1.27.0
+rapidocr==3.9.2            # локальное OCR через ONNX; использует существующие OpenCV/Pillow
+rapidfuzz==3.14.3          # устойчивое сопоставление надписи с вариантами названия
 # Ускорение на видеокарте (в РАЗЫ быстрее). Ставить можно ТОЛЬКО ОДИН пакет
 # onnxruntime* — они конфликтуют; код сам выберет CUDA → DirectML → CPU:
 #   NVIDIA:           pip uninstall onnxruntime && pip install onnxruntime-gpu

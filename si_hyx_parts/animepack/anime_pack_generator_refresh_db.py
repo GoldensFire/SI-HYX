@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 import animepack as _api
+from .db_source_refresh import refresh_database_sources
 
 
 def refresh_db(self, parts=None) -> int:
@@ -23,18 +24,17 @@ def refresh_db(self, parts=None) -> int:
         «Остановить», а набранное сохраняется по ходу дела.
 
         parts — какие части обновлять (см. db_refresh_parts); None значит
-        прежнее «обновить базу»: каталог аниме, каталог манги (если у пака есть
-        книжная доля) и узнаваемость франшиз. Возвращает, сколько карточек
+        полный обход: аниме, манга с популярностью внешних сайтов (если у пака
+        есть книжная доля) и франшизы. Возвращает, сколько карточек
         каталога лежит в кэше после обновления."""
     wanted = _api.db_refresh_parts(parts, self.s)
+    started = _api.time.time()
     if "extras" in wanted:
         gone = self.db_cache.clear_part("extras")
         self.log(f"База Shikimori: забыто {gone} запомненных ответов "
                  "(персонажи, кадры, пригодность тайтлов) — спросятся заново "
                  "при следующей генерации.")
-    cards = _refresh_catalogs(self, wanted)
-    if "favorites" in wanted and not self.stopped():
-        _refresh_favorites(self)
+    cards = refresh_database_sources(self, wanted, _refresh_catalogs, _refresh_favorites)
     if self.stopped():
         self.db_cache.save()
         self.log("База Shikimori: остановлено, набранное всё же сохранено.")
@@ -42,6 +42,18 @@ def refresh_db(self, parts=None) -> int:
     if "franchises" in wanted:
         _refresh_franchises(self, cards)
     self.db_cache.save()
+    failures = [message for target, message in
+                getattr(self, "_catalog_refresh_errors", {}).items() if target in wanted]
+    sources = [source for source in ("remanga", "mangalib") if source in wanted]
+    if "manga" in wanted or "favorites" in wanted:
+        sources.append("shikimori")
+    for source in sources:
+        status = self.db_cache.memo("ru_population_refresh_status_v1", source) or {}
+        if status.get("status") == "ERROR" and status.get("timestamp", 0) >= started:
+            failures.append(f"{source}: {status.get('reason', 'обход не завершён')}")
+    if failures:
+        raise _api.AnimePackError("Обновление базы не завершено. Полученные данные сохранены.\n"
+                                 + "\n".join(failures))
     total = _db_card_count(self)
     self.log(f"База Shikimori обновлена: {total} карточек, "
              f"{len(self._fr_parts)} франшиз.")
@@ -154,7 +166,8 @@ def _refresh_franchises(self, cards) -> None:
     self.log(f"База Shikimori: считаю узнаваемость {total} "
              "франшиз…")
     done = 0
-    for batch in _api._chunks(list(representatives.values()), 36):
+    batch_size = int(getattr(self.shikimori, "FRANCHISE_BATCH", 13))
+    for batch in _api._chunks(list(representatives.values()), batch_size):
         if self.stopped():
             break
         self._load_franchise_indexes(batch)

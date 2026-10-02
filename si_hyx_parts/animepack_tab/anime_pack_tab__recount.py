@@ -138,6 +138,7 @@ def _update_genres_btn(self):
 # ── настройки ─────────────────────────────────────────────────────────
 def collect(self) -> '_api.PackSettings':
     s = _api.PackSettings()
+    s.ru_popularity = dict(getattr(self, "_ru_popularity_config", s.ru_popularity))
     s.title = self.ed_title.text().strip() or "Сгенерировано в SI-HYX"
     s.rounds = self.sp_rounds.value()
     s.themes = self.sp_themes.value()
@@ -185,6 +186,7 @@ def collect(self) -> '_api.PackSettings':
     s.pixiv_exclude_ai = s.pixiv_ai_mode == "exclude"
     s.pixiv_allow_same_sex = self.chk_pixiv_same_sex.isChecked()
     s.pixiv_gemini_check = self.chk_pixiv_gemini.isChecked()
+    s.pixiv_title_check_mode = self.cb_pixiv_title_mode.currentData() or "gemini"
     s.pixiv_gemini_model = self.cb_pixiv_gemini_model.currentText().strip()
     # Комиксы Pixiv (type=manga) не берутся никогда: это кадры с
     # репликами, а не рисунок (просьба пользователя — галочку убрали).
@@ -195,6 +197,8 @@ def collect(self) -> '_api.PackSettings':
     s.pixiv_tags_extra = list(self._pixiv_tags_extra)
     from si_hyx_parts.animepack_tab.sakuga_controls import collect as collect_sakuga
     collect_sakuga(self, s)
+    from .episode_controls import collect as collect_episode
+    collect_episode(self, s)
     from si_hyx_parts.animepack_tab.studio_controls import collect as collect_studio
     collect_studio(self, s)
     s.cloudflare_account_id = self._api_key("cloudflare_account_id")
@@ -204,6 +208,7 @@ def collect(self) -> '_api.PackSettings':
     s.pixel_seconds = self.sp_pixel_sec.value()
     s.pixel_fps = self.sp_pixel_fps.value()
     s.pixel_steps = self.sp_pixel_steps.value()
+    s.frame_preset = self.sp_frame_preset.value()
     s.pixel_block = self.sp_pixel_block.value()
     from si_hyx_parts.animepack_tab.frame_effect_controls import selected_effects
     s.frame_effect = self.cb_frame_effect.currentData() or "pixelize"
@@ -211,6 +216,8 @@ def collect(self) -> '_api.PackSettings':
     s.frame_effect_strength = self.sp_frame_effect_strength.value()
     s.frame_dvd_folder = self.ed_dvd_folder.text().strip()
     s.frame_dvd_fps = int(self.cb_dvd_fps.currentData() or 30)
+    from .entrance_controls import collect as collect_entrance
+    collect_entrance(self, s)
     s.pack_anagram = self.chk_anagram.isChecked()
     s.anagram_lang = self.cb_anagram_lang.currentData() or "russian"
     s.anagram_max_chars = self.sp_anagram_max.value()
@@ -234,6 +241,8 @@ def collect(self) -> '_api.PackSettings':
     s.manga_allow_erotica = self.chk_manga_erotica.isChecked()
     from si_hyx_parts.animepack_tab.manga_gemini_controls import collect as collect_manga_gemini
     collect_manga_gemini(self, s)
+    from .manga_source_controls import collect as collect_manga_sources
+    collect_manga_sources(self, s)
     s.manga_kinds = {k: chk.isChecked()
                      for k, chk in self.chk_manga_kinds.items()}
     s.song_video = self.chk_video.isChecked()

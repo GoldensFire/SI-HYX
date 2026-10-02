@@ -71,18 +71,25 @@ def build_controls(tab):
     tab.chk_pixiv_gemini = _api.QCheckBox("Проверять арт через Gemini")
     tab.chk_pixiv_gemini.setChecked(True)
     tab.chk_pixiv_gemini.setToolTip(
-        "Перед добавлением Gemini смотрит сам арт. Работа пропускается, если "
-        "на ней видно название аниме или персонажей из других тайтлов. "
+        "Gemini проверяет персонажей из других тайтлов. Если способ проверки "
+        "названия — Gemini, он проверяет и видимые названия. "
         "До четырёх картинок с одинаковой моделью проверяются одним запросом.")
     layout.addWidget(tab.chk_pixiv_gemini, 5, 0, 1, 2)
+    tab.cb_pixiv_title_mode = _api.QComboBox()
+    tab.cb_pixiv_title_mode.addItem("Название: Gemini", "gemini")
+    tab.cb_pixiv_title_mode.addItem("Название: локальный OCR", "local")
+    tab.cb_pixiv_title_mode.setToolTip(
+        "В локальном режиме OCR проверяет видимое название. Gemini "
+        "по-прежнему проверяет персонажей других тайтлов, если галочка включена.")
+    layout.addWidget(tab.cb_pixiv_title_mode, 6, 0, 1, 2)
     tab.cb_pixiv_gemini_model = _api.QComboBox()
     for model in _api.GEMINI_MODELS:
         tab.cb_pixiv_gemini_model.addItem(model, model)
     tab.cb_pixiv_gemini_model.setCurrentText(_api.GEMINI_DEFAULT_MODEL)
     tab.cb_pixiv_gemini_model.setToolTip(
         "Модель Gemini, которая визуально проверяет арты Pixiv.")
-    layout.addWidget(tab._lab("Модель проверки"), 6, 0)
-    layout.addWidget(tab.cb_pixiv_gemini_model, 6, 1)
+    layout.addWidget(tab._lab("Модель проверки"), 7, 0)
+    layout.addWidget(tab.cb_pixiv_gemini_model, 7, 1)
     # Галочки «Пускать комиксы Pixiv» больше нет (просьба пользователя):
     # записи типа «манга» — это кадры с репликами, а не рисунок, и вопросом
     # такая работа не бывает. Поле pixiv_allow_manga осталось только ради
@@ -98,7 +105,7 @@ def build_controls(tab):
         "солянки и прочее.\nГруппу можно выключить целиком, метку — снять по "
         "одной, а свои метки дописать. Они уходят минусом в сам запрос.")
     tab.btn_pixiv_tags.clicked.connect(lambda: edit_tags(tab))
-    layout.addWidget(tab.btn_pixiv_tags, 7, 0, 1, 2)
+    layout.addWidget(tab.btn_pixiv_tags, 8, 0, 1, 2)
     layout.setColumnStretch(1, 1)
     tab.box_pixiv_art.setVisible(False)
     tab.chk_pixiv_art.toggled.connect(lambda value: toggle(tab, value))
@@ -122,6 +129,8 @@ def apply_controls(tab, settings):
         bool(getattr(settings, "pixiv_allow_same_sex", False)))
     tab.chk_pixiv_gemini.setChecked(
         bool(getattr(settings, "pixiv_gemini_check", True)))
+    mode = str(getattr(settings, "pixiv_title_check_mode", "gemini") or "gemini")
+    tab.cb_pixiv_title_mode.setCurrentIndex(max(0, tab.cb_pixiv_title_mode.findData(mode)))
     model = (str(getattr(settings, "pixiv_gemini_model", "") or "")
              or str(getattr(settings, "gemini_model", "") or "")
              or _api.GEMINI_DEFAULT_MODEL)

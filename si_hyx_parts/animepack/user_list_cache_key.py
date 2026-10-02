@@ -62,6 +62,7 @@ class ShikimoriDbCache:
         # увести кэш из настоящего %APPDATA% пользователя.
         self.path = path or _api.SHIKI_CACHE_FILE
         self._lock = _api.threading.Lock()
+        self._save_lock = _api.threading.Lock()
         self._data: _api.Optional[dict] = None
         self._dirty = False
         # Каким был файл, когда его прочли (время и размер): панель базы
@@ -90,6 +91,11 @@ class ShikimoriDbCache:
 
     def save(self) -> bool:
         """Сбрасывает накопленное на диск (без изменений — ничего не делает)."""
+        # Разные источники сохраняют один файл: снимок и замену сериализуем.
+        with self._save_lock:
+            return self._save()
+
+    def _save(self) -> bool:
         with self._lock:
             if not self._dirty or self._data is None:
                 return False

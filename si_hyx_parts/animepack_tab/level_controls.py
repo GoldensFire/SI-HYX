@@ -152,12 +152,13 @@ def build_manga(tab):
     tab.sp_manga_level_from = tab.manga_level_range.low_control
     tab.sp_manga_level_to = tab.manga_level_range.high_control
     tab.sp_manga_level_avg = _avg(tab, AVG_TIP)
-    tab.sp_manga_adapted = _api.QSpinBox()
-    tab.sp_manga_adapted.setRange(0, 100)
+    from .manga_adaptation_control import AdaptationPercent
+    tab.sp_manga_adapted = AdaptationPercent()
     tab.sp_manga_adapted.setValue(50)
-    tab.sp_manga_adapted.setSuffix(" %")
     tab.sp_manga_adapted.setToolTip(
-        "Сколько книжных вопросов достанется манге, у которой ЕСТЬ "
+        "Любое — брать книги независимо от наличия аниме-экранизации.\n"
+        "Крайнее левое положение ползунка — «Любое», далее 0…100%.\n"
+        "Процент — сколько книжных вопросов достанется манге, у которой ЕСТЬ "
         "аниме-экранизация. Такую книгу узнают по сериалу, и вопрос выходит "
         "заметно легче: её цена считается по узнаваемости самого аниме плюс "
         "два очка.\n"
@@ -165,20 +166,8 @@ def build_manga(tab):
         "кто читал.\n"
         "Доля соблюдается мягко: если подходящих книг в каталоге подряд не "
         "находится, генератор берёт что есть и пишет об этом в журнал.")
-    tab.sp_manga_manhwa = _api.QSpinBox()
-    tab.sp_manga_manhua = _api.QSpinBox()
-    for sp, tip in ((tab.sp_manga_manhwa,
-                     "Доля МАНХВЫ (корейские издания) среди книжных вопросов."),
-                    (tab.sp_manga_manhua,
-                     "Доля МАНЬХУА (китайские издания) среди книжных вопросов.")):
-        sp.setRange(0, 100)
-        sp.setValue(0)
-        sp.setSuffix(" %")
-        sp.setToolTip(tip + "\nОстальное достаётся японской манге и ранобэ. "
-                      "Без отдельной доли корейские и китайские издания в "
-                      "паке почти не появлялись: японской манги в каталоге "
-                      "Shikimori на порядок больше.\nСчитается только среди "
-                      "включённых выше типов изданий.")
+    from .manga_edition_controls import build
+    build(tab)
 
 
 def place_manga(tab, grid, row):
@@ -186,10 +175,7 @@ def place_manga(tab, grid, row):
     grid.addWidget(tab._lab("С аниме"), row, 0)
     grid.addWidget(tab.sp_manga_adapted, row, 1)
     row += 1
-    grid.addWidget(tab._lab("Манхва"), row, 0)
-    grid.addWidget(tab.sp_manga_manhwa, row, 1)
-    grid.addWidget(tab._lab("Маньхуа"), row, 2)
-    grid.addWidget(tab.sp_manga_manhua, row, 3)
+    grid.addWidget(tab.manga_edition_bar, row, 0, 1, 4)
     return row + 1
 
 
@@ -216,8 +202,8 @@ def collect(tab, settings):
     settings.art_level_avg = tab.sp_art_level_avg.value()
     settings.manga_level_avg = tab.sp_manga_level_avg.value()
     settings.manga_adapted_percent = tab.sp_manga_adapted.value()
-    settings.manga_pct_manhwa = tab.sp_manga_manhwa.value()
-    settings.manga_pct_manhua = tab.sp_manga_manhua.value()
+    from .manga_edition_controls import collect as collect_editions
+    collect_editions(tab, settings)
 
 
 def apply_controls(tab, settings):
@@ -255,7 +241,8 @@ def apply_controls(tab, settings):
     tab.sp_art_level_avg.setValue(clamp(getattr(settings, "art_level_avg", 0), 0))
     tab.sp_manga_level_avg.setValue(
         clamp(getattr(settings, "manga_level_avg", 0), 0))
-    tab.sp_manga_adapted.setValue(clamp(settings.manga_adapted_percent, 0, 100))
-    tab.sp_manga_manhwa.setValue(clamp(settings.manga_pct_manhwa, 0, 100))
-    tab.sp_manga_manhua.setValue(clamp(settings.manga_pct_manhua, 0, 100))
+    adapted = int(settings.manga_adapted_percent)
+    tab.sp_manga_adapted.setValue(max(-1, min(100, adapted)))
+    from .manga_edition_controls import apply_controls as apply_editions
+    apply_editions(tab, settings)
     refresh_art(tab)

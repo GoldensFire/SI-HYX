@@ -8,6 +8,7 @@ import os
 import tempfile
 
 import animepack as _api
+from .generation_diagnostics import locked, operation
 
 
 # Столько тайтлов подряд может не найтись на Sakugabooru, прежде чем род
@@ -29,6 +30,7 @@ def init_sakuga_service(self, client=None):
     self._sakuga_misses = 0
 
 
+@operation("поиск")
 def download_sakuga(self, cand) -> bool:
     """Режет вырезку анимации в ролик пака («ложь» — не вышло).
 
@@ -43,7 +45,7 @@ def download_sakuga(self, cand) -> bool:
     try:
         # Выбор отрывка и его резервирование — под одним замком: иначе два
         # рабочих потока взяли бы одну и ту же вырезку.
-        with self._sakuga_lock:
+        with locked(self, self._sakuga_lock):
             with self._frames_lock:
                 excluded = set(self._frames_used)
             clip = self.sakuga.clip(cand.anime, excluded)
@@ -71,13 +73,16 @@ def download_sakuga(self, cand) -> bool:
         return _miss(self, cand, misses)
     if self.stopped():
         return False
+    # Страница поста, а не файла: на ней видно, из какой сцены вырезка и кто
+    # её анимировал (просьба пользователя — ссылка на источник в ответе).
+    cand.source_link = _api.sakuga_post_link(clip.get("id"))
+    from .early_repeat import reserve
+    if not reserve(self, cand):
+        return False
     if not _encode(self, cand, clip):
         return False
     cand.sakuga = dict(clip)
     cand.frame_url = clip["url"]
-    # Страница поста, а не файла: на ней видно, из какой сцены вырезка и кто
-    # её анимировал (просьба пользователя — ссылка на источник в ответе).
-    cand.source_link = _api.sakuga_post_link(clip.get("id"))
     cand.has_video = True
     return True
 
@@ -98,7 +103,7 @@ def _download(self, clip: dict) -> str:
     сорок минут, а журнал молчал: одинаковая ошибка у сакуги уже была
     «приглушена» (_log_rare). Теперь под замком только загрузка — requests с
     таймаутом чтения, — а кодирование идёт параллельно с остальными."""
-    with self._sakuga_net_lock:
+    with locked(self, self._sakuga_net_lock):
         data = self._get_bytes(clip["url"], timeout=(10, 60))
     if not data:
         return ""

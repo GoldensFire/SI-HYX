@@ -1,7 +1,7 @@
 # Новые источники вопросов аниме-пака
 
-Источники, добавленные к генератору: AniZip, Jimaku, MangaDex и
-Sakugabooru. Ключ нужен только Jimaku.
+Источники, добавленные к генератору: AniZip, Jimaku, MangaDex, MangaFire,
+Comix.to, WeebCentral и Sakugabooru. Ключ нужен только Jimaku.
 
 ## AniZip — кадры эпизодов
 
@@ -57,7 +57,54 @@ SubDL кончилась (HTTP 429 `daily_limit`): в журнал пишетс�
 Ключ Jimaku задаётся в Настройки → Ключи API. Он передаётся только заголовком
 `Authorization` запросам домена Jimaku и не сохраняется в паке.
 
-## MangaDex — страница манги
+## Источники страниц манги
+
+В группе «Манга» можно выбрать ReManga, MangaLib, MangaDex, MangaFire,
+Comix.to и WeebCentral. Все шесть включены по умолчанию, включая настройки до появления
+новых источников. Выбор сохраняется; выключенные сайты не запрашиваются.
+Каталог тайтлов остаётся прежним: эти сайты поставляют страницы для вопросов.
+Сначала проверяются ReManga и MangaLib, затем русский перевод на MangaDex и
+MangaFire. Если русских страниц нет, проверяются английские и украинские.
+Ротация после непригодной сцены действует только внутри одного языка и
+приоритета источников. Явно выбранный язык сохраняется. Не найденный
+тайтл, недоступное API или непригодная страница дают шанс следующему сайту.
+После восьми тайтлов без страницы во всех выбранных источниках категория
+снимается с прогона.
+
+- **MangaFire:** подписанные `/api/titles`, `/api/titles/<hid>/chapters` и
+  `/api/chapters/<id>`; несколько языков. Протокол подписи сверён с
+  [VrfSigner.kt](https://github.com/keiyoushi/extensions-source/blob/main/src/all/mangafire/src/eu/kanade/tachiyomi/extension/all/mangafire/VrfSigner.kt).
+- **Comix.to:** подписанные `/api/v1/manga`, `/api/v1/manga/<hid>/chapters` и
+  `/api/v1/chapters/<id>`; английские главы. Зашифрованный JSON декодируется,
+  страницы восстанавливаются по заголовкам байтового потока и плиток 5×5.
+  Протокол сверён с [Cipher.kt](https://github.com/keiyoushi/extensions-source/blob/main/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Cipher.kt)
+  и [Descrambler.kt](https://github.com/keiyoushi/extensions-source/blob/main/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Descrambler.kt).
+- **WeebCentral:** `/search/data`, `/series/<id>/full-chapter-list` и
+  `/chapters/<id>/images` возвращают HTML-фрагменты; английские главы.
+  Схема сверена с [WeebCentral.kt](https://github.com/keiyoushi/extensions-source/blob/main/src/en/weebcentral/src/eu/kanade/tachiyomi/extension/en/weebcentral/WeebCentral.kt).
+- **MangaLib:** русские общедоступные главы через HTTP/2 API `api.cdnlibs.org`
+  с Referer зеркала `mangalib.org`. Поиск, главы и изображение проверены живым
+  клиентом SI-HYX. Хосты изображений берутся из публичного API constants.
+- **ReManga:** русские бесплатные главы через `/api/` зеркала `реманга.орг`.
+  API и скачивание страницы с `img3.reimg2.org` проверены живым клиентом.
+  Другой CDN, `img.reimg.org`, возвращает геоблокировку 403.
+  Подробности обоих контрактов и проверки: [manga-ru.md](manga-ru.md).
+
+Явно выбранный язык соблюдается: английские источники не подставляются при
+выборе русского или японского. Совпадение названия не перекрывает другой MAL id.
+Порнографические метки исключаются, erotica зависит от существующей галочки.
+Края главы и повторные страницы исключаются во всех источниках; проверки
+названия и выбор сцены применяются после получения исходной страницы.
+В ответ записывается адрес главы выбранного сайта, а не временный адрес CDN.
+
+Проверено живыми запросами 2026-10-01: поиск, главы и загрузка страниц MangaFire
+и Comix.to работают. WeebCentral в этой сети отвечает HTTP 403 Cloudflare:
+клиент и формат фрагментов проверены тестами, живую загрузку подтвердить не
+удалось. При 403/429 источник отключается до конца генерации, остальные
+продолжают работать. Подписи API могут меняться с обновлением сайтов;
+таблицы текущего протокола хранятся в `manga_request_signing.py`.
+
+### MangaDex — особенности основного источника
 
 **Заменил прежний вопрос по манге.** Раньше манга спрашивалась портретом
 персонажа или обложкой; обложку игроки узнавали по постеру из ответа, то есть
@@ -89,11 +136,9 @@ SubDL кончилась (HTTP 429 `daily_limit`): в журнал пишетс�
   вопроса (просьба пользователя). Если у найденной карточки читаемых глав нет,
   вопроса по этому тайтлу не будет. Всего лент на тайтл — не больше
   `FEED_TRIES`.
-- **Язык глав.** «Любой» (по умолчанию) — не «какой попадётся»: сперва русский,
-  потом английский, потом оригинал, и только затем остальные объявленные языки.
-  Одного выбора мало — у «Ван-Писа» русские главы объявлены, но все лежат на
-  стороне (Manga Plus), а английская глава в ленте ровно одна и без страниц,
-  поэтому языки перебираются до тех пор, пока страница не найдётся. Заданный
+- **Язык глав.** «Любой» (по умолчанию): русский → английский → украинский.
+  Пустые главы и внешние ссылки уступают следующему языку. Ленту без фильтра
+  не берём, чтобы не получить случайный иностранный перевод. Заданный
   вручную язык отменяет перебор.
 - **Возрастные метки.** Порнография не берётся никогда. Метка `erotica`
   включается галочкой: без неё не находится часть сэйнэн-классики — «Берсерк»
@@ -177,7 +222,7 @@ SubDL кончилась (HTTP 429 `daily_limit`): в журнал пишетс�
 
 | Род вопроса | Что за ссылка |
 |---|---|
-| Манга | страница ГЛАВЫ на MangaDex (`mangadex.org/chapter/<id>`) |
+| Манга | страница главы выбранного сайта: MangaDex, MangaFire, Comix.to или WeebCentral |
 | Сюжет | страница фэндом-вики, из которой взят пересказ |
 | Диалог | файл субтитров Jimaku без параметров авторизации |
 | Сакуга | пост на Sakugabooru (`sakugabooru.com/post/show/<id>`) |
@@ -209,11 +254,28 @@ SubDL кончилась (HTTP 429 `daily_limit`): в журнал пишетс�
 
 ## Реализация
 
+При включённом выборе сцены манхва и маньхуа проверяются даже в коротких
+файлах страниц. Соседние куски главы соединяются перед просмотром, чтобы
+выбрать лицо целиком на стыке. Gemini выбирает одну цельную панель;
+большие белые/чёрные поля обрезаются, маленькие сохраняются. Готовая вырезка
+проходит отдельную проверку: диалог без персонажа, обрезанное лицо, большая
+пустота и обрубки соседних панелей отклоняются. Память повторов учитывает
+соседние файлы, участвовавшие в сцене. Книжные страницы японской манги
+сохраняются целиком, длинные вертикальные ленты проходят выбор сцены.
+
+После окончания каталога книг квота сохраняется, пока есть кандидаты,
+отложенные ради средней сложности или долей изданий. Их используют для
+добора, продолжая соблюдать типы изданий и диапазон сложности.
+
+20-секундные отрывки серий, native Kuhi и опциональные русские субтитры:
+[описание и карта модулей](anime-episode-clips.md).
+
 | Что | Где |
 |---|---|
 | AniZip | [anizip_api.py](../si_hyx_parts/animepack_api/anizip_api.py) |
 | Jimaku | [jimaku_api.py](../si_hyx_parts/animepack_api/jimaku_api.py), [dialogue_questions.py](../si_hyx_parts/animepack/dialogue_questions.py), [dialogue_generation.py](../si_hyx_parts/animepack/dialogue_generation.py) |
 | MangaDex | [mangadex_api.py](../si_hyx_parts/animepack_api/mangadex_api.py), [manga_panel.py](../si_hyx_parts/animepack/manga_panel.py) |
+| Дополнительные страницы манги | [manga_page_sources.py](../si_hyx_parts/animepack_api/manga_page_sources.py), [manga_json_readers.py](../si_hyx_parts/animepack_api/manga_json_readers.py), [weebcentral_api.py](../si_hyx_parts/animepack_api/weebcentral_api.py) |
 | Экранизация книги и доли изданий | [manga_adaptation.py](../si_hyx_parts/animepack/manga_adaptation.py), [manga_mix.py](../si_hyx_parts/animepack/manga_mix.py) |
 | Sakugabooru | [sakugabooru_api.py](../si_hyx_parts/animepack_api/sakugabooru_api.py), [sakuga_generation.py](../si_hyx_parts/animepack/sakuga_generation.py) |
 | Панели вкладки | [dialogue_controls.py](../si_hyx_parts/animepack_tab/dialogue_controls.py), [sakuga_controls.py](../si_hyx_parts/animepack_tab/sakuga_controls.py) |

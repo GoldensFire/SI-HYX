@@ -18,7 +18,7 @@
 import os
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules, collect_all
+from PyInstaller.utils.hooks import collect_submodules, collect_all, collect_data_files
 
 datas = [('icon.ico', '.'), ('open-file.svg', '.')]
 # Standalone source for the isolated ML interpreter; torch stays excluded.
@@ -30,6 +30,8 @@ hiddenimports = ['numpy', 'lxml.etree']
 hiddenimports += ['google.auth', 'google.auth.transport.requests',
                   'google.oauth2.service_account']
 hiddenimports += collect_submodules('siquester')
+hiddenimports += collect_submodules('si_hyx_parts.kuhi')
+datas += [('si_hyx_parts/kuhi/LICENSE', 'si_hyx_parts/kuhi')]
 # Холст видео «Монтажа» выводит кадр через QML VideoOutput (см. VideoCanvas в
 # edit_tab_widgets.py), поэтому в сборку обязаны попасть Qt Quick/Qml вместе с
 # их qml-плагинами (их подтягивают хуки PyInstaller для этих модулей) и
@@ -50,6 +52,9 @@ hiddenimports += ['cover_audio', 'cover_cache', 'cover_fingerprint',
 for _pkg in ('soundfile', 'qtawesome', 'tzdata'):
     _d, _b, _h = collect_all(_pkg)
     datas += _d; binaries += _b; hiddenimports += _h
+# RapidOCR resolves model metadata and dictionaries as package data. Its
+# optional Torch/Paddle/TensorRT engines must not enter the ONNX-only build.
+datas += collect_data_files('rapidocr')
 
 # Тяжёлые пакеты, которые код НЕ импортирует, но PyInstaller втягивал из окружения
 # (стек torch/HuggingFace + data-science) — раздували сборку на ~0.5 ГБ впустую.

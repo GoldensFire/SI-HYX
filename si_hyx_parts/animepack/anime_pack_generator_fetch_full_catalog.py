@@ -4,42 +4,43 @@
 """AnimePackGenerator: fetch_full_catalog. Public namespace: animepack."""
 from __future__ import annotations
 import animepack as _api
+from dataclasses import replace
+from .catalog_pages import iter_catalog_pages
 
 
-def fetch_full_catalog(self, manga: bool = False) -> list[int]:
+def fetch_full_catalog(self, manga: bool = False, *, unfiltered: bool = False) -> list[int]:
     """Вычерпывает каталог Shikimori ЦЕЛИКОМ под текущие фильтры.
 
         В отличие от _random_shikimori_ids здесь нет потолка «сколько нужно на
         пак»: страницы идут одна за другой, пока каталог не кончится или пока не
         нажали «Остановить». Всё, что приехало, тут же уходит в кэш на диск —
         остановка на середине не теряет набранного. Возвращает id карточек."""
+    settings = self.s
+    if unfiltered:
+        settings = replace(self.s, year_from=0, year_to=9999, score_from=0,
+                           genres_exclude=[],
+                           manga_kinds=dict.fromkeys(_api.MANGA_KINDS, True),
+                           kinds=dict.fromkeys(_api.ANIME_KINDS, True))
     if manga:
-        kinds = [k for k in _api.MANGA_KINDS if self.s.manga_kinds.get(k)]
+        kinds = [k for k in _api.MANGA_KINDS if settings.manga_kinds.get(k)]
     else:
-        kinds = [k for k in _api.ANIME_KINDS if self.s.kinds.get(k)]
-    season = f"{int(self.s.year_from)}_{int(self.s.year_to)}"
+        kinds = [k for k in _api.ANIME_KINDS if settings.kinds.get(k)]
+    season = "" if unfiltered else f"{int(settings.year_from)}_{int(settings.year_to)}"
     what = "манги" if manga else "тайтлов"
     target = "manga" if manga else "anime"
+    errors = getattr(self, "_catalog_refresh_errors", None)
+    if errors is None:
+        errors = self._catalog_refresh_errors = {}
+    errors.pop(target, None)
     cache = self._manga_cache if manga else self._card_cache
-    sig = _api.shiki_cache_signature(self.s, manga)
-    fetch = (self.shikimori.random_mangas if manga
-             else self.shikimori.random_animes)
+    sig = _api.shiki_cache_signature(settings, manga)
     ids: list[int] = []
     seen: set[int] = set()
     try:
-        for page in range(1, self.FULL_MAX_PAGES + 1):
-            if self.stopped():
-                self.log(f"Каталог Shikimori: остановлено на {len(ids)} "
-                         f"{what} — набранное сохранено.")
-                break
-            try:
-                cards = fetch(page, season=season, kinds=kinds,
-                              score=int(self.s.score_from),
-                              genres_exclude=self.s.genres_exclude,
-                              order=self.FULL_ORDER)
-            except _api.AnimePackApiError as e:
-                self.log(f"Shikimori: {e} — беру, что успел набрать")
-                break
+        for _page, cards in iter_catalog_pages(
+                self.shikimori, self.FULL_MAX_PAGES, self.stopped, manga=manga,
+                limit=50, season=season, kinds=kinds, score=int(settings.score_from),
+                genres_exclude=settings.genres_exclude, order=self.FULL_ORDER):
             if not cards:
                 # Каталог по этим фильтрам кончился: генерация больше не
                 # полезет за ним на сервер (см. catalog_superset).
@@ -60,10 +61,16 @@ def fetch_full_catalog(self, manga: bool = False) -> list[int]:
             self.db_cache.add_cards(target, sig, cards)
             self.log(f"Каталог Shikimori: набрано {len(ids)} {what}…")
             if fresh == 0:
-                self.db_cache.mark_complete(target, sig)
-                break                 # страница без новых id — дальше пусто
+                raise _api.AnimePackApiError("Shikimori: каталог повторил непустую страницу.")
+    except _api.AnimePackApiError as e:
+        errors[target] = str(e)
+        self.log(f"Shikimori: {e} — беру, что успел набрать")
     finally:
-        self.db_cache.save()
+        from .generation_checkpoint import checkpoint
+        checkpoint(self)
+    if self.stopped():
+        self.log(f"Каталог Shikimori: остановлено на {len(ids)} "
+                 f"{what} — набранное сохранено.")
     return ids
 
 def _animes_by_ids(self, ids) -> list[dict]:
@@ -233,20 +240,22 @@ def _iter_manga_candidates(self) -> _api.Iterator[_api.SongCandidate]:
                                 franchise_index=self._franchise_index(card),
                                 compress_images=self.s.compress_images)
             _api.apply_adaptation(cand, anime)
+            from .ru_popularity_store import apply_ru_popularity
+            apply_ru_popularity(self, cand)
             cand._reserved = self._last_reserved
             yield cand
     # Каталог манги вычерпан. Мангой может стать только карточка ОТСЮДА, так
     # что доля манги дальше неисполнима — её места надо отдать остальным, иначе
     # цикл отбора будет требовать кандидатов до последнего тайтла базы аниме.
-    self.log(f"Каталог манги кончился: карточек в работе было {len(pairs)}. "
-             "Больше вопросов по манге взять неоткуда — если их нужно больше, "
-             "нажмите «Обновить базу»: она возьмёт каталог манги целиком, а не "
-             "выборку под размер пака.")
+    waiting = sum(c.is_manga for c in getattr(self, "_level_bench", ()))
+    self.log(f"Каталог манги просмотрен: {len(pairs)} карточек; "
+             f"отложено ради средней сложности {waiting}, "
+             f"ради долей изданий {self._manga_mix.bench_size}.")
     # Места книжной доли отдаём другим родам вопросов, только когда книг и
     # правда не осталось. Отложенные по книжным долям (скамейка MangaMix) —
     # это готовые кандидаты: раздать их места заранее значило бы недобрать пак
     # при полной скамейке (см. _close_spent_streams).
-    if not self._manga_mix.bench_size:
+    if not self._manga_mix.bench_size and not waiting:
         self._spend_kind(_api.MANGA_KIND)
 
 def _iter_anime_candidates(self) -> _api.Iterator[_api.SongCandidate]:

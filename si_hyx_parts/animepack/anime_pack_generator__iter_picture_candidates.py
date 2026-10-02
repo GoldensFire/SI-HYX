@@ -4,6 +4,8 @@
 """AnimePackGenerator: _iter_picture_candidates. Public namespace: animepack."""
 from __future__ import annotations
 import animepack as _api
+from .generation_runtime import encoding_operation, track_process, untrack_process
+from .generation_diagnostics import operation, process_label
 
 
 def _iter_picture_candidates(self, kind, ids, users_by_id, used_anime,
@@ -107,7 +109,8 @@ def _load_franchise_indexes(self, animes: list) -> None:
         got = {key: list(rows) for key, rows in (loaded or {}).items()
                if key in ask}
         self.db_cache.add_franchises(got)
-        self.db_cache.save()
+        from .generation_checkpoint import checkpoint
+        checkpoint(self)
         fresh.update(got)
     for key in need:
         self._fr_parts[key] = list(fresh.get(key) or [])
@@ -157,6 +160,8 @@ def _accept_anime(self, anime: dict, mal: int, used_anime: set,
                           media="manga" if manga else "anime",
                           franchise_index=self._franchise_index(anime))
     if manga:
+        from .ru_popularity_store import apply_ru_popularity
+        apply_ru_popularity(self, probe)
         # Экранизованная книга меряется узнаваемостью своего АНИМЕ: по книжной
         # шкале её вопрос вышел бы вдесятеро труднее, чем он на самом деле.
         _api.apply_adaptation(probe, adapted or {})
@@ -266,20 +271,32 @@ def prepare_dirs(self) -> str:
         _api.os.makedirs(_api.os.path.join(self.folder, sub), exist_ok=True)
     return self.folder
 
+@operation("скачивание")
 def _get_bytes(self, url: str, timeout=(10, 90)) -> bytes:
     last: _api.Optional[Exception] = None
     for attempt in range(_api._DOWNLOAD_RETRIES + 1):
         if self.stopped():
             raise _api.AnimePackError("Остановлено")
         try:
+            tracker = getattr(self, "_diagnostics", None)
+            if tracker is not None:
+                tracker.transfer()
             resp = self.session.get(url, timeout=timeout)
             resp.raise_for_status()
-            return resp.content
+            data = resp.content
+            if tracker is not None:
+                tracker.transfer(len(data))
+            return data
         except Exception as e:  # noqa: BLE001 — любая сетевая беда
             last = e
             if attempt < _api._DOWNLOAD_RETRIES:
-                _api.time.sleep(0.8 * (attempt + 1))
+                _download_retry_pause(self, 0.8 * (attempt + 1))
     raise _api.AnimePackError(str(last))
+
+
+@operation("ожидание повторного запроса")
+def _download_retry_pause(self, seconds):
+    _api.time.sleep(seconds)
 
 
 def _cached_bytes(self, url: str, namespace: str, minimum: int = 1) -> bytes:
@@ -336,6 +353,8 @@ def _run_killable(self, cmd, timeout: float = 180.0) -> tuple[int, str]:
     code, _out, err = self._run_capture(cmd, timeout)
     return code, err
 
+@encoding_operation
+@operation(process_label)
 def _run_capture(self, cmd, timeout: float = 180.0) -> tuple[int, str, str]:
     """То же самое, но с выводом процесса: ffprobe отвечает в stdout, а
         ffmpeg — в stderr, реестр процессов и «Стоп» им нужны одинаково."""
@@ -346,8 +365,7 @@ def _run_capture(self, cmd, timeout: float = 180.0) -> tuple[int, str, str]:
                                 stderr=_api.subprocess.PIPE, **kw)
     except Exception as e:  # noqa: BLE001
         return 1, "", str(e)
-    with self._procs_lock:
-        self._procs.add(proc)
+    track_process(self, proc)
     deadline = _api.time.monotonic() + max(1.0, float(timeout))
     try:
         while True:
@@ -370,8 +388,7 @@ def _run_capture(self, cmd, timeout: float = 180.0) -> tuple[int, str, str]:
                     return 1, "", "остановлено"
                 return 1, "", f"не уложился в {float(timeout):.0f} с"
     finally:
-        with self._procs_lock:
-            self._procs.discard(proc)
+        untrack_process(self, proc)
 
 @staticmethod
 def _kill(proc) -> None:

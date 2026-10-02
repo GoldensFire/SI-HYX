@@ -110,6 +110,15 @@ def join_posters(generator, cand, primary_data: bytes, primary_ext: str) -> None
         cand.has_poster = True
 
 
+def song_hint(cand) -> str:
+    """Все типы применения композиции, перечисленные в ответе вопроса."""
+    kinds = {cand.base_kind}
+    kinds.update(_api.song_kind((row.get("song") or {}).get("songType"))
+                 for row in cand.song_alternates)
+    labels = [_api.HINT_LABELS[kind] for kind in _api.SONG_KINDS if kind in kinds]
+    return "/".join(labels) or _api.KIND_TITLES.get(cand.base_kind, cand.base_kind)
+
+
 def _song_key(name: str, artist: str) -> str:
     return "|".join(" ".join(str(value).casefold().split())
                     for value in (name, artist))

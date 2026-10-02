@@ -190,7 +190,7 @@ def test_the_frames_of_the_studio_question_are_remembered(generator):
 
 
 # ── Как вопрос выглядит в паке ───────────────────────────────────────────────
-def test_the_task_is_shown_together_with_every_frame():
+def test_the_task_is_shown_together_with_every_four_second_frame():
     cand = SongCandidate({}, make_anime(), kind=STUDIO_KIND)
     cand.has_frame = True
     cand.frame_name = "a.jpg"
@@ -199,22 +199,22 @@ def test_the_task_is_shown_together_with_every_frame():
     items = _items(_question(cand, _settings()))
     assert len(items) == 6
     for task, frame in zip(items[0::2], items[1::2]):
-        # waitForFinish="False" — надпись идёт ОДНОВРЕМЕННО со своим кадром.
         assert task.get("waitForFinish") == "False"
+        assert task.get("duration") is None
         assert task.text == animepack.STUDIO_TASK_TEXT
         assert task.get("type") is None
         assert frame.get("type") == "image" and frame.get("isRef") == "True"
-        assert frame.get("duration") == "00:00:05"
+        assert frame.get("duration") == "00:00:04"
     assert [item.text for item in items[1::2]] == ["a.jpg", "b.jpg", "c.jpg"]
 
 
-def test_the_seconds_per_frame_come_from_the_settings():
+def test_old_studio_settings_do_not_change_the_fixed_timers():
     cand = SongCandidate({}, make_anime(), kind=STUDIO_KIND)
     cand.has_frame = True
     cand.frame_name = "a.jpg"
     cand.studios = ["Madhouse"]
     items = _items(_question(cand, _settings(studio_seconds=8)))
-    assert [item.get("duration") for item in items] == [None, "00:00:08"]
+    assert [item.get("duration") for item in items] == [None, "00:00:04"]
 
 
 def test_the_answer_is_the_studio_not_the_title():

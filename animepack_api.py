@@ -24,7 +24,7 @@
 # Источники отдельных родов вопросов — см. docs/anime-pack-sources.md:
 #   • AniZip — превью каждой серии (третий источник кадров рядом с AniList и
 #     Kitsu), ищется прямо по MAL id;
-#   • MangaDex — страница манги: сам вопрос по манге;
+#   • MangaDex, MangaFire, Comix.to, WeebCentral — страницы манги;
 #   • Sakugabooru — вырезки анимации без звука и титров.
 #
 # ВАЖНО, чем это отличается от оригинала ASPG (проверено живыми запросами):
@@ -134,17 +134,15 @@ LIST_SOURCES = ("shikimori", "myanimelist", "anilist")
 SOURCE_LABELS = {"myanimelist": "MyAnimeList", "shikimori": "Shikimori",
                  "anilist": "AniList"}
 
-# Что именно берём из списка человека. Манга, манхва, манхуа и ранобэ — это ОДИН
+# Что именно берём из списка человека. Манга, манхва и маньхуа — это ОДИН
 # раздел на всех трёх сайтах (Shikimori target_type=Manga, MAL /mangalist,
-# AniList type: MANGA), поэтому и у нас это один тип списка, а манхва/ранобэ
+# AniList type: MANGA), поэтому и у нас это один тип списка, а издания
 # отделяются потом фильтром «Типы» по полю kind карточки.
 LIST_TARGETS = ("anime", "manga")
-TARGET_LABELS = {"anime": "Аниме", "manga": "Манга/ранобэ"}
+TARGET_LABELS = {"anime": "Аниме", "manga": "Манга/манхва/маньхуа"}
 # Типы изданий Shikimori (поле kind у Manga).
-MANGA_KINDS = ("manga", "manhwa", "manhua", "light_novel", "novel", "one_shot",
-               "doujin")
+MANGA_KINDS = ("manga", "manhwa", "manhua", "one_shot", "doujin")
 MANGA_KIND_LABELS = {"manga": "Манга", "manhwa": "Манхва", "manhua": "Манхуа",
-                     "light_novel": "Ранобэ", "novel": "Роман",
                      "one_shot": "Ваншот", "doujin": "Додзинси"}
 
 from si_hyx_parts.animepack_api.anime_pack_api_error import (
@@ -166,6 +164,11 @@ from si_hyx_parts.animepack_api.subdl_api import SubdlApi, SubdlQuotaError
 from si_hyx_parts.animepack_api.mangadex_api import (MangaDexApi,
                                                      chapter_link as
                                                      mangadex_chapter_link)
+from si_hyx_parts.animepack_api.manga_json_readers import MangaFireApi, ComixApi
+from si_hyx_parts.animepack_api.weebcentral_api import WeebCentralApi
+from si_hyx_parts.animepack_api.remanga_reader import ReMangaApi
+from si_hyx_parts.animepack_api.mangalib_reader import MangaLibApi
+from si_hyx_parts.animepack_api.manga_page_sources import MangaPageSources
 
 from si_hyx_parts.animepack_api.sakugabooru_api import (SakugaApi,
                                                         post_link as

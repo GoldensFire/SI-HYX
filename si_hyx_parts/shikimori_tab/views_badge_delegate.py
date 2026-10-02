@@ -3,6 +3,7 @@
 # See LICENSE and the public module for attribution and API.
 """_ViewsBadgeDelegate. Public namespace: shikimori_tab."""
 import shikimori_tab as _api
+from si_hyx_parts.widgets.info_tip_frame import source_is_current
 
 
 class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
@@ -197,6 +198,8 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
         франшизы»), а НЕ системный QToolTip с синей рамкой. Возврат True гасит
         системную подсказку списка."""
         if event.type() == _api.QEvent.Type.ToolTip and _api._InfoTipPopup is not None:
+            if not source_is_current(view.viewport(), event.globalPos()):
+                return True
             aid = index.data(_api.Qt.ItemDataRole.UserRole + 1)
             rect = self._index_rects.get(aid)
             try:
@@ -206,9 +209,10 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
             if rect is not None and pos is not None and rect.contains(pos):
                 tip = self._tab._index_tooltip_for(aid)
                 if tip:
-                    _api._InfoTipPopup.instance().show_at(event.globalPos(), tip)
+                    _api._InfoTipPopup.instance().show_at(
+                        event.globalPos(), tip, owner=view.viewport())
                     return True
-            _api._InfoTipPopup.instance().hide()
+            _api._InfoTipPopup.instance().hide_for(view.viewport())
             return False
         return super().helpEvent(event, view, option, index)
 

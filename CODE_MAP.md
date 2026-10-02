@@ -11,6 +11,25 @@ rg -n "^def process_media" si_hyx_parts/workers
 Каждый файл ограничен 600 строками и 40 КиБ; целевой размер — 200–300 строк.
 Маленькие исходные файлы остаются на прежних местах. Подробные правила — [CLAUDE.md](CLAUDE.md).
 
+Полный ручной сбор манги из Shikimori, ReManga и MangaLib с резервной копией,
+журналом и проверкой сохранённых данных — [manga_db_refresh](tools/manga_db_refresh.py).
+
+Появление картинки: [image_entrance.py](image_entrance.py) — 25 эффектов в монтаже,
+20 в генерации, русские подписи и составы;
+[renderer](image_entrance_renderer.py), [motion](image_entrance_motion.py),
+[reveal](image_entrance_reveal.py) — покадровые преобразования;
+[entrance_controls](si_hyx_parts/animepack_tab/entrance_controls.py) — отдельная вкладка,
+[preview](si_hyx_parts/animepack_tab/entrance_preview.py) — живой пример;
+[processing](si_hyx_parts/animepack/entrance_processing.py),
+[encoding](si_hyx_parts/animepack/entrance_encoding.py),
+[content](si_hyx_parts/animepack/entrance_content.py) — применение к выбранным составам,
+кодирование изображений/начала ролика и только готовые видео с таймером 5 секунд в SIQ.
+Общее кодирование — [image_entrance_encoding](image_entrance_encoding.py).
+В монтаже меню «⋯» содержит «Появление» и «Удалить исходный файл»:
+[actions](si_hyx_parts/edit_tab/entrance_actions.py),
+[dialog](si_hyx_parts/edit_tab/entrance_dialog.py),
+[worker](si_hyx_parts/edit_tab/entrance_worker.py).
+
 Раскрытие кадров аниме-пака: [frame_reveal.py](frame_reveal.py) — список эффектов и ступени;
 отдельные эффекты на numpy — [tone](frame_reveal_tone.py) (темнота, пересвет),
 [warp](frame_reveal_warp.py) (волны, полосы, спираль),
@@ -27,13 +46,30 @@ rg -n "^def process_media" si_hyx_parts/workers
 Анонсы в пак не идут ничем — [announced.py](si_hyx_parts/animepack/announced.py),
 проверка в `filter_anime` и при поиске первого появления персонажа.
 Ctrl+F в консоли — [console_find_bar.py](si_hyx_parts/main/console_find_bar.py).
+Восстановление окна после сворачивания и смены мониторов —
+[window_visibility](si_hyx_parts/main/window_visibility.py): запоминает только
+видимую геометрию и не принимает служебную позицию свёрнутого окна за обычную.
+Фоновое сканирование ленты последних файлов —
+[recent_files_scan](si_hyx_parts/widgets/recent_files_scan.py).
+Запись базы при генерации —
+[generation_checkpoint](si_hyx_parts/animepack/generation_checkpoint.py):
+API-пачки накапливаются в памяти, сохраняются после остановки рабочих потоков,
+включая отмену и ошибки; ручное обновление сохраняет прежние контрольные точки.
 Ключ категории `pixel` и прежние настройки `pixel_*` сохранены для совместимости.
 
 ИИ-арты: [инструкция и карта модулей](docs/anime-ai-art.md).
 
+Отрывки серий: [источники, настройки и карта native Kuhi](docs/anime-episode-clips.md).
+
 Проверки картинок Gemini: [visual_batch](si_hyx_parts/animepack/visual_batch.py)
 собирает до четырёх параллельных проверок Pixiv и манги с одинаковой моделью
 в один запрос; каждый вердикт сопоставляется со своей картинкой по id.
+Локальный OCR: [local_visual_ocr](si_hyx_parts/animepack/local_visual_ocr.py)
+один раз находит текст и распознаёт crops PP-OCRv6 Small и кириллической
+PP-OCRv5 Mobile; [local_title_match](si_hyx_parts/animepack/local_title_match.py)
+сравнивает надписи с названиями. Первое использование загружает модели в
+пользовательский кэш SI-HYX; далее OCR работает без сети. Вердикт OCR
+кэшируется по хэшу изображения; сомнения уходят в существующий Gemini batch.
 
 Арты Pixiv: [pixiv_art_api.py](pixiv_art_api.py) — клиент и отбор;
 [pixiv_art_search.py](pixiv_art_search.py) — три источника выдачи;
@@ -44,10 +80,67 @@ Ctrl+F в консоли — [console_find_bar.py](si_hyx_parts/main/console_fin
 [pixiv_art_tags.py](pixiv_art_tags.py) и [pixiv_tag_rules.py](pixiv_tag_rules.py) —
 метки-исключения.
 
+RU-популярность книг, ReManga и MangaLib: [формула, зеркала API и проверки](docs/manga-ru.md).
+Расчёт — [ru_popularity_math](si_hyx_parts/animepack/ru_popularity_math.py),
+memo/история — [ru_popularity_store](si_hyx_parts/animepack/ru_popularity_store.py),
+обновление snapshots — [ru_popularity_refresh](si_hyx_parts/animepack/ru_popularity_refresh.py).
+Полный внешний каталог и возобновляемые детали —
+[ru_catalog_snapshot](si_hyx_parts/animepack/ru_catalog_snapshot.py);
+меню отдельных источников в кнопке манги —
+[manga_refresh_controls](si_hyx_parts/animepack_tab/manga_refresh_controls.py).
+Параллельные детали — [ru_catalog_details](si_hyx_parts/animepack/ru_catalog_details.py);
+одновременное обновление источников со сбором карточек Shikimori —
+[db_source_refresh](si_hyx_parts/animepack/db_source_refresh.py);
+темп, минутная квота и Retry-After —
+[population_rate_limit](si_hyx_parts/animepack_api/population_rate_limit.py).
+
 Страницы манги: [manga_panel](si_hyx_parts/animepack/manga_panel.py) — выбор и
-загрузка; [manga_visual_check](si_hyx_parts/animepack/manga_visual_check.py) —
-проверка Gemini «не видно ли названия» (как у Pixiv), галочка и модель —
+загрузка; [manga_page_sources](si_hyx_parts/animepack_api/manga_page_sources.py) —
+перебор выбранных сайтов; [manga_json_readers](si_hyx_parts/animepack_api/manga_json_readers.py) —
+неофициальные API MangaFire и Comix.to;
+[weebcentral_api](si_hyx_parts/animepack_api/weebcentral_api.py) — HTML API WeebCentral;
+[mangalib_reader](si_hyx_parts/animepack_api/mangalib_reader.py) — русские страницы MangaLib;
+[remanga_reader](si_hyx_parts/animepack_api/remanga_reader.py) — русские главы ReManga;
+[manga_request_signing](si_hyx_parts/animepack_api/manga_request_signing.py) — подписи запросов;
+[comix_image](si_hyx_parts/animepack_api/comix_image.py) — восстановление страниц Comix.to.
+Приоритет точных локальных совпадений в каталогах выбранных русских источников —
+[manga_source_candidates](si_hyx_parts/animepack/manga_source_candidates.py).
+Фоновая запись деталей и ожидание окончательного сохранения —
+[catalog_checkpoint](si_hyx_parts/animepack/catalog_checkpoint.py).
+Галочки источников — [manga_source_controls](si_hyx_parts/animepack_tab/manga_source_controls.py).
+[manga_visual_check](si_hyx_parts/animepack/manga_visual_check.py) —
+проверка названия через Gemini или локальный OCR; выбор режима и модель —
 [manga_gemini_controls](si_hyx_parts/animepack_tab/manga_gemini_controls.py).
+Выбор сцены с персонажами — [manga_character_crop](si_hyx_parts/animepack/manga_character_crop.py):
+манхва/маньхуа любой высоты и длинные ленты манги передаются Gemini
+перекрывающимися фрагментами. [manga_page_context](si_hyx_parts/animepack/manga_page_context.py)
+соединяет соседние куски главы, сохраняя параметры скачивания источника;
+ранее использованные соседи всё равно доступны как контекст для целых реплик.
+[manga_page_batch](si_hyx_parts/animepack/manga_page_batch.py) заранее скачивает
+до четырёх страниц манхвы/маньхуа без повторной загрузки соседей;
+[manga_scene_batch](si_hyx_parts/animepack/manga_scene_batch.py) выбирает
+до трёх вариантов одним запросом и проверяет все вырезки второй общей пачкой.
+Неверные координаты отсеиваются локально, без одиночных повторных запросов.
+[manga_scene_bounds](si_hyx_parts/animepack/manga_scene_bounds.py) расширяет
+выбор до пустых промежутков исходной ленты и сохраняет всю ширину панели;
+[manga_margins](si_hyx_parts/animepack/manga_margins.py) удаляет только пустые
+поля, сохраняя реплики и облачка за рамкой рисунка;
+[manga_scene_review](si_hyx_parts/animepack/manga_scene_review.py) независимо проверяет
+готовые пиксели и исходный контекст на цельность всех заметных лиц и реплик,
+пустоту, обрубки панелей и название.
+Книжные страницы японской манги сохраняются целиком; порог длинной ленты — в
+[manga_crop](si_hyx_parts/animepack/manga_crop.py). Завершение каталога книг
+сохраняет квоту, пока остаются отложенные ради средней сложности кандидаты.
+Живой прогон с сохранёнными настройками и кадрами для просмотра —
+[manga_pack_probe.py](tools/manga_pack_probe.py); повторная проверка всех
+вырезок, замена плохих сцен и пересборка их появления —
+[manga_pack_review.py](tools/manga_pack_review.py); проверка целостности пака,
+ссылок на медиа и просмотр готового кадра всех видео-вопросов —
+[manga_pack_verify.py](tools/manga_pack_verify.py).
+Одна полоса долей манги/манхвы/маньхуа —
+[manga_edition_controls](si_hyx_parts/animepack_tab/manga_edition_controls.py);
+перенос старых настроек без ранобэ и романов —
+[manga_editions](si_hyx_parts/animepack/manga_editions.py).
 
 Узнаваемость и цена вопроса: «в избранном» — вторая мера рядом со списками.
 Число берётся у САМОГО Shikimori, со страницы тайтла
@@ -80,6 +173,12 @@ Ctrl+F в консоли — [console_find_bar.py](si_hyx_parts/main/console_fin
 персонажа и у загадок по названию в ответе стоит не тайтл, и прежним способом
 такая франшиза не находилась. У паков, собранных раньше, названия достаются из
 подписей медиафайлов.
+
+Повторы персонажей — [character_repeat.py](si_hyx_parts/animepack/character_repeat.py):
+ID и имена героя сохраняются в манифесте; старые паки читаются по ответам.
+Название сезона и перекодирование портрета не меняют личность персонажа.
+Первое появление выбирается по дате среди выпущенных произведений, независимо
+от роли и TV-формата; рекламные PV/CM и музыкальные клипы пропускаются.
 
 Дата показа серии берётся из инфобокса и через ПОДЧЁРКИВАНИЕ
 (`|japanese_air_date =`): у вики «Обещанного Неверленда» поле зовётся так, и
@@ -141,6 +240,9 @@ Ctrl+F в консоли — [console_find_bar.py](si_hyx_parts/main/console_fin
 Части базы (каталог аниме, каталог манги, «в избранном», франшизы, «хвосты») и
 их выборочная чистка — [db_cache_parts.py](si_hyx_parts/animepack/db_cache_parts.py);
 сам сбор — [anime_pack_generator_refresh_db.py](si_hyx_parts/animepack/anime_pack_generator_refresh_db.py).
+Максимальные порции обновления: [пределы и живые проверки](docs/db-refresh-requests.md);
+GraphQL-пачки — [shikimori_catalog](si_hyx_parts/animepack_api/shikimori_catalog.py),
+общий обход — [catalog_pages](si_hyx_parts/animepack/catalog_pages.py).
 Кого имеет смысл спрашивать про «в избранном» (число живёт только на странице
 тайтла, то есть стоит запроса на карточку) —
 [favorites_sweep.py](si_hyx_parts/animepack/favorites_sweep.py).
@@ -177,10 +279,38 @@ Ctrl+F в консоли — [console_find_bar.py](si_hyx_parts/main/console_fin
 [level_controls.py](si_hyx_parts/animepack_tab/level_controls.py). Полоса с
 границами и средней — [difficulty_range.py](si_hyx_parts/animepack_tab/difficulty_range.py),
 очередь снимков настроек — [generation_queue.py](si_hyx_parts/animepack_tab/generation_queue.py).
-Низкий приоритет ограничивает параллелизм и понижает приоритет рабочих потоков
-и ffmpeg — [generation_priority.py](si_hyx_parts/animepack/generation_priority.py).
+Приоритет меняется во время генерации: лимиты рабочих задач и кодировщиков,
+приоритет уже запущенных потоков и ffmpeg (включая AVIF) —
+[generation_runtime.py](si_hyx_parts/animepack/generation_runtime.py), Windows API —
+[generation_priority.py](si_hyx_parts/animepack/generation_priority.py).
+Общие подсказки скрываются на время выбора в выпадающих списках —
+[info_tip_popup.py](si_hyx_parts/widgets/info_tip_popup.py).
+Превью AniList: короткий запрос и минутная пауза после сбоя; повторы запросов
+списка пользователя учитывают лимит API — [ani_list_api.py](si_hyx_parts/animepack_api/ani_list_api.py).
+Один кандидат запрашивается в фоне, пока принимаются готовые вопросы —
+[candidate_source.py](si_hyx_parts/animepack/candidate_source.py),
+[selection_results.py](si_hyx_parts/animepack/selection_results.py).
+Узкие рамки получают подходящие тайтлы первыми —
+[candidate_options.py](si_hyx_parts/animepack/candidate_options.py).
+Неудачная форма вопроса и временно заполненные квоты сохраняют тайтл для
+других форм — [candidate_reserve.py](si_hyx_parts/animepack/candidate_reserve.py);
+при возврате из книжной скамейки кандидат удаляется из этого запаса;
+перераспределение мест по оставшимся франшизам —
+[quota_balance.py](si_hyx_parts/animepack/quota_balance.py).
+Брони только реально показанных работ студии —
+[studio_reservations.py](si_hyx_parts/animepack/studio_reservations.py).
+После набора песенной доли MAL-каталог обходится без новых запросов песен;
+известные неподходящие карточки отсеиваются до AnisongDB —
+[anime_card_feed.py](si_hyx_parts/animepack/anime_card_feed.py).
 Старые одноразовые песни и кадры из медиа-кэша убирает
 [one_use_cache.py](si_hyx_parts/animepack/one_use_cache.py).
+Ранний отсев точных повторов и бронь их ключей на время загрузки —
+[early_repeat.py](si_hyx_parts/animepack/early_repeat.py); хеш готового медиа
+остаётся финальной страховкой в `exact_repeat.py`. Фактический параллелизм,
+раздельные замеры загрузок, кодирования и ожиданий —
+[generation_diagnostics.py](si_hyx_parts/animepack/generation_diagnostics.py).
+У кадров с эффектами свой `frame_preset` (включая DVD); старые настройки
+переносят в него прежний `video_preset`, пресет сакуги остаётся независимым.
 
 Панель настроек аниме-пака: коробки настроек — это
 [SettingsBox](si_hyx_parts/animepack_tab/settings_box.py), а не голый QWidget.
@@ -204,7 +334,7 @@ Shikimori (`studios` в `ANIME_FIELDS`); у карточек из старой �
 Правильный ответ кандидата (у каждого рода вопросов он свой) вынесен в
 [song_answer.py](si_hyx_parts/animepack/song_answer.py).
 
-Источники вопросов AniZip, Jimaku, MangaDex и Sakugabooru:
+Источники вопросов AniZip, Jimaku, MangaDex, MangaFire, Comix.to, WeebCentral и Sakugabooru:
 [описание и карта модулей](docs/anime-pack-sources.md). Реестр родов вопросов
 (имена, подписи, семьи «картинка / ролик / текст») —
 [question_kinds.py](si_hyx_parts/animepack/question_kinds.py).
@@ -294,9 +424,15 @@ URL держало замок минутами и при медленном пр
 [manga_adaptation.py](si_hyx_parts/animepack/manga_adaptation.py)
 (есть ли у книги аниме-экранизация — от неё берутся узнаваемость и цена) и
 [manga_mix.py](si_hyx_parts/animepack/manga_mix.py) (доли экранизованных книг,
-манхвы и маньхуа). Сами манхва и маньхуа добираются в каталог отдельным
+манхвы и маньхуа). «С аниме: Любое» отключает только долю экранизаций;
+ввод слова и процентов — [manga_adaptation_control.py](si_hyx_parts/animepack_tab/manga_adaptation_control.py).
+При первом заполнении манхва и маньхуа добираются отдельным
 запросом — [manga_catalog_topup.py](si_hyx_parts/animepack/manga_catalog_topup.py):
-в общем каталоге книг их почти нет. Длинная лента вебтуна режется до книжного разворота —
+в общем каталоге книг их почти нет. Сохранённый каталог книг генерация
+использует без фонового добора; обновление — кнопкой «Обновить базу».
+При пустом каталоге запас считается от квоты вопросов по манге —
+[anime_pack_generator__random_shikimori_ids.py](si_hyx_parts/animepack/anime_pack_generator__random_shikimori_ids.py).
+Длинная лента вебтуна режется до книжного разворота —
 [manga_crop.py](si_hyx_parts/animepack/manga_crop.py). Отдельные рамки и
 СРЕДНИЕ сложности для артов и книг —
 [level_controls.py](si_hyx_parts/animepack_tab/level_controls.py) на вкладке и
@@ -334,9 +470,14 @@ Gemini зависит от модели: «минимальный» умеет �
 `si_hyx_parts/animepack/title_questions.py`; локальный расход запросов — `gemini_usage.py`.
 Пределы бесплатного тарифа — [gemini_quota.py](gemini_quota.py): общая на оба
 клиента одного ключа доска (слоты RPM и исчерпанные модели) и разбор 429.
-Исчерпанная модель помнится СУТКИ, обслуженные запросы считаются отдельно от
-отклонённых, а запрос без ответа по таймауту не повторяется — Google его уже
-засчитал. Итог прогона печатает `log_gemini_spent`.
+Исчерпанная квота помнится СУТКИ. После двух последовательных серверных отказов
+модель пропускается до конца прогона, сначала пробуется Flash-Lite. Транспорт
+и повторы — [gemini_transport.py](gemini_transport.py). Ошибки 400/5xx и таймауты
+входят в локальную оценку расхода; HTTP-коды и успешные ответы считаются отдельно.
+Таймаут чтения не повторяется. Итог прогона печатает `log_gemini_spent`.
+Названия аниме исключаются из развёрнутых сюжетных ответов в обоих режимах:
+[plot_explanation.py](si_hyx_parts/animepack/plot_explanation.py) очищает написания
+и русские падежи локально; короткие ответы для зачёта остаются отдельно.
 Диалоги: отрывок ВСЕГДА выбирает Gemini, прочитав серию целиком
 (`animepack/dialogue_gemini.py`: номера реплик от модели, текст — из самих
 субтитров). Сначала русские субтитры SubDL (`animepack_api/subdl_api.py`,
@@ -365,7 +506,11 @@ Chiptune: [описание и проверки](docs/chiptune.md). Настро
 «Сжимать аудио» стоит в «Прочем» рядом со «Сжимать картинки».
 
 Панель настроек раскладывается по колонкам под ширину вкладки —
-`si_hyx_parts/animepack_tab/settings_columns.py`; таблица состава пака после
+`si_hyx_parts/animepack_tab/settings_columns.py`: «Списки» всегда сверху
+второй колонки, даже при полностью выключенном составе. Фильтры окна базы
+независимы от генерации — `animepack_tab/db_filters.py`. Приоритет задаёт
+`animepack_tab/priority_slider.py`, долю манги с аниме —
+`animepack_tab/manga_adaptation_control.py`. Таблица состава пака после
 генерации открывается отдельным окном кнопкой «Показать таблицу»
 (`animepack_tab/table_dialog.py`). Группа «Пак» в этих колонках НЕ
 лежит: она стоит в неподвижной правой колонке вместе с полосой запуска

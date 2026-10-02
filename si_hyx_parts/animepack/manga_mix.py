@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 import animepack as _api
+from .manga_editions import shares
 
 
 # Сколько книг держим на скамейке в расчёте на одно книжное место. Отложенные
@@ -51,24 +52,25 @@ class MangaMix:
         места умерших родов вопросов раздаются живым)."""
         self.quota = max(0, int(quota or 0))
         self.bench_cap = max(BENCH_MIN, self.quota * BENCH_PER_SLOT)
-        pct = max(0, min(100, int(getattr(self.s, "manga_adapted_percent", 50) or 0)))
-        adapted = int(round(self.quota * pct / 100.0))
-        self.adapted_target = {True: adapted, False: self.quota - adapted}
-        manhwa = max(0, min(100, int(getattr(self.s, "manga_pct_manhwa", 0) or 0)))
-        manhua = max(0, min(100, int(getattr(self.s, "manga_pct_manhua", 0) or 0)))
-        if manhwa + manhua > 100:
-            share = 100.0 / (manhwa + manhua)
-            manhwa, manhua = int(manhwa * share), int(manhua * share)
-        self.kind_target = {
-            "manhwa": int(round(self.quota * manhwa / 100.0)),
-            "manhua": int(round(self.quota * manhua / 100.0)),
-        }
-        self.kind_target[""] = max(0, self.quota - sum(self.kind_target.values()))
+        pct = int(getattr(self.s, "manga_adapted_percent", 50) or 0)
+        if pct < 0:
+            self.adapted_target = {True: self.quota, False: self.quota}
+        else:
+            adapted = int(round(self.quota * min(100, pct) / 100.0))
+            self.adapted_target = {True: adapted, False: self.quota - adapted}
+        values = shares(self.s)
+        targets = {k: self.quota * v // 100 for k, v in values.items()}
+        rest = self.quota - sum(targets.values()) if any(values.values()) else 0
+        order = sorted(values, key=lambda k: -(self.quota * values[k] % 100))
+        for key in order[:rest]:
+            targets[key] += 1
+        self.kind_target = {"manhwa": targets["manhwa"],
+                            "manhua": targets["manhua"], "": targets["manga"]}
 
     # ── учёт ──────────────────────────────────────────────────────────────
     @staticmethod
     def _edition(cand) -> str:
-        """Ключ издания: манхва, маньхуа или «всё остальное» (манга, ранобэ)."""
+        """Ключ издания: манхва, маньхуа или японские комиксы."""
         kind = str((cand.anime or {}).get("kind") or "").lower()
         return kind if kind in ("manhwa", "manhua") else ""
 
@@ -77,6 +79,10 @@ class MangaMix:
 
     def allows(self, cand) -> bool:
         """Нужен ли ещё такой вопрос. Лишний уходит на скамейку, а не в мусор."""
+        if cand.is_manga:
+            key = self._edition(cand) or "manga"
+            if not shares(self.s).get(key):
+                return False
         if self.off or not self.quota or not cand.is_manga:
             return True
         adapted_key, kind_key = self._keys(cand)

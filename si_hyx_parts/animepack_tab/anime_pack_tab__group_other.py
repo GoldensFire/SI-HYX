@@ -297,7 +297,7 @@ def _refresh_exact_label(self):
     self.lbl_exact_siq.setText(
         f"Не повторяю сами вопросы из {count} пак(ов)." if count else
         "Точные повторы из паков пока не исключаются.")
-    self.lbl_exact_siq.setToolTip("\n".join(self._exclude_exact_siq))
+    self.lbl_exact_siq.setToolTip("")
     self.btn_exact_clear.setEnabled(bool(count))
     self.btn_exact_list.setEnabled(True)
 

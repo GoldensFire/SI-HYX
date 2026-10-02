@@ -38,6 +38,11 @@ def test_ordinary_manga_spread_is_left_alone():
     assert fit_page(_page(1114, 1600), ".jpg") is None
 
 
+@pytest.mark.parametrize("height", [1440, 2000, 2400])
+def test_tall_book_pages_are_not_confused_with_webtoon_strips(height):
+    assert fit_page(_page(800, height), ".jpg") is None
+
+
 def test_cut_window_keeps_away_from_the_edges():
     """Шапка переводчиков сверху и «продолжение следует» снизу не берутся."""
     height = 10000

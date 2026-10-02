@@ -12,6 +12,7 @@ Public namespace: animepack.
 """
 from __future__ import annotations
 import animepack as _api
+from .plot_explanation import candidate_titles, without_titles
 
 
 # ── правильный ответ ─────────────────────────────────────────────────
@@ -75,12 +76,13 @@ def answer_variants(self) -> list[str]:
         # Страница вики, с которой взят пересказ, идёт последней строкой:
         # ведущему видно, откуда вопрос, и спорный ответ можно свериться.
         short = self.plot_answers[0]
-        expanded = _expanded_plot_answer(short, self.plot_explanation)
+        expanded = without_titles(
+            _expanded_plot_answer(short, self.plot_explanation),
+            candidate_titles(self))
         return _api._dedup_answers([expanded] + list(self.plot_answers)
                                    + [self.source_link])
     if self.kind == _api.PLOT_KIND:
-        variants = ([_expanded_plot_answer(self.title_ru,
-                                           self.plot_explanation)]
+        variants = ([without_titles(self.plot_explanation, candidate_titles(self))]
                     if self.plot_explanation else []) + [self.main_answer]
     else:
         variants = [self.main_answer]

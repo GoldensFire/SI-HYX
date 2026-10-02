@@ -83,7 +83,7 @@ def _group_songs(self) -> _api.QGroupBox:
     # ── Вопрос роликом (AnimeThemes) ─────────────────────────────────
     # Галочка живёт в составе пака: она включает в ползунке долю роликов,
     # а не превращает в видео все песни разом.
-    self.chk_video = _api.QCheckBox("Опенинги с видео")
+    self.chk_video = _api.QCheckBox("Опенинги с видеорядом")
     self.chk_video.setToolTip(
         "Добавляет в ползунок состава долю вопросов-РОЛИКОВ: вместо "
         "отрезка песни играет ВИДЕО опенинга или эндинга с "
@@ -94,6 +94,7 @@ def _group_songs(self) -> _api.QGroupBox:
         "обычным отрезком звука.\n"
         "Ответ у ролика точно такой же, как у песни: название с тегом, "
         "год, песня, исполнитель и постер.\n"
+        "Цена — как за обычный кадр этого тайтла, без надбавок за музыку.\n"
         "Ролик перекодируется в 720p тем же libsvtav1, что и во вкладке "
         "«Обработка», звук — в opus, как все дорожки пака.")
     self.chk_video.toggled.connect(self._on_video_toggled)
@@ -132,7 +133,7 @@ def _group_songs(self) -> _api.QGroupBox:
         "Добавляет в ползунок состава долю вопросов по МАНГЕ (а также "
         "манхве, манхуа и ранобэ). Вопросом служит СТРАНИЦА оригинала с "
         "MangaDex — разворот из середины случайной главы.\n"
-        "Тайтлы берутся из списков, переключённых на «Манга/ранобэ», либо "
+        "Тайтлы берутся из списков, переключённых на «Манга/манхва/маньхуа», либо "
         "из каталога Shikimori.\n"
         "Снятая галочка убирает мангу с ползунка целиком.")
     self.chk_manga.toggled.connect(self._on_manga_toggled)
@@ -141,8 +142,8 @@ def _group_songs(self) -> _api.QGroupBox:
         self.cb_manga_lang.addItem(_api.MANGA_LANG_LABELS[key], key)
     self.cb_manga_lang.setToolTip(
         "Из глав на каком языке брать страницу.\n"
-        "«Любой» находит больше всего тайтлов: русский перевод есть далеко "
-        "не у каждой манги.\n"
+        "«Любой»: сначала русский (ReManga и MangaLib в приоритете), "
+        "затем английский и украинский.\n"
         "«Японский» — страницы оригинала, без переводных надписей.")
     self.chk_manga_erotica = _api.QCheckBox("Пускать главы 18+ (erotica)")
     self.chk_manga_erotica.setToolTip(
@@ -329,21 +330,26 @@ def _group_songs(self) -> _api.QGroupBox:
     mg = _api.QGridLayout(self.box_manga)
     mg.setContentsMargins(16, 0, 0, 0)
     mg.setHorizontalSpacing(8); mg.setVerticalSpacing(4)
-    mg.addWidget(self._lab("Язык глав"), 0, 0)
-    mg.addWidget(self.cb_manga_lang, 0, 1, 1, 3)
-    mg.addWidget(self.chk_manga_erotica, 1, 0, 1, 4)
+    from .manga_source_controls import build_controls as build_sources
+    build_sources(self, mg, 0)
+    mg.addWidget(self._lab("Язык глав"), 1, 0)
+    mg.addWidget(self.cb_manga_lang, 1, 1, 1, 3)
+    mg.addWidget(self.chk_manga_erotica, 2, 0, 1, 4)
     from si_hyx_parts.animepack_tab.manga_gemini_controls import build_controls
-    build_controls(self, mg, 2)
-    for i, kind in enumerate(_api.MANGA_KINDS):
+    build_controls(self, mg, 3)
+    extras = [k for k in _api.MANGA_KINDS if k in ("one_shot", "doujin")]
+    for i, kind in enumerate(extras):
         chk = _api.QCheckBox(_api.MANGA_KIND_LABELS[kind])
-        chk.setChecked(kind in ("manga", "manhwa", "manhua", "light_novel"))
+        chk.setChecked(False)
         self.chk_manga_kinds[kind] = chk
-        mg.addWidget(chk, 3 + i // 2, (i % 2) * 2, 1, 2)
-    place_manga(self, mg, 3 + (len(_api.MANGA_KINDS) + 1) // 2)
+        mg.addWidget(chk, 4 + i // 2, (i % 2) * 2, 1, 2)
+    place_manga(self, mg, 4 + (len(extras) + 1) // 2)
     mg.setColumnStretch(1, 1)
     self.box_manga.setVisible(False)
 
     from si_hyx_parts.animepack_tab.sakuga_controls import build_controls
+    build_controls(self)
+    from si_hyx_parts.animepack_tab.episode_controls import build_controls
     build_controls(self)
     from si_hyx_parts.animepack_tab.studio_controls import build_controls
     build_controls(self)

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QPoint, QTimer, Qt
 from PyQt6.QtWidgets import QInputDialog, QLabel, QMessageBox
 
 import animepack_tab as _api
@@ -96,10 +96,17 @@ def _build_templates(self):
     save_btn.clicked.connect(self._save_template_as)
     row.addWidget(save_btn, 1)
     layout.addLayout(row)
-    self.template_notice = QLabel("Шаблон обновлён и сохранён")
-    self.template_notice.setStyleSheet("color: #399b68; font-size: 11px;")
+    self.template_notice = QLabel("Шаблон обновлён и сохранён", self,
+                                  Qt.WindowType.ToolTip)
+    self.template_notice.setTextFormat(Qt.TextFormat.PlainText)
+    self.template_notice.setWordWrap(True)
+    self.template_notice.setMaximumWidth(420)
+    self.template_notice.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+    self.template_notice.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+    self.template_notice.setStyleSheet(
+        "background: #243b2e; color: #bde8cc; padding: 8px; "
+        "border: 1px solid #399b68; border-radius: 6px; font-size: 11px;")
     self.template_notice.hide()
-    layout.addWidget(self.template_notice)
     self._template_notice_timer = QTimer(self)
     self._template_notice_timer.setSingleShot(True)
     self._template_notice_timer.timeout.connect(self.template_notice.hide)
@@ -144,6 +151,9 @@ def _update_template(self) -> None:
             saved = saver()
         if saved:
             self.template_notice.setText(f"Шаблон «{name}» обновлён и сохранён")
+            self.template_notice.adjustSize()
+            self.template_notice.move(self.templates_box.mapToGlobal(
+                QPoint(0, self.templates_box.height())))
             self.template_notice.show()
             self._template_notice_timer.start(3500)
 

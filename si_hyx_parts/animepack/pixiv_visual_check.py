@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Визуальная проверка арта Pixiv через Gemini."""
+"""OCR названия арта Pixiv и семантическая проверка через Gemini."""
 from __future__ import annotations
 
 import base64
@@ -21,6 +21,42 @@ SCHEMA = {
 
 
 def check(generator, cand, data: bytes, ext: str, illust=None):
+    mode = getattr(getattr(generator, "s", None), "pixiv_title_check_mode", "gemini")
+    if mode != "local":
+        return _gemini_check(generator, cand, data, ext, illust)
+    from .local_title_match import decide, titles
+    from .local_visual_ocr import note, read
+    mixed_check = bool(getattr(generator.s, "pixiv_gemini_check", True))
+
+    try:
+        rows, elapsed, cached = read(generator, data)
+    except Exception as exc:
+        if (generator.stopped() or not mixed_check
+                or getattr(generator, "gemini_pixiv", None) is None):
+            raise
+        note(generator, "Pixiv", {"status": "uncertain", "ocr": "",
+                                   "title": "", "similarity": 0,
+                                   "confidence": 0}, 0.0, False, True)
+        generator.log(f"OCR Pixiv недоступен ({exc}) — проверяю через Gemini")
+        return _gemini_check(generator, cand, data, ext, illust)
+    result = decide(rows, titles(cand.anime or {}))
+    fallback = (mixed_check and result["status"] == "uncertain"
+                and getattr(generator, "gemini_pixiv", None) is not None)
+    note(generator, "Pixiv", result, elapsed, cached, fallback)
+    if result["status"] == "title":
+        return False, f"OCR: «{result['ocr']}» = «{result['title']}»"
+    if result["status"] == "uncertain":
+        if fallback:
+            return _gemini_check(generator, cand, data, ext, illust)
+        return False, "OCR распознал возможное название"
+    if mixed_check:
+        return _gemini_check(generator, cand, data, ext, illust,
+                             mixed_only=True)
+    return True, ""
+
+
+def _gemini_check(generator, cand, data: bytes, ext: str, illust=None, *,
+                  mixed_only=False):
     """Возвращает ``(можно_брать, причина)``; результат хранится в базе."""
     client = getattr(generator, "gemini_pixiv", None)
     if client is None:
@@ -40,9 +76,13 @@ def check(generator, cand, data: bytes, ext: str, illust=None):
     prompt = (
         "Проверь фан-арт для вопроса по аниме. Ожидаемое аниме: "
         + " / ".join(titles) + ".\nМетки Pixiv: " + ", ".join(tags)
-        + "\nВерни accept=false, если на изображении видны название, логотип "
-          "или надпись с названием ожидаемого аниме: это раскрывает ответ. "
-          "Также верни accept=false и mixed_anime=true, если изображены "
+        + ("\nНаличие названия ожидаемого аниме уже проверено локальным OCR. "
+           "Проверяй только чужие франшизы; has_title_text=false. "
+           "Здесь accept=false означает только чужую франшизу. "
+           if mixed_only else
+           "\nВерни accept=false и has_title_text=true, если видно название "
+           "или логотип ожидаемого аниме. ")
+        + "Верни accept=false и mixed_anime=true, если изображены "
           "узнаваемые персонажи, логотипы или названия любого другого аниме "
           "либо смешаны несколько тайтлов. Обычные подписи автора и текст, "
           "не раскрывающий название, допустимы. Если метки явно называют "
@@ -63,12 +103,16 @@ def check(generator, cand, data: bytes, ext: str, illust=None):
     ]
     verdict = request(generator, client, parts, SCHEMA)
     if not isinstance(verdict, dict):
-        verdict = {"accept": False, "reason": "Gemini не вернула вердикт"}
-    accept = (bool(verdict.get("accept"))
+        verdict = {"accept": False, "mixed_anime": True,
+                   "reason": "Gemini не вернула вердикт"}
+    accept = ((verdict.get("accept") is True and
+               verdict.get("mixed_anime") is False) if mixed_only else
+              bool(verdict.get("accept"))
               and not bool(verdict.get("has_title_text"))
               and not bool(verdict.get("mixed_anime")))
     saved = {"accept": accept,
-             "has_title_text": bool(verdict.get("has_title_text")),
+             "has_title_text": (False if mixed_only else
+                                bool(verdict.get("has_title_text"))),
              "mixed_anime": bool(verdict.get("mixed_anime")),
              "reason": str(verdict.get("reason") or "")}
     generator.db_cache.remember_memo("pixiv_visual_v2", key, saved)

@@ -30,26 +30,31 @@ import zipfile
 # «chiptune.json» и «covers.json», и путать их незачем.
 MANIFEST_NAME = "si-hyx-pack.json"
 # Версия формата: читатель обязан пережить пак, собранный будущей версией.
-VERSION = 2
+VERSION = 3
 
 
 def build(songs) -> str:
     """Манифест пака строкой JSON («» — писать нечего)."""
     rows = []
     studios = set()
+    characters = []
     seen = set()
     for cand in (songs or []):
+        if getattr(cand, "is_character", False) and cand.character:
+            characters.append({"id": cand.character.get("id"),
+                               "names": cand.char_names})
         studios.update(str(name).strip().casefold()
                        for name in (getattr(cand, "studios", None) or [])
                        if str(name).strip())
-        cards = [getattr(cand, "anime", None) or {}]
-        cards += list(getattr(cand, "studio_cards", None) or [])
+        cards = list(getattr(cand, "studio_cards", None) or [])
+        if not cards:
+            cards = [getattr(cand, "anime", None) or {}]
         for card in cards:
             _append_card(rows, seen, card)
-    if not rows and not studios:
+    if not rows and not studios and not characters:
         return ""
     return json.dumps({"version": VERSION, "titles": rows,
-                       "studios": sorted(studios)},
+                       "studios": sorted(studios), "characters": characters},
                       ensure_ascii=False, indent=1)
 
 

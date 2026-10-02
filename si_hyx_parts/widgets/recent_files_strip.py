@@ -29,6 +29,9 @@ class RecentFilesStrip(_api.QWidget):
             self._custom_folder = ""
         self._known_paths: list = []  # текущий список путей (актуальный снимок)
         self._anchor_thumb = None      # якорь для Shift-выделения диапазона
+        from .recent_files_scan import DirectoryScanner
+        self._scanner = DirectoryScanner(self)
+        self._scanner.ready.connect(self._scan_finished)
         self.setFixedHeight(128)
 
         outer = _api.QHBoxLayout(self)
@@ -80,7 +83,7 @@ class RecentFilesStrip(_api.QWidget):
             pass
         if self._custom_folder:        # своя папка задана — показываем сразу, до refresh()
             self._folder = self._effective_folder()
-            self._apply(self._scan())
+            self._request_scan()
 
     def wheelEvent(self, event):
         """Колесо мыши — горизонтальная прокрутка стрипа."""
@@ -172,48 +175,32 @@ class RecentFilesStrip(_api.QWidget):
         return cls._ALL_EXT
 
     def _scan(self) -> list:
-        """Возвращает список путей из _folder, сортированных по mtime DESC, макс. 30.
-        Устойчив к гонке: файл может исчезнуть между listdir и getmtime.
-        """
-        if not self._folder or not _api.os.path.isdir(self._folder):
-            return []
-        result = []
-        try:
-            entries = _api.os.listdir(self._folder)
-        except Exception:
-            return []
-        for f in entries:
-            try:
-                fp = _api.os.path.join(self._folder, f)
-                if not _api.os.path.isfile(fp):
-                    continue
-                ext = _api.os.path.splitext(f)[1].lower()
-                if self._mode == 'all':
-                    if ext in self._EXCLUDE_EXT:
-                        continue
-                    result.append(fp)
-                else:
-                    if ext in self._get_all_ext():
-                        result.append(fp)
-            except Exception:
-                continue
+        """Synchronous compatibility helper; GUI callers use the worker."""
+        from .recent_files_scan import scan_recent
+        return scan_recent(self._folder, self._mode, self._get_all_ext(),
+                           self._EXCLUDE_EXT)
 
-        def _safe_mtime(p):
-            try:
-                return _api.os.path.getmtime(p)
-            except Exception:
-                return 0.0
+    def _request_scan(self):
+        self._scanner.request(self._folder, self._mode, self._get_all_ext(),
+                              self._EXCLUDE_EXT)
 
-        result.sort(key=_safe_mtime, reverse=True)
-        return result[:30]
+    def _scan_finished(self, paths):
+        if paths != self._known_paths:
+            self._apply(paths)
+
+    def showEvent(self, event):  # noqa: N802 — Qt override
+        super(_api.RecentFilesStrip, self).showEvent(event)
+        self._request_scan()
 
     def _poll(self):
         """Вызывается таймером — обновляет стрип если список файлов изменился."""
-        if not self._folder:
+        if (not self._folder or not self.isVisible()
+                or self.window().isMinimized()):
             return
-        new_paths = self._scan()
-        if new_paths != self._known_paths:
-            self._apply(new_paths)
+        self._request_scan()
+        self._recheck_pending()
+
+    def _recheck_pending(self):
         # Пингуем карточки без миниатюры: файл мог дозаписаться (mp4 при
         # перекодировании весь процесс висит ~48 Б, moov пишется в конце).
         for i in range(self._row.count()):
@@ -227,14 +214,15 @@ class RecentFilesStrip(_api.QWidget):
         задана — лента берёт её; иначе остаётся на пользовательской."""
         self._default_folder = folder or ""
         self._folder = self._effective_folder()
-        self._apply(self._scan())
+        self._request_scan()
 
     def force_refresh(self):
         """Немедленный опрос папки/карточек, не дожидаясь 5-сек. таймера — напр.
         после обрезки/экспорта в «Монтаже», когда файл по тому же пути
         перезаписан перекодировкой (стал короче/легче)."""
         try:
-            self._poll()
+            self._request_scan()
+            self._recheck_pending()
         except Exception:
             pass
 
@@ -252,14 +240,14 @@ class RecentFilesStrip(_api.QWidget):
         self._custom_folder = d
         self._persist_folder()
         self._folder = self._effective_folder()
-        self._apply(self._scan())
+        self._request_scan()
         self._update_folder_btn()
 
     def _reset_folder(self):
         self._custom_folder = ""
         self._persist_folder()
         self._folder = self._effective_folder()
-        self._apply(self._scan())
+        self._request_scan()
         self._update_folder_btn()
 
     def _persist_folder(self):

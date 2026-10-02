@@ -3,6 +3,7 @@
 # See LICENSE and the public module for attribution and API.
 """DraggableTreeWidget. Public namespace: widgets."""
 import widgets as _api
+from .info_tip_frame import source_is_current
 
 
 class DraggableTreeWidget(_api.QTreeWidget):
@@ -70,6 +71,9 @@ class DraggableTreeWidget(_api.QTreeWidget):
         try:
             et = e.type()
             if et == _api.QEvent.Type.ToolTip:
+                if not source_is_current(self.viewport(), e.globalPos()):
+                    e.accept()
+                    return True
                 item = self.itemAt(e.pos())
                 idx = self.indexAt(e.pos())
                 col = idx.column() if idx.isValid() else -1
@@ -88,15 +92,16 @@ class DraggableTreeWidget(_api.QTreeWidget):
                     # иначе путь файла из колонки превью.
                     tip = item.toolTip(col) or item.toolTip(0)
                 if tip:
-                    _api._InfoTipPopup.instance().show_at(e.globalPos(), tip)
+                    _api._InfoTipPopup.instance().show_at(
+                        e.globalPos(), tip, owner=self.viewport())
                 else:
-                    _api._InfoTipPopup.instance().hide()
+                    _api._InfoTipPopup.instance().hide_for(self.viewport())
                 e.accept()
                 return True
             if et == _api.QEvent.Type.MouseMove:
                 self._update_badge_hover(e.pos())
             if et in (_api.QEvent.Type.Leave, _api.QEvent.Type.Wheel):
-                _api._InfoTipPopup.instance().hide()
+                _api._InfoTipPopup.instance().hide_for(self.viewport())
                 self._update_badge_hover(None)
         except Exception:
             pass

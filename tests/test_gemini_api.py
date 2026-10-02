@@ -38,8 +38,11 @@ def _catch_sleep(client, monkeypatch) -> list:
     """Перехватывает паузы клиента. Возвращает только заметные (от секунды):
     доли секунды — это троттлинг под RPM, у него свой тест."""
     seen: list = []
+    now = [time.monotonic()]
+    monkeypatch.setattr(gemini_api.time, "monotonic", lambda: now[0])
 
     def fake_sleep(sec):
+        now[0] += sec
         if sec >= 1:
             seen.append(sec)
 
@@ -264,7 +267,7 @@ def test_server_error_is_retried(fake_session, fake_response, monkeypatch):
     assert len(s.calls) == 2
 
 
-def test_server_busy_after_all_retries_is_unavailable_not_quota(
+def test_busy_models_stop_after_two_errors_each(
         fake_session, fake_response, monkeypatch):
     """503 «high demand» до конца ретраев — отдельный тип: по нему пачка
     проверок картинок решает, что сервер лежит (visual_batch.DOWN_AFTER)."""
@@ -272,9 +275,12 @@ def test_server_busy_after_all_retries_is_unavailable_not_quota(
                        lambda url, **kw: fake_response(503, text="high demand"))])
     c = _client(s)
     monkeypatch.setattr(c, "_sleep", lambda _s: None)
-    with pytest.raises(gemini_api.GeminiUnavailableError):
+    with pytest.raises(gemini_api.GeminiDownError):
         c.generate_json("привет", SCHEMA)
-    assert len(s.calls) == c.max_retries
+    assert len(s.calls) == 2 * len(gemini_api.MODELS)
+    with pytest.raises(gemini_api.GeminiDownError):
+        c.generate_json("другой тайтл", SCHEMA)
+    assert len(s.calls) == 2 * len(gemini_api.MODELS)
 
 
 # ── троттлинг и отмена ───────────────────────────────────────────────────────

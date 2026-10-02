@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import animepack as _api
+from .generation_diagnostics import locked, operation
 from pixiv_art_api import PixivArtClient, PixivArtError, PixivArtUnavailable
 
 
@@ -137,20 +138,23 @@ def _searched_title(first: dict, cand) -> str:
 VISUAL_TRIES = 3
 
 
+@operation("поиск и загрузка Pixiv")
 def _pick_art(self, first, also):
     """Один арт по тегу тайтла: данные, расширение, адрес и его карточка.
 
     Поиск идёт под общим замком вместе с бронью адреса, чтобы параллельные
     потоки не взяли одну и ту же работу. Отвергнутая работа остаётся в
     брони — следующий поиск её уже не предложит."""
-    with self._pixiv_lock:
+    with locked(self, self._pixiv_lock):
         with self._frames_lock:
             excluded = set(self._frames_used)
         # Работы, уже бывшие в выбранных паках («не повторять сами
         # вопросы»), отсеиваются ДО выбора: поздний отказ по отпечатку
         # стоил бы загрузки, проверки Gemini и самого тайтла.
         from .exact_repeat import pixiv_links
-        skip = pixiv_links(self._exact_keys) | pixiv_links(self._exact_seen)
+        with self._exact_lock:
+            skip = pixiv_links(self._exact_keys | self._exact_seen
+                               | set(self._exact_pending))
         data, ext, url = self.pixiv.fetch(first, excluded, also=also,
                                           skip_links=skip)
         # И карточка, и ссылка на работу читаются ЗДЕСЬ, под тем же
@@ -168,9 +172,11 @@ def _pick_art(self, first, also):
     return data, ext, url, matched, art_link, illust
 
 
+@operation("проверка изображения")
 def _visual_ok(self, cand, data, ext, illust):
     """Вердикт Gemini по картинке: True, False или None — сбой, дальше не пробовать."""
-    if not getattr(self.s, "pixiv_gemini_check", True):
+    if (not getattr(self.s, "pixiv_gemini_check", True)
+            and getattr(self.s, "pixiv_title_check_mode", "gemini") != "local"):
         return True
     from .pixiv_visual_check import check
     try:
@@ -192,7 +198,7 @@ def _visual_ok(self, cand, data, ext, illust):
         return None
     if not approved:
         self._log_rare(
-            "Pixiv-арт отклонён Gemini",
+            "Pixiv-арт отклонён проверкой",
             f"Pixiv-арт «{cand.title_ru}»: арт отклонён "
             f"({reason or 'название или персонажи другого аниме'}), "
             f"берётся другой арт того же тайтла")
@@ -228,6 +234,10 @@ def download_pixiv_art(self, cand):
                     and matched is not cand.anime):
                 cand.anime = matched
                 cand.media_base = self._media_base(cand)
+            cand.art_link = art_link
+            from .early_repeat import reserve
+            if not reserve(self, cand):
+                return False
             verdict = _visual_ok(self, cand, data, ext, illust)
             if verdict is None:
                 return False

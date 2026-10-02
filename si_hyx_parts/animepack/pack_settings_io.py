@@ -17,6 +17,9 @@ from cloudflare_art_api import DEFAULT_MODEL as ART_DEFAULT_MODEL
 from cover_meta_rules import LANGUAGE_KEYS as COVER_LANGUAGE_KEYS
 from cover_meta_rules import TYPE_LABELS as COVER_TYPE_LABELS
 from frame_reveal import EFFECT_LABELS, REMOVED_EFFECTS, add_new_effects, clean_effects
+from image_entrance import (
+    PACK_EFFECT_LABELS as ENTRANCE_EFFECT_LABELS, EDITOR_ONLY_EFFECTS,
+    TARGET_LABELS, clean_keys)
 
 
 def to_dict(self) -> dict:
@@ -24,6 +27,7 @@ def to_dict(self) -> dict:
          if k not in ("users", "saved_users")}
     d["users"] = [u.to_dict() for u in self.users]
     d["saved_users"] = [u.to_dict() for u in self.saved_users]
+    d["manga_kinds"] = {k: bool(self.manga_kinds.get(k)) for k in _api.MANGA_KINDS}
     return d
 
 # Как старые галочки состава превращаются в проценты ползунка. Ключи —
@@ -95,10 +99,22 @@ def from_dict(cls, d: dict) -> '_api.PackSettings':
                     s.frame_effects, d.get("frame_effects_known"))
         elif key == "frame_effects_known":
             continue
+        elif key in ("entrance_effects", "entrance_targets"):
+            labels = ENTRANCE_EFFECT_LABELS if key == "entrance_effects" else TARGET_LABELS
+            setattr(s, key, clean_keys(value, labels))
+            if (key == "entrance_effects" and not s.entrance_effects
+                    and isinstance(value, (list, tuple))
+                    and any(isinstance(k, str) and k in EDITOR_ONLY_EFFECTS for k in value)):
+                s.entrance_effects = list(ENTRANCE_EFFECT_LABELS)
+        elif key == "entrance_effect" and isinstance(value, str) and value in EDITOR_ONLY_EFFECTS:
+            s.entrance_effect = "random"
         elif key == "frame_effect" and value == "blinds":
             s.frame_effect = "window"
         elif key == "frame_effect" and value in REMOVED_EFFECTS:
             s.frame_effect = "pixelize"
+        elif key == "manga_sources":
+            from si_hyx_parts.animepack_api.manga_reader_base import clean_sources
+            s.manga_sources = clean_sources(value)
         elif key in ("categories", "kinds", "manga_kinds"):
             if isinstance(value, dict):
                 getattr(s, key).update({k: bool(v) for k, v in value.items()})
@@ -129,6 +145,10 @@ def from_dict(cls, d: dict) -> '_api.PackSettings':
                 pass
     if s.chiptune_version == "chiptune-1":
         s.chiptune_version = "chiptune-2"
+    # Старые кадры с эффектами брали общий пресет роликов. Сохраняем его
+    # при миграции; после сохранения новая настройка независима.
+    if "frame_preset" not in d:
+        s.frame_preset = s.video_preset
     if s.song_video and "pct_videos" not in d:
         # До ползунка галочка «Вопрос — ролик» превращала в ролики ВСЕ
         # песенные вопросы разом — читаем её как «доля роликов = вся доля
@@ -170,4 +190,6 @@ def from_dict(cls, d: dict) -> '_api.PackSettings':
     s.cover_langs = [k for k in (s.cover_langs or ()) if k in COVER_LANGUAGE_KEYS]
     if str(s.cover_lang_mode or "") not in ("allow", "exclude"):
         s.cover_lang_mode = "allow"
+    from .manga_editions import migrate
+    migrate(s, d)
     return s

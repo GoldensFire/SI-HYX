@@ -10,7 +10,7 @@
 # модели). Ни Qt, ни requests здесь нет.
 #
 # Зачем доска. Генератор держит ДВА клиента на одном ключе (сюжет и загадки по
-# названию), а квота у Google одна на ключ. С раздельным состоянием они вдвое
+# названию), а квота Google общая на проект. С раздельным состоянием они вдвое
 # превышали RPM и продолжали слать запросы в модель, про которую сосед уже
 # узнал, что она кончилась (в логе — 503 по 3.8-flash через пять секунд после
 # перехода на 3.7-flash). Поэтому слоты RPM и список мёртвых моделей общие.
@@ -27,6 +27,7 @@ _QUOTA_MARKS = ("quota", "resource_exhausted")
 # мягкой: под тем же 429 прячется и минутный предел.
 _DAY_MARKS = ("perday", "per day")
 _MINUTE_MARKS = ("perminute", "per minute", "requests per minute")
+SERVER_FAILURE_LIMIT = 2
 # «… limit: 20 …» — сам сервер называет потолок, гадать не нужно.
 _LIMIT = re.compile(r"limit[:=]?\s*'?\"?(\d{1,6})", re.IGNORECASE)
 
@@ -43,6 +44,11 @@ def is_daily(text: str) -> bool:
     if any(mark in low for mark in _MINUTE_MARKS):
         return False
     return any(mark in low for mark in _DAY_MARKS)
+
+
+def is_minute(text: str) -> bool:
+    """Явный минутный предел: его пережидаем, не записываем как суточный."""
+    return any(mark in str(text or "").casefold() for mark in _MINUTE_MARKS)
 
 
 def daily_cap(text: str) -> int:
@@ -74,6 +80,31 @@ class QuotaBoard:
         self._lock = threading.Lock()
         self._next_at: dict[str, float] = {}
         self._dead: set[str] = set()
+        self._server_failures: dict[str, int] = {}
+        self._unavailable: set[str] = set()
+
+    def unavailable(self, model: str) -> bool:
+        """Перегрузка помнится только этой доской, не переносится на завтра."""
+        with self._lock:
+            return model in self._unavailable
+
+    def note_server_failure(self, model: str) -> bool:
+        with self._lock:
+            count = self._server_failures.get(model, 0) + 1
+            self._server_failures[model] = count
+            if count >= SERVER_FAILURE_LIMIT:
+                self._unavailable.add(model)
+            return model in self._unavailable
+
+    def note_response(self, model: str) -> None:
+        with self._lock:
+            self._server_failures.pop(model, None)
+
+    def defer(self, model: str, seconds: float) -> None:
+        """Retry-After действует и на соседние клиенты той же модели."""
+        with self._lock:
+            self._next_at[model] = max(self._next_at.get(model, 0),
+                                       time.monotonic() + seconds)
 
     # ── троттлинг ────────────────────────────────────────────────────────
     def reserve(self, model: str, interval: float) -> float:
@@ -119,7 +150,7 @@ class QuotaBoard:
                                         cap=daily_cap(text))
 
     def spend(self, model: str) -> None:
-        """Обслуженный сервером запрос — он и идёт в суточный лимит."""
+        """Локальная оценка: ошибки сервера тоже могут расходовать квоту."""
         if self.api_key:
             import gemini_usage
 

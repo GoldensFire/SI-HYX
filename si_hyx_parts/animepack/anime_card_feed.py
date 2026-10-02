@@ -62,18 +62,32 @@ class AnimeCardFeed:
         self._source = self._walk()
 
     # ── производитель ────────────────────────────────────────────────────
+    def _songs_needed(self):
+        return self.want_songs and getattr(self.gen, "_song_lookup_needed", True)
+
+    def _eligible_song_ids(self, batch):
+        """Только чистые фильтры известных MAL-карточек; брони здесь нет."""
+        gen = self.gen
+        cards = getattr(gen, "_card_cache", {})
+        return [aid for aid in batch if aid not in cards or (
+            _api.filter_anime(cards[aid], gen.s)
+            and not gen._root_excluded(cards[aid]))]
+
     def _ask_songs(self, batch):
         """Песни пачки. Возвращает (подходящие по id, все названия по id,
         MAL id пачки) либо None, если пачку пришлось пропустить."""
         gen = self.gen
-        if not self.want_songs:
+        if not self._songs_needed() and not gen._ids_are_ann:
             return {}, {}, list(batch)
-        gen.log(f"AnisongDB: спрашиваю песни для {len(batch)} аниме…")
+        asked = batch if gen._ids_are_ann else self._eligible_song_ids(batch)
+        if not asked:
+            return {}, {}, list(batch)
+        gen.log(f"AnisongDB: спрашиваю песни для {len(asked)} аниме…")
         try:
             if gen._ids_are_ann:
-                songs = gen.anisong.songs_by_ann_ids(batch)
+                songs = gen.anisong.songs_by_ann_ids(asked)
             else:
-                songs = gen.anisong.songs_by_mal_ids(batch)
+                songs = gen.anisong.songs_by_mal_ids(asked)
         except _api.AnimePackApiError as e:
             if gen._ids_are_ann:
                 # Мастер-лист AMQ хранит ANN id: без ответа AnisongDB карточку
@@ -142,14 +156,24 @@ class AnimeCardFeed:
                     queue.append(row)
                 yield True
 
-    def _fill(self, queue) -> bool:
-        """Докручивает каталог, пока в очереди не появится карточка."""
-        while not queue:
-            if self.done or self.gen.stopped():
-                return False
+    def _rows(self, song_stream):
+        """После набора песен оба потока обслуживают оставшиеся карточки.
+
+        Потребность проверяется между пачками: перераспределение квот может
+        снова потребовать песни. ANN по-прежнему нужен для получения MAL id.
+        """
+        while not self.gen.stopped():
+            needed = self._songs_needed()
+            queue = self.with_song if song_stream and needed else self.no_song
+            if not needed and not queue:
+                queue = self.with_song
+            if queue:
+                yield queue.popleft(), needed
+                continue
+            if self.done:
+                return
             if next(self._source, _EMPTY) is _EMPTY:
                 self.done = True
-        return True
 
     # ── кандидаты ────────────────────────────────────────────────────────
     def _candidates(self, row, kind, used_franchise):
@@ -188,18 +212,18 @@ class AnimeCardFeed:
     # ── потоки ───────────────────────────────────────────────────────────
     def songs(self, used_franchise):
         """Кандидаты с песней, прошедшей filter_song."""
-        while self._fill(self.with_song):
-            yield from self._candidates(self.with_song.popleft(), "",
-                                        used_franchise)
+        for row, needed in self._rows(True):
+            kind = "" if needed else self.gen._silent_kind()
+            if kind is not None:
+                yield from self._candidates(row, kind, used_franchise)
 
     def pictures(self, kind, used_franchise):
         """Кандидаты БЕЗ подходящей песни: кадры, персонажи, сюжет, арты…
 
         Род вопроса тут лишь первый по списку: `_pick_kind` переставит его по
         недобранным квотам."""
-        while self._fill(self.no_song):
-            yield from self._candidates(self.no_song.popleft(), kind,
-                                        used_franchise)
+        for row, _needed in self._rows(False):
+            yield from self._candidates(row, kind, used_franchise)
 
 
 AnimeCardFeed.__module__ = _api.__name__

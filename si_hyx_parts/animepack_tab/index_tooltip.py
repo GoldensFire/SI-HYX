@@ -15,6 +15,7 @@ QToolTip: синюю всплывашку пользователь не выно
 from __future__ import annotations
 
 from PyQt6.QtCore import QEvent, QObject, Qt
+from si_hyx_parts.widgets.info_tip_frame import source_is_current
 
 # Роль, в которой текст подсказки лежит прямо в ячейке: item.clone() уносит
 # её вместе с ячейкой в отдельное окно состава пака (см. _NumItem.clone).
@@ -77,7 +78,12 @@ def build_text(cand) -> str:
         lines.append(f"Избранное: {_fmt(favorites)} → ×{_dec(fav)}")
     if manga:
         book = float(getattr(cand, "book_index", 0.0) or 0.0)
-        reached = ap.manga_reach(book)
+        effective = float(getattr(cand, "effective_book_index", book) or 0.0)
+        details = getattr(cand, "ru_popularity", {}) or {}
+        if effective > book:
+            lines.append(f"RU узнаваемость: {_fmt(book)} → {_fmt(effective)} "
+                         f"(percentile {_dec(100 * details.get('P_ru', 0))}%)")
+        reached = ap.manga_reach(effective)
         lines.append(f"Книжная шкала: {_fmt(own)} × {_dec(fav)} → "
                      f"{_fmt(reached)}")
         if franchise > 0:
@@ -167,6 +173,8 @@ class _TipWatcher(QObject):
     def eventFilter(self, _object, event):   # noqa: N802 — имя из Qt
         if event.type() != QEvent.Type.ToolTip:
             return False
+        if not source_is_current(self._table.viewport(), event.globalPos()):
+            return True
         item = self._table.itemAt(event.pos())
         text = None
         if item is not None:
@@ -176,9 +184,10 @@ class _TipWatcher(QObject):
             if not text and self._whole_row:
                 text = self._row_text(item.row())
         if text:
-            _InfoTipPopup.instance().show_at(event.globalPos(), str(text))
+            _InfoTipPopup.instance().show_at(
+                event.globalPos(), str(text), owner=self._table.viewport())
         else:
-            _InfoTipPopup.instance().hide()
+            _InfoTipPopup.instance().hide_for(self._table.viewport())
         return True
 
     def _row_text(self, row: int) -> str:
@@ -206,11 +215,14 @@ class _HeadWatcher(QObject):
         if event.type() != QEvent.Type.ToolTip:
             return False
         header = self._table.horizontalHeader()
+        if not source_is_current(header, event.globalPos()):
+            return True
         column = header.logicalIndexAt(event.pos())
         item = self._table.horizontalHeaderItem(column)
         text = self._hints.get(item.text() if item is not None else "")
         if text:
-            _InfoTipPopup.instance().show_at(event.globalPos(), str(text))
+            _InfoTipPopup.instance().show_at(
+                event.globalPos(), str(text), owner=header)
         else:
-            _InfoTipPopup.instance().hide()
+            _InfoTipPopup.instance().hide_for(header)
         return True

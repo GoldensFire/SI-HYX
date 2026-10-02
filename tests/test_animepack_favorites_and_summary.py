@@ -257,7 +257,7 @@ def test_composition_lines_show_only_the_average_level():
     rows = [SimpleNamespace(kind="manga", level=3, has_video=False),
             SimpleNamespace(kind="manga", level=6, has_video=False)]
     text = pack_summary.composition_text(rows, None, {"manga": "Манга"})
-    assert text.splitlines()[0] == "  • Манга: 2 (4.5 сложность в ср.)"
+    assert text.splitlines()[0] == "Манга: 2 (4.5🎯в ср.)"
 
 
 def test_content_xml_numbers_the_pack_and_describes_its_parts():
@@ -272,7 +272,7 @@ def test_content_xml_numbers_the_pack_and_describes_its_parts():
     assert "Из чего состоит" not in comments
     assert "Опенинг: 1" in comments
     assert "Кадр: 1" in comments
-    assert "сложность в ср." in comments and "Сложность от" not in comments
+    assert "🎯в ср." in comments and "Сложность от" not in comments
     assert "AMQ - от" in comments
     assert "Сложность (Ур.)" in comments
     # Ни числа раундов, ни разброса цен, ни предупреждения «собрано

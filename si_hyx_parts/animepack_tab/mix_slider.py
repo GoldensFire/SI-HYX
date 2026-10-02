@@ -15,17 +15,17 @@ class _MixSlider(PercentageSliders, _api._ShareBar):
 
     KEYS = ("songs", "video", "frames", "chars", "manga", "pixel", "anagram",
             "dialogue", "plot", "description_audio", "ai_art", "pixiv_art", "sakuga",
-            "studio") + TITLE_KINDS
+            "studio", "episode") + TITLE_KINDS
     # Первые пять — «историческая» пятёрка percents(): её ждут и сохранённые
     # настройки, и PackSettings.percents.
     LEGACY = KEYS[:5]
-    LABELS = {"songs": "Песни", "video": "Ролики", "frames": "Кадры",
+    LABELS = {"songs": "Песни", "video": "Опенинги с видеорядом", "frames": "Кадры",
               "chars": "Персонажи", "manga": "Манга", "pixel": "Кадры с эффектами",
               "anagram": "Анаграммы", "dialogue": "Диалоги",
               "plot": "Сюжет", "description_audio": "Описание",
               "ai_art": "ИИ-арты",
               "pixiv_art": "Арты Pixiv",
-              "sakuga": "Сакуга", "studio": "Студия",
+              "sakuga": "Сакуга", "studio": "Студия", "episode": "Отрывки серий",
               "synonyms": "Синонимы",
               "antonyms": "Антонимы", "ukrainian": "Название на украинском"}
     COLORS = {"songs": "accent", "video": "accent2", "frames": "green",
@@ -34,7 +34,7 @@ class _MixSlider(PercentageSliders, _api._ShareBar):
               "description_audio": "accent2",
               "ai_art": "accent2",
               "pixiv_art": "yellow", "sakuga": "red",
-              "studio": "accent"}
+              "studio": "accent", "episode": "accent2"}
     LABELS.update(TITLE_LABELS)
     # Части, которые появляются на полосе только по своей галочке.
     OPTIONAL = KEYS
@@ -161,6 +161,15 @@ class _GenTask(_api.QRunnable):
         self.signals = _api._GenSignals()
         self._stop = False
         self._gen = None
+        from si_hyx_parts.animepack.generation_runtime import GenerationRuntime
+        self._runtime = GenerationRuntime(settings, lambda: self._stop)
+
+    def set_priority(self, value):
+        if self._runtime.set_priority(value):
+            labels = {"low": "низкий", "normal": "обычный", "high": "высокий"}
+            self.signals.log.emit(
+                f"Приоритет текущей генерации: {labels.get(value, 'обычный')}; "
+                f"лимит кодировщиков AV1 {self._runtime.encoder_limit}.")
 
     def stop(self):
         self._stop = True
@@ -176,14 +185,14 @@ class _GenTask(_api.QRunnable):
     def run(self):
         gen = None
         try:
-            from si_hyx_parts.animepack.generation_priority import apply_thread_priority
-            apply_thread_priority(self.settings)
-            gen = self._gen = _api.AnimePackGenerator(
-                self.settings,
-                log=self.signals.log.emit,
-                progress=lambda d, t, m: self.signals.progress.emit(d, t, m),
-                should_stop=lambda: self._stop)
-            self.signals.finished.emit(gen.run())
+            with self._runtime.worker():
+                gen = self._gen = _api.AnimePackGenerator(
+                    self.settings,
+                    log=self.signals.log.emit,
+                    progress=lambda d, t, m: self.signals.progress.emit(d, t, m),
+                    should_stop=lambda: self._stop,
+                    generation_runtime=self._runtime)
+                self.signals.finished.emit(gen.run())
         except _api.AnimePackError as e:
             self.signals.failed.emit(str(e))
         except Exception as e:  # noqa: BLE001

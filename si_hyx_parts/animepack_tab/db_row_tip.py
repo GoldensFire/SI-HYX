@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import QEvent, QObject
+from si_hyx_parts.widgets.info_tip_frame import source_is_current
 
 try:
     from widgets import _InfoTipPopup
@@ -65,14 +66,18 @@ class RowTipWatcher(QObject):
         return False
 
     def _visible(self) -> bool:
-        return self._key is not None and _InfoTipPopup.instance().isVisible()
+        popup = _InfoTipPopup.instance()
+        return (self._key is not None and popup.isVisible()
+                and popup._anchor == id(self._page.table.viewport()))
 
     def _show(self, pos, global_pos) -> None:
+        if not source_is_current(self._page.table.viewport(), global_pos):
+            return
         key = self._page.tip_key_at(pos)
         if key is None:
             self._hide()
             return
-        if key == self._key and _InfoTipPopup.instance().isVisible():
+        if key == self._key and self._visible():
             return          # та же ячейка — попап стоит, где стоял
         text = self._texts.get(key)
         if text is None:
@@ -84,10 +89,11 @@ class RowTipWatcher(QObject):
             self._hide()
             return
         self._key = key
-        _InfoTipPopup.instance().show_at(global_pos, text)
+        _InfoTipPopup.instance().show_at(
+            global_pos, text, owner=self._page.table.viewport())
 
     def _hide(self) -> None:
         if self._key is None:
             return
         self._key = None
-        _InfoTipPopup.instance().hide()
+        _InfoTipPopup.instance().hide_for(self._page.table.viewport())

@@ -23,6 +23,8 @@ def __init__(self):
     except Exception: pass
 
     self.setAcceptDrops(True)
+    from .window_visibility import WindowVisibilityGuard
+    self._window_visibility_guard = WindowVisibilityGuard(self)
     # Прогресс на иконке в панели задач (Windows 11, ITaskbarList3)
     self._taskbar = _api.TaskbarProgress()
     self._taskbar_hwnd = 0

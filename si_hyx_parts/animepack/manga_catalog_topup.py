@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 import animepack as _api
+from .manga_editions import shares
 
 
 # Издания со своей долей в книжной части пака и их русские имена (те же, что
@@ -33,7 +34,7 @@ MAX_PAGES = 20
 def edition_want(self, edition: str) -> int:
     """Сколько карточек этого издания нужно в каталоге (0 — не нужно вовсе)."""
     quota = int(self.s.question_quotas.get(_api.MANGA_KIND, 0) or 0)
-    pct = max(0, min(100, int(getattr(self.s, f"manga_pct_{edition}", 0) or 0)))
+    pct = shares(self.s).get(edition, 0)
     if not quota or not pct or not self.s.manga_kinds.get(edition):
         return 0
     questions = int(round(quota * pct / 100.0))
@@ -79,5 +80,6 @@ def topup_editions(self, sig: str, take) -> None:
             if not fresh:
                 break             # каталог этого издания кончился
         self.log(f"{name}: в каталоге теперь {have} карточек.")
-        self.db_cache.save()
+        from .generation_checkpoint import checkpoint
+        checkpoint(self)
 

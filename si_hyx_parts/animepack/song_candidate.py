@@ -45,6 +45,11 @@ class SongCandidate:
     frame_url: str = ""
     # Реально выбранный эффект (в том числе при случайном выборе).
     frame_effect: str = ""
+    # Исходные медиа сохраняются для памяти повторов и чистого кадра после появления.
+    entrance_effect: str = ""
+    entrance_frames: dict[str, str] = _api.field(default_factory=dict)
+    entrance_durations: dict[str, float] = _api.field(default_factory=dict)
+    entrance_video: str = ""
     # Адрес самой работы на Pixiv. Уходит последним вариантом ответа (просьба
     # пользователя): ведущему видно, что именно показано и чей это рисунок.
     art_link: str = ""
@@ -129,14 +134,15 @@ class SongCandidate:
     description_language: str = ""
     description_text: str = ""
     popular_franchise_title: str = ""
+    ru_popularity: dict = _api.field(default_factory=dict)
+    episode_clip: dict = _api.field(default_factory=dict)
 
     @property
     def base_kind(self) -> str:
         """Тип песни, лежащей в основе вопроса.
 
         У вопроса-ролика это опенинг или эндинг: сам ролик — только форма
-        подачи, а подсказка, надбавка к цене и ответ берутся от песни, как у
-        обычного песенного вопроса."""
+        подачи. Подсказка и ответ берутся от песни, цена — как у кадра."""
         if self.kind == _api.VIDEO_KIND:
             return _api.song_kind(self.song.get("songType")) or "opening"
         return self.kind
@@ -161,6 +167,10 @@ class SongCandidate:
     def is_sakuga(self) -> bool:
         """Вопрос-вырезка анимации: внутри это ролик без звука."""
         return self.kind == _api.SAKUGA_KIND
+
+    @property
+    def is_episode(self) -> bool:
+        return self.kind == _api.EPISODE_KIND
 
     @property
     def is_studio(self) -> bool:
@@ -444,6 +454,13 @@ class SongCandidate:
         return float(self.franchise_index or 0.0) * self.favorites_factor
 
     @property
+    def effective_book_index(self) -> float:
+        """Positive-only RU correction; original book_index remains public."""
+        from .ru_popularity_math import number
+        equivalent = number(self.ru_popularity.get("ru_equivalent_book_index"))
+        return max(self.book_index, equivalent or 0.0) if self.is_manga else 0.0
+
+    @property
     def index(self) -> float:
         """Узнаваемость вопроса на ОДНОЙ, анимешной шкале.
 
@@ -457,7 +474,7 @@ class SongCandidate:
         только читавшие, и выше MANGA_TOP_INDEX ей не подняться. Рядом стоит
         узнаваемость её аниме, и побеждает БОЛЬШЕЕ из двух: книгу узнают либо
         по сериалу, либо по тому, что её читали."""
-        own = (_api.manga_reach(self.book_index) if self.is_manga
+        own = (_api.manga_reach(self.effective_book_index) if self.is_manga
                else self.own_index * self.favorites_factor)
         return max(own, self.screen_index)
 

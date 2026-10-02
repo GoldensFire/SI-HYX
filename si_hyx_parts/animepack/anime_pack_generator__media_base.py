@@ -38,57 +38,14 @@ def _pick_kind(self, cand: _api.SongCandidate, counts, inflight, quotas):
     """Каким вопросом станет кандидат — или None, если он больше не нужен.
 
         В смешанном режиме песня может стать вопросом-кадром: карточка аниме у
-        неё уже есть, кадр берётся оттуда же. Выбираем из доступного тот тип,
-        который сильнее отстаёт от своей квоты, — так пак набирается ровно, а не
-        сначала все песни, потом все кадры."""
-    options = [cand.kind]
-    if cand.kind != _api.MANGA_KIND:
-        # Мангу не трогаем ни с какой стороны: её карточка приходит из
-        # своего каталога, ни кадров, ни песен у книги нет.
-        options += [k for k in _api.SILENT_KINDS
-                    if k not in (_api.MANGA_KIND, cand.kind) and quotas.get(k, 0)]
-        # Роликом может стать любая песня, кроме OST: их на AnimeThemes
-        # нет вовсе (см. _theme_video). А вот у кандидата без песни ролику
-        # взяться неоткуда.
-        if (cand.kind not in _api.SILENT_KINDS and cand.kind != "insert"
-                and quotas.get(_api.VIDEO_KIND, 0)):
-            options.append(_api.VIDEO_KIND)
-    free = [k for k in options
-            if k not in self._dead_kinds
-            and counts[k] + inflight[k] < quotas.get(k, 0)]
-    # Рамка сложности у артов своя (просьба пользователя): тайтл, слишком
-    # безвестный для арта, всё ещё годится в кадр или песню, и наоборот.
-    free = [k for k in free if _level_ok(self.s, cand, k)]
+        неё уже есть, кадр берётся оттуда же. Узкая рамка получает подходящие
+        тайтлы прежде широкой; одинаковые рамки делятся по заполненности."""
+    from .candidate_options import available_kinds, choose_kind
+    free = [k for k in available_kinds(self, cand, quotas)
+            if counts[k] + inflight[k] < quotas.get(k, 0)]
     # Книжные доли: экранизованная/нет, манхва, маньхуа.
     if _api.MANGA_KIND in free and not self._manga_mix.allows(cand):
         free.remove(_api.MANGA_KIND)
-    from .title_selection import TITLE_QUESTION_KINDS, short_title
-    title_cand = getattr(cand, "_title_variant", cand)
-    if title_cand is None or not short_title(title_cand.anime):
-        free = [k for k in free if k not in TITLE_QUESTION_KINDS]
-    if any(k in _api.GEMINI_TITLE_KINDS for k in free):
-        from .title_eligibility import russian_title, verdict
-        checked = verdict(getattr(self, "_title_eligibility", {}),
-                          russian_title(title_cand))
-        if not checked["eligible"]:
-            free = [k for k in free if k not in _api.GEMINI_TITLE_KINDS]
-        elif "antonyms" in free and not _antonyms_ok(checked, title_cand):
-            # Антонимы подходят не всякому названию: одно имя собственное
-            # перевернуть не во что. Такой тайтл просто получает другой род
-            # вопроса, а антонимы ждут следующего кандидата (просьба
-            # пользователя). Заодно берём только ТВ-сериалы и полнометражки:
-            # OVA и ONA для этого слишком безвестны.
-            free.remove("antonyms")
-    if _api.AI_ART_KIND in free:
-        from animepack_art_filter import possible_art_title
-        if not possible_art_title(cand.anime):
-            free.remove(_api.AI_ART_KIND)
-    if _api.STUDIO_KIND in free:
-        # Студии лежат в самой карточке, так что проверка бесплатная: тайтл
-        # без них незачем доводить до загрузки трёх кадров.
-        from .studio_question import studio_possible
-        if not studio_possible(cand.anime):
-            free.remove(_api.STUDIO_KIND)
     if not free:
         return None
     if self._prefers_music(cand):
@@ -99,7 +56,7 @@ def _pick_kind(self, cand: _api.SongCandidate, counts, inflight, quotas):
             free = songs
     if len(free) == 1:
         return free[0]
-    return min(free, key=lambda k: (counts[k] + inflight[k]) / max(1, quotas[k]))
+    return choose_kind(self.s, free, counts, inflight, quotas)
 
 # Из каких типов аниме вообще берутся антонимы (просьба пользователя):
 # только ТВ-сериалы и полнометражки, без OVA, ONA и спешлов.

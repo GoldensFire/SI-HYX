@@ -107,7 +107,8 @@ def _build_settings_panel(self, body):
     from si_hyx_parts.animepack_tab.settings_columns import SettingsColumns
     groups = [self._group_songs(), self._group_lists(),
               self._group_anime(), self._group_other()]
-    self.settings_columns = SettingsColumns(groups, self.SETTINGS_MIN_W)
+    self.settings_columns = SettingsColumns(
+        groups, self.SETTINGS_MIN_W, pinned_second=True)
     pv.addWidget(self.settings_columns)
 
     self.btn_reset = _api.QPushButton("Сбросить настройки")
@@ -117,7 +118,13 @@ def _build_settings_panel(self, body):
     pv.addStretch(1)
 
     scroll.setWidget(panel)
-    body.addWidget(scroll, 1)
+    from PyQt6.QtWidgets import QTabWidget
+    from .entrance_controls import build_page
+    self.settings_tabs = QTabWidget()
+    self.settings_tabs.addTab(scroll, "Настройки")
+    self.scroll_entrance = build_page(self)
+    self.settings_tabs.addTab(self.scroll_entrance, "Появление")
+    body.addWidget(self.settings_tabs, 1)
 
     self.right_col = _api.QWidget()
     self.right_col.setObjectName("packSettingsPanel")
@@ -163,18 +170,13 @@ def _build_actions(self) -> _api.QWidget:
     self.btn_start.setIconSize(_api.QSize(16, 16))
     self.btn_start.setObjectName("b_primary")
     self.btn_start.clicked.connect(self.start)
-    priority_row = _api.QHBoxLayout()
-    priority_row.addWidget(_api.QLabel("Приоритет генерации:"))
-    self.cb_generation_priority = _api.QComboBox()
-    for title, key in (("Низкий", "low"), ("Обычный", "normal"),
-                       ("Высокий", "high")):
-        self.cb_generation_priority.addItem(title, key)
-    self.cb_generation_priority.setCurrentIndex(1)
+    from .priority_slider import PrioritySlider
+    self.cb_generation_priority = PrioritySlider()
+    self.cb_generation_priority.currentIndexChanged.connect(self._change_priority)
     self.cb_generation_priority.setToolTip(
         "Низкий ограничивает параллельные задачи двумя и понижает приоритет "
-        "рабочих потоков и ffmpeg. Обычный использует заданное число потоков.")
-    priority_row.addWidget(self.cb_generation_priority)
-    priority_row.addStretch()
+        "рабочих потоков и ffmpeg. Обычный использует заданное число потоков. "
+        "Приоритет можно менять во время генерации; начатые задачи завершаются.")
     self.queue_list = _api.QListWidget()
     self.queue_list.setMaximumHeight(100)
     self.queue_list.setVisible(False)
@@ -200,7 +202,8 @@ def _build_actions(self) -> _api.QWidget:
         "Что именно отобрано в пак: тема, раунд, аниме, песня, род вопроса и "
         "цена. После генерации открывается в отдельном окне.")
     self.btn_table.clicked.connect(self._toggle_table)
-    v.addLayout(priority_row)
+    v.addWidget(_api.QLabel("Приоритет генерации:"))
+    v.addWidget(self.cb_generation_priority)
     v.addWidget(self.btn_start)
     v.addWidget(self.queue_list)
     v.addWidget(self.btn_queue_remove)

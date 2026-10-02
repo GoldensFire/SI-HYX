@@ -9,6 +9,7 @@ import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
 from urllib.parse import urlsplit
+from .character_repeat import answer_keys, character_keys, manifest_keys
 
 
 def _host_matches(value: str, domain: str) -> bool:
@@ -82,6 +83,8 @@ def read_exact_keys(path: str) -> set[tuple]:
     keys: set[tuple] = set()
     try:
         with zipfile.ZipFile(path) as zf:
+            identities, identified_names = manifest_keys(zf)
+            keys.update(identities)
             xml_name = next((n for n in zf.namelist()
                              if n.lower().endswith("content.xml")), "")
             if not xml_name or zf.getinfo(xml_name).file_size > 20_000_000:
@@ -91,7 +94,7 @@ def read_exact_keys(path: str) -> set[tuple]:
             for question in root.iter():
                 if _local(question.tag) != "question":
                     continue
-                answers, text, refs = [], "", []
+                answers, text, refs, texts = [], "", [], []
                 precise = False
                 for node in question.iter():
                     tag = _local(node.tag)
@@ -105,7 +108,11 @@ def read_exact_keys(path: str) -> set[tuple]:
                                 refs.append((item.get("type"), item.text.strip()))
                             elif item.text and item.get("placement") != "replic":
                                 text = item.text.strip()
+                                texts.append(text)
                 if answers:
+                    characters = answer_keys(answers, texts)
+                    keys.update(characters - identified_names)
+                    precise = bool(characters)
                     song = _song_key(answers[0])
                     if song:
                         keys.add(song)
@@ -135,9 +142,11 @@ def read_exact_keys(path: str) -> set[tuple]:
     return keys
 
 
-def candidate_keys(cand, folder: str) -> set[tuple]:
-    """Отпечатки готового вопроса. Медиа уже записано в рабочую папку."""
+def known_keys(cand) -> set[tuple]:
+    """Отпечатки из метаданных: доступны без скачивания и обработки медиа."""
     keys: set[tuple] = set()
+    if cand.is_character and cand.character:
+        keys.update(character_keys(cand.character, cand.char_names))
     if cand.song and not cand.is_silent:
         song = _song_key(cand.main_answer)
         if song:
@@ -153,6 +162,12 @@ def candidate_keys(cand, folder: str) -> set[tuple]:
             keys.add(fact)
     elif cand.plot_question and cand.kind == "plot":
         keys.add(("plot-text", _norm(cand.plot_question)))
+    return keys
+
+
+def candidate_keys(cand, folder: str) -> set[tuple]:
+    """Отпечатки готового вопроса, включая хеш уже записанного медиа."""
+    keys = known_keys(cand)
     if any(key[0] in ("song", "source", "plot-fact", "plot-text")
            for key in keys):
         return keys

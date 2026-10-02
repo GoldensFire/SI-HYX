@@ -63,6 +63,14 @@ def _append_question(questions_el, cand: _api.SongCandidate, s: _api.PackSetting
 
     # ── Вопрос: текст, кадр, ролик ЛИБО аудио (фоном) с коллажем и подсказкой ─
     q_param = _api.ET.SubElement(params, "param", {"name": "question", "type": "content"})
+    if cand.is_character:
+        # Задание показывается одновременно с портретом или видео появления.
+        task = _api.ET.SubElement(q_param, "item", {"waitForFinish": "False"})
+        task.text = _api.CHAR_TASK_TEXT
+    from .entrance_content import append_question
+    if not cand.is_studio and append_question(q_param, cand):
+        _api._append_answer(params, q, cand, s)
+        return
     if cand.kind == _api.DESCRIPTION_AUDIO_KIND:
         if cand.description_audio_ext:
             audio = _api.ET.SubElement(q_param, "item", {
@@ -100,34 +108,24 @@ def _append_question(questions_el, cand: _api.SongCandidate, s: _api.PackSetting
         video = _api.ET.SubElement(q_param, "item", {
             "type": "video", "isRef": "True",
             "duration": _api.fmt_duration(s.pixel_seconds)})
-        video.text = cand.video_out
-    elif cand.is_sakuga:
-        # Вырезка анимации: ролик без звука и без подписи. Таймера у неё нет
+        video.text = cand.entrance_video or cand.video_out
+    elif cand.is_episode or cand.is_sakuga:
+        # Отрывок серии со звуком или сакуга без звука. Таймера у них нет
         # ВОВСЕ (просьба пользователя): duration не пишем, и вопрос стоит,
         # пока ведущий не перейдёт дальше, — отрывок в несколько секунд иначе
         # закрывался бы раньше, чем игроки успевают сообразить.
         video = _api.ET.SubElement(q_param, "item", {
             "type": "video", "isRef": "True"})
-        video.text = cand.video_out
+        video.text = cand.entrance_video or cand.video_out
     elif cand.is_studio:
-        # Вопрос-студия: кадры идут один за другим, и над каждым висит
-        # «Назовите студию» — надпись показывается ОДНОВРЕМЕННО со своим
-        # кадром (просьба пользователя). Почему она повторяется у каждого
-        # кадра, а не стоит одна в начале, — см. studio_question.py.
+        # Надпись показывается одновременно с каждым кадром студии.
         from .studio_question import append_items
         append_items(q_param, cand, s)
     elif cand.is_picture:
         # Вопрос-картинка: песни нет, показывается кадр тайтла либо портрет
-        # персонажа. Без duration картинка висит, пока ведущий не откроет ответ.
-        if cand.is_character:
-            # У портрета задание неочевидно: с виду это такой же кадр из аниме,
-            # и игроки называют тайтл вместо героя. Поэтому текстом ПЕРЕД
-            # картинкой и с waitForFinish="False" — задание висит на экране
-            # ровно тогда, когда виден портрет (просьба пользователя).
-            task = _api.ET.SubElement(q_param, "item", {"waitForFinish": "False"})
-            task.text = _api.CHAR_TASK_TEXT
-        frame = _api.ET.SubElement(q_param, "item", {"type": "image", "isRef": "True"})
-        frame.text = cand.frame_file
+        # персонажа. Портрет персонажа имеет четырёхсекундный таймер.
+        from .entrance_content import append_image
+        append_image(q_param, cand, cand.frame_file, 4 if cand.is_character else None)
     else:
         # Подсказка «Опенинг/Эндинг/OST» идёт ПЕРЕД дорожкой и с
         # waitForFinish="False": так текст выводится одновременно с песней и
@@ -136,9 +134,8 @@ def _append_question(questions_el, cand: _api.SongCandidate, s: _api.PackSetting
         # Поверх ролика той же надписи нет: она загородила бы картинку. Там
         # «Опенинг»/«Эндинг» уходит ведущему в реплику — он произносит это вслух
         # одновременно с видео (просьба пользователя, см. ниже).
-        hint_text = _api.HINT_LABELS.get(cand.base_kind,
-                                    _api.KIND_TITLES.get(cand.base_kind,
-                                                    cand.base_kind))
+        from .song_multi_anime import song_hint
+        hint_text = song_hint(cand)
         if cand.music_effect == "chiptune":
             hint_text += " · Chiptune"
         elif cand.music_effect == "cover":
@@ -165,7 +162,7 @@ def _append_question(questions_el, cand: _api.SongCandidate, s: _api.PackSetting
             video = _api.ET.SubElement(q_param, "item", {
                 "type": "video", "isRef": "True",
                 "duration": _api.fmt_duration(s.video_cut)})
-            video.text = cand.video_out
+            video.text = cand.entrance_video or cand.video_out
             _api._append_answer(params, q, cand, s)
             return
         # Чьё исполнение звучит — устным текстом ведущего, одновременно с

@@ -23,6 +23,7 @@ def select_songs(self) -> list:
     """Набирает ровно столько вопросов, сколько в паке, соблюдая квоты по
         типам. Медиа качаются параллельно прямо по ходу отбора."""
     total = self.s.total_questions
+    from .early_repeat import reserve as reserve_exact
     quotas = self.s.question_quotas
     from music_effects import EffectSlots
     effect_slots = EffectSlots(self.s, sum(quotas.get(k, 0) for k in _api.SONG_KINDS))
@@ -35,8 +36,19 @@ def select_songs(self) -> list:
     candidates = checked_candidates(self, self.iter_candidates())
     exhausted = False
     over_budget = False
-    from .generation_priority import parallel_limit, apply_thread_priority
+    from .generation_priority import parallel_limit
+    from .candidate_source import CandidateSource
+    from .selection_results import collect_finished
+    from .candidate_reserve import CandidateReserve, remember
+    reserve = CandidateReserve(self, quotas)
     workers = parallel_limit(self.s)
+    runtime = self._runtime
+    runtime.begin_selection()
+    fetch_media = runtime.wrap_task(
+        self._diagnostics.wrap(self._fetch_media, _api.KIND_TITLES))
+    self.log(f"Параллелизм: запрошено {self.s.parallel}, "
+             f"действующий лимит {workers} задач.")
+    self.log(f"Кодирование AV1: лимит {runtime.encoder_limit} процессов одновременно.")
     pending: dict = {}
     # Кандидат, которому место в паке есть, но прямо сейчас оно занято
     # ЗАГРУЗКОЙ. Такого не выбрасываем: дождёмся свободного потока и возьмём
@@ -48,13 +60,28 @@ def select_songs(self) -> list:
     # Пул НЕ через `with`: выход из блока ждал бы конца всех запущенных
     # загрузок, и «Стоп» отзывался бы только через десятки секунд. Здесь
     # очередь сбрасывается, а работающие ffmpeg убиваются сразу.
-    pool = _api.ThreadPoolExecutor(max_workers=workers,
-                              thread_name_prefix="animepack",
-                              initializer=apply_thread_priority,
-                              initargs=(self.s,))
+    source = CandidateSource(self, candidates)
+    pool = _api.ThreadPoolExecutor(max_workers=runtime.worker_capacity,
+                                  thread_name_prefix="animepack")
+    self._defer_cache_writes = True
     try:
         try:
             while not self.stopped():
+                workers = parallel_limit(self.s)
+                done = [future for future in pending if future.done()]
+                over_budget = collect_finished(
+                    self, done, pending, accepted, counts, inflight, levels,
+                    quotas, effect_slots, deferred, total, reserve)
+                if over_budget:
+                    mb = self._bytes_used / (1024.0 * 1024.0)
+                    self.log(
+                        f"Пак упрётся в потолок {self.s.max_pack_mb} МБ: "
+                        f"останавливаюсь на {len(accepted)} вопросах из "
+                        f"{total} ({mb:.1f} МБ набрано). Дайте паку больше "
+                        "мегабайт или ужмите медиа.")
+                    break
+                if len(accepted) >= total:
+                    break
                 # Род вопросов мог отвалиться совсем (кончился ключ Gemini) —
                 # его места надо отдать остальным ДО того, как просить
                 # следующего кандидата.
@@ -62,8 +89,12 @@ def select_songs(self) -> list:
                     self._share_out_dead(quotas, counts, inflight)
                     effect_slots.expand(self.s, sum(quotas.get(k, 0) for k in _api.SONG_KINDS))
                     self._manga_mix.sync(quotas.get(_api.MANGA_KIND, 0))
+                self._song_lookup_needed = any(
+                    quotas.get(kind, 0) > counts[kind]
+                    for kind in _api.SONG_KINDS + (_api.VIDEO_KIND,)
+                    if kind not in self._dead_kinds)
                 # Досыпаем задач, пока есть куда: набранное + в работе < нужного.
-                while ((not exhausted or deferred)
+                while ((not exhausted or deferred or reserve)
                        and len(accepted) + sum(inflight.values()) < total
                        and len(pending) < workers * 2
                        and any(quotas[k] > counts[k] + inflight[k]
@@ -71,12 +102,18 @@ def select_songs(self) -> list:
                     # Проверяем на КАЖДОМ кандидате, а не раз за круг: этот
                     # цикл не выходит наружу, пока есть кого просить, и
                     # каталог книг успел бы вычерпаться целиком.
+                    if any(future.done() for future in pending):
+                        break
+                    workers = parallel_limit(self.s)
                     self._close_spent_streams(quotas, counts)
                     if deferred:
                         cand = deferred.pop()
                     else:
-                        with self._timed("поиск кандидатов"):
-                            cand = next(candidates, None)
+                        cand = reserve.take(counts, inflight, quotas)
+                        if cand is None:
+                            if exhausted or not source.request().done():
+                                break
+                            cand = source.take()
                     if cand is not None and cand.is_manga:
                         # Сколько книг каталог уже отдал: по этому счёту
                         # решается, не пора ли перейти на отложенных (см.
@@ -100,16 +137,22 @@ def select_songs(self) -> list:
                             # середине (см. _take_level_bench).
                             bench = self._take_level_bench(levels, pending.values())
                         if bench:
-                            candidates = iter(bench)
+                            # Запас и книжная скамейка могут хранить один
+                            # объект. Передаём его источнику только один раз.
+                            for returned in bench:
+                                reserve.withdraw(returned)
+                            source.replace(bench)
                             continue
                         exhausted = True
                         break
+                    reserve.withdraw(cand)
                     if not self._rebook_candidate(cand):
                         # Пока кандидат лежал на скамейке, его серию занял
                         # другой тайтл — двух вопросов из одной серии в паке
                         # быть не должно.
                         self._drops["франшизу заняли, пока кандидат ждал"] += 1
                         continue
+                    remember(cand)
                     kind = self._pick_kind(cand, counts, inflight, quotas)
                     if kind is None:
                         # Мест под этот тайтл нет — но почему? Если они заняты
@@ -126,6 +169,7 @@ def select_songs(self) -> list:
                         # держим, она ещё пригодится другому тайтлу серии.
                         self._drops["мест под такой тайтл уже не осталось"] += 1
                         self._release_candidate(cand)
+                        reserve.park(cand)
                         continue        # квоты подходящих типов уже заняты
                     from .title_selection import TITLE_QUESTION_KINDS
                     variant = getattr(cand, "_title_variant", None)
@@ -139,85 +183,32 @@ def select_songs(self) -> list:
                         self._bench_candidate(cand)
                         continue        # средняя сложность уехала бы дальше
                     cand.kind = kind    # в смешанном режиме тип мог смениться
+                    if not reserve_exact(self, cand):
+                        if getattr(cand, "_exact_waiting", False):
+                            deferred.append(cand)
+                            break
+                        self._drops["тот же вопрос — отсечён до загрузки"] += 1
+                        self._release_candidate(cand)
+                        reserve.park(cand, failed=True)
+                        continue
                     if kind in _api.SONG_KINDS:
                         effect_slots.reserve(cand)
                     inflight[kind] += 1
                     self._tries[kind] += 1
                     self._manga_mix.reserve(cand)
-                    pending[pool.submit(self._fetch_media, cand)] = cand
-                if not pending:
-                    break
-                # timeout: без него цикл спал бы до конца первой загрузки и
-                # не замечал нажатого «Стоп» по полминуты.
-                done, _ = _api.wait(list(pending), timeout=0.3,
-                               return_when=_api.FIRST_COMPLETED)
-                for fut in done:
-                    cand = pending.pop(fut)
-                    inflight[cand.kind] -= 1
-                    try:
-                        ok = fut.result()
-                    except Exception as e:  # noqa: BLE001
-                        self.log(f"Загрузка сорвалась: {e}")
-                        ok = False
-                    if not ok:
-                        self._manga_mix.release(cand)
-                        self._release_candidate(cand)
-                        if cand.music_slot >= 0:
-                            effect_slots.release(cand)
-                        # Отвергнутый по средней сложности — не «не
-                        # скачалось»: медиа мы даже не трогали.
-                        if cand.rejected:
-                            self._rejected_media += 1
-                        else:
-                            self._failed_media += 1
+                    cand._queued_at = _api.time.monotonic()
+                    pending[pool.submit(fetch_media, cand)] = cand
+                waiting = list(pending)
+                if source.future is not None and not source.future.done():
+                    waiting.append(source.future)
+                if not waiting:
+                    if exhausted and reserve.redistribute(quotas, counts):
+                        effect_slots.expand(self.s, sum(
+                            quotas.get(k, 0) for k in _api.SONG_KINDS))
+                        self._manga_mix.sync(quotas.get(_api.MANGA_KIND, 0))
                         continue
-                    if len(accepted) >= total or counts[cand.kind] >= quotas.get(cand.kind, 0):
-                        self._late["пока качали, место занял другой"] += 1
-                        self._manga_mix.release(cand)
-                        self._release_candidate(cand)
-                        # Слот способа подачи возвращаем ОБЯЗАТЕЛЬНО: вопрос
-                        # готов, а места ему не нашлось, и это не неудача
-                        # эффекта. Без этого слоты утекали, и на последних
-                        # вопросах пака reserve оставался без свободных.
-                        if cand.music_slot >= 0:
-                            effect_slots.give_back(cand)
-                        continue        # пока качали, место уже заняли
-                    if self._exact_keys:
-                        from .exact_repeat import candidate_keys
-                        keys = candidate_keys(cand, self.folder)
-                        if keys & (self._exact_keys | self._exact_seen):
-                            self._late["тот же вопрос в выбранных паках"] += 1
-                            self._manga_mix.release(cand)
-                            self._release_candidate(cand)
-                            if cand.music_slot >= 0:
-                                effect_slots.give_back(cand)
-                            continue
-                        self._exact_seen.update(keys)
-                    if cand.music_slot >= 0:
-                        effect_slots.succeed(cand)
-                    accepted.append(cand)
-                    self._remember_level(cand, levels)
-                    self._remember_char_level(cand)
-                    counts[cand.kind] += 1
-                    self._bytes_used += self._media_size(cand)
-                    # Название тайтла на прогресс-баре не пишем (просьба
-                    # пользователя): в лог оно и так идёт, а на баре нужны
-                    # счётчик, оставшееся время и то, чем генератор занят
-                    # прямо сейчас — «Сакуга», «Кадр», «Манга».
-                    self._progress(len(accepted), total, _busy(inflight))
-                    if self._over_budget(len(accepted), total):
-                        over_budget = True
-                        break
-                if over_budget:
-                    mb = self._bytes_used / (1024.0 * 1024.0)
-                    self.log(
-                        f"Пак упрётся в потолок {self.s.max_pack_mb} МБ: "
-                        f"останавливаюсь на {len(accepted)} вопросах из "
-                        f"{total} ({mb:.1f} МБ набрано). Дайте паку больше "
-                        "мегабайт или ужмите медиа.")
                     break
-                if len(accepted) >= total:
-                    break
+                _api.wait(waiting, timeout=0.1, return_when=_api.FIRST_COMPLETED)
         finally:
             for fut in pending:
                 fut.cancel()
@@ -227,15 +218,21 @@ def select_songs(self) -> list:
         # нельзя, поэтому обязательно дожидаемся его выхода. Иначе он успевает
         # менять общий кэш во время save(), а cleanup удаляет Images у него из
         # под ног — отсюда шли обе ошибки живого прогона.
+        runtime.end_selection()
         self.stop_processes()
-        pool.shutdown(wait=True, cancel_futures=True)
-
-    # Всё, что приехало с Shikimori за этот отбор, сохраняем на диск. Само по
-    # себе это дёшево (без изменений save() ничего не делает), а нужно из-за
-    # старых карточек манги: их перезапрашивает _mangas_by_ids, и без этой
-    # строки свежие карточки жили бы только до конца генерации — следующий
-    # прогон спрашивал бы их заново.
-    self.db_cache.save()
+        try:
+            source.close()
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+            with self._exact_lock:
+                self._exact_pending.clear()
+            # Include new metadata on success, cancellation and exceptions.
+            # No producers can still mutate it or trigger another checkpoint.
+            self._defer_cache_writes = False
+            self.db_cache.save()
+    if reserve.returned:
+        self.log(f"Из сохранённого запаса вернулись в отбор: "
+                 f"{reserve.returned} кандидатов.")
 
     if self.s.only_kind:
         self.log(f"Отобрано тайтлов: {len(accepted)} из {total}")
@@ -408,12 +405,15 @@ def write_package(self, songs: list, out_path: _api.Optional[str] = None) -> str
                   if (not c.is_silent or c.kind == _api.DESCRIPTION_AUDIO_KIND)
                   and not c.has_video}
     # Ролик — и с AnimeThemes, и собранный из кадра (вопрос-пиксели).
-    used_video = {c.video_out for c in songs if c.has_video}
+    used_video = {c.entrance_video or c.video_out for c in songs if c.has_video}
+    used_video |= {name for c in songs for name in c.entrance_frames.values()}
     used_images = {c.poster_file for c in songs if c.has_poster}
     used_images |= {c.collage_file for c in songs if c.has_collage}
-    used_images |= {c.frame_file for c in songs if c.has_frame}
+    used_images |= {c.frame_file for c in songs if c.has_frame
+                    and c.frame_file not in c.entrance_frames}
     # У вопроса-студии кадров несколько, и в пак обязаны попасть все.
-    used_images |= {name for c in songs for name in c.extra_frames if name}
+    used_images |= {name for c in songs for name in c.extra_frames
+                    if name and name not in c.entrance_frames}
 
     if out_path:
         target = Path(out_path)
@@ -449,6 +449,10 @@ def write_package(self, songs: list, out_path: _api.Optional[str] = None) -> str
         covers = covers_manifest(songs, self.s)
         if covers:
             zf.writestr("covers.json", covers, _api.zipfile.ZIP_DEFLATED)
+        episodes = [{"file": c.video_out, **c.episode_clip} for c in songs if c.episode_clip]
+        if episodes:
+            zf.writestr("episodes.json", _api.json.dumps(episodes, ensure_ascii=False, indent=2),
+                        _api.zipfile.ZIP_DEFLATED)
         # Список спрошенного: по нему следующий пак узнаёт франшизы этого,
         # даже когда ответом стояло не название тайтла (см. pack_manifest).
         from .pack_manifest import MANIFEST_NAME, build as build_manifest
@@ -466,6 +470,9 @@ def write_package(self, songs: list, out_path: _api.Optional[str] = None) -> str
 
 def cleanup(self) -> None:
     self.stop_processes()
+    kuhi = getattr(self, "kuhi", None)
+    if kuhi is not None:
+        kuhi.close()
     service = getattr(self, "_cover_service", None)
     if service is not None:
         service.close()

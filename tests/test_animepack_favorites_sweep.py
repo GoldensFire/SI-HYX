@@ -46,7 +46,7 @@ def test_targets_go_from_the_loudest_titles_down():
 
 # ── сам обход ───────────────────────────────────────────────────────────────
 class _Shiki:
-    """Shikimori, который умеет только отдавать «в избранном»."""
+    """Favorites plus the separate empty popularity reference census."""
 
     def __init__(self, stop_after=None, on_ask=None):
         self.asked = []
@@ -61,6 +61,9 @@ class _Shiki:
 
     def random_animes(self, page, **_kw):
         raise AssertionError("«в избранном» каталог не трогает")
+
+    def random_mangas(self, page, **_kw):
+        return []  # Independent reference census follows updated favorites.
 
     def franchise_parts(self, keys):
         raise AssertionError("«в избранном» франшизы не трогает")

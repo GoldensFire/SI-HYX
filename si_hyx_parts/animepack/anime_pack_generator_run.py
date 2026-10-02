@@ -89,6 +89,8 @@ def run(self, out_path: _api.Optional[str] = None) -> _api.PackResult:
         # Цена прогона в запросах к Gemini — перед раскладкой времени: по ней
         # видно, во сколько запросов обошлись вопросы по сюжету и загадки.
         self.log_gemini_spent()
+        from .local_visual_ocr import summary as log_ocr_summary
+        log_ocr_summary(self)
         # Раскладка времени по этапам — в самом конце, чтобы её было видно
         # последней строкой лога (просьба пользователя).
         self.log_stage_times(result.elapsed)

@@ -234,14 +234,16 @@ def assign_prices(songs: list, s: _api.PackSettings) -> list:
             parts.add_mult(lines, f"Студия (×{_api.STUDIO_PRICE_MULT:g})",
                            int(round(mean)), studio)
             base = studio
-        if cand.is_silent:
+        if cand.is_video:
+            # Видеоряд позволяет узнать тайтл по картинке: цена как у кадра.
+            step = 0
+        elif cand.is_silent:
             # Манге надбавка положена, только пока её знают по экранизации: у
             # книги без аниме цена и так посчитана по своей, книжной шкале.
             step = (0 if (cand.is_manga and not cand.adapted_from)
                     else _api._SILENT_PRICE_STEP.get(cand.kind, 0))
             parts.add_step(lines, _api.KIND_TITLES.get(cand.kind, cand.kind), step)
         else:
-            # У ролика надбавка та же, что у его песни: опенинг он или эндинг.
             # Надбавка за музыку считает песню и кавер вместе (одни и те же
             # десять очков на обе, см. cover_difficulty).
             kind_step = _api._KIND_PRICE_STEP.get(cand.base_kind, 0)

@@ -43,14 +43,12 @@ CHAPTER_LIMIT = 100
 # заходов за страницами делаем на тайтл всего: раздача страниц лимитируется
 # строже остального API, и перебирать её без счёта нельзя.
 CHAPTER_TRIES = 3
-PAGE_TRIES = 4
+PAGE_TRIES = 9
 # На каком языке брать главу, когда язык не задан («Любой»). Порядок не
 # случайный: перевод на MangaDex бывает на трёх десятках языков, и без этого
-# списка «Ван-Пис» приезжал каталанским разворотом. Русский лучше всего, дальше
-# английский, дальше оригинал; чего нет — то и берём, лишь бы вопрос состоялся.
-LANGUAGE_ORDER = ("ru", "en", "ja")
-# Сколько объявленных языков перебираем, прежде чем спросить ленту без фильтра.
-LANGUAGE_TRIES = 3
+# списка «Ван-Пис» приезжал каталанским разворотом. После русского пробуем
+# английский и украинский; другие языки требуют явного выбора.
+LANGUAGE_ORDER = ("ru", "en", "uk")
 # Сколько лент (карточка + язык) спрашиваем на тайтл всего: без потолка редкий
 # многоязычный тайтл выедал бы лимит запросов MangaDex в одиночку.
 FEED_TRIES = 6
@@ -113,11 +111,13 @@ class MangaDexApi:
         # глав ДО запроса ленты. Без этого лента отдаёт первую сотню глав со
         # всех языков сразу, и «Ван-Пис» приезжал португальским разворотом.
         self._langs: dict[str, list[str]] = {}
+        self._titles_by_id: dict[str, list[str]] = {}
         self._chapters: dict[tuple[str, str], list[str]] = {}
         # Глава, из которой взят последний разворот: её адрес уходит последней
         # строкой ответа (просьба пользователя — видеть источник вопроса).
         # Читается сразу после panel_url, под тем же замком, что и выбор.
         self.last_chapter: str = ""
+        self.last_titles: list[str] = []
         self._lock = _api.threading.Lock()
 
     # ── сеть ──────────────────────────────────────────────────────────────
@@ -194,6 +194,7 @@ class MangaDexApi:
                 "availableTranslatedLanguages") or []
             with self._lock:
                 self._langs[manga_id] = [str(lang) for lang in langs if lang]
+                self._titles_by_id[manga_id] = _titles(row.get("attributes") or {})
             return
 
     @staticmethod
@@ -204,6 +205,8 @@ class MangaDexApi:
             link = str((attrs.get("links") or {}).get("mal") or "").strip()
             if mal and link and link == str(mal):
                 return str(row.get("id") or "")
+            if mal and link and link != str(mal):
+                continue
             if not by_title and wanted:
                 if any(_norm(t) in wanted for t in _titles(attrs)):
                     by_title = str(row.get("id") or "")
@@ -233,6 +236,8 @@ class MangaDexApi:
             if not isinstance(row, dict):
                 continue
             attrs = row.get("attributes") or {}
+            if lang and attrs.get("translatedLanguage", lang) != lang:
+                continue
             # Глава, которая лежит не на MangaDex (Manga Plus, Viz), приходит
             # с externalUrl и нулём страниц — читать её нам нечем.
             if attrs.get("externalUrl"):
@@ -252,20 +257,12 @@ class MangaDexApi:
     def languages(self, manga_id: str) -> list[str]:
         """Языки глав по предпочтению — их и пробуем один за другим.
 
-        Одного выбора языка мало: у «Ван-Писа» русские главы объявлены, но все
-        до одной лежат на стороне (Manga Plus), и лента по ним пуста. Поэтому
-        порядок такой: сперва русский, английский и оригинал (какие вообще
-        объявлены), потом остальные объявленные языки, а последним заходом —
-        лента без фильтра вовсе. Заданный язык отменяет весь перебор: раз
-        человек попросил именно его, подсовывать другой нельзя."""
+        Пустая русская лента уступает английской, затем украинской. Ленту без
+        фильтра не берём: она может вернуть перевод на произвольном языке.
+        Явно заданный язык отменяет перебор."""
         if self.language:
             return [self.language]
-        with self._lock:
-            have = [str(lang) for lang
-                    in self._langs.get(str(manga_id or ""), []) if lang]
-        ordered = [lang for lang in LANGUAGE_ORDER if lang in have]
-        ordered += [lang for lang in have if lang not in ordered]
-        return ordered[:LANGUAGE_TRIES] + [""]
+        return list(LANGUAGE_ORDER)
 
     def _plan(self, manga_id: str) -> list[tuple[str, str]]:
         """Пары «карточка, язык» в том порядке, в каком их стоит просить.
@@ -283,12 +280,6 @@ class MangaDexApi:
         pairs.sort(key=lambda pair: rank.get(
             pair[1], len(rank) if pair[1] else unfiltered))
         plan = pairs[:FEED_TRIES]
-        # Лента карточки БЕЗ фильтра языка обязана остаться в плане: у
-        # «Ван-Писа» все объявленные языки лежат на стороне (Manga Plus), и без
-        # этого захода вопроса не выходило вовсе.
-        tail = (entry, "")
-        if tail in pairs and tail not in plan:
-            plan[-1] = tail
         return plan
 
     def page_urls(self, chapter_id: str) -> list[str]:
@@ -310,13 +301,14 @@ class MangaDexApi:
         пропускаются: один и тот же тайтл в разных паках спрашивается разными
         разворотами. Язык при этом не случаен (см. languages).
 
-        Языки перебираются до самого конца, а не до первого непустого: у
-        «Ван-Писа» английская глава в ленте ровно одна, и страниц у неё нет —
-        остановись мы на ней, вопроса не вышло бы, хотя каталанских глав там
-        сотня. Число заходов за страницами ограничено PAGE_TRIES: раздача
+        Пустая глава не останавливает перебор русского, английского и
+        украинского переводов. Число заходов ограничено PAGE_TRIES: раздача
         страниц лимитируется строже всего остального API."""
         manga = self.manga_id(card)
         self.last_chapter = ""
+        self.last_page_info = {}
+        with self._lock:
+            self.last_titles = list(self._titles_by_id.get(manga, []))
         if not manga:
             return ""
         blocked = {str(u).split("?")[0] for u in excluded}
@@ -334,7 +326,12 @@ class MangaDexApi:
                 free = [u for u in body if u.split("?")[0] not in blocked]
                 if free:
                     self.last_chapter = str(chapter)
-                    return self.rng.choice(free)
+                    url = self.rng.choice(free)
+                    index = urls.index(url)
+                    self.last_page_info = {"neighbors": [
+                        {"url": urls[index + step], "offset": step} for step in (-1, 1)
+                        if 0 <= index + step < len(urls)]}
+                    return url
         return ""
 
 

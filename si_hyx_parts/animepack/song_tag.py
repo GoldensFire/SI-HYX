@@ -134,7 +134,7 @@ def filter_anime(anime: dict, s: _api.PackSettings, manga: bool = False) -> bool
         return False
     kind = str(anime.get("kind") or "").lower()
     if manga:
-        if not s.manga_kinds.get(kind, False):
+        if kind not in _api.MANGA_KINDS or not s.manga_kinds.get(kind, False):
             return False
     else:
         # Скриншоты нужны, только если из них собирается коллаж (ASPG требовал

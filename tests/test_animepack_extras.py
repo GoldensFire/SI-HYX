@@ -356,7 +356,7 @@ def test_character_answer_keeps_the_title_when_nothing_earlier():
     assert cand.mal_id == 1535
 
 
-def test_character_answer_prefers_a_full_tv_series_over_earlier_promos():
+def test_character_answer_uses_earlier_special_but_excludes_promos():
     gen = _gen(PackSettings())
     cand = make_candidate(anime={"malId": 999, "id": 999,
                                  "russian": "Поздний сезон"})
@@ -369,10 +369,10 @@ def test_character_answer_prefers_a_full_tv_series_over_earlier_promos():
             {"id": 3, "kind": "tv", "aired_on": "2015-01-01"},
         ], "mangas": []}
     gen.shikimori.animes_by_ids = lambda ids: [
-        make_anime(malId=3, id=3, russian="Полноценный сериал")]
+        make_anime(malId=2, id=2, russian="Первый спешл")]
     gen._use_first_title(cand)
-    assert cand.mal_id == 3
-    assert cand.main_answer.startswith("Полноценный сериал (")
+    assert cand.mal_id == 2
+    assert cand.main_answer.startswith("Первый спешл (")
 
 
 # ── Время по этапам и мелочи настроек ───────────────────────────────────────
@@ -417,7 +417,8 @@ def test_stage_percent_counts_wall_clock_not_thread_seconds():
     row = next(l for l in lines if "картинки" in l)
     # 90 секунд по часам из 180 — это половина, а не 267%.
     assert "50%" in row
-    assert "8 потоков суммарно" in row
+    assert "суммарно по задачам" in row
+    assert "максимум одновременно 8" in row
 
 
 def test_user_list_roundtrip_keeps_target_share_and_music():

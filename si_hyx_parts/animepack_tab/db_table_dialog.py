@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
 import animepack_tab as api
 
 from .db_part_blocks import build_blocks
+from .manga_refresh_controls import MANGA_PARTS
 from .db_table_view import Page, build_cells
 
 TITLE_HEADERS = ("Место", "Название", "Тип", "Год", "Оценка", "База",
@@ -85,6 +86,7 @@ class DbTableDialog(QDialog):
         self._title_rows: dict = {}
         self._filled: set = set()
         self._pending: set = set()
+        self._filter_kinds = {"anime": None, "manga": None}
         self.setWindowTitle("База Shikimori: что в ней и как её обновить")
         self.resize(1050, 700)
         # Один поток на всю панель: разбор вкладок ходит по одному и тому же
@@ -101,6 +103,12 @@ class DbTableDialog(QDialog):
         for block in self.blocks.values():
             blocks_row.addWidget(block, 1)
         layout.addLayout(blocks_row)
+        filter_row = QHBoxLayout()
+        filter_row.addStretch()
+        self.btn_filters = QPushButton("Фильтры…")
+        self.btn_filters.clicked.connect(self._open_filters)
+        filter_row.addWidget(self.btn_filters)
+        layout.addLayout(filter_row)
         self.tabs = QTabWidget()
         from . import db_rows
         self.anime = Page(TITLE_HEADERS, db_rows.explain_title,
@@ -122,7 +130,8 @@ class DbTableDialog(QDialog):
         row = QHBoxLayout()
         self.btn_all = QPushButton("Обновить всю базу")
         self.btn_all.setToolTip(
-            "Каталог аниме, каталог манги и узнаваемость франшиз подряд — то "
+            "Каталог аниме, каталог манги, популярность ReManga и MangaLib "
+            "и узнаваемость франшиз подряд — то "
             "же самое, что делала прежняя кнопка «Обновить базу Shikimori». "
             "Идти может десятки минут; остановить можно там же, а набранное "
             "останется в базе.\n"
@@ -151,8 +160,8 @@ class DbTableDialog(QDialog):
         # Кнопка обещает обновить ВСЮ базу независимо от текущего состава
         # пака. ``None`` здесь оставляло мангу нетронутой, когда её доля в
         # настройках была нулевой, хотя подпись и подсказка говорили обратное.
-        parts = (("anime", "manga", "franchises")
-                 if part == "all" else (part,))
+        parts = (("anime", *MANGA_PARTS, "franchises") if part == "all" else
+                 MANGA_PARTS if part == "manga_all" else (part,))
         self._tab._refresh_db(parts)
         self.sync_state()
 
@@ -162,8 +171,9 @@ class DbTableDialog(QDialog):
         active = set(getattr(self._tab, "_db_parts", ()) or ())
         for part, block in self.blocks.items():
             row = self._counts.get(part) or {}
+            collecting = part in active or (part == "manga" and bool(active & set(MANGA_PARTS)))
             block.set_state(row.get("count", 0), row.get("fetched", 0.0),
-                            running and part in active, running)
+                            running and collecting, running)
         self.btn_all.setEnabled(not running)
 
     def refresh(self):
@@ -176,7 +186,7 @@ class DbTableDialog(QDialog):
         for page in (self.anime, self.manga, self.chars):
             page.set_busy("Читаю базу…")
         self.sync_state()
-        self._start(("counts", self._book_kinds()))
+        self._start(("counts", self._filters_snapshot()))
         self._fill_current()
 
     def closeEvent(self, event):             # noqa: N802 — имя из Qt
@@ -241,14 +251,14 @@ class DbTableDialog(QDialog):
                     (self.anime, self.manga, self.chars))
                 target = task[1]
                 self._pending.add(target)
-                self._start(("page", target, self._book_kinds(), True))
+                self._start(("page", target, self._filters_snapshot(), True))
             return
         if task[0] == "character":
             self._pending.discard(task)
             if result is not None:
                 self._filled.discard(self.chars)
                 self._pending.add("chars")
-                self._start(("page", "chars", self._book_kinds(), True))
+                self._start(("page", "chars", self._filters_snapshot(), True))
             return
         self._pending.discard(task[1])
         page = self._page_for(task[1])
@@ -300,20 +310,16 @@ class DbTableDialog(QDialog):
             return
         self._pending.add(target)
         page.set_busy("Собираю таблицу…")
-        self._start(("page", target, self._book_kinds()))
+        self._start(("page", target, self._filters_snapshot()))
 
     # ── разбор кэша (всё это идёт в рабочем потоке) ───────────────────────
     def _read_counts(self, kinds) -> dict:
         self._cache.reload()              # базу собирает другой экземпляр кэша
-        counts = dict(self._cache.part_counts())
-        # Каталог книг считаем по включённым родам — ровно то, что показывает
-        # таблица: иначе блок обещал бы 48 тысяч карточек, а в таблице их было
-        # бы шесть тысяч (см. _book_kinds).
-        if kinds is not None and "manga" in counts:
-            from . import db_rows
-            counts["manga"] = dict(counts["manga"], count=len(
-                db_rows.filter_kinds(self._cache.all_cards("manga"), kinds)))
-        return counts
+        # Один рабочий поток: прежний расчёт уже завершился. Он мог вернуть
+        # старые строки в кэш после refresh(), пока ещё читал прежнюю базу.
+        self._title_rows = {}
+        # Блоки показывают всю базу; выбранные фильтры относятся к таблицам.
+        return dict(self._cache.part_counts())
 
     def _read_page(self, target: str, kinds):
         from . import db_rows
@@ -410,30 +416,28 @@ class DbTableDialog(QDialog):
         """Разбор каталога с оглядкой на уже посчитанное: тайтлы нужны и
         вкладке персонажей — их уровень берётся у их же тайтлов.
 
-        Роды изданий — только у книг: у аниме своя колода типов («tv»,
-        «movie»…), и книжный фильтр вычищал из таблицы аниме ВСЁ подряд."""
+        Аниме и книги используют собственные независимые фильтры типов."""
         if target not in self._title_rows:
             from . import db_rows
             self._title_rows[target] = db_rows.title_rows(
-                self._cache, target, kinds if target == "manga" else None)
+                self._cache, target, kinds.get(target) if kinds else None)
         return self._title_rows[target]
 
-    def _book_kinds(self):
-        """Роды изданий, включённые сейчас в настройках пака (None — все).
+    def _filters_snapshot(self):
+        """Снимок собственных фильтров для расчёта таблиц в рабочем потоке."""
+        return dict(self._filter_kinds)
 
-        База копится месяцами: мешок, набранный со включёнными ранобэ, никуда
-        из неё не девается, и семь тысяч ранобэ висели в таблице каталога книг,
-        хотя вопросом стать уже не могут (просьба пользователя). Показываем то,
-        из чего пак и правда собирается."""
-        collect = getattr(self._tab, "collect", None)
-        if collect is None:
-            return None
-        try:
-            kinds = getattr(collect(), "manga_kinds", None) or {}
-        except Exception:      # noqa: BLE001 — панель живёт и без настроек
-            return None
-        allowed = {str(k) for k, on in kinds.items() if on}
-        return allowed or None
+    def _open_filters(self):
+        from .db_filters import DbFiltersDialog
+        dialog = DbFiltersDialog(self._filter_kinds, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._set_filters(dialog.values())
+
+    def _set_filters(self, filters):
+        self._filter_kinds = dict(filters)
+        active = any(value is not None for value in filters.values())
+        self.btn_filters.setText("Фильтры (включены)…" if active else "Фильтры…")
+        self.refresh()
 
 
 def _kind_label(kind: str) -> str:

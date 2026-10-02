@@ -119,7 +119,7 @@ def download_images(self, cand: _api.SongCandidate) -> None:
     if cand.is_text or cand.kind in (_api.DESCRIPTION_AUDIO_KIND,
                                      _api.AI_ART_KIND, _api.PIXIV_ART_KIND,
                                      _api.MANGA_KIND,
-                                     _api.SAKUGA_KIND):
+                                     _api.SAKUGA_KIND, _api.EPISODE_KIND):
         # Анаграмме и вопросу по сюжету картинка не нужна вовсе: весь вопрос
         # — текст. Страница манги, уличный снимок, вырезка анимации и кадры
         # вопроса-студии (их несколько) к этому часу уже скачаны своими
@@ -321,7 +321,9 @@ def download_video(self, cand: _api.SongCandidate) -> bool:
         with self._video_lock:
             code, err = self._run_killable(cmd, timeout=600)
         size = _api.os.path.getsize(final) if _api.os.path.exists(final) else 0
-        if code == 0 and size >= _api.MIN_VIDEO_BYTES:
+        broken_stream = any(text in err.casefold() for text in
+                            ("file ended prematurely", "stream ends prematurely"))
+        if code == 0 and size >= _api.MIN_VIDEO_BYTES and not broken_stream:
             cand.has_video = True
             return True
         # Оборванный вход ffmpeg не считает ошибкой: код ноль, а в файле
@@ -334,6 +336,8 @@ def download_video(self, cand: _api.SongCandidate) -> bool:
         if attempt < _api.VIDEO_RETRIES:
             _api.time.sleep(_api.VIDEO_RETRY_PAUSE * (attempt + 1))
     if not self.stopped():
-        self.log(f"Ролик «{cand.title_ru}» не вышел, беру звук: "
-                 f"{(err or 'пустой файл').strip()[:160]}")
+        reason = ("поток AnimeThemes оборвался до конца ролика"
+                  if broken_stream else (err or "пустой файл").strip()[:160])
+        self.log(f"Ролик «{cand.title_ru}» не получен: {reason}. "
+                 f"После {_api.VIDEO_RETRIES + 1} попыток беру аудио песни.")
     return False

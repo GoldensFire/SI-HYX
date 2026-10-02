@@ -134,30 +134,28 @@ def test_chosen_language_is_the_only_one_asked(fake_session, fake_response):
     assert feeds == [["ru"]]
 
 
-def test_language_order_prefers_russian_english_original_then_anything(
+def test_language_order_prefers_russian_english_then_ukrainian(
         fake_session, fake_response):
     session = _mangadex_session(fake_session, fake_response,
                                 langs=("ca", "en", "ja", "pt-br", "ru"))
     api = MangaDexApi(session, rng=random.Random(1))
     manga = api.manga_id(_card())
-    # Последним заходом идёт лента без фильтра вовсе — на случай, когда у всех
-    # объявленных языков главы лежат на стороне.
-    assert api.languages(manga) == ["ru", "en", "ja", ""]
+    assert api.languages(manga) == ["ru", "en", "uk"]
 
 
 def test_next_language_is_tried_when_the_chapter_has_no_pages(fake_session,
                                                               fake_response):
     # «Ван-Пис»: русская лента пуста, английская глава ровно одна и без
-    # страниц, а каталанских глав сотня — вопрос обязан состояться.
+    # страниц, а украинская глава доступна — вопрос обязан состояться.
     feeds = {
         "ru": {"data": []},
         "en": {"data": [{"id": "dead", "attributes": {"pages": 20,
                                                       "chapter": "1"}}]},
-        "ca": {"data": [{"id": "alive", "attributes": {"pages": 16,
+        "uk": {"data": [{"id": "alive", "attributes": {"pages": 16,
                                                        "chapter": "1"}}]},
     }
     session = _mangadex_session(fake_session, fake_response,
-                                langs=("ru", "en", "ca"), feeds=feeds,
+                                langs=("ru", "en", "uk"), feeds=feeds,
                                 empty_chapters=("dead",))
     api = MangaDexApi(session, rng=random.Random(1))
     assert api.panel_url(_card()).startswith("https://cdn.md/data/abc/")

@@ -288,22 +288,15 @@ def _build_center_area(self):
         "Вшивается при «Обрезать» (перекодировка)")
     self.btn_image_overlay.clicked.connect(self.add_image_overlay)
     self.btn_image_overlay.setEnabled(False)
-    self.btn_delete_source = _api.make_icon_btn("", danger=True)
-    self.btn_delete_source.setIcon(_api.get_icon('fa5s.trash-alt', color='#11111b'))
-    self.btn_delete_source.setIconSize(_api.QSize(18, 18))
-    self._relax_width(self.btn_delete_source)
-    self.btn_delete_source.setToolTip("Удалить исходный файл с диска (без возможности отмены)")
-    self.btn_delete_source.clicked.connect(self.delete_source_file)
-    self.btn_delete_source.setEnabled(False)
+    self._build_more_actions()
 
     # Две колонки по 4 квадратные кнопки (место под 8 штук) — левая и правая,
     # каждая прижата к низу (симметрично высоте шкалы уровня звука справа).
-    # Правая колонка нарочно короче: «Удалить исходник» (опасная, красная)
-    # держим самой нижней — как и раньше в одной колонке.
+    # Дополнительные действия собраны в нижней кнопке с тремя точками.
     self._montage_side_btns = [self.btn_crop_frame, self.btn_pixelize,
                                self.btn_save_frame, self.btn_remove_object,
                                self.btn_create_subs, self.btn_track_object,
-                               self.btn_image_overlay, self.btn_delete_source]
+                               self.btn_image_overlay, self.btn_more_actions]
     col_l = _api.QVBoxLayout(); col_l.setContentsMargins(0, 0, 0, 0)
     col_l.setSpacing(self._MSIDE_GAP)
     col_l.addStretch(1)
@@ -314,7 +307,7 @@ def _build_center_area(self):
     col_r.setSpacing(self._MSIDE_GAP)
     col_r.addStretch(1)
     for _b in (self.btn_create_subs, self.btn_track_object,
-               self.btn_image_overlay, self.btn_delete_source):
+               self.btn_image_overlay, self.btn_more_actions):
         col_r.addWidget(_b)
     btn_col = _api.QHBoxLayout(); btn_col.setContentsMargins(0, 0, 0, 0)
     btn_col.setSpacing(self._MSIDE_GAP)

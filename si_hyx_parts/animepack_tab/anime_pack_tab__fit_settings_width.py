@@ -76,6 +76,9 @@ def _fit_settings_width(self):
     pack = _fit_pack_column(self)
     margins = self.layout().contentsMargins()
     available = self.width() - margins.left() - margins.right()
+    entrance_columns = getattr(self, "entrance_columns", None)
+    if entrance_columns is not None:
+        entrance_columns.apply_width(max(1, available - pack - BODY_SPACING - 40))
     if not self._table_shown():
         # Таблица спрятана — настройки забирают всю оставшуюся ширину вкладки
         # и сами раскладываются в несколько колонок (settings_columns).

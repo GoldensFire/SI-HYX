@@ -17,6 +17,7 @@ import time
 from PyQt6.QtWidgets import QFrame, QLabel, QPushButton, QVBoxLayout
 
 import animepack_tab as api
+from .manga_refresh_controls import refresh_button, sync_menu
 
 # Части базы: ключ, заголовок блока, подпись счётчика, надпись на кнопке.
 PARTS = (
@@ -46,7 +47,11 @@ TIPS = {
         "«Индекс», а «Ур.» — место индекса в лесенке порогов: 1 — узнают все, "
         "10 — не узнает никто."),
     "manga": (
-        "Каталог манги, манхвы и ранобэ\n\n"
+        "Каталог манги, манхвы и маньхуа\n\n"
+        "Основная кнопка обновляет Shikimori. Стрелка справа открывает "
+        "отдельные обновления популярности ReManga, MangaLib и всех источников. "
+        "Первый обход внешнего сайта требует деталей каждого тайтла и может "
+        "занять часы; загруженное сохраняется для продолжения.\n\n"
         "Собирается тем же обходом и теми же мешками фильтров, что и аниме, "
         "только своими типами (манга, манхва, ранобэ…) — и только если у пака "
         "есть книжная доля.\n\n"
@@ -157,8 +162,11 @@ class PartBlock(QFrame):
         self.when = QLabel("")
         self.when.setStyleSheet(
             f"color: {api.C['text3']}; font-size: 11px; {flat}")
-        self.button = QPushButton(action)
-        self.button.clicked.connect(lambda: on_action(self.part))
+        if part == "manga":
+            self.button = refresh_button(on_action, self)
+        else:
+            self.button = QPushButton(action)
+            self.button.clicked.connect(lambda: on_action(self.part))
         for widget in (self.title, self.count, self.when):
             layout.addWidget(widget)
         layout.addWidget(self.button)
@@ -177,6 +185,8 @@ class PartBlock(QFrame):
         self.when.setText("идёт сбор…" if running else _fmt_when(fetched))
         self.button.setEnabled(running or not busy)
         self.button.setText("Остановить" if running else self._action)
+        if self.part == "manga":
+            sync_menu(self.button, busy)
 
 
 def build_blocks(on_action, parent=None) -> dict:

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
-"""Визуальная проверка страницы манги через Gemini.
+"""Проверка видимого названия манги через Gemini или локальный OCR.
 
 Как у артов Pixiv (pixiv_visual_check): страница, на которой видно название
 самой манги — титул главы, колонтитул, логотип, страница переводчиков, — сразу
@@ -30,26 +30,58 @@ MEMO_GROUP = "manga_visual_v1"
 _SEND_SIDE = 1600
 
 
-def check(generator, cand, data: bytes, ext: str):
+def check(generator, cand, data: bytes, ext: str, *, manga_titles=()):
+    """Use local OCR when selected, with Gemini for ambiguous lettering."""
+    mode = getattr(getattr(generator, "s", None), "manga_title_check_mode", "gemini")
+    if mode != "local":
+        return _gemini_check(generator, cand, data, ext, manga_titles)
+    from .local_title_match import decide, titles as all_titles
+    from .local_visual_ocr import note, read
+
+    try:
+        rows, elapsed, cached = read(generator, data)
+    except Exception as exc:
+        if generator.stopped() or getattr(generator, "gemini_manga", None) is None:
+            raise
+        note(generator, "MangaDex", {"status": "uncertain", "ocr": "",
+                                      "title": "", "similarity": 0,
+                                      "confidence": 0}, 0.0, False, True)
+        generator.log(f"OCR манги недоступен ({exc}) — проверяю через Gemini")
+        return _gemini_check(generator, cand, data, ext, manga_titles)
+    result = decide(rows, all_titles(cand.anime or {}, manga_titles))
+    fallback = (result["status"] == "uncertain"
+                and getattr(generator, "gemini_manga", None) is not None)
+    note(generator, "MangaDex", result, elapsed, cached, fallback)
+    if result["status"] == "title":
+        return False, f"OCR: «{result['ocr']}» = «{result['title']}»"
+    if result["status"] == "safe":
+        return True, ""
+    if fallback:
+        return _gemini_check(generator, cand, data, ext, manga_titles)
+    return False, "OCR распознал возможное название, нужна другая страница"
+
+
+def _gemini_check(generator, cand, data: bytes, ext: str, manga_titles=()):
     """Возвращает ``(можно_брать, причина)``; результат хранится в базе."""
     client = getattr(generator, "gemini_manga", None)
     if client is None:
         raise RuntimeError("клиент Gemini для манги не создан")
     model = str(getattr(client, "model", "") or "default")
-    key = f"{model}:{hashlib.sha256(data).hexdigest()}"
-    cached = generator.db_cache.memo(MEMO_GROUP, key)
-    if isinstance(cached, dict) and "accept" in cached:
-        return bool(cached["accept"]), str(cached.get("reason") or "")
-
     prompt = (
         "Это страница манги для вопроса викторины «угадай мангу по странице». "
-        "Ожидаемая манга: " + " / ".join(titles(cand.anime or {})) + ".\n"
+        "Ожидаемая манга: " + " / ".join(titles(cand.anime or {}) +
+                                        list(manga_titles)) + ".\n"
         "Верни has_title_text=true и accept=false, если на странице где угодно "
         "видно название этой манги — на любом языке и в любом написании: "
         "титул главы, колонтитул, логотип, обложка, страница с титрами "
         "переводчиков или реклама с названием. Это раскрывает ответ. "
         "Имена персонажей, реплики, звуки и номер главы без названия "
         "допустимы. Причину напиши кратко по-русски.")
+    key = (f"{model}:{hashlib.sha256(data).hexdigest()}:"
+           f"{hashlib.sha256(prompt.encode()).hexdigest()}")
+    cached = generator.db_cache.memo(MEMO_GROUP, key)
+    if isinstance(cached, dict) and "accept" in cached:
+        return bool(cached["accept"]), str(cached.get("reason") or "")
     mime, payload = _prepare(data, ext)
     parts = [
         {"type": "text", "text": prompt},

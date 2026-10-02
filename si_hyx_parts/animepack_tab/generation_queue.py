@@ -5,6 +5,12 @@ from __future__ import annotations
 import os
 
 
+def change_priority(self):
+    task = getattr(self, "_task", None)
+    if task is not None:
+        task.set_priority(self.cb_generation_priority.currentData() or "normal")
+
+
 def refresh_queue(self):
     view = self.queue_list
     view.clear()

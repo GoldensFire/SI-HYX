@@ -53,10 +53,12 @@ def _refresh_tree(widget) -> None:
 class SettingsColumns(SettingsBox):
     """Раскладывает готовые группы настроек по колонкам под ширину панели."""
 
-    def __init__(self, groups, min_column=MIN_COLUMN_W, parent=None):
+    def __init__(self, groups, min_column=MIN_COLUMN_W, parent=None, *,
+                 pinned_second=False):
         super().__init__(parent)
         self._groups = [g for g in groups if g is not None]
         self._min_column = int(min_column)
+        self._pinned_second = bool(pinned_second and len(self._groups) >= 2)
         self._columns = 0
         self._holders: list[QWidget] = []
         self._root = QHBoxLayout(self)
@@ -73,8 +75,8 @@ class SettingsColumns(SettingsBox):
         вдвое уже. По одной планке колонок выходило больше, чем помещается, и
         панель уезжала под горизонтальную полосу."""
         width = max(1, int(width))
-        best = 1
-        for count in range(2, len(self._groups) + 1):
+        best = 2 if self._pinned_second else 1
+        for count in range(best + 1, len(self._groups) + 1):
             if self._needed_width(self._split(count)) > width:
                 break
             best = count
@@ -145,7 +147,8 @@ class SettingsColumns(SettingsBox):
 
     # ── сама раскладка ────────────────────────────────────────────────────
     def relayout(self, columns: int) -> None:
-        columns = max(1, min(int(columns), len(self._groups) or 1))
+        minimum = 2 if self._pinned_second else 1
+        columns = max(minimum, min(int(columns), len(self._groups) or 1))
         if columns == self._columns:
             return
         self._columns = columns
@@ -175,6 +178,15 @@ class SettingsColumns(SettingsBox):
         Порядок групп не меняется: колонка набирается сверху вниз, пока не
         наберёт свою долю общей высоты."""
         buckets: list[list[QWidget]] = [[] for _ in range(columns)]
+        if self._pinned_second:
+            # Состав всегда в первой колонке, «Списки» всегда наверху второй.
+            # Узкому окну отдаём горизонтальную прокрутку, а не перенос списка.
+            buckets[0] = [self._groups[0]]
+            buckets[1] = [self._groups[1]]
+            for index, group in enumerate(self._groups[2:], 2):
+                column = min(columns - 1, max(1, index - len(self._groups) + columns))
+                buckets[column].append(group)
+            return buckets
         if columns == 1:
             buckets[0] = list(self._groups)
             return buckets

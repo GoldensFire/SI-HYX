@@ -50,11 +50,13 @@ def test_chars_only_quotas_and_xml():
     cand.has_frame = True
     root, ns = _api._parse(_api.build_content_xml([cand], s))
     items = root.findall(".//s:param[@name='question']/s:item", ns)
-    # Первым идёт задание «Назвать персонажа» (иначе портрет неотличим от
-    # обычного кадра), следом сам портрет.
+    # Задание «Назвать персонажа» запускается вместе с портретом,
+    # чтобы его можно было отличить от обычного кадра.
     assert items[0].text == "Назвать персонажа"
+    assert items[0].get("duration") is None
     assert items[0].get("waitForFinish") == "False"
     assert items[1].get("type") == "image"
+    assert items[1].get("duration") == "00:00:04"
     assert items[1].text.endswith("_frame.avif")
 
 test_chars_only_quotas_and_xml.__module__ = _api.__name__

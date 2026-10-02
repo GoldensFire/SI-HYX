@@ -20,17 +20,15 @@
 # разбирает _extract_text.
 #
 # Рассчитан на БЕСПЛАТНЫЙ тариф, и это определяет всё поведение:
-#   • модель по умолчанию — Flash-Lite: у неё самые высокие бесплатные лимиты
-#     (порядка 15 запросов в минуту и 1000 в сутки против 10/250 у Flash);
+#   • модель по умолчанию — Flash-Lite; актуальные лимиты показывает AI Studio;
 #   • запросы троттлятся по RPM ЛОКАЛЬНО, до отправки: упереться в 429 и потом
 #     ждать — значит потратить лимит впустую;
-#   • 429 и 5xx переживаются ретраями с паузой, которую называет сам сервер
-#     (RetryInfo.retryDelay / заголовок Retry-After);
+#   • минутный 429 пережидаем по Retry-After, после двух серверных отказов
+#     переходим на другую модель; перегрузка помнится только в этом прогоне;
 #   • исчерпанная модель запоминается НА СУТКИ (gemini_quota.QuotaBoard): иначе
 #     каждый следующий прогон выяснял это заново десятком отброшенных запросов;
-#   • ответ, не дождавшийся таймаута, НЕ повторяется: сервер запрос уже
-#     обработал и в суточный лимит его засчитал, а четыре повтора превращали
-#     один вопрос в четыре потраченных запроса.
+#   • таймаут чтения не повторяется, поскольку сервер мог принять запрос;
+#     ошибки 400/5xx и таймаут включаем в локальную оценку расхода квоты.
 #
 # Ключ — ВСЕГДА пользовательский (вводится в настройках вкладки). Зашивать
 # общий ключ в открытое GPL-приложение нельзя: его вытащат из бинаря, а платить
@@ -46,7 +44,8 @@ from typing import Any, Callable, Optional
 
 import requests
 
-from gemini_quota import QuotaBoard, error_message, is_quota, retry_after
+from gemini_quota import (QuotaBoard, error_message as error_message,
+                          is_quota as is_quota, retry_after as retry_after)
 
 API_ROOT = "https://generativelanguage.googleapis.com/v1beta"
 INTERACTIONS_URL = f"{API_ROOT}/interactions"
@@ -177,6 +176,10 @@ class _ModelChanged(RuntimeError):
     """Запланированный запрос относится к уже исчерпанной модели."""
 
 
+class _ModelUnavailable(GeminiUnavailableError):
+    """Повторные серверные отказы: эту модель пропускаем до конца прогона."""
+
+
 def discover_models(api_key: str, session=None, timeout: float = 15.0) -> tuple[str, ...]:
     """Return built-in choices plus stable general-purpose Flash models.
 
@@ -245,10 +248,9 @@ def _is_blocked(text: str) -> bool:
 def _answered(exc: BaseException) -> bool:
     """Успел ли сервер принять запрос, ответа которого мы не дождались.
 
-    Таймаут ЧТЕНИЯ значит, что тело ушло и модель над ним уже работала: такой
-    запрос Google засчитал в суточный лимит, и повторять его — платить второй
-    раз за тот же вопрос. Таймаут соединения и обрыв до отправки — другое
-    дело: там не дошло ничего, и ретрай уместен."""
+    После таймаута чтения или обрыва ответа сервер мог обработать запрос:
+    повтор способен расходовать квоту ещё раз. Таймаут соединения не означает
+    отправку тела, поэтому такой запрос допустимо повторить."""
     if isinstance(exc, requests.exceptions.ConnectTimeout):
         return False
     return isinstance(exc, (requests.exceptions.ReadTimeout,
@@ -342,15 +344,16 @@ class GeminiClient:
         self._interval = self._model_interval(self.model)
         self._model_lock = threading.Lock()
         self._terminal_quota = ""
+        self._terminal_down = ""
         # Доска квот общая на все клиенты одного ключа: троттлинг, исчерпанные
         # модели и память между прогонами живут там (см. gemini_quota).
         self.board = board or QuotaBoard(self.api_key, daily_limits)
-        # Сколько запросов сделали — вкладке есть что показать пользователю,
-        # когда он подбирается к суточному потолку бесплатного тарифа. spent
-        # считает ВСЕ отправленные тела, включая отброшенные сервером: именно
-        # из них складывается разница между «13 вопросов» и «47 запросов».
+        # spent — все HTTP-попытки; requests_made — оценка расхода квоты,
+        # включая 5xx и таймаут чтения. Коды ответов считаются независимо:
+        # успешный HTTP ещё не гарантирует пригодный вопрос.
         self.requests_made = 0
         self.spent: Counter = Counter()
+        self.response_codes: Counter = Counter()
 
     # ── служебное ────────────────────────────────────────────────────────────
     @property
@@ -411,9 +414,15 @@ class GeminiClient:
             raise GeminiAuthError("Не введён ключ Gemini API")
         while True:
             with self._model_lock:
+                if self._terminal_down:
+                    raise GeminiDownError(self._terminal_down)
                 if self._terminal_quota:
                     raise GeminiQuotaError(self._terminal_quota)
                 model, thinking = self.model, self.thinking
+            if self.board.unavailable(model):
+                self._switch(model, f"Gemini: {model} временно недоступна",
+                             unavailable=True)
+                continue
             if self.board.exhausted(model):
                 # Про исчерпанную квоту уже известно — с прошлого прогона или
                 # от соседнего клиента. Запрос не отправляем вовсе: раньше на
@@ -450,10 +459,12 @@ class GeminiClient:
                 return _json_from_text(_extract_text(self._post(body)))
             except _ModelChanged:
                 continue
+            except _ModelUnavailable as exc:
+                self._switch(model, str(exc), unavailable=True)
             except GeminiQuotaError as exc:
                 self._switch(model, str(exc))
 
-    def _switch(self, model: str, why: str) -> None:
+    def _switch(self, model: str, why: str, *, unavailable=False) -> None:
         """Переходит на следующую живую модель.
 
         Заменить нечем — это конец: дальше клиент сразу отвечает квотой, не
@@ -462,117 +473,26 @@ class GeminiClient:
         with self._model_lock:
             if self.model != model:
                 return
-            next_model = next((name for name in fallback_models(model)
-                               if not self.board.exhausted(name)), None)
+            choices = fallback_models(model)
+            if unavailable:
+                # При перегрузке сначала пробуем менее тяжёлую Flash-Lite.
+                choices = tuple(n for n in choices if n.endswith("-lite")) + tuple(
+                    n for n in choices if not n.endswith("-lite"))
+            next_model = next((name for name in choices
+                               if not self.board.exhausted(name)
+                               and not self.board.unavailable(name)), None)
             if next_model is None:
+                if unavailable or any(self.board.unavailable(n) for n in choices):
+                    self._terminal_down = ("Gemini: доступных моделей не осталось "
+                                           f"(квота или перегрузка); {why}")
+                    raise GeminiDownError(self._terminal_down)
                 self._terminal_quota = why
                 raise GeminiQuotaError(why)
             self.model = next_model
             self.thinking = thinking_level(self.thinking, next_model)
             self._interval = self._model_interval(next_model)
-        self.log(f"Gemini: квота {model} исчерпана, "
-                 f"переключаюсь на {next_model}.")
+        reason = ("сервер временно недоступен, пропускаю модель до конца прогона"
+                  if unavailable else "квота исчерпана")
+        self.log(f"Gemini: {model}: {reason}; переключаюсь на {next_model}.")
 
-    def _post(self, body: dict) -> Any:
-        """POST с ретраями. Возвращает разобранное тело ответа."""
-        headers = {"x-goog-api-key": self.api_key,
-                   "Content-Type": "application/json"}
-        delay = 2.0
-        last = ""
-        model = str(body.get("model") or self.model)
-        if "contents" in body:
-            url = f"{API_ROOT}/models/{model}:generateContent"
-            payload = {key: value for key, value in body.items() if key != "model"}
-        else:
-            url, payload = INTERACTIONS_URL, body
-        for attempt in range(self.max_retries):
-            if self.stopped():
-                raise GeminiError("Отменено")
-            self._throttle(model)
-            if self.stopped():
-                raise GeminiError("Отменено")
-            # Восемь рабочих потоков заранее занимают будущие слоты. Если
-            # первый из них узнал, что квота модели кончилась, остальные не
-            # должны по очереди досылать старые тела и тратить ещё 7 RPD.
-            with self._model_lock:
-                if self._terminal_quota:
-                    raise GeminiQuotaError(self._terminal_quota)
-                if model != self.model:
-                    raise _ModelChanged()
-            try:
-                resp = self.session.post(
-                    url, headers=headers, json=payload,
-                    timeout=(CONNECT_TIMEOUT, self.timeout))
-            except Exception as e:  # noqa: BLE001 — сеть отвалилась, пробуем ещё
-                if _answered(e):
-                    # Ответа мы не дождались, но сервер запрос ПРИНЯЛ и в
-                    # суточный лимит его засчитал. Повторять такое — платить
-                    # за один вопрос четырежды: отдаём ошибку сразу, вкладка
-                    # возьмёт следующий тайтл.
-                    self.spent[model] += 1
-                    self.requests_made += 1
-                    self.board.spend(model)
-                    raise GeminiUnavailableError(
-                        f"Gemini не ответил за {self.timeout:.0f} с "
-                        "(запрос всё равно засчитан в суточный лимит)") from e
-                last = str(e)
-                self.log(f"Gemini: сеть недоступна ({e}), попытка "
-                         f"{attempt + 1} из {self.max_retries}")
-                self._sleep(delay)
-                delay *= 2
-                continue
-            self.spent[model] += 1
-            code = int(getattr(resp, "status_code", 0) or 0)
-            if code != 429 and code < 500:
-                # В суточный лимит идут только ОБСЛУЖЕННЫЕ запросы: 429 сервер
-                # отклоняет, 5xx не его вина. Считая их, приложение показывало
-                # больше, чем видит Google, — и своя же проверка потолка
-                # срабатывала раньше времени.
-                self.requests_made += 1
-                self.board.spend(model)
-            text = getattr(resp, "text", "") or ""
-            if 200 <= code < 300:
-                try:
-                    return resp.json()
-                except Exception:
-                    return _json_from_text(text)
-            if code == 400 and _is_blocked(text):
-                # «Запрос содержит недопустимые слова» — беда одного текста, а
-                # не ключа: следующий запрос той же моделью пройдёт как ни в чём
-                # не бывало.
-                raise GeminiBlockedError(error_message(text, code))
-            if code in (400, 401, 403):
-                # 400 сюда же: у Gemini это «ключ не той формы» и «модель не
-                # существует» — ретраить бессмысленно, надо править настройки.
-                raise GeminiAuthError(error_message(text, code))
-            if code == 429:
-                if is_quota(text):
-                    # Квота модели исчерпана. Повторять такой 429 четыре раза
-                    # нельзя: каждый повтор сам попадает в RPD и на скрине
-                    # получается 23 / 20. Разовый rate-limit без слова quota
-                    # по-прежнему пережидаем по Retry-After ниже.
-                    #
-                    # Запоминаем исчерпанную модель на сутки: следующий прогон
-                    # не должен выяснять то же самое заново.
-                    self.board.mark(model, text)
-                    raise GeminiQuotaError(error_message(text, code))
-                wait = retry_after(resp, text, default=delay)
-                last = error_message(text, code)
-                self.log(f"Gemini: лимит бесплатного тарифа, жду {wait:.0f} с "
-                         f"(попытка {attempt + 1} из {self.max_retries})")
-                self._sleep(wait)
-                delay = min(delay * 2, 60.0)
-                continue
-            if code >= 500:
-                last = error_message(text, code)
-                self.log(f"Gemini: сервер ответил {code}, повтор через "
-                         f"{delay:.0f} с")
-                self._sleep(delay)
-                delay *= 2
-                continue
-            raise GeminiError(error_message(text, code))
-        # Ретраи кончились. Отдельным типом — только квота: вкладке надо
-        # сказать пользователю не «ошибка», а «на сегодня хватит».
-        if "429" in last or "RESOURCE_EXHAUSTED" in last or "quota" in last.lower():
-            raise GeminiQuotaError(last or "Gemini: исчерпана квота")
-        raise GeminiUnavailableError(last or "Gemini не ответил")
+    from gemini_transport import _post

@@ -70,9 +70,9 @@ def test_page_skip_shrinks_with_the_chapter():
 def test_five_page_chapters_are_still_usable(fake_session, fake_response):
     """Прежнее правило «меньше одиннадцати страниц — мимо» съедало всю ёнкому."""
     rows = [_row(MAIN, "Tsuredure Children", ["kk"], mal="58027")]
-    feeds = {(MAIN, ""): {"data": [_chapter("kk-1", 5)]}}
+    feeds = {(MAIN, "kk"): {"data": [_chapter("kk-1", 5)]}}
     session = _session(fake_session, fake_response, rows, feeds, pages=5)
-    api = MangaDexApi(session, rng=random.Random(1))
+    api = MangaDexApi(session, language="kk", rng=random.Random(1))
     url = api.panel_url(_card())
     assert url.startswith("https://cdn.md/data/abc/")
     # Титул и последняя страница по-прежнему не попадают в вопрос.
@@ -127,13 +127,11 @@ def test_chosen_language_still_wins_over_everything(fake_session, fake_response)
     assert asked == {"ru"}
 
 
-def test_the_unfiltered_feed_of_the_main_card_stays_in_the_plan(fake_session,
-                                                                fake_response):
-    """«Ван-Пис»: все объявленные языки лежат на стороне — спасает только она."""
+def test_automatic_languages_never_include_an_unfiltered_feed(fake_session,
+                                                             fake_response):
     rows = [_row(MAIN, "Tsuredure Children", ["ru", "en", "ca", "it", "fr"],
                  mal="58027")]
     session = _session(fake_session, fake_response, rows, {})
     api = MangaDexApi(session, rng=random.Random(1))
     plan = api._plan(api.manga_id(_card()))
-    assert len(plan) <= 6
-    assert (MAIN, "") in plan
+    assert plan == [(MAIN, "ru"), (MAIN, "en"), (MAIN, "uk")]

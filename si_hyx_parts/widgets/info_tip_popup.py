@@ -4,6 +4,7 @@
 """_InfoTipPopup. Public namespace: widgets."""
 import widgets as _api
 from PyQt6.QtGui import QCursor
+from .info_tip_frame import source_is_current
 
 
 # --- Информационные подсказки "ⓘ" для пунктов настроек ---
@@ -17,6 +18,9 @@ class _InfoTipPopup(_api.QLabel):
     по enter и прячется по leave значка — циклов enter/leave не возникает."""
     _instance = None
 
+    from .info_tip_frame import (_prepare_frame, paintEvent, _reveal_frame,
+                                 hideEvent)
+
     @classmethod
     def instance(cls):
         if cls._instance is None:
@@ -26,6 +30,11 @@ class _InfoTipPopup(_api.QLabel):
     def __init__(self):
         super().__init__(None)
         self._anchor = None
+        self._frame_version = 0
+        self._awaiting_frame = False
+        self._source_ref = None
+        self._source_point = None
+        self._hover_managed = False
         # WindowTransparentForInput — прозрачность для мыши на уровне САМОЙ
         # Windows. Одного WA_TransparentForMouseEvents у окна верхнего уровня
         # мало: курсор, заехавший на попап (он стоит справа-снизу от курсора,
@@ -79,11 +88,15 @@ class _InfoTipPopup(_api.QLabel):
         self.move(x, y); self.show(); self.raise_()
 
     def show_for(self, badge, text):
+        if _api.QApplication.activePopupWidget() is not None:
+            self.hide()
+            return
         # Уже показываем ровно эту подсказку — не дёргаем show()/move() повторно.
         # При перестроении виджетов под курсором (списки/плитки) ToolTip-события
         # повторяются с тем же текстом; без этой проверки попап моргал.
         if self.isVisible() and self.text() == text and self._anchor == id(badge):
             return
+        self._prepare_frame(badge, managed=True)
         self._anchor = id(badge)
         self._fit_size(text)
         # Ниже-правее значка — курсор на значке не попадёт на попап (иначе цикл).
@@ -97,11 +110,21 @@ class _InfoTipPopup(_api.QLabel):
         top = badge.mapToGlobal(badge.rect().topLeft()).y()
         self._place(gp.x(), gp.y() + 4, top, sg)
 
-    def show_at(self, global_point, text, owner=None):
+    def show_at(self, global_point, text, owner=None, managed=False):
         """Показывает подсказку у заданной глобальной точки (напр. у курсора над
         ячейкой дерева). Тот же стабильный попап, что и у значков ⓘ."""
+        if _api.QApplication.activePopupWidget() is not None:
+            self.hide()
+            return
         if not text:
             return
+        if owner is not None and not source_is_current(owner, global_point):
+            return
+        if (self.isVisible() and self.text() == text
+                and self._anchor == (id(owner) if owner is not None else None)):
+            return
+        self._prepare_frame(owner, global_point if owner is not None else None,
+                            managed=managed)
         self._anchor = id(owner) if owner is not None else None
         self._fit_size(text)
         try:
@@ -161,6 +184,8 @@ class HoverTipManager(_api.QObject):
     @classmethod
     def _tip_at(cls, point):
         """Return the deepest tip at a global point, including item views."""
+        if _api.QApplication.activePopupWidget() is not None:
+            return None, "", False
         hovered = _api.QApplication.widgetAt(point)
         if hovered is None:
             return None, "", False
@@ -193,13 +218,13 @@ class HoverTipManager(_api.QObject):
         owner, text, is_item = self._tip_at(point)
         popup = _api._InfoTipPopup.instance()
         if owner is None:
-            if popup._anchor is not None:
+            if popup._hover_managed:
                 popup.hide()
             return
         if is_item:
             if not (popup.isVisible() and popup._anchor == id(owner)
                     and popup.text() == text):
-                popup.show_at(point, text, owner=owner)
+                popup.show_at(point, text, owner=owner, managed=True)
         else:
             popup.show_for(owner, text)
 
@@ -230,14 +255,22 @@ class HoverTipManager(_api.QObject):
         self._hover_pos = point
         self._hover_version += 1
         if popup.isVisible() and (popup._anchor is not None or owner is not None):
-            if (owner is None or popup._anchor != id(owner)
-                    or popup.text() != text):
+            custom_here = (not popup._hover_managed and owner is None
+                           and popup._source_ref is not None
+                           and popup._source_ref() is not None
+                           and source_is_current(popup._source_ref(), point))
+            if not custom_here and (owner is None or popup._anchor != id(owner)
+                                    or popup.text() != text):
                 popup.hide()
         self._queue_hover_tip()
 
     def eventFilter(self, obj, ev):
         try:
             et = ev.type()
+            if (et == _api.QEvent.Type.Show and isinstance(obj, _api.QWidget)
+                    and obj.windowType() == _api.Qt.WindowType.Popup):
+                self._hover_version += 1
+                _api._InfoTipPopup.instance().hide()
             # Курсор-«рука» на ЛЮБОЙ кнопке при наведении (как в вебе): большинство
             # кнопок в проге не задавали курсор явно и оставались со стрелкой — теперь
             # везде единообразно. Ставим только если у кнопки ДЕФОЛТНЫЙ курсор-стрелка
@@ -326,7 +359,8 @@ class HoverTipManager(_api.QObject):
                     popup.hide()
                 else:
                     popup.hide_for(obj)
-            elif et in (_api.QEvent.Type.MouseButtonPress, _api.QEvent.Type.Wheel,
+            elif et in (_api.QEvent.Type.MouseButtonPress, _api.QEvent.Type.KeyPress,
+                        _api.QEvent.Type.Wheel,
                         _api.QEvent.Type.WindowDeactivate):
                 _api._InfoTipPopup.instance().hide()
         except Exception:

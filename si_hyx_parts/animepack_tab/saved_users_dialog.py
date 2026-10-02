@@ -277,7 +277,7 @@ class AnimePackTab(_api.QWidget):
                    _api.DESCRIPTION_AUDIO_KIND,
                    _api.AI_ART_KIND,
                    _api.PIXIV_ART_KIND, _api.SAKUGA_KIND,
-                   _api.STUDIO_KIND)
+                   _api.STUDIO_KIND, _api.EPISODE_KIND)
     COUNT_LABELS = {_api.FRAME_KIND: "Кадров", "opening": "Опенингов",
                     "ending": "Эндингов", "insert": "OST",
                     _api.CHAR_KIND: "Персонажей", _api.VIDEO_KIND: "Видео",
@@ -289,7 +289,7 @@ class AnimePackTab(_api.QWidget):
                     _api.AI_ART_KIND: "ИИ-артов",
                     _api.PIXIV_ART_KIND: "Артов Pixiv",
                     _api.SAKUGA_KIND: "Сакуги",
-                    _api.STUDIO_KIND: "Студий"}
+                    _api.STUDIO_KIND: "Студий", _api.EPISODE_KIND: "Отрывков серий"}
 
     from si_hyx_parts.animepack_tab.anime_pack_tab__recount import (
         _recount,
@@ -323,6 +323,7 @@ class AnimePackTab(_api.QWidget):
     )
 
     from si_hyx_parts.animepack_tab.generation_queue import (
+        change_priority as _change_priority,
         refresh_queue as _refresh_queue,
         remove_queued as _remove_queued,
         start_next as _start_next,

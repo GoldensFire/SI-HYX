@@ -11,6 +11,9 @@ def apply_settings(self, data: dict):
     if not _api._HAS_CORE or not isinstance(data, dict):
         return
     s = _api.PackSettings.from_dict(data)
+    self._ru_popularity_config = dict(s.ru_popularity)
+    from .entrance_controls import apply as apply_entrance
+    apply_entrance(self, s)
     self.ed_title.setText(s.title)
     self.ed_theme.setText(s.theme_title)
     # Сколько паков уже собрано: следующий получит номер на единицу больше.
@@ -61,6 +64,8 @@ def apply_settings(self, data: dict):
     self.mix.set_pixiv_art(s.pack_pixiv_art)
     self.chk_sakuga.setChecked(s.pack_sakuga)
     self.mix.set_sakuga(s.pack_sakuga)
+    from .episode_controls import apply_controls as apply_episode
+    apply_episode(self, s)
     self.chk_studio.setChecked(s.pack_studio)
     self.mix.set_studio(s.pack_studio)
     from .composition_controls import apply, TITLE_LABELS
@@ -79,6 +84,7 @@ def apply_settings(self, data: dict):
         "ai_art": shares.get(_api.AI_ART_KIND, 0),
         "pixiv_art": shares.get(_api.PIXIV_ART_KIND, 0),
         "sakuga": shares.get(_api.SAKUGA_KIND, 0),
+        "episode": shares.get(_api.EPISODE_KIND, 0),
         "studio": shares.get(_api.STUDIO_KIND, 0),
         **{k: shares.get(k, 0) for k in TITLE_LABELS}})
     from si_hyx_parts.animepack_tab.ai_art_controls import apply_controls
@@ -153,6 +159,8 @@ def apply_settings(self, data: dict):
         bool(getattr(s, "manga_allow_erotica", False)))
     from si_hyx_parts.animepack_tab.manga_gemini_controls import apply_controls as apply_manga_gemini
     apply_manga_gemini(self, s)
+    from .manga_source_controls import apply_controls as apply_manga_sources
+    apply_manga_sources(self, s)
     for kind, chk in self.chk_manga_kinds.items():
         chk.setChecked(bool(s.manga_kinds.get(kind, False)))
     self.chk_op.setChecked(s.pick_openings)
@@ -296,6 +304,13 @@ def start(self):
 
 
 def _launch_generation(self, settings):
+    # В очереди каждый пак хранит свой приоритет; поле показывает активный.
+    blocked = self.cb_generation_priority.blockSignals(True)
+    try:
+        self.cb_generation_priority.setCurrentIndex(
+            self.cb_generation_priority.findData(settings.generation_priority))
+    finally:
+        self.cb_generation_priority.blockSignals(blocked)
     # Каждый новый пак — следующий номер в названии (просьба пользователя).
     # Считаем ЗДЕСЬ, а не в генераторе: имя файла и название внутри пака должны
     # совпасть, а известны они генератору с самого начала. Сохраняем сразу —

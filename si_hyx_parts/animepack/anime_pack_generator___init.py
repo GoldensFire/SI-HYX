@@ -11,26 +11,29 @@ def __init__(self, settings: _api.PackSettings, *,
              anilist=None, kitsu=None, themes=None, fandom=None, gemini=None,
              tmdb=None, cloudflare=None, pixiv=None, anizip=None,
              mangadex=None, sakuga=None,
-             jimaku=None, subdl=None,
+             jimaku=None, subdl=None, kuhi=None,
              log: _api.Optional[_api.Callable[[str], None]] = None,
              progress: _api.Optional[_api.Callable[[int, int, str], None]] = None,
              should_stop: _api.Optional[_api.Callable[[], bool]] = None,
              rng: _api.Optional[_api.random.Random] = None,
              frames_history_path: str = _api.FRAMES_HISTORY_FILE,
-             db_cache: _api.Optional[_api.ShikimoriDbCache] = None):
+             db_cache: _api.Optional[_api.ShikimoriDbCache] = None,
+             generation_runtime=None):
     self.s = settings
     # Эти обратные вызовы нужны клиентам, создаваемым ниже. В частности Pixiv
     # сразу получает rng; поэтому они должны существовать до init_*_service.
     self._log = log or (lambda msg: None)
     self._progress = progress or (lambda done, total, msg: None)
     self._should_stop = should_stop or (lambda: False)
+    from .generation_runtime import GenerationRuntime
+    self._runtime = generation_runtime or GenerationRuntime(settings, self.stopped)
     self.rng = rng or _api.random.Random()
     self.session = session or _api.make_session()
     self.amq = amq or _api.AmqApi(self.session)
     self.anisong = anisong or _api.AnisongApi(self.session)
     self.mal = mal or _api.MalApi(self.session)
     self.shikimori = shikimori or _api.ShikimoriApi(self.session)
-    self.anilist = anilist or _api.AniListApi(self.session)
+    self.anilist = anilist or _api.AniListApi(self.session, log=self.log)
     self.kitsu = kitsu or _api.KitsuApi(self.session)
     # AniZip — третий источник кадров эпизодов рядом с AniList и Kitsu: у него
     # превью КАЖДОЙ серии с TheTVDB, поэтому один тайтл даёт десятки разных
@@ -51,14 +54,21 @@ def __init__(self, settings: _api.PackSettings, *,
     needs_general = any(settings.mix_shares.get(k)
                         for k in (_api.PLOT_KIND, _api.DIALOGUE_KIND,
                                   _api.DESCRIPTION_AUDIO_KIND))
+    needs_episode_subtitles = bool(settings.mix_shares.get(_api.EPISODE_KIND)
+                                  and settings.episode_ru_subtitles)
+    needs_general = needs_general or needs_episode_subtitles
     needs_titles = any(settings.mix_shares.get(k)
                        for k in _api.GEMINI_TITLE_KINDS)
+    key_available = bool(str(settings.gemini_key or "").strip())
     needs_pixiv = bool(settings.mix_shares.get(_api.PIXIV_ART_KIND)
-                        and getattr(settings, "pixiv_gemini_check", True))
-    # Страницы манги Gemini проверяет на название тайтла (manga_panel);
-    # без галочки клиента нет — и проверки тоже.
+                       and getattr(settings, "pixiv_gemini_check", True))
+    # Gemini chooses the character scene on the original page and can also
+    # check the final crop for title lettering.
     needs_manga = bool(settings.mix_shares.get(_api.MANGA_KIND)
-                       and getattr(settings, "manga_gemini_check", True))
+                       and (getattr(settings, "manga_character_crop", True)
+                            or (getattr(settings, "manga_gemini_check", True)
+                                and (settings.manga_title_check_mode == "gemini"
+                                     or key_available))))
     self.gemini_manga = gemini if needs_manga else None
     if needs_general or needs_titles or needs_pixiv or needs_manga:
         if settings.mix_shares.get(_api.PLOT_KIND) and self.fandom is None:
@@ -110,24 +120,32 @@ def __init__(self, settings: _api.PackSettings, *,
                     str(getattr(settings, "manga_gemini_model", "") or "")
                     or settings.gemini_model, "minimal",
                     timeout=visual_timeout)
+    # Держим ссылки для итоговой статистики даже после отключения Gemini.
+    self._gemini_clients = (self.gemini, self.gemini_titles,
+                            self.gemini_pixiv, self.gemini_manga)
     from .visual_batch import initialize as initialize_visual_batches
     initialize_visual_batches(self)
+    from .local_visual_ocr import initialize as initialize_local_ocr
+    initialize_local_ocr(self)
     from .plot_batch import initialize as initialize_plot_batches
     initialize_plot_batches(self)
     self.jimaku = jimaku
-    if settings.mix_shares.get(_api.DIALOGUE_KIND) and self.jimaku is None:
+    needs_subtitles = bool(settings.mix_shares.get(_api.DIALOGUE_KIND) or needs_episode_subtitles)
+    if needs_subtitles and self.jimaku is None:
         key = str(getattr(settings, "jimaku_key", "") or "").strip()
         if key:
             self.jimaku = _api.JimakuApi(key, self.session)
     # SubDL — первый источник диалогов (русские субтитры, без Gemini);
     # Jimaku остаётся на время, когда суточная квота SubDL кончится.
     self.subdl = subdl
-    if settings.mix_shares.get(_api.DIALOGUE_KIND) and self.subdl is None:
+    if needs_subtitles and self.subdl is None:
         key = str(getattr(settings, "subdl_key", "") or "").strip()
         if key:
             self.subdl = _api.SubdlApi(key, self.session)
     self._dialogue_lock = _api.threading.Lock()
     self._dialogue_seen: set[tuple[int, int]] = set()
+    from .episode_generation import initialize as initialize_episode
+    initialize_episode(self, kuhi)
     # Запасной источник обложек. Без ключа клиент всё равно создаётся —
     # просто ничего не умеет (enabled=False), и проверок по всему коду не
     # нужно.
@@ -223,6 +241,10 @@ def __init__(self, settings: _api.PackSettings, *,
     self._excluded_studios: set[str] = set()
     self._exact_keys: set[tuple] = set()
     self._exact_seen: set[tuple] = set()
+    self._exact_lock = _api.threading.Lock()
+    self._exact_pending: dict = {}
+    self._early_repeats = 0
+    self._early_repeat_attempts = 0
     # Франшизы, уже взятые В ЭТОМ паке. Набор ОДИН на оба потока кандидатов:
     # у каждого потока был свой, и пак выдавал кадр из франшизы, а следом
     # страницу манги оттуда же (просьба пользователя — повторов быть не должно).
@@ -248,8 +270,8 @@ def __init__(self, settings: _api.PackSettings, *,
     self._manga_mix = _api.MangaMix(settings, 0, log=lambda m: self.log(m))
     # Запущенные ffmpeg: по «Стоп» их надо убить, иначе вкладка ждёт
     # окончания кодирования (до нескольких секунд на вопрос).
-    self._procs_lock = _api.threading.Lock()
-    self._procs: set = set()
+    self._procs_lock = self._runtime.lock
+    self._procs = self._runtime.processes
     # Карточки, уже приехавшие из каталога Shikimori (order: random).
     self._card_cache: dict[int, dict] = {}
     # То же для манги — отдельным словарём: id манги и аниме на MAL живут в
@@ -281,6 +303,8 @@ def __init__(self, settings: _api.PackSettings, *,
     self._stage_lock = _api.threading.Lock()
     self._stage_spans: dict[str, list[tuple[float, float]]] = {}
     self._stage_order: list[str] = []
+    from .generation_diagnostics import GenerationDiagnostics
+    self._diagnostics = GenerationDiagnostics()
     # Ники, чьи списки просили «в основном музыку»: их тайтлы по возможности
     # становятся песенными вопросами, а не кадрами и персонажами.
     self._music_nicks = {u.username.strip().casefold()

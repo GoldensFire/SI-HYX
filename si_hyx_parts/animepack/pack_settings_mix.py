@@ -35,6 +35,8 @@ def mix_shares(self) -> dict:
                               if self.pack_pixiv_art else 0),
         _api.SAKUGA_KIND: (max(0, int(self.pct_sakuga))
                            if self.pack_sakuga else 0),
+        _api.EPISODE_KIND: (max(0, int(self.pct_episode))
+                            if self.pack_episode else 0),
         _api.STUDIO_KIND: (max(0, int(self.pct_studio))
                            if self.pack_studio else 0),
     }

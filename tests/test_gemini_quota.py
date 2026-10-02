@@ -73,9 +73,9 @@ def test_only_a_daily_limit_is_taken_as_daily():
 
 
 # ── что идёт в суточный счёт ─────────────────────────────────────────────────
-def test_rejected_requests_are_not_counted(fake_session, fake_response,
-                                           monkeypatch):
-    """429 и 5xx сервер не обслужил — в суточный лимит они не идут."""
+def test_server_errors_count_as_possible_quota_usage(fake_session, fake_response,
+                                                    monkeypatch):
+    """503 может расходовать квоту; отклонённый 429 считается отдельно."""
     replies = iter([fake_response(429, text=RATE_BODY),
                     fake_response(503, text="oops"),
                     fake_response(json_data=_ok_body())])
@@ -83,9 +83,10 @@ def test_rejected_requests_are_not_counted(fake_session, fake_response,
     client = _client(session, monkeypatch, max_retries=4)
     assert client.generate_json("привет", SCHEMA) == {"ok": True}
     assert len(session.calls) == 3
-    assert client.requests_made == 1            # столько видит Google
+    assert client.requests_made == 2            # оценка, включая 503
     assert sum(client.spent.values()) == 3      # а столько мы отправили
-    assert gemini_usage.requests_today("test-key", gemini_api.DEFAULT_MODEL) == 1
+    assert client.response_codes == {429: 1, 503: 1, 200: 1}
+    assert gemini_usage.requests_today("test-key", gemini_api.DEFAULT_MODEL) == 2
 
 
 def test_read_timeout_is_counted_and_never_repeated(fake_session):
@@ -145,9 +146,12 @@ def test_a_minute_limit_does_not_bury_the_model_for_a_day(fake_session,
                                               "per minute, limit: 5"}})
     session = fake_session([("interactions", fake_response(429, text=minute))])
     client = _client(session, monkeypatch, model="gemini-3.8-flash")
-    with pytest.raises(GeminiQuotaError):
+    with pytest.raises(gemini_api.GeminiUnavailableError):
         client.generate_json("привет", SCHEMA)
-    # Метка мягкая: через час она сама снимется, суточного потолка мы не узнали.
+    assert len(session.calls) == client.max_retries
+    assert client.model == "gemini-3.8-flash"
+    assert not client.board.exhausted(client.model)
+    # Минутный отказ не записывается как исчерпанная суточная квота.
     assert gemini_usage.daily_cap("test-key", "gemini-3.8-flash") == 0
     monkeypatch.setattr(gemini_usage.time, "time",
                         lambda: 9e9)                 # «прошёл час»

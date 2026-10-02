@@ -109,6 +109,19 @@ def test_page_with_the_title_is_replaced_by_another_page(generator):
     assert len(gen.gemini_manga.calls) == 2
 
 
+def test_ordinary_page_still_checks_title_when_scene_crop_is_enabled(generator):
+    gen = generator
+    gen.s.manga_character_crop = True
+    _pages(gen)
+    gen.gemini_manga = _Gemini([_verdict(False), _verdict(True)])
+    cand = SongCandidate({}, make_anime(malId=656), kind=MANGA_KIND, media="manga")
+    assert gen._fetch_media(cand)
+    assert cand.frame_url.endswith("p1.png")
+    assert len(gen.gemini_manga.calls) == 2
+    with Image.open(gen.folder + "/Images/" + cand.frame_name) as picture:
+        assert picture.size == (600, 900)
+
+
 def test_title_on_every_page_gives_the_slot_to_the_next_title(generator):
     from si_hyx_parts.animepack.manga_panel import VISUAL_TRIES
     gen = generator
@@ -147,7 +160,7 @@ def test_settings_need_a_gemini_key_only_when_the_check_is_on():
     base = dict(pct_songs=0, pack_manga=True, pct_manga=100)
     on = PackSettings(**base)
     assert any("страниц манги" in p for p in on.validate())
-    off = PackSettings(**base, manga_gemini_check=False)
+    off = PackSettings(**base, manga_gemini_check=False, manga_character_crop=False)
     assert not any("страниц манги" in p for p in off.validate())
     keyed = PackSettings(**base, gemini_key="key")
     assert not any("страниц манги" in p for p in keyed.validate())
@@ -159,6 +172,8 @@ def test_tab_keeps_the_manga_check_and_its_model(qapp):
     try:
         assert tab.collect().manga_gemini_check is True     # как у Pixiv
         tab.chk_manga_gemini.setChecked(False)
+        assert tab.cb_manga_gemini_model.isEnabled()  # выбор сцены тоже требует модель
+        tab.chk_manga_character_crop.setChecked(False)
         assert not tab.cb_manga_gemini_model.isEnabled()
         box = tab.cb_manga_gemini_model
         other = [box.itemText(i) for i in range(box.count())
@@ -170,6 +185,7 @@ def test_tab_keeps_the_manga_check_and_its_model(qapp):
         tab.apply_settings(saved)
         got = tab.collect()
         assert got.manga_gemini_check is False
+        assert got.manga_character_crop is False
         assert got.manga_gemini_model == other
     finally:
         tab.cleanup()

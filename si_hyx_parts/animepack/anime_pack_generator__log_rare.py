@@ -30,7 +30,10 @@ def _log_warn_totals(self) -> None:
         self.log(f"{tag}: всего таких ошибок за прогон — {n}.")
 
 def stopped(self) -> bool:
-    return bool(self._should_stop())
+    runtime = getattr(self, "_runtime", None)
+    event = getattr(runtime.local, "candidate_stop", None) if runtime else None
+    return (bool(self._should_stop()) or bool(event and event.is_set())
+            or bool(runtime and runtime.current_task_cancelled()))
 
 # ── сколько времени ушло на что ───────────────────────────────────────
 @_api.contextmanager
@@ -41,7 +44,8 @@ def _timed(self, stage: str):
         появлений запоминаем — по нему потом печатается итог."""
     started = _api.time.monotonic()
     try:
-        yield
+        with self._diagnostics.stage(stage):
+            yield
     finally:
         ended = _api.time.monotonic()
         with self._stage_lock:
@@ -80,55 +84,60 @@ def log_stage_times(self, total: float = 0.0) -> None:
                   for name in self._stage_order]
     if not stages:
         return
+    from .generation_diagnostics import peak_parallel
+    self._diagnostics.report(self)
     if total > 0:
         self.log(f"Время по этапам (всего {_api.fmt_elapsed(total)}):")
     else:
         self.log("Время по этапам:")
-    parallel = max(1, int(self.s.parallel))
     for name, spans in stages:
         wall = self._merge_spans(spans)
         summed = sum(max(0.0, b - a) for a, b in spans)
         share = f", {min(100.0, wall / total * 100):.0f}%" if total > 0 else ""
         tail = ""
-        if parallel > 1 and summed > wall * 1.2:
-            tail = f" (в {parallel} потоков суммарно {_api.fmt_elapsed(summed)})"
+        if summed > wall * 1.2:
+            tail = (f" (суммарно по задачам {_api.fmt_elapsed(summed)}, "
+                    f"максимум одновременно {peak_parallel(spans)})")
         self.log(f"  • {name}: {_api.fmt_elapsed(wall)}{share}{tail}")
 
 def log_gemini_spent(self) -> None:
-    """Сколько запросов к Gemini стоил прогон — и сколько пропало зря.
-
-        Вопросов по сюжету в паке 13, а запросов за них уходило под полсотни:
-        ретраи, таймауты и отказы модели не видны нигде, пока не сложить их в
-        одну строку (просьба пользователя). Обслуженные запросы — те, что идут
-        в суточный лимит; остальное сервер отклонил (429) или не смог (5xx)."""
+    """HTTP-попытки, коды ответов и оценка расхода квоты данного ключа."""
     # Клиент в тестах бывает заглушкой — считаем только настоящие счётчики.
     clients = {id(c): c for c in (getattr(self, "gemini", None),
                                   getattr(self, "gemini_titles", None),
                                   getattr(self, "gemini_pixiv", None),
-                                  getattr(self, "gemini_manga", None))
+                                  getattr(self, "gemini_manga", None),
+                                  *getattr(self, "_gemini_clients", ()))
                if isinstance(getattr(c, "spent", None), dict)}
     spent: _api.Counter = _api.Counter()
-    served = 0
+    quota_estimate = 0
+    codes: _api.Counter = _api.Counter()
     for client in clients.values():
         spent.update(client.spent)
-        try:
-            served += int(getattr(client, "requests_made", 0) or 0)
-        except (TypeError, ValueError):
-            served = -1
+        quota_estimate += int(getattr(client, "requests_made", 0) or 0)
+        codes.update(getattr(client, "response_codes", {}) or {})
     if not spent:
         return
     parts = ", ".join(f"{name}: {count}"
                       for name, count in sorted(spent.items()))
     total = sum(spent.values())
-    lost = total - served
-    tail = (f"; из них {lost} сервер отклонил или не ответил" if lost > 0 else "")
+    ok = sum(count for code, count in codes.items()
+             if isinstance(code, int) and 200 <= code < 300)
+    labels = {"network": "сеть", "timeout": "таймаут"}
+    errors = ", ".join(f"{labels.get(code, code)}: {count}" for code, count in sorted(
+        codes.items(), key=lambda item: str(item[0]))
+        if not isinstance(code, int) or not 200 <= code < 300)
+    tail = f"; успешных HTTP-ответов {ok}"
+    if errors:
+        tail += f"; ошибки ({errors})"
+    tail += f"; возможный расход квоты {quota_estimate} (локальная оценка)"
     # Куда ушли обращения за сюжетом: без этой расшифровки «16 вопросов —
     # 23 запроса» выглядело необъяснимо (просьба пользователя).
     plot = getattr(self, "_plot_calls", None) or {}
     if plot:
         tail += "; сюжет: " + ", ".join(
             f"{name} — {count}" for name, count in sorted(plot.items()))
-    self.log(f"Gemini: запросов за прогон {total} ({parts}){tail}.")
+    self.log(f"Gemini: HTTP-попыток за прогон {total} ({parts}){tail}.")
 
 
 def _over_budget(self, done: int, total: int) -> bool:
@@ -149,20 +158,22 @@ def _media_size(self, cand: _api.SongCandidate) -> int:
     """Сколько байт занимает медиа этого вопроса в готовом паке."""
     names = []
     if cand.has_video:
-        names.append(_api.os.path.join("Video", cand.video_out))
+        names.append(_api.os.path.join("Video", cand.entrance_video or cand.video_out))
     elif not cand.is_silent or (cand.kind == _api.DESCRIPTION_AUDIO_KIND
                                 and cand.description_audio_ext):
         names.append(_api.os.path.join("Audio", cand.audio_out))
     for flag, name in ((cand.has_poster, cand.poster_file),
                        (cand.has_collage, cand.collage_file),
-                       (cand.has_frame, cand.frame_file)):
+                       (cand.has_frame and cand.frame_file not in cand.entrance_frames,
+                        cand.frame_file)):
         if flag and name:
             names.append(_api.os.path.join("Images", name))
     # Остальные кадры вопроса-студии весят столько же, сколько первый, и в
     # бюджет пака обязаны входить наравне с ним.
     for name in cand.extra_frames:
-        if name:
+        if name and name not in cand.entrance_frames:
             names.append(_api.os.path.join("Images", name))
+    names.extend(_api.os.path.join("Video", name) for name in cand.entrance_frames.values())
     total = 0
     # Через set: у вопроса-обложки картинка вопроса и постер ответа — это
     # ОДИН файл, и считать его дважды нельзя.

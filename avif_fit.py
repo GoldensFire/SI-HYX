@@ -156,20 +156,21 @@ def strip_allintra(cmd) -> list:
 _strip_allintra = strip_allintra          # прежнее внутреннее имя
 
 
-def _run(cmd, should_stop=None) -> bool:
+def _run(cmd, should_stop=None, runner=None) -> bool:
     """Одно кодирование. Если сборка ffmpeg не знает `-usage allintra`, команда
     повторяется без него и дальше он больше не подставляется."""
     global _allintra_ok
     if _allintra_ok is False:
         cmd = _strip_allintra(cmd)
-    ok = _run_once(cmd, should_stop)
+    run = runner if runner is not None else lambda command: _run_once(command, should_stop)
+    ok = run(cmd)
     if ok:
         if _allintra_ok is None and _ALLINTRA[0] in cmd:
             _allintra_ok = True
         return True
     if _allintra_ok is None and not (should_stop and should_stop()):
         plain = _strip_allintra(cmd)
-        if plain != list(cmd) and _run_once(plain, should_stop):
+        if plain != list(cmd) and run(plain):
             _allintra_ok = False
             return True
     return False
@@ -235,7 +236,7 @@ def start_cq_guess(width: int, height: int, limit_kb: int) -> int:
 def fit_to_limit(src: str, out: str, limit_kb: int = 150, *, speed: int = 5,
                  passes: int = 4, chroma: str = "420",
                  start_cq: Optional[int] = None, max_side: int = 0,
-                 should_stop=None, log=None) -> bool:
+                 should_stop=None, log=None, runner=None) -> bool:
     """Кодирует src в AVIF ≤ limit_kb килобайт и кладёт результат в out.
 
     Та же стратегия, что в «Обработке» (ProcessWorker.process_avif): пробуем
@@ -266,7 +267,7 @@ def fit_to_limit(src: str, out: str, limit_kb: int = 150, *, speed: int = 5,
         tmp_files.append(tmp)
         if not _run(avif_encode_cmd(src, tmp, cq, vf, False,
                                     avif_pix_fmt(False, chroma), speed),
-                    should_stop):
+                    should_stop, runner):
             return None, 0
         if not os.path.exists(tmp):
             return None, 0
