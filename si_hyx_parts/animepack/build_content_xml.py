@@ -159,9 +159,12 @@ def _append_question(questions_el, cand: _api.SongCandidate, s: _api.PackSetting
                 said.text = hint_text
             # Ролик опенинга с AnimeThemes: он и картинка, и звук сразу, так
             # что ни коллаж, ни фоновая дорожка тут не нужны.
-            video = _api.ET.SubElement(q_param, "item", {
-                "type": "video", "isRef": "True",
-                "duration": _api.fmt_duration(s.video_cut)})
+            attrs = {"type": "video", "isRef": "True"}
+            # Karaoke duration comes from its cropped/tempo-adjusted recording;
+            # omit the separate AnimeThemes timer and wait for the media end.
+            if cand.music_effect != "karaoke":
+                attrs["duration"] = _api.fmt_duration(s.video_cut)
+            video = _api.ET.SubElement(q_param, "item", attrs)
             video.text = cand.entrance_video or cand.video_out
             _api._append_answer(params, q, cand, s)
             return

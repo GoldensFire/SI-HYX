@@ -21,8 +21,10 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules, collect_all, collect_data_files
 
 datas = [('icon.ico', '.'), ('open-file.svg', '.')]
+datas += [(str(p), 'karaoke/fonts') for p in Path('karaoke/fonts').glob('*')]
 # Standalone source for the isolated ML interpreter; torch stays excluded.
 datas += [(str(p), 'chiptune') for p in Path('chiptune').glob('*.py')]
+datas += [('karaoke/asr_worker.py', 'karaoke')]
 binaries = []
 # numpy/lxml тянутся лениво (волны/LUFS/разбор .siq), siquester — внутри try/except,
 # поэтому пакет включаем целиком. soundfile несёт нативный libsndfile (collect_all).
@@ -31,6 +33,11 @@ hiddenimports += ['google.auth', 'google.auth.transport.requests',
                   'google.oauth2.service_account']
 hiddenimports += collect_submodules('siquester')
 hiddenimports += collect_submodules('si_hyx_parts.kuhi')
+# Alloha uses the installed Edge/Chrome; package only Playwright's driver.
+_pw_data, _pw_bin, _pw_imports = collect_all('playwright')
+datas += _pw_data
+binaries += _pw_bin
+hiddenimports += _pw_imports
 datas += [('si_hyx_parts/kuhi/LICENSE', 'si_hyx_parts/kuhi')]
 # Холст видео «Монтажа» выводит кадр через QML VideoOutput (см. VideoCanvas в
 # edit_tab_widgets.py), поэтому в сборку обязаны попасть Qt Quick/Qml вместе с
@@ -49,6 +56,15 @@ hiddenimports += ['cover_audio', 'cover_cache', 'cover_fingerprint',
                   'si_hyx_parts.animepack_tab.cover_controls',
                   'si_hyx_parts.animepack_tab.cover_lang_controls',
                   'si_hyx_parts.animepack_tab.cover_preview']
+hiddenimports += collect_submodules('karaoke')
+hiddenimports += collect_submodules('pykakasi')
+hiddenimports += ['si_hyx_parts.animepack.karaoke_processing',
+                  'si_hyx_parts.animepack_tab.karaoke_controls']
+datas += collect_data_files('pykakasi')
+hiddenimports += collect_submodules('sudachipy')
+hiddenimports += ['sudachidict_core']
+datas += collect_data_files('sudachipy')
+datas += collect_data_files('sudachidict_core')
 for _pkg in ('soundfile', 'qtawesome', 'tzdata'):
     _d, _b, _h = collect_all(_pkg)
     datas += _d; binaries += _b; hiddenimports += _h

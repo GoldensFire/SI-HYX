@@ -42,6 +42,16 @@ def _mal_of_card(card: dict) -> int:
         return 0
 
 
+def _known_favorites(gen, anime):
+    """Use saved popularity before average selection, without extra HTTP calls."""
+    try:
+        title_id = int(anime.get("id") or 0)
+        value = gen.db_cache.memo("anime_favorites", title_id, _api.ENRICHMENT_CACHE_TTL)
+        return int(value) if value is not None else -1
+    except (TypeError, ValueError):
+        return -1
+
+
 class AnimeCardFeed:
     """Каталог аниме, разобранный один раз на два потока кандидатов."""
 
@@ -201,6 +211,7 @@ class AnimeCardFeed:
                 kind=_api.song_kind(song.get("songType")) or "opening",
                 trim_start=gen._trim_start(song),
                 franchise_index=gen._franchise_index(anime),
+                favorites=_known_favorites(gen, anime),
                 compress_audio=gen.s.compress_audio,
                 compress_images=gen.s.compress_images,
                 siblings=list(siblings))

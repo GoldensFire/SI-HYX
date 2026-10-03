@@ -149,6 +149,10 @@ def from_dict(cls, d: dict) -> '_api.PackSettings':
     # при миграции; после сохранения новая настройка независима.
     if "frame_preset" not in d:
         s.frame_preset = s.video_preset
+    if "karaoke_crf" not in d:
+        s.karaoke_crf = s.video_crf
+    if "karaoke_preset" not in d:
+        s.karaoke_preset = s.video_preset
     if s.song_video and "pct_videos" not in d:
         # До ползунка галочка «Вопрос — ролик» превращала в ролики ВСЕ
         # песенные вопросы разом — читаем её как «доля роликов = вся доля

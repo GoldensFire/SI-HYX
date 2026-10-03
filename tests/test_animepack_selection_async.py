@@ -6,6 +6,21 @@ import animepack as ap
 from test_animepack_mixed_streams import _generator, make_anime
 
 
+def test_song_average_uses_saved_favorites_before_media_selection(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from test_animepack_mixed_streams import make_song
+    card = make_anime(1)
+    gen = _generator(tmp_path, monkeypatch, [card], [make_song(1)], pct_songs=100, pct_frames=0)
+    gen.db_cache.remember_memo("anime_favorites", card["id"], 5000)
+    gen.shikimori = SimpleNamespace(title_favorites=lambda *_: 0)
+    candidate = next(gen.iter_candidates())
+    assert candidate.favorites == 5000
+    before = candidate.level
+    candidate.favorites = gen._title_favorites(candidate)
+    assert candidate.favorites == 5000
+    assert candidate.level == before, "Сохранённое избранное меняет уровень после выбора средней"
+
+
 def _frame(number):
     return ap.SongCandidate({}, make_anime(number), kind=ap.FRAME_KIND)
 

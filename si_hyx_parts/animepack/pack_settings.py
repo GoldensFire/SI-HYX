@@ -406,6 +406,17 @@ class PackSettings:
     pack_episode: bool = False
     pct_episode: int = 0
     episode_ru_subtitles: bool = False
+    animelib_token: str = _api.field(default="", repr=False)
+    karaoke_enabled: bool = False
+    karaoke_translations: bool = False
+    karaoke_percent: int = 25
+    karaoke_ai_fallback: bool = True
+    karaoke_python: str = ""
+    karaoke_effect: str = "original"
+    karaoke_tempo: float = 1.0
+    karaoke_pitch: int = 0
+    karaoke_crf: int = _api.VIDEO_CRF
+    karaoke_preset: int = _api.VIDEO_PRESET
 
     # ── производные ──────────────────────────────────────────────────────
     @property

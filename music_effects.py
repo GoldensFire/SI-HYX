@@ -19,12 +19,13 @@ from pathlib import Path
 VERSION = "chiptune-2"
 MODEL = "htdemucs-955717e8+rmvpe-5370e71a+crepe-full-0.0.23"
 ORIGINAL = "original"
-EFFECTS = {ORIGINAL: "Оригинал", "chiptune": "Chiptune", "cover": "Кавер"}
+EFFECTS = {ORIGINAL: "Оригинал", "chiptune": "Chiptune", "cover": "Кавер", "karaoke": "Караоке"}
 # Эффекты, у которых череда неудач означает неверные настройки, а не пустой
 # результат: такие останавливают генерацию.
 STRICT = {"chiptune": ("Chiptune: слишком много неудачных распознаваний. "
                        "Проверьте фрагмент в прослушивании или смените "
-                       "ведущую партию.")}
+                       "ведущую партию."),
+          "karaoke": "Караоке: не хватает песен с подтверждённой версией и таймингами."}
 # Сколько неудач терпим: по четыре на запланированный вопрос, но не меньше
 # дюжины — иначе одиночный вопрос падал бы с первой же осечки.
 FAILURES_PER_SLOT = 4
@@ -56,6 +57,8 @@ def shares(settings):
         out.append(("chiptune", int(getattr(settings, "chiptune_percent", 0))))
     if getattr(settings, "cover_enabled", False):
         out.append(("cover", int(getattr(settings, "cover_percent", 0))))
+    if getattr(settings, "karaoke_enabled", False):
+        out.append(("karaoke", int(getattr(settings, "karaoke_percent", 0))))
     return out
 
 
@@ -87,6 +90,18 @@ def validate(settings):
     if total > 100:
         errors.append("Доли способов подачи музыки вместе больше 100% — "
                       "последним не хватит вопросов.")
+    if getattr(settings, "karaoke_enabled", False):
+        from karaoke.render import EFFECT_LABELS
+        if settings.karaoke_effect not in EFFECT_LABELS:
+            errors.append("Караоке: неизвестный аудиоэффект.")
+        if not .5 <= settings.karaoke_tempo <= 2:
+            errors.append("Караоке: темп должен быть от 0.5 до 2.")
+        if not -12 <= settings.karaoke_pitch <= 12:
+            errors.append("Караоке: высота тона от −12 до +12 полутонов.")
+        if not 0 <= settings.karaoke_crf <= 63:
+            errors.append("Караоке: CRF должен быть от 0 до 63.")
+        if not 0 <= settings.karaoke_preset <= 13:
+            errors.append("Караоке: пресет кодирования должен быть от 0 до 13.")
     if getattr(settings, "cover_enabled", False):
         low = int(getattr(settings, "cover_amq_from", 0))
         high = int(getattr(settings, "cover_amq_to", 100))

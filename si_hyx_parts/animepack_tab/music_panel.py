@@ -72,6 +72,8 @@ def build_controls(tab):
     grid.addWidget(build_chiptune(tab), 2, 0, 1, 4)
     from .cover_controls import build_controls as build_cover
     grid.addWidget(build_cover(tab), 3, 0, 1, 4)
+    from .karaoke_controls import build_controls as build_karaoke
+    grid.addWidget(build_karaoke(tab), 4, 0, 1, 4)
     for column in (1, 3):
         grid.setColumnStretch(column, 1)
     return tab.box_audio_opts

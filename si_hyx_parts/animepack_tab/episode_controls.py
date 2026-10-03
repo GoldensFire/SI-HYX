@@ -5,17 +5,19 @@ import animepack_tab as api
 def build_controls(tab):
     tab.chk_episode = api.QCheckBox("Отрывки серий")
     tab.chk_episode.setToolTip(
-        "Случайные 20 секунд из существующей серии выбранного аниме. "
-        "Оригинальная японская озвучка; опенинги и эндинги пропускаются.")
+        "Случайные 15 секунд из существующей серии выбранного аниме. "
+        "AnimeGO, YummyAnime, AnimeLIB → резерв Kuhi. Только проверенные ≥1080p, "
+        "сжатие в 720p; японская озвучка, без опенингов и эндингов.")
     tab.box_episode = api.SettingsBox()
     layout = api.QGridLayout(tab.box_episode)
     layout.setContentsMargins(16, 0, 0, 0)
     tab.chk_episode_ru = api.QCheckBox("Русские субтитры")
     tab.chk_episode_ru.setChecked(False)
     tab.chk_episode_ru.setToolTip(
-        "SubDL → Jimaku, с ключами из настроек диалогов. Для перевода Jimaku "
-        "используется настроенный Gemini. Если русских субтитров нет, отрывок "
-        "всё равно попадёт в пак. Настройки качества общие с роликами.")
+        "Русские субтитры обязательны: встроенные RU или дорожка самого видео. "
+        "Иностранная дорожка переводится через настроенный Gemini с сохранением таймкодов. "
+        "Видео без синхронных субтитров и с вшитыми английскими заменяются. "
+        "Приоритет плееров: CVH → Aniboom → AnimeLIB native → Alloha.")
     layout.addWidget(tab.chk_episode_ru, 0, 0)
     crf = api.QSpinBox()
     crf.setRange(0, 63)
@@ -32,8 +34,9 @@ def build_controls(tab):
     layout.addWidget(tab._lab("Скорость кодирования"), 2, 0)
     layout.addWidget(preset, 2, 1)
     preset.setToolTip("13 — быстрее, 0 — медленнее. Качество и скорость общие с видео опенингов.")
-    layout.addWidget(tab._api_key_button("subdl", "Ключ SubDL"), 3, 0)
-    layout.addWidget(tab._api_key_button("jimaku", "Ключ Jimaku"), 3, 1)
+    layout.addWidget(tab._api_key_button("gemini", "Ключ Gemini для перевода"), 3, 0, 1, 2)
+    layout.addWidget(tab._lab("Аккаунт AnimeLIB (необязательно)"), 4, 0)
+    layout.addWidget(tab._api_key_button("animelib", "Токен AnimeLIB"), 4, 1)
     tab.chk_episode_ru.toggled.connect(lambda _: tab._refresh_song_opts())
     tab.box_episode.hide()
     tab.chk_episode.toggled.connect(lambda checked: _toggle(tab, checked))
@@ -49,9 +52,11 @@ def collect(tab, settings):
     settings.pack_episode = tab.chk_episode.isChecked()
     settings.pct_episode = tab.mix.shares()["episode"]
     settings.episode_ru_subtitles = tab.chk_episode_ru.isChecked()
+    settings.animelib_token = tab._api_key("animelib")
 
 
 def apply_controls(tab, settings):
     tab.chk_episode.setChecked(settings.pack_episode)
     tab.mix._set_part("episode", settings.pack_episode)
     tab.chk_episode_ru.setChecked(settings.episode_ru_subtitles)
+    tab._migrate_api_key("animelib", getattr(settings, "animelib_token", ""))

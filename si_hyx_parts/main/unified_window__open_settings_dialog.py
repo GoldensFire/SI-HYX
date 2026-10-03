@@ -245,6 +245,16 @@ def _open_settings_dialog(self, section=None):
     add_row(sec_api, grp_jimaku,
             "jimaku джимаку субтитры диалоги аниме ключ api серии")
 
+    grp_animelib = _api.QGroupBox("AnimeLIB — отрывки серий")
+    _key_row(_api.QVBoxLayout(grp_animelib),
+             'Аккаунт: <a href="https://animelib.org/" style="color:#89b4fa;">animelib.org</a>',
+             "Bearer-токен аккаунта AnimeLIB (необязательно)", "animelib",
+             "Для native-видео, доступных вашему аккаунту. В браузере после входа: "
+             "F12 → Network → запрос к API → Authorization; скопируйте токен после Bearer. "
+             "Без токена проверяются публичные релизы. Токен передаётся только API AnimeLIB "
+             "и в пак не попадает.")
+    add_row(sec_api, grp_animelib, "animelib анимелиб аниме отрывки субтитры аккаунт токен")
+
     grp_tmdb = _api.QGroupBox("TMDB (themoviedb.org)")
     vt = _api.QVBoxLayout(grp_tmdb)
     _key_row(vt,

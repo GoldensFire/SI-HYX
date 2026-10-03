@@ -291,6 +291,8 @@ def collect(self) -> '_api.PackSettings':
     collect_controls(self, s)
     from .cover_controls import collect_controls as collect_cover_controls
     collect_cover_controls(self, s)
+    from .karaoke_controls import collect_controls as collect_karaoke
+    collect_karaoke(self, s)
     s.compress_images = self.chk_compress_images.isChecked()
     s.image_limit_kb = self.sp_img_kb.value()
     s.image_speed = self.sp_img_speed.value()
@@ -311,6 +313,6 @@ def get_settings(self) -> dict:
     # копии при следующем запуске.
     for k in ("gemini_key", "elevenlabs_key", "jimaku_key", "subdl_key", "tmdb_key",
               "cloudflare_token",
-              "cloudflare_account_id", "pixiv_refresh_token"):
+              "cloudflare_account_id", "pixiv_refresh_token", "animelib_token"):
         data.pop(k, None)
     return self._templates_to_settings(data)

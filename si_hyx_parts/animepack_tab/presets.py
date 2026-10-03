@@ -20,6 +20,7 @@ _PRESERVE = {
     "exclude_siq", "exclude_exact_siq", "auto_add_to_exclusions", "out_dir",
     "gemini_key", "elevenlabs_key", "jimaku_key", "subdl_key", "tmdb_key", "cloudflare_token",
     "cloudflare_account_id", "pixiv_refresh_token",
+    "animelib_token",
 }
 
 

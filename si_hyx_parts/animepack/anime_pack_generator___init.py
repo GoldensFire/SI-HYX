@@ -11,7 +11,7 @@ def __init__(self, settings: _api.PackSettings, *,
              anilist=None, kitsu=None, themes=None, fandom=None, gemini=None,
              tmdb=None, cloudflare=None, pixiv=None, anizip=None,
              mangadex=None, sakuga=None,
-             jimaku=None, subdl=None, kuhi=None,
+             jimaku=None, subdl=None, kuhi=None, episode_ru=None,
              log: _api.Optional[_api.Callable[[str], None]] = None,
              progress: _api.Optional[_api.Callable[[int, int, str], None]] = None,
              should_stop: _api.Optional[_api.Callable[[], bool]] = None,
@@ -29,6 +29,8 @@ def __init__(self, settings: _api.PackSettings, *,
     self._runtime = generation_runtime or GenerationRuntime(settings, self.stopped)
     self.rng = rng or _api.random.Random()
     self.session = session or _api.make_session()
+    from .karaoke_processing import init_service as init_karaoke
+    init_karaoke(self)
     self.amq = amq or _api.AmqApi(self.session)
     self.anisong = anisong or _api.AnisongApi(self.session)
     self.mal = mal or _api.MalApi(self.session)
@@ -145,7 +147,7 @@ def __init__(self, settings: _api.PackSettings, *,
     self._dialogue_lock = _api.threading.Lock()
     self._dialogue_seen: set[tuple[int, int]] = set()
     from .episode_generation import initialize as initialize_episode
-    initialize_episode(self, kuhi)
+    initialize_episode(self, kuhi, episode_ru)
     # Запасной источник обложек. Без ключа клиент всё равно создаётся —
     # просто ничего не умеет (enabled=False), и проверок по всему коду не
     # нужно.

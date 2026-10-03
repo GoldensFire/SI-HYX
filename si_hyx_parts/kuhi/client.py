@@ -67,6 +67,14 @@ class KuhiClient:
         self.log(f"Kuhi / AniList {anilist_id}, серия {episode}: потоков {len(result)}.")
         return result
 
+    def episode_batches(self, aid, ctx, scope):
+        from .batches import ProviderBatches, episode_batches
+        return ProviderBatches(self, episode_batches(aid, ctx), scope, event_loop())
+
+    def stream_batches(self, aid, episode, ctx, providers, scope):
+        from .batches import ProviderBatches, watch_batches
+        return ProviderBatches(self, watch_batches(aid, episode, ctx, providers), scope, event_loop())
+
     def range_supported(self, url, headers, scope):
         async def check():
             async with AsyncClient(follow_redirects=True) as client:
@@ -90,6 +98,30 @@ class KuhiClient:
         if not stream.get("chapters") or (stream.get("intro") and stream.get("outro")):
             return {}
         return self.call(chapters.timings(stream, headers), scope, 12) or {}
+
+    def captions(self, stream, scope):
+        from urllib.parse import urljoin, urlsplit
+        from ._http import UA
+        async def collect():
+            result = []
+            async with AsyncClient(follow_redirects=True) as client:
+                for row in stream.get("subtitles") or []:
+                    url = urljoin(stream.get("referer") or stream["url"], row.get("url", ""))
+                    if urlsplit(url).scheme not in ("http", "https"):
+                        continue
+                    headers = {"User-Agent": UA, **(stream.get("headers") or {})}
+                    if stream.get("referer"):
+                        headers.setdefault("Referer", stream["referer"])
+                        origin = urlsplit(stream["referer"])
+                        headers.setdefault("Origin", f"{origin.scheme}://{origin.netloc}")
+                    response = await client.get(url, headers=headers)
+                    response.raise_for_status()
+                    name = row.get("name") or urlsplit(url).path.rsplit("/", 1)[-1]
+                    if not name.lower().endswith((".ass", ".ssa", ".srt", ".vtt")):
+                        name = "captions.vtt"
+                    result.append((response.content, name))
+            return result
+        return self.call(collect(), scope, 20) or []
 
     def close(self):
         self.closed = True

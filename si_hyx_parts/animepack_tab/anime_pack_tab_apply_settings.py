@@ -212,6 +212,8 @@ def apply_settings(self, data: dict):
     apply_controls(self, s)
     from .cover_controls import apply_controls as apply_cover_controls
     apply_cover_controls(self, s)
+    from .karaoke_controls import apply_controls as apply_karaoke
+    apply_karaoke(self, s)
     self.chk_compress_images.setChecked(s.compress_images)
     self.sp_img_kb.setValue(max(20, int(s.image_limit_kb)))
     self.sp_img_speed.setValue(max(0, min(8, int(s.image_speed))))

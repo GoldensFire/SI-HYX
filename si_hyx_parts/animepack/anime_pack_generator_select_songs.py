@@ -193,6 +193,8 @@ def select_songs(self) -> list:
                         continue
                     if kind in _api.SONG_KINDS:
                         effect_slots.reserve(cand)
+                        from .song_downloads import prefetch
+                        prefetch(self, cand)
                     inflight[kind] += 1
                     self._tries[kind] += 1
                     self._manga_mix.reserve(cand)
@@ -223,6 +225,8 @@ def select_songs(self) -> list:
         try:
             source.close()
         finally:
+            from .song_downloads import close as close_downloads
+            close_downloads(self)
             pool.shutdown(wait=True, cancel_futures=True)
             with self._exact_lock:
                 self._exact_pending.clear()
@@ -244,6 +248,9 @@ def select_songs(self) -> list:
             for k in (_api.SONG_KINDS + (_api.VIDEO_KIND,) + _api.SILENT_KINDS)
             if quotas.get(k))
         self.log(f"Отобрано вопросов: {len(accepted)} из {total} ({by_kind})")
+    if self.s.karaoke_enabled:
+        made = sum(c.music_effect == "karaoke" and c.has_video for c in accepted)
+        self.log(f"Караоке: готово {made} из {effect_slots.slots.count('karaoke')} запланированных")
     if self.s.chiptune_enabled:
         made = sum(c.music_effect == "chiptune" for c in accepted)
         target = effect_slots.slots.count("chiptune")
@@ -449,6 +456,15 @@ def write_package(self, songs: list, out_path: _api.Optional[str] = None) -> str
         covers = covers_manifest(songs, self.s)
         if covers:
             zf.writestr("covers.json", covers, _api.zipfile.ZIP_DEFLATED)
+        from .karaoke_processing import manifest as karaoke_manifest
+        karaoke_data = karaoke_manifest(songs)
+        if karaoke_data:
+            zf.writestr("karaoke.json", karaoke_data, _api.zipfile.ZIP_DEFLATED)
+            for candidate in songs:
+                if candidate.music_effect == "karaoke" and candidate.has_video:
+                    subtitle = Path(self.folder) / "Video" / (Path(candidate.video_out).stem + ".ass")
+                    if subtitle.is_file():
+                        zf.write(subtitle, "Karaoke/" + subtitle.name, _api.zipfile.ZIP_DEFLATED)
         episodes = [{"file": c.video_out, **c.episode_clip} for c in songs if c.episode_clip]
         if episodes:
             zf.writestr("episodes.json", _api.json.dumps(episodes, ensure_ascii=False, indent=2),
@@ -470,9 +486,14 @@ def write_package(self, songs: list, out_path: _api.Optional[str] = None) -> str
 
 def cleanup(self) -> None:
     self.stop_processes()
+    from .song_downloads import close as close_downloads
+    close_downloads(self)
     kuhi = getattr(self, "kuhi", None)
     if kuhi is not None:
         kuhi.close()
+    episode_ru = getattr(self, "episode_ru", None)
+    if episode_ru is not None:
+        episode_ru.close()
     service = getattr(self, "_cover_service", None)
     if service is not None:
         service.close()

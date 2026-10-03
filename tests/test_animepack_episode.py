@@ -13,10 +13,10 @@ from si_hyx_parts.animepack.episode_sources import choose_start, episode_catalog
 from test_animepack_new_kinds import make_anime
 
 
-def info(language="jpn", duration=20, video=True, audio=True):
+def info(language="jpn", duration=15, video=True, audio=True, height=1080):
     streams = []
     if video:
-        streams.append({"index": 0, "codec_type": "video", "duration": str(duration)})
+        streams.append({"index": 0, "codec_type": "video", "duration": str(duration), "width": 1920, "height": height})
     if audio:
         streams.append({"index": 1, "codec_type": "audio", "tags": {"language": language}, "duration": str(duration)})
     return {"streams": streams, "format": {"duration": str(duration)}}
@@ -43,17 +43,17 @@ def test_sampled_windows_exclude_entire_intro_and_outro():
     rng = random.Random(42)
     starts = [choose_start(1400, source, rng) for _ in range(2000)]
     for start in starts:
-        assert 0 <= start <= 1380
-        assert start + 20 <= 300 or start >= 390
-        assert start + 20 <= 1000 or start >= 1090
+        assert 0 <= start <= 1385
+        assert start + 15 <= 300 or start >= 390
+        assert start + 15 <= 1000 or start >= 1090
     assert any(s < 100 for s in starts) and any(s > 1200 for s in starts)
 
 
 def test_unknown_op_ed_avoids_edges_and_rejects_too_short():
     for seed in range(100):
         start = choose_start(1400, {}, random.Random(seed))
-        assert 180 <= start and start + 20 <= 1220
-    assert choose_start(20, {}, random.Random()) is None
+        assert 180 <= start and start + 15 <= 1220
+    assert choose_start(15, {}, random.Random()) is None
     assert choose_start(1400, {"intro": {"start": 0, "end": 1400}}, random.Random()) is None
 
 
@@ -78,7 +78,7 @@ def test_cut_seeks_input_forwards_headers_and_checks_result(tmp_path):
     calls = []
     def capture(cmd, timeout):
         source = str(cmd[-1]).startswith("https:")
-        return 0, json.dumps(info("jpn", 1400 if source else 20)), ""
+        return 0, json.dumps(info("jpn", 1400 if source else 15)), ""
     def run(cmd, timeout):
         calls.append(cmd)
         Path(cmd[-1]).write_bytes(b"clip")
@@ -93,11 +93,11 @@ def test_cut_seeks_input_forwards_headers_and_checks_result(tmp_path):
     assert "Referer: https://site/watch\r\n" in cmd[cmd.index("-headers") + 1]
     assert "User-Agent: required\r\n" in cmd[cmd.index("-headers") + 1]
     assert "Origin: https://custom\r\n" in cmd[cmd.index("-headers") + 1]
-    assert cmd[cmd.index("-t") + 1] == "20.0"
+    assert cmd[cmd.index("-t") + 1] == "15.0"
 
 
 @pytest.fixture
-def generator(tmp_path):
+def generator(tmp_path, monkeypatch):
     settings = api.PackSettings(pack_episode=True, pct_episode=100, pct_songs=0,
                                 rounds=1, themes=1, questions=5, mark_owners=False)
     anizip = SimpleNamespace(info=lambda _: {"mappings": {"anilist_id": 1}})
@@ -106,6 +106,10 @@ def generator(tmp_path):
                                 anilist=object(), kitsu=object(), themes=object(), tmdb=object(),
                                 rng=random.Random(2))
     gen.prepare_dirs()
+    # Unit fixtures don't contact real catalogues or probe imaginary hosts.
+    gen.episode_ru.close()
+    gen.episode_ru = None
+    monkeypatch.setattr(generation, "inspect_stream", lambda *a: info(duration=1400))
     yield gen
     gen.cleanup()
 

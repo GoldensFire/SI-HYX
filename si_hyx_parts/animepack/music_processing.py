@@ -34,9 +34,8 @@ def download_chiptune(generator, candidate):
         with tempfile.TemporaryDirectory(prefix="chip-", dir=generator.folder) as directory:
             work = Path(directory)
             source, rendered = work / "source.audio", work / "synth.wav"
-            url = f"{_api.AMQ_CDN}/{candidate.audio_file}"
-            data = generator._cached_bytes(
-                url, "amq-audio", _api._MIN_AUDIO_BYTES)
+            from .song_downloads import source_bytes
+            data = source_bytes(generator, candidate)
             if len(data) < _api._MIN_AUDIO_BYTES:
                 raise ValueError("Исходный файл подозрительно мал.")
             source.write_bytes(data)

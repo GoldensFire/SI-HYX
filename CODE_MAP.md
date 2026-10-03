@@ -1,5 +1,16 @@
 # Карта небольших модулей SI-HYX
 
+Караоке OP/ED/OST: [karaoke](karaoke/) — источники, проверка записи, ASS/TTML,
+тайминги и рендер; интеграция — [karaoke_processing](si_hyx_parts/animepack/karaoke_processing.py),
+интерфейс — [karaoke_controls](si_hyx_parts/animepack_tab/karaoke_controls.py).
+Описание и ограничения — [anime-karaoke](docs/anime-karaoke.md).
+Стиль и шрифт — `karaoke/style.py`, недельные отказы — `karaoke/rejections.py`,
+предварительная загрузка песен — `si_hyx_parts/animepack/song_downloads.py`.
+Распознавание и постоянный кэш вокала — `karaoke/recognition.py`;
+изолированный обработчик CPU/CUDA — `karaoke/asr_worker.py`.
+AnimeGO.online — `si_hyx_parts/animepack/episode_ru_animego.py`,
+списки серий Alloha — `si_hyx_parts/animepack/episode_alloha_catalog.py`.
+
 Изменяй реализацию в указанной папке; прежний файл сохраняет публичные импорты и общее состояние.
 Сначала найди нужный символ, например:
 
@@ -60,6 +71,15 @@ API-пачки накапливаются в памяти, сохраняютс�
 ИИ-арты: [инструкция и карта модулей](docs/anime-ai-art.md).
 
 Отрывки серий: [источники, настройки и карта native Kuhi](docs/anime-episode-clips.md).
+RU-sub каталоги AnimeGO/YummyAnime/AnimeLIB — `animepack/episode_ru_*.py`;
+проверка и ограничение HLS/DASH — `animepack/episode_stream_quality.py`,
+временная передача manifest FFmpeg — `animepack/episode_manifest.py`.
+Живая сессия Alloha и локальный мост — `episode_ru_alloha.py`, `episode_alloha_proxy.py`.
+Синхронные RU-дорожки и один проход AV1 — `episode_captions.py`,
+`episode_caption_text.py`; готовые провайдеры без ожидания всех —
+`episode_fallback.py`, `si_hyx_parts/kuhi/batches.py`.
+Полный прогон сохранённых настроек — `tools/episode_probe.py --current-settings`;
+проверка видео и видимых сабов SIQ — `tools/episode_pack_audit.py`.
 
 Проверки картинок Gemini: [visual_batch](si_hyx_parts/animepack/visual_batch.py)
 собирает до четырёх параллельных проверок Pixiv и манги с одинаковой моделью

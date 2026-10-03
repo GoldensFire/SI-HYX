@@ -10,6 +10,9 @@ from .generation_diagnostics import operation
 
 def download_audio(self, cand: _api.SongCandidate) -> bool:
     """Качает mp3 с CDN AMQ и режет его ffmpeg-ом до нужной длины."""
+    if cand.music_effect == "karaoke":
+        from .karaoke_processing import download_karaoke
+        return download_karaoke(self, cand)
     if cand.music_effect == "chiptune":
         from .music_processing import download_chiptune
         return download_chiptune(self, cand)
@@ -27,8 +30,8 @@ def download_audio(self, cand: _api.SongCandidate) -> bool:
         return True
     raw = _api.os.path.join(self.folder, "Audio", f"_tmp_{name}")
     try:
-        url = f"{_api.AMQ_CDN}/{name}"
-        data = self._cached_bytes(url, "amq-audio", _api._MIN_AUDIO_BYTES)
+        from .song_downloads import source_bytes
+        data = source_bytes(self, cand)
         if len(data) < _api._MIN_AUDIO_BYTES:
             raise _api.AnimePackError("файл подозрительно мал")
         with open(raw, "wb") as f:

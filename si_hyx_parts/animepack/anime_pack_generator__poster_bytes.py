@@ -221,7 +221,7 @@ def _theme_video(self, cand: _api.SongCandidate) -> str:
     row = (known or {}).get(tag) or {}
     return str(row.get("url") or "")
 
-def video_encode_args(self, preset=None) -> list[str]:
+def video_encode_args(self, preset=None, *, crf=None) -> list[str]:
     """Флаги кодирования ролика — тот же libsvtav1, что в «Обработке»
         (ProcessWorker._svt_args): keyint=-1 и scd=1, ключевые кадры только на
         сменах сцены. Из настроек вкладки берутся crf и пресет, остальное
@@ -230,7 +230,7 @@ def video_encode_args(self, preset=None) -> list[str]:
         preset задаётся отдельно там, где скорость кодирования своя: у сакуги
         она настраивается независимо от вопросов-роликов (просьба
         пользователя)."""
-    crf = max(0, min(63, int(self.s.video_crf)))
+    crf = max(0, min(63, int(self.s.video_crf if crf is None else crf)))
     preset = max(0, min(13, int(self.s.video_preset if preset is None
                                 else preset)))
     return ["-c:v", "libsvtav1", "-crf", str(crf), "-preset", str(preset),

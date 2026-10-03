@@ -46,12 +46,18 @@ class RangeHandler(SimpleHTTPRequestHandler):
 
 def fixtures(folder):
     source = folder / "episode.mp4"
-    run(["-f", "lavfi", "-i", "testsrc2=size=128x96:rate=5", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
-         "-t", "120", "-c:v", "libx264", "-preset", "ultrafast", "-g", "20", "-c:a", "aac",
+    run(["-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=2", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+         "-t", "120", "-c:v", "libx264", "-preset", "ultrafast", "-g", "8", "-c:a", "aac",
          "-metadata:s:a:0", "language=jpn", "-movflags", "+faststart", str(source)])
     run(["-i", str(source), "-c", "copy", "-f", "hls", "-hls_time", "4", "-hls_list_size", "0",
          "-hls_segment_filename", str(folder / "segment%03d.ts"), str(folder / "episode.m3u8")])
     run(["-i", str(source), "-c", "copy", "-f", "dash", "-seg_duration", "4", "episode.mpd"], cwd=folder)
+    run(["-i", str(source), "-map", "0:v:0", "-c", "copy", "-f", "hls", "-hls_time", "4",
+         "-hls_list_size", "0", "-hls_segment_filename", str(folder / "video%03d.ts"),
+         str(folder / "video.m3u8")])
+    run(["-i", str(source), "-map", "0:a:0", "-c", "copy", "-f", "hls", "-hls_time", "4",
+         "-hls_list_size", "0", "-hls_segment_filename", str(folder / "audio%03d.ts"),
+         str(folder / "audio.m3u8")])
     for path in folder.glob("segment*.ts"):
         shutil.copyfile(path, path.with_suffix(".jpg"))
     text = (folder / "episode.m3u8").read_text(encoding="utf-8")

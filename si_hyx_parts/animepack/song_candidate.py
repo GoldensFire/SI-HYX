@@ -136,6 +136,7 @@ class SongCandidate:
     popular_franchise_title: str = ""
     ru_popularity: dict = _api.field(default_factory=dict)
     episode_clip: dict = _api.field(default_factory=dict)
+    karaoke: dict = _api.field(default_factory=dict)
 
     @property
     def base_kind(self) -> str:
@@ -326,7 +327,8 @@ class SongCandidate:
     def video_out(self) -> str:
         """Имя ролика внутри пака. mp4, как и у «Обработки»: AV1 в mp4 —
         то, что она сама выдаёт на выходе."""
-        return f"{self.file_base}.mp4"
+        suffix = "_karaoke" if self.music_effect == "karaoke" else ""
+        return f"{self.file_base}{suffix}.mp4"
 
     @property
     def image_ext(self) -> str:

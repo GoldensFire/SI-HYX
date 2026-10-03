@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from urllib.parse import urlsplit
 
-CUT_SECONDS = 20.0
+CUT_SECONDS = 15.0
 
 
 def context(generator, candidate):
@@ -13,8 +13,6 @@ def context(generator, candidate):
     mapping = data.get("mappings") or {}
     aid = int(card.get("anilistId") or card.get("anilist_id")
               or mapping.get("anilist_id") or 0)
-    if not aid:
-        return 0, {}
     titles = data.get("titles") or {}
     date = card.get("airedOn") or {}
     year = date.get("year") if isinstance(date, dict) else None
@@ -94,7 +92,7 @@ def _range(value, duration):
 
 
 def choose_start(duration, stream, rng):
-    """Sample uniformly over starts whose complete 20 seconds exclude OP/ED."""
+    """Sample uniformly over starts whose complete clip excludes OP/ED."""
     if not math.isfinite(duration) or duration < CUT_SECONDS + 2:
         return None
     intro = _range(stream.get("intro"), duration)
