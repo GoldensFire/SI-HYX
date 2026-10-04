@@ -159,6 +159,8 @@ def apply_settings(self, data: dict):
         bool(getattr(s, "manga_allow_erotica", False)))
     from si_hyx_parts.animepack_tab.manga_gemini_controls import apply_controls as apply_manga_gemini
     apply_manga_gemini(self, s)
+    from .frame_gemini_controls import apply_controls as apply_frame_checks
+    apply_frame_checks(self, s)
     from .manga_source_controls import apply_controls as apply_manga_sources
     apply_manga_sources(self, s)
     for kind, chk in self.chk_manga_kinds.items():

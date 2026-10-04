@@ -45,19 +45,17 @@ def download_pixel(self, cand: _api.SongCandidate) -> bool:
     """Кадр с выбранным эффектом; прежнее имя сохраняет API и историю кадров."""
     effect = choose_effect(self.s.frame_effect, self.s.frame_effects, self.rng)
     seed = self.rng.getrandbits(64)
-    url = self._pick_frame_url(cand)
-    if not url:
-        if not self.stopped():
-            self.log(f"«{cand.title_ru}»: свободных кадров нет — беру "
-                     "следующий тайтл")
+    from .frame_visual_check import select
+    selected = select(self, cand)
+    if selected is None:
         return False
-    cand.frame_url = url
+    data, ext = selected
     raw = _api.os.path.join(self.folder, "Images",
-                       f"_pix_{_api.uuid.uuid4().hex}{self._url_ext(url)}")
+                       f"_pix_{_api.uuid.uuid4().hex}{ext}")
     final = _api.os.path.join(self.folder, "Video", cand.video_out)
     try:
         with open(raw, "wb") as f:
-            f.write(self._cached_bytes(url, "anime-frame"))
+            f.write(data)
     except Exception as e:  # noqa: BLE001
         self.log(f"Кадр «{cand.title_ru}» не скачался: {e}")
         return False

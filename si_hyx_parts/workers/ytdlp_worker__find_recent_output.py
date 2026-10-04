@@ -3,6 +3,7 @@
 # See LICENSE and the public module for attribution and API.
 """YtdlpWorker: _find_recent_output. Public namespace: workers."""
 import workers as _api
+from .download_network import is_network_error, network_hint
 
 
 def _find_recent_output(self, out_dir):
@@ -29,12 +30,9 @@ def _find_recent_output(self, out_dir):
 
 def _emit_hints(self, err_msg):
     low = err_msg.lower()
-    if ("10054" in err_msg or "connection aborted" in low
-            or "connection reset" in low or "connectionreseterror" in low):
-        self.log_sig.emit("СОВЕТ: Соединение принудительно разорвано (10054). Обычно это "
-                          "блокировка/замедление YouTube провайдером.")
-        self.log_sig.emit("  Попробуйте: включить VPN, либо повторить позже. Ретраи уже "
-                          "увеличены, но против DPI-блокировки помогает только VPN/прокси.")
+    if is_network_error(err_msg):
+        self.log_sig.emit("СОВЕТ: Сетевое соединение оборвалось или сервер не ответил.")
+        self.log_sig.emit(network_hint())
         return
     if "Sign in to confirm" in err_msg or "not a bot" in err_msg:
         self.log_sig.emit("СОВЕТ: YouTube требует «не бот» — куки без данных входа.")

@@ -60,9 +60,10 @@ def test_crop_through_a_syllable_and_tempo_scale_preserves_phrase():
     result = transform(read_ass(ASS), crop_start=3, crop_end=4.5, tempo=1.5)
     assert result[0].text == "kimi wa"
     assert result[0].start == 0
-    assert result[0].end == 1
+    assert result[0].end == pytest.approx(4 / 3)
+    assert result[0].visible_end == 1
     assert [(u.start, u.end) for u in result[0].units] == [
-        (0, 0), (0, pytest.approx(2 / 3)), (pytest.approx(2 / 3), 1)]
+        (0, 0), (0, pytest.approx(2 / 3)), (pytest.approx(2 / 3), pytest.approx(4 / 3))]
     assert result[0].translation == "Ты свет"
     assert transform(read_ass(ASS), reverse=True) == []
 

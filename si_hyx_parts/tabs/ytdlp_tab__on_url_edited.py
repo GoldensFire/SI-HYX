@@ -10,6 +10,13 @@ def _on_url_edited(self):
     # Ссылка вида youtu.be/xxx?t=9182 — сразу выставляем «С:» на этот тайминг
     # (не дожидаясь ответа InfoWorker с длительностью).
     url = self.url_edit.text().strip()
+    if url != self._timing_url:
+        if self.info_worker:
+            self.info_worker.cancel()
+        self._timing_url = url
+        self._source_duration = None
+        self._source_url = ""
+        self._clear_timings()
     ts = _api.parse_youtube_start_seconds(url) if url else None
     self._url_start_s = ts
     if ts is not None:
@@ -43,19 +50,23 @@ def _start_fetch(self):
             except Exception:
                 pass
         _api.threading.Thread(target=_kinfo, daemon=True).start()
-    # Отменяем предыдущий воркер через флаг — НЕ terminate(), он вызывает сегфолт в PyQt6
+    # Stop the subprocess, retaining the QThread until its finished signal.
     if self.info_worker and self.info_worker.isRunning():
-        self.info_worker.cancelled = True
+        self.info_worker.cancel()
         # Отключаем сигналы старого воркера чтобы не получить stale callback
         try: self.info_worker.success.disconnect()
         except Exception: pass
         try: self.info_worker.error.disconnect()
         except Exception: pass
-        # Не ждём завершения — пусть доработает в фоне и тихо умрёт
     self.info_worker = _api.InfoWorker(url, proxy=self.proxy_edit.text().strip())
-    self.info_worker.success.connect(self._on_info_success)
-    self.info_worker.error.connect(self._on_info_error)
-    self.info_worker.start()
+    worker = self.info_worker
+    self._info_workers.add(worker)
+    worker.finished.connect(lambda w=worker: self._info_workers.discard(w))
+    worker.success.connect(lambda *args, w=worker: self._on_info_success(*args)
+                           if w is self.info_worker and not w.cancelled else None)
+    worker.error.connect(lambda message, w=worker: self._on_info_error(message)
+                         if w is self.info_worker and not w.cancelled else None)
+    worker.start()
 
 def _kodik_episode_value(self):
     """Номер выбранной серии (int) или None, если список ещё не заполнен."""
@@ -92,6 +103,8 @@ def _populate_kodik(self, translations, episodes, cur_translation, cur_episode):
 
 def _on_info_success(self, duration, thumb_url, sub_langs=None, audio_langs=None):
     self.main.log(f"Длительность получена: {duration} сек.")
+    self._source_duration = duration if duration > 0 else None
+    self._source_url = self.info_worker.url if self.info_worker else self.url_edit.text().strip()
     try:
         if duration > 0:
             self.slider_start.setRange(0, duration); self.slider_end.setRange(0, duration)
@@ -150,6 +163,8 @@ def on_url_ctx(self, pos):
     m.exec(self.url_edit.mapToGlobal(pos))
 
 def stop_all_dl(self):
+    for entry in self.items.values():
+        entry.pop('restart_config', None)
     for w in list(self.active_workers.values()):
         try: w.stop()
         except Exception: pass
@@ -157,6 +172,7 @@ def stop_all_dl(self):
 def stop_sel_dl(self):
     for it in self.tree.selectedItems():
         iid = it.data(0, _api.Qt.ItemDataRole.UserRole)
+        self.items.get(iid, {}).pop('restart_config', None)
         w = self.active_workers.get(iid)
         if w:
             try: w.stop()
@@ -203,7 +219,7 @@ def _connect_worker_signals(self, w: '_api.YtdlpWorker', iid: str):
         # Опоздавший тик уже завершённого воркера (его watchdog мог эмитнуть
         # «Скачивание…» в момент гибели процесса) не должен воскрешать строку
         # и индикатор в панели задач после ошибки/остановки.
-        if iid_ not in self.active_workers:
+        if self.active_workers.get(iid_) is not w:
             return
         item = self.items.get(iid_, {}).get('item')
         if item:
@@ -214,6 +230,8 @@ def _connect_worker_signals(self, w: '_api.YtdlpWorker', iid: str):
         self._update_dl_taskbar()
 
     def on_done(iid_, status, clean_info, file_path):
+        if self.active_workers.get(iid_) is not w:
+            return
         self._dl_pct.pop(iid_, None); self._update_dl_taskbar()
         item = self.items.get(iid_, {}).get('item')
         if item:
@@ -231,6 +249,8 @@ def _connect_worker_signals(self, w: '_api.YtdlpWorker', iid: str):
                 except Exception: pass
 
     def on_err(iid_, msg):
+        if self.active_workers.get(iid_) is not w:
+            return
         self._dl_pct.pop(iid_, None); self._update_dl_taskbar()
         try:
             item = self.items.get(iid_, {}).get('item')
@@ -278,12 +298,7 @@ def add_dl_direct(self, url: str, audio_only: bool = False, outdir: str = ""):
             'cookie_path': self.cookie_edit.text().strip() if hasattr(self, 'cookie_edit') else '',
             'proxy': self.proxy_edit.text().strip() if hasattr(self, 'proxy_edit') else '',
         }
-        w = _api.YtdlpWorker(config)
-        self.active_workers[iid] = w
-        w.finished.connect(lambda _=None, i=iid: self._remove_worker(i))
-        self._connect_worker_signals(w, iid)
-        w.start()
-        self._update_stop_btn()
+        self._start_download(config)
         self.main.log(f"Загрузка добавлена: {url}")
     except Exception as e:
         self.main.log(f"add_dl_direct error: {e}")

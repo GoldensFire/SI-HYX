@@ -54,21 +54,23 @@ def read_ass(payload):
                         last = units[-1]
                         units[-1] = Unit(last.start, last.end, last.text + clean)
                     continue
-                units.append(Unit(cursor, min(end, cursor + pending), clean))
+                units.append(Unit(cursor, cursor + pending, clean))
                 cursor += pending
                 pending = None
         if units and end > start:
-            # Timing annotations may contain a trailing empty \k segment.
-            units = [u for u in units if u.start <= end]
             clean = "".join(u.text for u in units)
+            # ASS display may finish in the middle of the final sung phrase.
+            # Keep future timing: the event end only limits visibility.
+            timed_end = max(end, units[-1].end)
+            line = Line(start, timed_end, units, cutoff=end if timed_end > end else None)
             if re.search(r"[А-Яа-яЁё]", clean):
                 translations.append((start, end, "ru", clean))
             elif re.search(r"[\u3040-\u30ff\u3400-\u9fff]", clean):
-                native.append(Line(start, end, units))
+                native.append(line)
             elif any(t in style for t in ["trans", "eng", "en "]):
                 translations.append((start, end, "en", clean))
             elif units:
-                lines.append(Line(start, end, units))
+                lines.append(line)
         elif end > start:
             clean = TAG.sub("", body).replace(r"\N", " ").strip()
             language = "ru" if re.search(r"[А-Яа-яЁё]", clean) else "en"
@@ -76,11 +78,11 @@ def read_ass(payload):
                 translations.append((start, end, language, clean))
     if not lines and native:
         from .romanization import romanize_units
-        lines = [Line(line.start, line.end, romanize_units(line.units)) for line in native]
+        lines = [Line(line.start, line.end, romanize_units(line.units), cutoff=line.cutoff) for line in native]
     lines.sort(key=lambda x: x.start)
     for start, end, language, text in translations:
         matches = [line for line in lines if abs(line.start - start) < .2
-                   and abs(line.end - end) < .3]
+                   and abs(line.visible_end - end) < .3]
         if len(matches) == 1:
             matches[0].translations[language] = text
     return validate(lines)
@@ -112,17 +114,21 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Romaji,{FONT_NAME},{size},{colour},&H00F8F8FF,&H00101016,&H70000000,-1,0,0,0,100,100,0,0,1,5,1.5,5,48,48,0,1
-Style: Translation,{FONT_NAME},{round(size*.65)},&H00F8F8FF,&H00F8F8FF,&H00101016,&H70000000,-1,0,0,0,100,100,0,0,1,4,1.5,5,48,48,0,1
+Style: Translation,{FONT_NAME},{size},&H00F8F8FF,&H00F8F8FF,&H00101016,&H70000000,-1,0,0,0,100,100,0,0,1,5,1.5,5,48,48,0,1
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events = []
     layout = positions(lines, height, size, translations=translations)
     for index, line in enumerate(lines):
+        if index not in layout:
+            continue
         visible_start, y, translation_y = layout[index]
         cursor = round(visible_start * 100)
         body = [r"{\pos(" + f"{width // 2},{y}" + ")}"]
         fitted = fitted_size(line.text, width, size)
+        if translations and line.translation:
+            fitted = min(fitted, fitted_size(line.translation, width, size))
         if fitted < size:
             body.append(r"{\fs" + str(fitted) + "}")
         for unit in line.units:
@@ -131,11 +137,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 body.append(r"{\kf" + str(start - cursor) + "}")
             body.append(r"{\kf" + str(max(0, end - start)) + "}" + escape(unit.text))
             cursor = end
-        prefix = f"0,{stamp(visible_start)},{stamp(line.end)},"
+        prefix = f"0,{stamp(visible_start)},{stamp(line.visible_end)},"
         events.append("Dialogue: " + prefix + "Romaji,,0,0,0,," + "".join(body))
         if translations and line.translation:
             position = r"{\pos(" + f"{width // 2},{translation_y}" + ")}"
-            translated_size = fitted_size(line.translation, width, round(size * .65))
-            position += r"{\fs" + str(translated_size) + "}"
+            position += r"{\fs" + str(fitted) + "}"
             events.append("Dialogue: " + prefix + "Translation,,0,0,0,," + position + escape(line.translation))
     return header + "\n".join(events) + "\n"

@@ -1,4 +1,4 @@
-"""Require Russian captions from the selected video's own timed track."""
+"""Russian captions with an English fallback from the selected video."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -26,9 +26,18 @@ def wanted(generator, stream):
 
 
 def allowed(generator, stream):
-    # A foreign burned track cannot be removed or covered without losing picture.
-    return not (generator.s.episode_ru_subtitles and not stream.get("ru_subtitles")
-                and hard_subbed(stream))
+    return (not wanted(generator, stream) or not hard_subbed(stream)
+            or hard_language(stream) in ("ru", "en"))
+
+
+def hard_language(stream):
+    if stream.get("ru_subtitles"):
+        return "ru"
+    explicit = stream.get("subtitle_language") or stream.get("subtitleLanguage")
+    if explicit:
+        return language({"language": explicit})
+    # Kuhi's unlabelled sub releases come from English subtitle providers.
+    return "en" if stream.get("audio") == "sub" else "other"
 
 
 def load(generator, stream, scope):
@@ -42,7 +51,9 @@ def load(generator, stream, scope):
             selected = {**stream, "subtitles": [track]}
             files = client.captions(selected, scope)
             for data, name in files:
-                lang = "ru" if stream.get("ru_subtitles") else language(track)
+                lang = language(track)
+                if lang == "other" and stream.get("ru_subtitles"):
+                    lang = "ru"
                 rows = parse(data, name, ru=lang == "ru")
                 if rows:
                     return rows, lang
@@ -76,8 +87,10 @@ def prepare(generator, stream, info, scope):
     duration = duration or number((video_track(info) or {}).get("duration"))
     if not allowed(generator, stream):
         return None
-    if not wanted(generator, stream) or (stream.get("ru_subtitles") and hard_subbed(stream)):
+    if not wanted(generator, stream) or hard_subbed(stream):
         start = choose_start(duration, stream, generator.rng)
+        if wanted(generator, stream) and start is not None:
+            stream["_caption_output_language"] = hard_language(stream)
         return (start, []) if start is not None else None
     rows, lang = load(generator, stream, scope)
     if not rows:
@@ -89,13 +102,22 @@ def prepare(generator, stream, info, scope):
             return None
         clip = cropped(rows, start)
         if clip and sum(right - left for left, right, _ in clip) >= 1:
-            shown = translate(generator, clip)
+            try:
+                shown = translate(generator, clip)
+            except Exception as error:  # noqa: BLE001 — оставляем EN резерв
+                from .episode_generation import error_text
+                generator._log_rare("Перевод субтитров отрывка", error_text(error))
+                shown = []
+            output_language = "ru"
+            if not shown and lang == "en" and not generator.stopped():
+                shown, output_language = clip, "en"
             if not shown:
                 return None
             stream["_ru_cues"] = [{"start": round(left, 3), "end": round(right, 3),
                                   "text": text, "source_text": source[2]}
                                  for (left, right, text), source in zip(shown, clip)]
             stream["_caption_language"] = lang
+            stream["_caption_output_language"] = output_language
             return start, shown
     return None
 

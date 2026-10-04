@@ -9,6 +9,13 @@ from karaoke import recognition
 from karaoke.lyrics import Sheet, clean_lines, parse_html, text_lines
 
 
+@pytest.fixture(autouse=True)
+def no_runtime_install(monkeypatch):
+    recognition._FAILED_SEPARATORS.clear()
+    monkeypatch.setattr(recognition, "ensure_packages", lambda *a, **k: None)
+    monkeypatch.setattr(recognition, "ensure_separator", lambda *a, **k: None)
+
+
 def test_html_expanders_and_music_separators_are_not_sung_lines():
     content = '<div>君は<br>+<br>世界<br>♪<br>...<br>2人で<br><button>Expand</button></div>'
     assert text_lines(parse_html(content.encode()), short=True) == ["君は", "世界", "2人で"]
@@ -49,7 +56,7 @@ def test_failed_asr_keeps_vocals_and_retry_skips_demucs(tmp_path, monkeypatch):
     assert target.is_file() and calls.count("separate") == 1
     before = len(calls)
     recognition.transcribe("python", "source.audio", "sha", tmp_path, stopped=lambda: False, log=lambda _: None)
-    assert len(calls) == before
+    assert calls[before:] == ["devices"]
 
 
 def test_missing_cuda_libraries_retry_asr_on_cpu_without_reseparation(tmp_path, monkeypatch):

@@ -9,6 +9,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 from lxml import html
 from .model import normalize
 from .matching import title_key
+from .search import queries, title_names, matches_page
 
 
 @dataclass
@@ -58,51 +59,57 @@ class LyricSites:
         self.http, self.log = http, log
         self._blocked = set()
 
-    def search(self, title, artist, *, duration):
+    def search(self, title, artist, *, duration, context=None):
         # AnimeLyrics first. It may be unavailable behind its challenge page.
         providers = (self.animelyrics, self.animesonglyrics)
+        partial = None
         for provider in providers:
             if provider.__name__ in self._blocked:
                 continue
             try:
-                result = provider(title, artist, duration < 150)
-                if result:
-                    return result
+                visited = set()
+                for query in queries(title, artist, context):
+                    result = provider(title, artist, duration < 150, query=query,
+                                      context=context, visited=visited)
+                    if result:
+                        if result.original:
+                            return result
+                        partial = partial or result
             except Exception as error:
                 if getattr(getattr(error, "response", None), "status_code", 0) == 403:
                     self._blocked.add(provider.__name__)
                 self.log(f"Караоке: {provider.__name__}: {str(error)[:140]}")
-        return None
+        return partial
 
-    def animelyrics(self, title, artist, short):
+    def animelyrics(self, title, artist, short, *, query=None, context=None, visited=None):
         base = "https://www.animelyrics.com"
-        url = base + "/search.php?" + urlencode({"q": title})
+        url = base + "/search.php?" + urlencode({"q": query or title})
         tree = parse_html(self.http.bytes(url, maximum=2_000_000))
         for link in tree.xpath('//a[contains(@href,".htm")]'):
-            if title_key(title) not in title_key(link.text_content()):
-                continue
             page = urljoin(base, link.get("href"))
             if urlparse(page).hostname != "www.animelyrics.com":
                 continue
+            if visited is not None:
+                if page in visited:
+                    continue
+                visited.add(page)
             document = parse_html(self.http.bytes(page, maximum=2_000_000))
             headings = " ".join(document.xpath('//h1//text()|//h2//text()'))
-            if title_key(title) not in title_key(headings):
-                continue
-            if normalize(artist) not in normalize(document.text_content()):
+            if not matches_page(title, artist, headings, "\n".join(document.xpath('//text()')), context):
                 continue
             roman = document.xpath('//*[contains(@class,"romaji") or @id="romaji"]')
             japanese = document.xpath('//*[contains(@class,"kanji") or @id="kanji"]')
             english = document.xpath('//*[contains(@class,"translation") or @id="translation"]')
-            if roman:
+            if roman or japanese:
                 return Sheet(title, artist, page,
                              text_lines(japanese[0], short=short) if japanese else [],
-                             text_lines(roman[0], short=short),
+                             text_lines(roman[0], short=short) if roman else [],
                              {"en": text_lines(english[0], short=short)} if english else {})
         return None
 
-    def animesonglyrics(self, title, artist, short):
+    def animesonglyrics(self, title, artist, short, *, query=None, context=None, visited=None):
         base = "https://www.animesonglyrics.com"
-        tree = parse_html(self.http.bytes(base + "/results?" + urlencode({"q": title}),
+        tree = parse_html(self.http.bytes(base + "/results?" + urlencode({"q": query or title}),
                                          maximum=3_000_000))
         pages = []
         for link in tree.xpath('//a[@href]'):
@@ -110,13 +117,19 @@ class LyricSites:
             if (urlparse(page).hostname != "www.animesonglyrics.com"
                     or page in pages or page.count("/") != 4):
                 continue
-            text = link.text_content()
-            if title_key(title) in title_key(text) and normalize(artist) in normalize(text):
-                pages.append(page)
-        for page in pages[:3]:
+            # Anime/performer searches may show only the anime in the link.
+            # Validate song and performer on the destination page instead.
+            pages.append(page)
+        names = title_names(title, context)
+        pages.sort(key=lambda page: not any(title_key(name) in title_key(page) for name in names))
+        for page in pages[:12]:
+            if visited is not None:
+                if page in visited:
+                    continue
+                visited.add(page)
             document = parse_html(self.http.bytes(page, maximum=3_000_000))
             heading = " ".join(document.xpath('//h1//text()'))
-            if title_key(title) not in title_key(heading) or normalize(artist) not in normalize(heading):
+            if not matches_page(title, artist, heading, "\n".join(document.xpath('//text()')), context):
                 continue
             def extract(name):
                 nodes = document.xpath(f'//div[contains(@class,"{name}lyrics-sbs")]')
@@ -124,7 +137,7 @@ class LyricSites:
             roman, native, english = extract("romaji"), extract("kanji"), extract("english")
             native = [re.sub(r"(?<=[\u3400-\u9fff])[（(][\u3040-\u30ffー]+[）)]", "", line).strip("\ufeff ")
                       for line in native]
-            if roman:
+            if roman or native:
                 return Sheet(title, artist, page, native, roman,
                              {"en": english} if english else {})
         return None

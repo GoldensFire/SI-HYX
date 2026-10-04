@@ -1,4 +1,4 @@
-"""Standalone isolated ML worker: cache stems, select usable CUDA, bounded beam search."""
+"""Standalone cancellable ML worker; optional backends never load at app startup."""
 from __future__ import annotations
 
 import argparse
@@ -8,21 +8,10 @@ import shutil
 import subprocess
 import sys
 
+# -I excludes the script directory; publish only this project's package root.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-def devices():
-    import ctranslate2
-    import torch
-    asr = "cpu"
-    compute = "int8"
-    try:
-        if ctranslate2.get_cuda_device_count():
-            supported = ctranslate2.get_supported_compute_types("cuda")
-            asr = "cuda"
-            compute = "float16" if "float16" in supported else "float32"
-    except RuntimeError:
-        pass  # A driver without compatible CUDA/cuDNN is not a usable accelerator.
-    return {"asr": asr, "compute": compute,
-            "demucs": "cuda" if torch.cuda.is_available() else "cpu"}
+from karaoke.hardware import devices
 
 
 def separate(source, target, device):
@@ -40,20 +29,12 @@ def separate(source, target, device):
     temporary.replace(target)
 
 
-def transcribe(source, target, device, compute):
-    from faster_whisper import WhisperModel
-    model = WhisperModel("medium", device=device, compute_type=compute)
-    # Five-beam search and conditioning on prior sung verses can spend minutes
-    # repeating hallucinated lyrics. Every resulting line still passes acoustic
-    # anchors and the app's mandatory 80% coverage check.
-    segments, _ = model.transcribe(str(source), language="ja", word_timestamps=True,
-                                   vad_filter=False, beam_size=1,
-                                   condition_on_previous_text=False)
-    rows = []
-    for segment in segments:
-        rows.append({"start": segment.start, "end": segment.end, "text": segment.text,
-                     "words": [{"start": word.start, "end": word.end, "word": word.word}
-                               for word in segment.words or []]})
+def transcribe(source, target, device, compute, language=None, model_name="medium", backend="faster-whisper"):
+    if backend == "whisper.cpp":
+        from karaoke.whisper_cpp import transcribe as cpp_transcribe
+        rows = cpp_transcribe(source, language, model_name)
+    else:
+        rows = faster_transcribe(source, device, compute, language, model_name)
     if not rows:
         raise ValueError("Whisper: вокал не распознан")
     target = Path(target)
@@ -62,20 +43,49 @@ def transcribe(source, target, device, compute):
     temporary.replace(target)
 
 
+def faster_transcribe(source, device, compute, language, model_name):
+    from faster_whisper import WhisperModel
+    model = WhisperModel(model_name, device=device, compute_type=compute)
+    # Five-beam search and conditioning on prior sung verses can spend minutes
+    # repeating hallucinated lyrics. Every resulting line still passes acoustic
+    # anchors and the app's mandatory 80% coverage check.
+    segments, _ = model.transcribe(str(source), language=language, word_timestamps=True,
+                                   vad_filter=False, beam_size=1,
+                                   condition_on_previous_text=False)
+    rows = []
+    for segment in segments:
+        rows.append({"start": segment.start, "end": segment.end, "text": segment.text,
+                     "words": [{"start": word.start, "end": word.end, "word": word.word}
+                               for word in segment.words or []]})
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("devices", "separate", "transcribe"))
+    parser.add_argument("action", choices=("devices", "separate", "transcribe", "languages"))
     parser.add_argument("source", nargs="?")
     parser.add_argument("target", nargs="?")
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--compute", default="int8")
+    parser.add_argument("--backend", default="faster-whisper")
+    parser.add_argument("--language", default="auto")
+    parser.add_argument("--model", default="medium")
     args = parser.parse_args()
     if args.action == "devices":
         print(json.dumps(devices()))
     elif args.action == "separate":
-        separate(args.source, args.target, args.device)
+        if args.backend == "kim-onnx":
+            from karaoke.roformer import separate as kim_separate
+            kim_separate(args.source, args.target, args.device)
+        else:
+            separate(args.source, args.target, args.device)
+    elif args.action == "languages":
+        from karaoke.languages import detect
+        original = json.loads(Path(args.source).read_text(encoding="utf-8"))
+        Path(args.target).write_text(json.dumps(detect(original)), encoding="utf-8")
     else:
-        transcribe(args.source, args.target, args.device, args.compute)
+        transcribe(args.source, args.target, args.device, args.compute,
+                   None if args.language == "auto" else args.language, args.model, args.backend)
 
 
 if __name__ == "__main__":

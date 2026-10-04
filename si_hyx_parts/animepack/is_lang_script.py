@@ -252,6 +252,9 @@ def assign_prices(songs: list, s: _api.PackSettings) -> list:
                                                        cand.base_kind), kind_step)
             parts.add_step(lines, "Трудно угадать песню", music_step)
             step = kind_step + music_step
+        if cand.is_frame and cand.frame_has_characters is False:
+            parts.add_step(lines, "В кадре нет персонажей", 2)
+            step += 2
         cand.price = max(_api._PRICE_MIN, base + step)
         cand.price_parts = parts.finish(lines, cand.price, _api._PRICE_MIN)
     return songs

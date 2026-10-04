@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from urllib.parse import urlencode, quote
 from .model import Track
+from .search import queries
 
 BASE = "https://kara.moe"
 
@@ -11,9 +12,18 @@ class Mugen:
     def __init__(self, http):
         self.http = http
 
-    def search(self, title, artist):
-        data = self.http.json(BASE + "/api/karas/search?" + urlencode(
-            {"filter": title, "size": 30}), maximum=4_000_000)
+    def search(self, title, artist, *, context=None):
+        seen = set()
+        for query in queries(title, artist, context):
+            data = self.http.json(BASE + "/api/karas/search?" + urlencode(
+                {"filter": query, "size": 30}), maximum=4_000_000)
+            for track in self.tracks(data):
+                if track.lyrics_url not in seen:
+                    seen.add(track.lyrics_url)
+                    yield track
+
+    @staticmethod
+    def tracks(data):
         for row in data.get("content", []):
             lyrics = row.get("lyrics_infos") or []
             lyric = next((item for item in lyrics if item.get("default")), lyrics[0] if lyrics else {})

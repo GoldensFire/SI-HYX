@@ -87,6 +87,12 @@ def caption_check(reader, video, row, folder):
     foreign = [text for sample in observed for text in sample["text"]
                if len(normalized(text)) > 12 and not russian(text)
                and re.search("[a-zA-Z]", text)]
+    if row.get("subtitle_language") == "en" and not row.get("ru_subtitles"):
+        english = [text for sample in observed for text in sample["text"]
+                   if re.search("[a-zA-Z]", text) and not russian(text)]
+        if not english or (matched and not any(matched)):
+            raise ValueError("Видимые английские субтитры не подтверждены: " + str(observed))
+        return {"visible_en": True, "cue_matches": matched, "frames": observed}
     if not ru or (matched and not any(matched)):
         raise ValueError("Видимые русские субтитры не подтверждены: " + str(observed))
     if foreign:
@@ -142,10 +148,13 @@ def audit(package, out, expected, ocr):
                     raise ValueError("Ожидалось AV1 720p")
                 if streams["audio"]["codec_name"] != "opus":
                     raise ValueError("Ожидалось аудио Opus")
-                if row.get("source_height", 0) < 1080 or not row.get("ru_subtitles"):
-                    raise ValueError("Не подтверждён источник ≥1080p с RU-субтитрами")
+                english = row.get("subtitle_language") == "en" and not row.get("ru_subtitles")
+                if row.get("source_height", 0) < 1080 or not (row.get("ru_subtitles") or english):
+                    raise ValueError("Не подтверждён источник ≥1080p с RU/EN-субтитрами")
                 for cue in row.get("subtitle_cues") or []:
-                    if not 0 <= cue["start"] < cue["end"] <= 15 or not russian(cue["text"]):
+                    language_ok = (bool(re.search("[a-zA-Z]", cue["text"])) if english
+                                   else russian(cue["text"]))
+                    if not 0 <= cue["start"] < cue["end"] <= 15 or not language_ok:
                         raise ValueError("Неверный язык или таймкод реплики")
                 run([api.FFMPEG, "-v", "error", "-xerror", "-i", str(video), "-map", "0:v:0", "-map", "0:a:0",
                      "-f", "null", "-"])

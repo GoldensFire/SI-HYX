@@ -19,6 +19,10 @@ def __init__(self, main_win):
     self.fetch_timer.setInterval(800)
     self.fetch_timer.timeout.connect(self._start_fetch)
     self.info_worker = None
+    self._info_workers = set()  # retain cancelled threads until they actually finish
+    self._source_duration = None
+    self._source_url = ""
+    self._timing_url = ""
     self._url_start_s = None    # тайминг из ?t=/&t= ссылки (None — не задан)
     self.setup_ui()
     self.kodik_info_sig.connect(self._populate_kodik)

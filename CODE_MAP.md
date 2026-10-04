@@ -1,13 +1,24 @@
 # Карта небольших модулей SI-HYX
 
+Загрузка: `si_hyx_parts/workers/download_result.py` — проверка результата и повторы;
+`download_validation.py` — полнота дорожек, `download_network.py` — сетевые ошибки,
+`download_process.py` — остановка дочерних процессов. Поведение и zapret:
+[downloads](docs/downloads.md).
+
 Караоке OP/ED/OST: [karaoke](karaoke/) — источники, проверка записи, ASS/TTML,
 тайминги и рендер; интеграция — [karaoke_processing](si_hyx_parts/animepack/karaoke_processing.py),
 интерфейс — [karaoke_controls](si_hyx_parts/animepack_tab/karaoke_controls.py).
 Описание и ограничения — [anime-karaoke](docs/anime-karaoke.md).
+Поисковые запросы по песне/исполнителю/аниме — `karaoke/search.py`;
+граница показа отрезка отделена от таймингов слогов (`Line.cutoff`).
 Стиль и шрифт — `karaoke/style.py`, недельные отказы — `karaoke/rejections.py`,
 предварительная загрузка песен — `si_hyx_parts/animepack/song_downloads.py`.
 Распознавание и постоянный кэш вокала — `karaoke/recognition.py`;
-изолированный обработчик CPU/CUDA — `karaoke/asr_worker.py`.
+изолированный обработчик — `karaoke/asr_worker.py`;
+языки original lyrics — `karaoke/languages.py`, объединение ASR — `karaoke/asr_passes.py`;
+Kim ONNX/STFT — `karaoke/roformer.py`, `karaoke/stft.py`, `karaoke/audio_chunks.py`;
+Vulkan — `karaoke/whisper_cpp.py`, устройства — `karaoke/hardware.py`;
+ленивые зависимости и закреплённые веса — `karaoke/ai_runtime.py`, `karaoke/ai_assets.py`.
 AnimeGO.online — `si_hyx_parts/animepack/episode_ru_animego.py`,
 списки серий Alloha — `si_hyx_parts/animepack/episode_alloha_catalog.py`.
 
@@ -82,8 +93,11 @@ RU-sub каталоги AnimeGO/YummyAnime/AnimeLIB — `animepack/episode_ru_*.
 проверка видео и видимых сабов SIQ — `tools/episode_pack_audit.py`.
 
 Проверки картинок Gemini: [visual_batch](si_hyx_parts/animepack/visual_batch.py)
-собирает до четырёх параллельных проверок Pixiv и манги с одинаковой моделью
+собирает до четырёх параллельных проверок кадров, Pixiv и манги с одинаковой моделью
 в один запрос; каждый вердикт сопоставляется со своей картинкой по id.
+Кадры и кадры с эффектами: [frame_visual_check](si_hyx_parts/animepack/frame_visual_check.py)
+проверяет исходное изображение на название и наличие персонажей;
+[frame_gemini_controls](si_hyx_parts/animepack_tab/frame_gemini_controls.py) — две галочки.
 Локальный OCR: [local_visual_ocr](si_hyx_parts/animepack/local_visual_ocr.py)
 один раз находит текст и распознаёт crops PP-OCRv6 Small и кириллической
 PP-OCRv5 Mobile; [local_title_match](si_hyx_parts/animepack/local_title_match.py)

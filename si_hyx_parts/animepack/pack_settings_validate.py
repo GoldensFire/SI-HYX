@@ -139,6 +139,12 @@ def validate(self) -> list[str]:
             "Для выбора сцен и проверки страниц манги нужен ключ Gemini. "
             "Введите ключ или отключите выбор сцен через Gemini и проверку "
             "через Gemini в настройках манги.")
+    from .frame_visual_check import enabled as frame_check_enabled
+    if (any(self.mix_shares.get(kind) and frame_check_enabled(self, kind)
+            for kind in _api.FRAME_KINDS)
+            and not str(self.gemini_key or "").strip()):
+        problems.append("Для проверки кадров нужен ключ Gemini. Введите ключ "
+                        "или отключите проверку кадров через Gemini.")
     if self.mix_shares.get(_api.PIXEL_KIND) and int(self.pixel_seconds or 0) < 2:
         problems.append("Ролик-проявление короче двух секунд — проявляться "
                         "в нём нечему.")

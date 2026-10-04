@@ -11,13 +11,17 @@ from karaoke.render import render, reverse_audio, tempo
 from karaoke.resolver import Resolver
 from karaoke.timeline import transform
 from karaoke.style import choose_colour, font_size, FONT_NAME
-from karaoke.rejections import Rejected, SourceRejected, cache_key
+from karaoke.rejections import Rejected, SourceRejected, cache_key, AI_POLICY
+from karaoke.search import context, SEARCH_POLICY
 from .song_downloads import source_bytes
 
 
 def rejection_key(generator, candidate, *, source=False):
     values = ["candidate-source" if source else "candidate", candidate.audio_file,
-              candidate.song_name, candidate.artist, bool(generator.s.karaoke_ai_fallback)]
+              candidate.song_name, candidate.artist, bool(generator.s.karaoke_ai_fallback),
+              SEARCH_POLICY, context(candidate.song, candidate.anime, candidate.kind)]
+    if generator.s.karaoke_ai_fallback:
+        values.append(AI_POLICY)
     if not source:
         values.extend((candidate.trim_start, generator.s.audio_cut))
     return cache_key(*values)
@@ -53,7 +57,8 @@ def download_karaoke(generator, candidate):
                 return reverse_audio(generator, candidate, source)
             resolver = generator.karaoke_resolver
             with generator._timed("караоке: тайминги и проверка записи"):
-                lines, metadata = resolver.resolve(source, candidate.song_name, candidate.artist)
+                lines, metadata = resolver.resolve(source, candidate.song_name, candidate.artist,
+                                                   context(candidate.song, candidate.anime, candidate.kind))
             metadata = dict(metadata)
             requested = float(candidate.trim_start)
             start = aligned_start(lines, requested, float(generator.s.audio_cut),
@@ -64,6 +69,7 @@ def download_karaoke(generator, candidate):
             cropped = transform(lines, crop_start=start, crop_end=start + duration,
                                 tempo=tempo(generator.s), offset=metadata["offset"])
             if not cropped or not any(unit.end > unit.start and unit.text.strip()
+                                      and unit.start < line.visible_end and unit.end > line.start
                                       for line in cropped for unit in line.units):
                 raise Rejected("В выбранном отрезке нет вокала с таймингами.")
             highlight = choose_colour(generator.rng)

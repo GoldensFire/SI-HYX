@@ -80,6 +80,7 @@ def rebuild(tab, group):
 _OPTIONS = {
     "songs": ("box_song_opts",),
     "video": ("box_video_opts",),
+    "frames": ("box_frames",),
     "chars": ("box_chars",),
     "manga": ("box_manga",),
     "pixel": ("box_pixel",),
@@ -142,11 +143,14 @@ def toggle(tab, key, value):
 
 
 def refresh_gemini(tab):
+    from .frame_gemini_controls import refresh as refresh_frames
+    frames = refresh_frames(tab)
     titles = any(getattr(tab, "chk_" + key).isChecked()
                  for key in GEMINI_TITLE_KINDS)
     enabled = (tab.chk_plot.isChecked() or tab.chk_dialogue.isChecked()
                or tab.chk_description_audio.isChecked() or titles
-               or (tab.chk_episode.isChecked() and tab.chk_episode_ru.isChecked()))
+               or (tab.chk_episode.isChecked() and tab.chk_episode_ru.isChecked())
+               or frames)
     tab.box_plot.setVisible(enabled)
     # Своя модель загадок по названию нужна только при включённых загадках.
     box = getattr(tab, "box_gemini_titles", None)

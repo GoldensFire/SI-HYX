@@ -87,6 +87,8 @@ def refresh(tab):
     tab.sp_karaoke_tempo.setEnabled(effect == "tempo")
     tab.sp_karaoke_pitch.setEnabled(effect == "pitch")
     tab.chk_karaoke_ai.setEnabled(effect != "reverse")
+    if getattr(tab, "settings_columns", None) is not None:
+        tab._fit_settings_width()
 
 
 def collect_controls(tab, settings):

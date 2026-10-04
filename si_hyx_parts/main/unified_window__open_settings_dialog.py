@@ -319,63 +319,46 @@ def _open_settings_dialog(self, section=None):
     chk_prompt.setChecked(bool(getattr(self, "_prompt_tab_enabled", False)))
     chk_prompt.toggled.connect(self._set_prompt_tab_enabled)
     vexp.addWidget(chk_prompt)
-    vexp.addWidget(hint("Менеджер промптов: хранение и быстрый выбор заготовок."))
-    chk_siq = _api.QCheckBox("Включить вкладку «SiQuesterHYX» (просмотр .siq + статистика)")
+    vexp.addWidget(hint("Хранение и быстрый выбор промптов."))
+    chk_siq = _api.QCheckBox("Включить вкладку «SiQuesterHYX»")
     chk_siq.setChecked(bool(getattr(self, "_siquester_tab_enabled", False)))
     chk_siq.toggled.connect(self._set_siquester_tab_enabled)
     vexp.addWidget(chk_siq)
     vexp.addWidget(hint(_api.icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
-                        + " Вам это не надо. Просмотрщик пакетов SIGame (.siq) и "
-                        "статистика."))
-    chk_shiki = _api.QCheckBox("Включить вкладку «ShikimoriHYX» (поиск аниме по Shikimori API)")
+                        + " Просмотр пакетов .siq и статистики."))
+    chk_shiki = _api.QCheckBox("Включить вкладку «ShikimoriHYX»")
     chk_shiki.setChecked(bool(getattr(self, "_shikimori_tab_enabled", False)))
     chk_shiki.toggled.connect(self._set_shikimori_tab_enabled)
     vexp.addWidget(chk_shiki)
     vexp.addWidget(hint(_api.icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
-                        + " Экспериментально. Поиск аниме через Shikimori API с фильтрами, сортировка по индексу популярности, нужен, если вы делаете аниме пак, пишите в лс, если будете пользоваться - объясню; "
-            ))
-    chk_lb = _api.QCheckBox("Включить вкладку «ЛидербордHYX» (просмотр выгрузки рекордов)")
+                        + " Поиск аниме на Shikimori с фильтрами."))
+    chk_lb = _api.QCheckBox("Включить вкладку «ЛидербордHYX»")
     chk_lb.setChecked(bool(getattr(self, "_leaderboard_tab_enabled", False)))
     chk_lb.toggled.connect(self._set_leaderboard_tab_enabled)
     vexp.addWidget(chk_lb)
     vexp.addWidget(hint(_api.icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
-                        + " Загрузите JSON-выгрузку лидерборда из Firebase — увидите "
-                        "никнеймы с их рекордами и сможете убрать ник из списка."))
-    chk_coop = _api.QCheckBox("Включить вкладку «Collab» (совместная работа над .siq)")
+                        + " Просмотр рекордов из JSON-выгрузки Firebase."))
+    chk_coop = _api.QCheckBox("Включить вкладку «Collab»")
     chk_coop.setChecked(bool(getattr(self, "_coop_tab_enabled", False)))
     chk_coop.toggled.connect(self._set_coop_tab_enabled)
     vexp.addWidget(chk_coop)
     vexp.addWidget(hint(_api.icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
-                        + " Для совместных паков: вы и соавторы видите темы, "
-                        "вопросы и ответы друг друга в реальном времени и не дублируете "
-                        "работу. Нужен адрес сервера синхронизации (см. coop_worker.js)."))
-    chk_animepack = _api.QCheckBox("Включить вкладку «Генерация аниме-пака» (готовый .siq по опенингам)")
+                        + " Совместное редактирование .siq. Нужен сервер синхронизации."))
+    chk_animepack = _api.QCheckBox("Включить вкладку «Генерация аниме-пака»")
     chk_animepack.setChecked(bool(getattr(self, "_animepack_tab_enabled", False)))
     chk_animepack.toggled.connect(self._set_animepack_tab_enabled)
     vexp.addWidget(chk_animepack)
     vexp.addWidget(hint(_api.icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
-                        + " Экспериментально. Собирает пак «угадай аниме по "
-                        "песне»: аниме берутся из базы AMQ или из списков "
-                        "MyAnimeList/Shikimori, песни — из AnisongDB, обложки "
-                        "и кадры — с Shikimori. Порт генератора ASPG (Leleath) "
-                        "с его разрешения."))
-    chk_ap_upgrade = _api.QCheckBox("Включить вкладку «Апгрейд пака» "
-                               "(доводка готового .siq)")
+                        + " Создание .siq «угадай аниме по песне». "
+                        "На основе ASPG (Leleath), с разрешения автора."))
+    chk_ap_upgrade = _api.QCheckBox("Включить вкладку «Апгрейд пака»")
     chk_ap_upgrade.setChecked(
         bool(getattr(self, "_animepack_upgrade_tab_enabled", False)))
     chk_ap_upgrade.toggled.connect(self._set_animepack_upgrade_tab_enabled)
     vexp.addWidget(chk_ap_upgrade)
     vexp.addWidget(hint(_api.icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
-                        + " Экспериментально. Берёт ГОТОВЫЙ пак и правит "
-                        "его на выбор: превращает спецвопросы (с секретом, "
-                        "со ставкой, для себя) в обычные, дописывает в "
-                        "ответы остальные названия (аниме-пак спрашивает "
-                        "Shikimori, кино-пак — Wikidata, ключей не надо), "
-                        "переписывает название в тамошнем написании, кладёт "
-                        "в ответ постер, пережимает тяжёлые картинки в "
-                        "AVIF, дорожки в opus и ролики в AV1 и выбрасывает "
-                        "файлы, на которые в паке нет ссылок. Исходный файл "
-                        "не меняется — результат пишется рядом."))
+                        + " Добавляет названия и постеры, упрощает вопросы и сжимает медиа. "
+                        "Результат сохраняется рядом."))
     add_row(sec_exp, grp_siq,
             "промпт prompt заготовки шаблоны "
             "siquester сиквестер siq пакет вопросы статистика эксперимент вкладка просмотр sigame "
@@ -414,13 +397,16 @@ def _open_settings_dialog(self, section=None):
     links = _api.QLabel(
         f'Discord: <a href="{_api.DISCORD_URL}" style="color:#89b4fa;">{_api.DISCORD_URL}</a><br>'
         f'GitHub: <a href="{_api.GITHUB_URL}" style="color:#89b4fa;">{_api.GITHUB_URL}</a><br>'
-        f'Гайд: <a href="{_api.GUIDE_URL}" style="color:#89b4fa;">{_api.GUIDE_URL}</a>')
+        f'Гайд: <a href="{_api.GUIDE_URL}" style="color:#89b4fa;">{_api.GUIDE_URL}</a><br>'
+        'Поддержать автора: <a href="https://www.donationalerts.com/r/goldensfire" '
+        'style="color:#89b4fa;">DonationAlerts</a>')
     links.setOpenExternalLinks(True)
     links.setTextInteractionFlags(_api.Qt.TextInteractionFlag.TextBrowserInteraction)
     links.setWordWrap(True)
     links.setStyleSheet("color:#a6adc8; font-size:12px;")
     vl.addWidget(links)
-    add_row(sec_about, grp_links, "discord github ссылки сообщество поддержка обновления")
+    add_row(sec_about, grp_links,
+            "discord github ссылки сообщество поддержка поддержать автора донат donationalerts обновления")
 
     content_l.addStretch(1)
 

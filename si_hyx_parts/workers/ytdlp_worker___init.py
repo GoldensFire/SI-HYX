@@ -3,6 +3,9 @@
 # See LICENSE and the public module for attribution and API.
 """YtdlpWorker: __init__. Public namespace: workers."""
 import workers as _api
+from .download_network import terminal_ffmpeg_error
+from .download_validation import positive_seconds
+from .download_process import stop_process
 
 
 def __init__(self, config):
@@ -19,6 +22,9 @@ def __init__(self, config):
     # и его нельзя выдавать за «Скачивание…».
     self._download_phase = False
     self._dl_phase_ts = None
+    self._download_failure = ""
+    self._source_duration = None
+    self._expected_audio = None
 
 def _enter_download_phase(self):
     """Отмечаем переход «извлечение → реальная загрузка». До этого момента
@@ -60,10 +66,7 @@ def _watchdog(self, proc):
 
 def stop(self):
     self.is_running = False
-    p = self._proc
-    if p and p.poll() is None:
-        try: p.kill()
-        except Exception: pass
+    stop_process(self._proc)
 
 def _sleep_interruptible(self, seconds):
     """Пауза, прерываемая кнопкой СТОП: спим мелкими квантами и выходим, как
@@ -115,11 +118,18 @@ def _exec_ytdlp(self, cmd: list, iid: str, is_audio_only: bool):
     # Новая попытка снова начинается с извлечения — сбрасываем фазу загрузки.
     self._download_phase = False
     self._dl_phase_ts = None
+    self._download_failure = ""
+    self._source_duration = None
+    self._expected_audio = True if is_audio_only else None
 
+    if not self.is_running:
+        return None, "", "", []
     self._proc = _api.subprocess.Popen(
         cmd, stdout=_api.subprocess.PIPE, stderr=_api.subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
         creationflags=_api.CREATE_NO_WINDOW, bufsize=1, env=_api.subprocess_env())
+    if not self.is_running:
+        stop_process(self._proc)
     _api.threading.Thread(target=self._watchdog, args=(self._proc,), daemon=True).start()
 
     for raw in self._iter_stream_lines(self._proc.stdout):
@@ -130,6 +140,12 @@ def _exec_ytdlp(self, cmd: list, iid: str, is_audio_only: bool):
             continue
         if line.startswith("@@@"):
             self._parse_progress(line[3:])
+            continue
+        if "@@CHECK@@" in line:
+            fields = (line.split("@@CHECK@@", 1)[1].split("\t") + ["", "", ""])[:3]
+            self._source_duration = positive_seconds(fields[0])
+            if fields[2] not in ("", "NA"):
+                self._expected_audio = fields[2] != "none"
             continue
         if "@@META@@" in line:
             # before_dl: извлечение прошло, начинается реальная загрузка.
@@ -168,6 +184,9 @@ def _exec_ytdlp(self, cmd: list, iid: str, is_audio_only: bool):
                     self._iid, pct,
                     f"Нарезка {sp.group(1)}" if sp else "Нарезка…")
             continue
+        failure = terminal_ffmpeg_error(line)
+        if failure and not self._download_failure:
+            self._download_failure = failure
         tail.append(line)
         self.log_sig.emit(line)
         low = line.lower()

@@ -186,6 +186,8 @@ def collect(self) -> '_api.PackSettings':
     s.pixiv_exclude_ai = s.pixiv_ai_mode == "exclude"
     s.pixiv_allow_same_sex = self.chk_pixiv_same_sex.isChecked()
     s.pixiv_gemini_check = self.chk_pixiv_gemini.isChecked()
+    from .frame_gemini_controls import collect as collect_frame_checks
+    collect_frame_checks(self, s)
     s.pixiv_title_check_mode = self.cb_pixiv_title_mode.currentData() or "gemini"
     s.pixiv_gemini_model = self.cb_pixiv_gemini_model.currentText().strip()
     # Комиксы Pixiv (type=manga) не берутся никогда: это кадры с

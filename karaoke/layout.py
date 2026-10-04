@@ -11,8 +11,10 @@ def positions(lines, height, size, *, translations=False):
         # ASS often previews the next phrase while the previous one is sung.
         # Delay that preview, keeping every sung syllable on its original clock.
         start = max(line.start, min(previous_end, onset))
-        windows.append((start, line.end, index))
-        previous_end = max(previous_end, line.end)
+        if start >= line.visible_end:
+            continue
+        windows.append((start, line.visible_end, index))
+        previous_end = max(previous_end, line.visible_end)
     groups = []
     for window in sorted(windows):
         if not groups or window[0] >= max(row[1] for row in groups[-1]):

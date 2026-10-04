@@ -20,14 +20,16 @@ def title_key(value):
     return normalize(value)
 
 
-def metadata_matches(title, artist, duration, track):
+def metadata_matches(title, artist, duration, track, *, aliases=(), artists=()):
     names = [track.title, *track.aliases]
-    if not title_key(title) or not any(title_key(title) == title_key(n) for n in names):
+    if not title_key(title) or not any(title_key(t) == title_key(n)
+                                      for t in [title, *aliases] for n in names):
         return False
-    singer = normalize(artist)
     singers = [normalize(name) for name in track.artists]
-    if not singer or not singers or not (singer in singers or singer == "".join(singers)
-            or any(SequenceMatcher(None, singer, name).ratio() >= .93 for name in singers)):
+    requested = [normalize(name) for name in [artist, *artists] if normalize(name)]
+    if not singers or not any(singer in singers or singer == "".join(singers)
+            or any(SequenceMatcher(None, singer, name).ratio() >= .93 for name in singers)
+            for singer in requested):
         return False
     if re.search(r"\b(cover|remix|live|instrumental|off.?vocal)\b", track.version, re.I):
         return False

@@ -10,6 +10,7 @@ from gemini_api import GeminiError, GeminiQuotaError
 from si_hyx_parts.animepack import visual_batch as batch
 from si_hyx_parts.animepack.manga_visual_check import SCHEMA as MANGA_SCHEMA
 from si_hyx_parts.animepack.pixiv_visual_check import SCHEMA as PIXIV_SCHEMA
+from si_hyx_parts.animepack.frame_visual_check import SCHEMA as FRAME_SCHEMA
 
 
 def _parts(index):
@@ -19,6 +20,7 @@ def _parts(index):
 
 def _verdict(index):
     return {"id": index, "accept": index % 2 == 0,
+            "has_characters": index % 2 == 0,
             "has_title_text": index % 2 != 0, "mixed_anime": False,
             "reason": f"picture {index}"}
 
@@ -75,6 +77,31 @@ def test_single_or_partial_batch_finishes_without_waiting_for_more_images():
     assert batcher.check(_parts(0), MANGA_SCHEMA)["accept"] is True
     assert len(_together(batcher, count=2)) == 2
     assert len(client.calls) == 2
+
+
+def test_frame_title_and_character_results_share_one_request_and_keep_their_ids():
+    client = _Client()
+    batcher = batch.VisualCheckBatcher(client, collect_seconds=1)
+    verdicts = _together(batcher, schema=FRAME_SCHEMA)
+    assert len(client.calls) == 1
+    assert [row["has_characters"] for row in verdicts] == [True, False, True, False]
+    assert [row["has_title_text"] for row in verdicts] == [False, True, False, True]
+
+
+def test_frames_pixiv_and_manga_can_share_the_same_model_request():
+    client = _Client()
+    gen = SimpleNamespace(stopped=lambda: False)
+    batch.initialize(gen)
+    schemas = [FRAME_SCHEMA, PIXIV_SCHEMA, MANGA_SCHEMA, FRAME_SCHEMA]
+    gate = threading.Barrier(4)
+    def check(index):
+        gate.wait(timeout=3)
+        return batch.request(gen, client, _parts(index), schemas[index])
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(check, i) for i in range(4)]
+        rows = [future.result(timeout=5) for future in futures]
+    assert len(client.calls) == 1
+    assert [row["reason"] for row in rows] == [f"picture {i}" for i in range(4)]
 
 
 @pytest.mark.parametrize("response", [

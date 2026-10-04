@@ -24,7 +24,7 @@ MAL_IDS = [38000, 30, 16498, 1535, 11757, 5114, 1, 205, 269, 20, 1735,
            52991, 52034, 37450, 9253, 12189, 20507, 457, 226, 849, 6702]
 
 
-def verify_package(path, ffprobe, run, expected=24):
+def verify_package(path, ffprobe, run, expected=24, *, require_authored=True):
     with zipfile.ZipFile(path) as archive:
         xml = ET.fromstring(archive.read("content.xml"))
         manifest = json.loads(archive.read("karaoke.json"))
@@ -52,7 +52,7 @@ def verify_package(path, ffprobe, run, expected=24):
         with tempfile.TemporaryDirectory(prefix="karaoke-verify-") as directory:
             for row in manifest["questions"]:
                 video = "Video/" + row["file"]
-                if video not in videos or row["ai_used"]:
+                if video not in videos or (row["ai_used"] and require_authored):
                     raise ValueError("Проверочный пак должен использовать готовые тайминги.")
                 subtitle = "Karaoke/" + Path(row["file"]).stem + ".ass"
                 text = archive.read(subtitle).decode("utf-8-sig")

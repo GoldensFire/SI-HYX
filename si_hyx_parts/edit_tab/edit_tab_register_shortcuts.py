@@ -6,17 +6,20 @@ import edit_tab as _api
 
 
 # ── Shortcuts ─────────────────────────────────────────────────────────
-def register_shortcuts(self):
+def register_shortcuts(self, target=None):
+    """Один набор команд для вкладки, полноэкранного окна и его панели."""
+    if target is None:
+        target = self
     # Контекст WidgetWithChildren: хоткеи работают только когда вкладка
     # «Монтаж» в фокусе — не перехватывают Space/I/O на других вкладках.
     ctx = _api.Qt.ShortcutContext.WidgetWithChildrenShortcut
 
     def add_shortcut(seq, handler):
-        act = _api.QAction(self)
+        act = _api.QAction(target)
         act.setShortcut(_api.QKeySequence(seq))
         act.setShortcutContext(ctx)
         act.triggered.connect(handler)
-        self.addAction(act)
+        target.addAction(act)
 
     try:
         add_shortcut(_api.Qt.Key.Key_Space, self.toggle_play)
@@ -31,12 +34,12 @@ def register_shortcuts(self):
         # nativeVirtualKey — независимо от раскладки.
         # Обрезка до точки воспроизведения (настраиваемые сочетания) —
         # храним QShortcut, чтобы можно было переназначить в Настройках.
-        self._sc_trim_start = _api.QShortcut(_api.QKeySequence(self.trim_start_seq), self)
-        self._sc_trim_start.setContext(ctx)
-        self._sc_trim_start.activated.connect(self.trim_start_to_playhead)
-        self._sc_trim_end = _api.QShortcut(_api.QKeySequence(self.trim_end_seq), self)
-        self._sc_trim_end.setContext(ctx)
-        self._sc_trim_end.activated.connect(self.trim_end_to_playhead)
+        target._sc_trim_start = _api.QShortcut(_api.QKeySequence(self.trim_start_seq), target)
+        target._sc_trim_start.setContext(ctx)
+        target._sc_trim_start.activated.connect(self.trim_start_to_playhead)
+        target._sc_trim_end = _api.QShortcut(_api.QKeySequence(self.trim_end_seq), target)
+        target._sc_trim_end.setContext(ctx)
+        target._sc_trim_end.activated.connect(self.trim_end_to_playhead)
         # Undo/redo: ВСЕ сочетания вешаем на ОДНО действие каждого типа через
         # setShortcuts([...]). Раньше StandardKey.Redo и явный "Ctrl+Y" были
         # ДВУМЯ разными QAction с одинаковым сочетанием (на Windows
@@ -64,18 +67,18 @@ def register_shortcuts(self):
                     seen.add(key); out.append(s)
             return out
 
-        act_undo = _api.QAction(self)
+        act_undo = _api.QAction(target)
         act_undo.setShortcuts(_dedup_seqs([_api.QKeySequence(_api.QKeySequence.StandardKey.Undo),
                                _api.QKeySequence("Ctrl+Z")]))
         act_undo.setShortcutContext(ctx)
         act_undo.triggered.connect(self.undo)
-        self.addAction(act_undo)
-        act_redo = _api.QAction(self)
+        target.addAction(act_undo)
+        act_redo = _api.QAction(target)
         act_redo.setShortcuts(_dedup_seqs([_api.QKeySequence(_api.QKeySequence.StandardKey.Redo),
                                _api.QKeySequence("Ctrl+Y"), _api.QKeySequence("Ctrl+Shift+Z")]))
         act_redo.setShortcutContext(ctx)
         act_redo.triggered.connect(self.redo)
-        self.addAction(act_redo)
+        target.addAction(act_redo)
         # Раньше тут ещё висела «подстраховка» — те же Ctrl+Z/Ctrl+Y вторым
         # QShortcut'ом WidgetShortcut прямо на self.waveform (на случай, если
         # после перетаскивания маркеров IN/OUT фокус остаётся на волне, а

@@ -134,17 +134,14 @@ def download_images(self, cand: _api.SongCandidate) -> None:
         # раз качать его в Images/ незачем.
         return
     if cand.is_frame:
-        url = self._pick_frame_url(cand)
-        if not url:
-            if shots:
-                self.log(f"«{cand.title_ru}»: все кадры уже были в прошлых "
-                         "паках — беру следующий тайтл")
+        from .frame_visual_check import select
+        selected = select(self, cand)
+        if selected is None:
             return
-        cand.frame_url = url
+        data, ext = selected
         try:
             name = self._save_reusable_image(
-                self._cached_bytes(url, "anime-frame"),
-                f"{cand.file_base}_frame", self._url_ext(url), reuse=False)
+                data, f"{cand.file_base}_frame", ext, reuse=False)
             cand.frame_name = name or cand.frame_name
             cand.has_frame = bool(name)
         except Exception as e:  # noqa: BLE001

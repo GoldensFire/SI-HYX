@@ -53,6 +53,10 @@ def __init__(self, settings: _api.PackSettings, *,
     # пользователя). Подменённый в тестах клиент один на всё.
     self.gemini_titles = gemini
     self.gemini_pixiv = gemini
+    self.gemini_frames = gemini
+    from .frame_visual_check import enabled as frame_check_enabled
+    needs_frames = any(settings.mix_shares.get(kind) and frame_check_enabled(settings, kind)
+                       for kind in _api.FRAME_KINDS)
     needs_general = any(settings.mix_shares.get(k)
                         for k in (_api.PLOT_KIND, _api.DIALOGUE_KIND,
                                   _api.DESCRIPTION_AUDIO_KIND))
@@ -72,7 +76,7 @@ def __init__(self, settings: _api.PackSettings, *,
                                 and (settings.manga_title_check_mode == "gemini"
                                      or key_available))))
     self.gemini_manga = gemini if needs_manga else None
-    if needs_general or needs_titles or needs_pixiv or needs_manga:
+    if needs_general or needs_titles or needs_pixiv or needs_manga or needs_frames:
         if settings.mix_shares.get(_api.PLOT_KIND) and self.fandom is None:
             self.fandom = _api.FandomApi(self.session)
         key = str(settings.gemini_key or "").strip()
@@ -112,6 +116,9 @@ def __init__(self, settings: _api.PackSettings, *,
             # Проверке картинки хватает минуты: дольше отвечает только
             # перегруженный сервер (см. visual_batch.READ_TIMEOUT).
             from .visual_batch import READ_TIMEOUT as visual_timeout
+            if needs_frames and self.gemini_frames is None:
+                self.gemini_frames = _client(settings.gemini_model, "minimal",
+                                             timeout=visual_timeout)
             if needs_pixiv and self.gemini_pixiv is None:
                 self.gemini_pixiv = _client(
                     str(getattr(settings, "pixiv_gemini_model", "") or "")
@@ -124,7 +131,7 @@ def __init__(self, settings: _api.PackSettings, *,
                     timeout=visual_timeout)
     # Держим ссылки для итоговой статистики даже после отключения Gemini.
     self._gemini_clients = (self.gemini, self.gemini_titles,
-                            self.gemini_pixiv, self.gemini_manga)
+                            self.gemini_pixiv, self.gemini_manga, self.gemini_frames)
     from .visual_batch import initialize as initialize_visual_batches
     initialize_visual_batches(self)
     from .local_visual_ocr import initialize as initialize_local_ocr

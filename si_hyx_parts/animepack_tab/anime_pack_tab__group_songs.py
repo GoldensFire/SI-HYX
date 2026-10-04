@@ -153,6 +153,9 @@ def _group_songs(self) -> _api.QGroupBox:
     from si_hyx_parts.animepack_tab.frame_effect_controls import build_controls
     build_controls(self)
 
+    from .frame_gemini_controls import build_controls as build_frame_checks
+    build_frame_checks(self)
+
     # ── Вопрос-анаграмма ──────────────────────────────────────────────
     self.chk_anagram = _api.QCheckBox("Анаграммы")
     self.chk_anagram.setToolTip(

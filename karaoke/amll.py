@@ -6,6 +6,7 @@ import threading
 from urllib.parse import quote
 from .model import Track
 from .matching import title_key
+from .search import title_names
 
 BASE = "https://raw.githubusercontent.com/amll-dev/amll-ttml-db/main"
 
@@ -16,7 +17,7 @@ class Amll:
         self._index = None
         self._lock = threading.Lock()
 
-    def search(self, title, artist):
+    def search(self, title, artist, *, context=None):
         with self._lock:
             if self._index is None:
                 data = self.http.bytes(BASE + "/metadata/raw-lyrics-index.jsonl", maximum=16_000_000)
@@ -25,7 +26,8 @@ class Amll:
         for row in reversed(self._index):
             meta = dict(row.get("metadata") or [])
             names = meta.get("musicName") or []
-            if not any(title_key(name) == title_key(title) for name in names):
+            if not any(title_key(name) == title_key(wanted)
+                       for name in names for wanted in title_names(title, context)):
                 continue
             # Unverified platform IDs are never a substitute for audio identity.
             ids = meta.get("ncmMusicId") or []

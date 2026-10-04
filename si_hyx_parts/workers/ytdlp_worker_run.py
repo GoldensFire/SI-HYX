@@ -3,6 +3,7 @@
 # See LICENSE and the public module for attribution and API.
 """YtdlpWorker: run. Public namespace: workers."""
 import workers as _api
+from .download_result import verified_download
 
 
 def run(self):
@@ -81,6 +82,10 @@ def run(self):
         self._section_dur = None   # длительность отрезка → % прогресса ffmpeg
         start_s = self.c.get('start_s')
         end_s = self.c.get('end_s')
+        source_duration = self.c.get('source_duration')
+        if source_duration and not start_s and end_s and end_s >= source_duration:
+            end_s = None
+            self.c['end_s'] = None
         if start_s is not None or end_s is not None:
             s_val = int(start_s) if start_s else 0
             e_val = int(end_s) if (end_s and end_s > s_val) else None
@@ -124,8 +129,11 @@ def run(self):
             # задан --progress-template).
             "--no-quiet",
             "--print", "before_dl:@@META@@%(thumbnail)s\t%(width)s\t%(height)s\t%(abr)s",
+            "--print", "before_dl:@@CHECK@@%(duration)s\t%(vcodec)s\t%(acodec)s",
             "--print", "after_move:@@PATH@@%(filepath)s",
         ]
+        if self.c.get('overwrite'):
+            cmd += ["--force-overwrites"]
 
         # Указываем yt-dlp на наш ffmpeg (bundled в bin/) — иначе отдельный
         # процесс yt-dlp не найдёт ffmpeg для склейки/извлечения аудио.
@@ -240,6 +248,12 @@ def run(self):
 
         if section_arg:
             cmd += ["--download-sections", section_arg]
+            # _i applies to BOTH remote inputs. EOF reconnection is deliberately
+            # omitted: a normally completed finite video must stop at EOF.
+            cmd += ["--downloader-args", "ffmpeg_i:-reconnect 1 -reconnect_streamed 1 "
+                    "-reconnect_on_network_error 1 -reconnect_delay_max 5 "
+                    "-reconnect_on_http_error 408,429,500,502,503,504 -rw_timeout 30000000",
+                    "--downloader-args", "ffmpeg_o:-xerror"]
             # Force KF → точный рез с перекодированием в точках; иначе быстрый
             # рез копированием (по ближайшим ключевым кадрам).
             if not is_audio_only and self.c.get('force_kf'):
@@ -275,6 +289,8 @@ def run(self):
             """Готовый файл этой загрузки: путь из @@PATH@@, иначе свежий
                 медиафайл задания (если @@PATH@@ не пришёл, но файл реально скачан).
                 Поиск скоупится по mtime ≥ старта задания — чужой .siq не подхватится."""
+            if rc not in (0, None):
+                return ""
             if out_fullpath and _api.os.path.exists(out_fullpath):
                 return out_fullpath
             if rc in (0, None):
@@ -316,67 +332,9 @@ def run(self):
             rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(
                 cmd_fallback, iid, is_audio_only)
 
-        # ── Любой хост: «успех без файла» лечится повтором ───────────────────
-        # rc=0, ни одной строки ошибки, но итогового файла нет — наблюдалось на
-        # YouTube: процесс выходил через ~7 секунд, не создав в папке даже .part.
-        # Это тот же класс сбоя, что флапающий challenge TikTok выше: внутри
-        # процесса он не-retryable, а новый процесс обычно доводит дело до конца.
-        # TikTok сюда не попадает — у него свой цикл на 20 попыток.
-        GEN_MAX = 2
-        gen_try = 0
-        while (not _is_tiktok and self.is_running and not _resolved()
-               and rc in (0, None) and gen_try < GEN_MAX):
-            gen_try += 1
-            self.log_sig.emit(
-                f"yt-dlp завершился без файла (код 0) — повтор {gen_try}/{GEN_MAX}…")
-            # pct=0 → строка показывает повтор, но не выглядит как идущая загрузка.
-            self.progress_sig.emit(iid, 0.0, f"Повтор {gen_try}/{GEN_MAX}…")
-            if gen_try > 1:
-                self._sleep_interruptible(2.0)
-                if not self.is_running:
-                    break
-            rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(
-                cmd, iid, is_audio_only)
-
-        if not self.is_running:
-            raise Exception("Загрузка остановлена пользователем")
-
-        final_path = _resolved()
-        if not final_path or not _api.os.path.exists(final_path):
-            if rc not in (0, None):
-                raise Exception("\n".join(tail) or f"yt-dlp завершился с кодом {rc}")
-            # rc==0, но файла нет — раньше причина терялась молча. Тянем
-            # хвост вывода: с --no-quiet он содержит нормальный лог yt-dlp, и
-            # пустым остаётся только если процесс не напечатал вообще ничего.
-            detail = "\n".join(tail).strip()
-            raise Exception(
-                "yt-dlp завершил работу (код 0), но файл не найден"
-                + (f":\n{detail}" if detail
-                   else " — процесс завершился без единой строки вывода "
-                        "(повторы не помогли)."))
-        out_fullpath = final_path
-
-        # На некоторых роликах yt-dlp завершается с rc=0, но молча скатывается
-        # на audio-only формат (обычно сбой nsig-расшифровки видеоформатов) —
-        # раньше такой результат репортился как «Готово» с битым файлом без
-        # картинки. Проверяем видеодорожку, если запрос был не аудио-only.
-        if not is_audio_only:
-            try:
-                vp = _api.subprocess.run(
-                    [_api.FFPROBE, "-v", "error", "-select_streams", "v:0",
-                     "-show_entries", "stream=codec_type",
-                     "-of", "csv=p=0", out_fullpath],
-                    stdout=_api.subprocess.PIPE, stderr=_api.subprocess.DEVNULL,
-                    text=True, encoding="utf-8", errors="replace", creationflags=_api.CREATE_NO_WINDOW,
-                )
-                has_video = bool(vp.stdout.strip())
-            except Exception:
-                has_video = True  # ffprobe недоступен — проверку не блокируем
-            if not has_video:
-                raise Exception(
-                    "yt-dlp скачал файл без видеодорожки (только аудио) — "
-                    "вероятно, сбой получения видеоформатов (nsig/Deno). "
-                    "Попробуйте скачать заново.")
+        out_fullpath, clean_res_str = verified_download(
+            self, cmd, iid, is_audio_only,
+            (rc, out_fullpath, clean_res_str, tail))
 
         try: self._cleanup_partials(out_dir, out_fullpath)
         except Exception: pass

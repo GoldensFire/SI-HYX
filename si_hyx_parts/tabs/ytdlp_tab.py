@@ -44,6 +44,7 @@ class YtdlpTab(_api.QWidget):
         _update_dl_taskbar,
         _remove_worker,
         _dl_config,
+        _start_download,
         redownload_sel,
         delete_sel,
         set_thumb,

@@ -7,6 +7,7 @@ import time
 
 TTL = 7 * 86400
 VERSION = "karaoke-rejections-v2"  # Old rejects may have counted the site's '+' expanders.
+AI_POLICY = "multilingual-kim-v3"
 
 
 class Rejected(ValueError):

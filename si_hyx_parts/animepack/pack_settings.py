@@ -70,6 +70,9 @@ class PackSettings:
     # Прежние ключи pixel сохраняют совместимость настроек и квот.
     pack_pixel: bool = False
     pct_pixel: int = 0
+    # Проверка названия и наличия персонажей в исходном кадре.
+    frame_gemini_check: bool = False
+    pixel_gemini_check: bool = False
     pixel_steps: int = _api.PIXEL_STEPS
     pixel_block: int = _api.PIXEL_BLOCK
     pixel_seconds: int = _api.PIXEL_SECONDS

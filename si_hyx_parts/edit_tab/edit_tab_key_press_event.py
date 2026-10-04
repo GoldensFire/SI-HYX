@@ -69,10 +69,8 @@ def trim_start_to_playhead(self):
     if new_in >= self.current_out:
         new_in = max(0.0, self.current_out - 0.04)
     self.set_in_out(new_in, self.current_out)
-    # Возвращаем фокус на вкладку: если он был на нативной видео-поверхности
-    # (overlay-режим, исключена из WidgetWithChildrenShortcut), Ctrl+Z после
-    # обрезки иначе не доходил до undo. Кнопка с NoFocus фокус не перехватит.
-    self.setFocus(_api.Qt.FocusReason.OtherFocusReason)
+    # Возвращаем фокус в текущий режим плеера для последующих сочетаний.
+    self._grab_kbd_focus()
 
 def trim_end_to_playhead(self):
     """Ставит точку OUT на текущую позицию воспроизведения (обрезает конец)."""
@@ -84,7 +82,7 @@ def trim_end_to_playhead(self):
     if new_out <= self.current_in:
         new_out = min(self.duration, self.current_in + 0.04)
     self.set_in_out(self.current_in, new_out)
-    self.setFocus(_api.Qt.FocusReason.OtherFocusReason)
+    self._grab_kbd_focus()
 
 def _trim_ctx_menu(self, pos=None):
     """Контекстное меню аудио-визуализации (ПКМ): обрезка старт/конец до
@@ -110,10 +108,12 @@ def set_trim_shortcuts(self, start_seq, end_seq, save=True):
     self.trim_start_seq = (start_seq or "Shift+C").strip() or "Shift+C"
     self.trim_end_seq   = (end_seq or "Shift+V").strip() or "Shift+V"
     try:
-        if getattr(self, "_sc_trim_start", None) is not None:
-            self._sc_trim_start.setKey(_api.QKeySequence(self.trim_start_seq))
-        if getattr(self, "_sc_trim_end", None) is not None:
-            self._sc_trim_end.setKey(_api.QKeySequence(self.trim_end_seq))
+        fs = getattr(self, "_fs_window", None)
+        for target in (self, fs, getattr(fs, "bar", None)):
+            if getattr(target, "_sc_trim_start", None) is not None:
+                target._sc_trim_start.setKey(_api.QKeySequence(self.trim_start_seq))
+            if getattr(target, "_sc_trim_end", None) is not None:
+                target._sc_trim_end.setKey(_api.QKeySequence(self.trim_end_seq))
     except Exception:
         pass
     if save:

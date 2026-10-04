@@ -6,11 +6,14 @@ import edit_tab as _api
 
 
 def _grab_kbd_focus(self):
-    """Ставит фокус клавиатуры на вкладку «Монтаж». Хоткеи привязаны к ней с
-        контекстом WidgetWithChildren — без фокуса на вкладке (или её потомке)
-        Пробел и прочие не срабатывают, пока пользователь не кликнет по видео."""
+    """Возвращает фокус на вкладку или активное полноэкранное окно плеера."""
     try:
-        self.setFocus(_api.Qt.FocusReason.OtherFocusReason)
+        target = getattr(self, "_fs_window", None)
+        if target is None:
+            target = self
+        elif target.bar.isActiveWindow():
+            target = target.bar
+        target.setFocus(_api.Qt.FocusReason.OtherFocusReason)
     except Exception:
         pass
 

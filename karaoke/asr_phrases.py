@@ -9,7 +9,7 @@ def key(text):
     return "".join(c for c in unicodedata.normalize("NFKC", text).casefold() if c.isalnum())
 
 
-def phrases(segments, lyrics):
+def phrases(segments, lyrics, *, indices=False):
     """Split on known text anchors, retaining ASR times and never filling gaps.
 
     Whisper often returns a 20-second stanza as one segment. The aligner's
@@ -32,7 +32,7 @@ def phrases(segments, lyrics):
         for shift in range(block.size):
             mapping[block.a + shift] = block.b + shift
     result, cursor, previous = [], 0, -1
-    for text in source:
+    for index, text in enumerate(source):
         matched = [mapping[i] for i in range(cursor, cursor + len(text)) if i in mapping]
         cursor += len(text)
         if not text or len(matched) / len(text) < .6:
@@ -47,5 +47,7 @@ def phrases(segments, lyrics):
             continue
         result.append({"start": selected[0]["start"], "end": selected[-1]["end"],
                        "text": "".join(word["word"] for word in selected), "words": selected})
+        if indices:
+            result[-1]["line_index"] = index
         previous = last
     return result

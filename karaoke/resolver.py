@@ -15,7 +15,8 @@ from .matching import decode, metadata_matches, verify_audio
 from .mugen import Mugen
 from .ttml import read_ttml
 from .model import Line, Unit, validate
-from .rejections import Rejections, SourceRejected, cache_key
+from .rejections import Rejections, SourceRejected, cache_key, AI_POLICY
+from .search import SEARCH_POLICY
 
 
 class Resolver:
@@ -29,21 +30,23 @@ class Resolver:
         self.cache = Path(cache or Path.home() / ".cache/si-hyx-karaoke") / "verified"
         self.rejections = Rejections(self.cache.parent)
 
-    def resolve(self, source, title, artist):
+    def resolve(self, source, title, artist, context=None):
         source = Path(source)
         sha = hashlib.sha256(source.read_bytes()).hexdigest()
-        key = hashlib.sha256((sha + title + artist + "karaoke-v5").encode()).hexdigest()
+        key = cache_key(sha, title, artist, "karaoke-v6", SEARCH_POLICY, context or {})
         target = self.cache / (key + ".json")
         if target.is_file():
             try:
                 data = json.loads(target.read_text(encoding="utf-8"))
                 lines = [Line(row["start"], row["end"], [Unit(**u) for u in row["units"]],
-                              row.get("translations", {})) for row in data["lines"]]
+                              row.get("translations", {}), row.get("cutoff")) for row in data["lines"]]
                 if self.settings.karaoke_ai_fallback or not data["metadata"].get("ai_used"):
-                    return self._present(validate(lines), data["metadata"], title, artist, target)
+                    return self._present(validate(lines), data["metadata"], title, artist, target, context)
             except (ValueError, KeyError, TypeError):
                 target.unlink(missing_ok=True)
         rejection_key = cache_key(key, "song", bool(self.settings.karaoke_ai_fallback))
+        if self.settings.karaoke_ai_fallback:
+            rejection_key = cache_key(rejection_key, AI_POLICY)
         rejected = self.rejections.get(rejection_key)
         if rejected:
             raise SourceRejected("Недельный кэш: " + rejected)
@@ -58,8 +61,11 @@ class Resolver:
             if self.stopped():
                 raise RuntimeError("Караоке: остановлено.")
             try:
-                for track in provider.search(title, artist):
-                    if not metadata_matches(title, artist, duration, track):
+                options = {"context": context} if context else {}
+                for track in provider.search(title, artist, **options):
+                    if not metadata_matches(title, artist, duration, track,
+                                            aliases=(context or {}).get("titles", []),
+                                            artists=(context or {}).get("artists", [])):
                         continue
                     track_key = cache_key(key, track.source, track.lyrics_url, track.audio_url)
                     if self.rejections.get(track_key):
@@ -101,16 +107,16 @@ class Resolver:
                     raise SourceRejected(reason)
                 raise ValueError(reason)
             from .fallback import align
-            sheet = self.lyrics.search(title, artist, duration=duration)
+            sheet = self.lyrics.search(title, artist, duration=duration, context=context)
             found = align(source, sheet, self.settings, stopped=self.stopped, log=self.log)
-            metadata.update(source="Demucs + lyric-align", offset=0.0, ai_used=True,
+            metadata.update(source="Whisper + lyric-align (Kim ONNX / HTDemucs)", offset=0.0, ai_used=True,
                             lyrics_url=sheet.url, recording={"aligned_to_source_sha256": sha})
-        return self._present(found, metadata, title, artist, target)
+        return self._present(found, metadata, title, artist, target, context)
 
-    def _present(self, lines, metadata, title, artist, target):
+    def _present(self, lines, metadata, title, artist, target, context=None):
         metadata = dict(metadata)
         if self.settings.karaoke_translations and not metadata.get("translation_checked"):
-            sheet = self.lyrics.search(title, artist, duration=metadata["duration"])
+            sheet = self.lyrics.search(title, artist, duration=metadata["duration"], context=context)
             add_translations(lines, sheet)
             metadata["translation_checked"] = True
             if sheet:
@@ -122,6 +128,6 @@ class Resolver:
             temporary = Path(stream.name)
         temporary.replace(target)
         if not self.settings.karaoke_translations:
-            lines = [Line(row.start, row.end, row.units) for row in lines]
+            lines = [Line(row.start, row.end, row.units, cutoff=row.cutoff) for row in lines]
             metadata.pop("translation_url", None)
         return lines, metadata

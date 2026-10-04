@@ -19,6 +19,11 @@ class Line:
     end: float
     units: list[Unit]
     translations: dict[str, str] = field(default_factory=dict)
+    cutoff: float | None = None
+
+    @property
+    def visible_end(self):
+        return self.end if self.cutoff is None else min(self.end, self.cutoff)
 
     @property
     def text(self):
@@ -52,6 +57,9 @@ def validate(lines):
                 or line.start < 0 or line.end <= line.start or line.start < previous):
             raise ValueError("Неверный порядок строк караоке.")
         previous = line.start
+        if ((line.cutoff is not None and not math.isfinite(line.cutoff))
+                or not math.isfinite(line.visible_end) or line.visible_end <= line.start):
+            raise ValueError("Неверная граница показа строки караоке.")
         cursor = line.start
         if not line.units or not line.text.strip():
             raise ValueError("Пустая строка караоке.")

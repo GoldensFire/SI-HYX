@@ -149,7 +149,7 @@ def _overlaps(widget) -> list:
     return found
 
 
-@pytest.mark.parametrize("name", ["chk_chiptune", "chk_cover", "chk_manga",
+@pytest.mark.parametrize("name", ["chk_chiptune", "chk_cover", "chk_karaoke", "chk_manga",
                                   "chk_plot", "chk_pixiv_art"])
 def test_open_settings_never_overlap_the_composition_checkboxes(tab, qapp, name):
     """Раскрытая коробка настроек не рисуется поверх соседних галочек.
@@ -177,6 +177,26 @@ def test_settings_boxes_do_not_report_height_for_width(tab):
         box = getattr(tab, name)
         assert isinstance(box, SettingsBox)
         assert not box.hasHeightForWidth()
+
+
+def test_karaoke_collapses_without_leaving_empty_space_or_resizing_the_window(tab, qapp):
+    tab.resize(2000, 1000)
+    tab.show()
+    for _ in range(3):
+        qapp.processEvents()
+    tab.chk_karaoke.setChecked(False)
+    qapp.processEvents()
+    before = tab.box_audio_opts.minimumHeight()
+    for _ in range(3):
+        tab.chk_karaoke.setChecked(True)
+        for _ in range(3):
+            qapp.processEvents()
+        assert tab.box_audio_opts.minimumHeight() > before + 100
+        tab.chk_karaoke.setChecked(False)
+        for _ in range(3):
+            qapp.processEvents()
+        assert tab.box_audio_opts.minimumHeight() == before
+        assert tab.box_audio_opts.height() <= tab.box_audio_opts.sizeHint().height() + 2
 
 
 # ── панель каверов больше не занимает две трети колонки ──────────────────────

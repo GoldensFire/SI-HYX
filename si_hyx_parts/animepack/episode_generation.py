@@ -37,8 +37,9 @@ def initialize(generator, client=None, ru_client=None):
 
 
 def _finish(generator, candidate, aid, episode, stream, start, final, scope):
+    output_language = stream.get("_caption_output_language") or ("ru" if stream.get("ru_subtitles") else "")
     burned = bool(stream.get("_captions_burned") or
-                  (stream.get("ru_subtitles") and hard_subbed(stream)))
+                  (output_language in ("ru", "en") and hard_subbed(stream)))
     if wanted(generator, stream) and not burned:
         Path(final).unlink(missing_ok=True)
         return False
@@ -49,20 +50,23 @@ def _finish(generator, candidate, aid, episode, stream, start, final, scope):
     candidate.episode_clip = {"anilist_id": aid, "episode": episode,
                               "provider": stream["provider"], "start": round(start, 3),
                               "duration": int(CUT_SECONDS), "audio": stream["audio"],
-                              "hardsub": hard_subbed(stream), "ru_subtitles": burned,
+                              "hardsub": hard_subbed(stream),
+                              "ru_subtitles": burned and output_language == "ru",
                               "source_height": stream.get("source_height"), "output_height": 720,
                               "release": stream.get("release", "")}
     if stream.get("_ru_cues"):
         candidate.episode_clip.update(subtitle_source="video_track",
-                                      subtitle_language=stream.get("_caption_language"),
+                                      subtitle_language=output_language,
+                                      subtitle_source_language=stream.get("_caption_language"),
                                       subtitle_cues=stream["_ru_cues"])
     elif burned:
-        candidate.episode_clip["subtitle_source"] = "ru_hardsub"
+        candidate.episode_clip.update(subtitle_source=f"{output_language}_hardsub",
+                                      subtitle_language=output_language)
     # Stable source identity excludes signed stream tokens and HTTP headers.
     candidate.source_link = stream.get("source_link") or f"https://anilist.co/anime/{aid}"
     generator.log(f"Отрывок «{candidate.title_ru}»: серия {episode}, "
                   f"{start:.1f}–{start + CUT_SECONDS:.1f} с, {stream['provider']}"
-                  + (", RU-субтитры" if burned else ""))
+                  + (f", {output_language.upper()}-субтитры" if burned else ""))
     return True
 
 

@@ -36,11 +36,10 @@ class FullscreenVideo(_api.QWidget):
                           | _api.Qt.WindowType.Tool
                           | _api.Qt.WindowType.WindowStaysOnTopHint)
         self.bar.setAttribute(_api.Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self.bar.setAttribute(_api.Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.bar.setFocusPolicy(_api.Qt.FocusPolicy.StrongFocus)
         self.bar.setObjectName("FsBar")
         self.bar.setStyleSheet(
-            "#FsBar { background: rgba(15,15,18,0.88); "
-            "border-top: 1px solid rgba(255,255,255,0.10); }"
+            "#FsBar { background: #0f0f12; border-top: 1px solid #27272a; }"
             # Та же тёмная подсказка, что и во вкладке (см. EditTab.apply_theme) —
             # чтобы штатные tooltip'ы кнопок панели выглядели одинаково.
             f"QToolTip {{ background: {_api.C['surface3']}; color: {_api.C['text']}; "
@@ -100,15 +99,15 @@ class FullscreenVideo(_api.QWidget):
         row.setSpacing(8)
 
         _fsbtn_css = (
-            "QPushButton { background: rgba(255,255,255,0.08); border: none;"
+            f"QPushButton {{ background: {_api.C['surface3']}; border: none;"
             " border-radius: 7px; } "
-            "QPushButton:hover { background: rgba(255,255,255,0.18); } "
-            "QPushButton:pressed { background: rgba(255,255,255,0.30); }")
+            f"QPushButton:hover {{ background: {_api.C['border']}; }} "
+            f"QPushButton:pressed {{ background: {_api.C['border2']}; }}")
         _fsbtn_accent_css = (
-            "QPushButton { background: rgba(137,180,250,0.85); border: none;"
+            f"QPushButton {{ background: {_api.C['accent']}; border: none;"
             " border-radius: 7px; } "
-            "QPushButton:hover { background: rgba(180,190,254,0.95); } "
-            "QPushButton:pressed { background: rgba(137,180,250,0.65); }")
+            f"QPushButton:hover {{ background: {_api.C['accent2']}; }} "
+            f"QPushButton:pressed {{ background: {_api.C['accent']}; }}")
 
         def _fsbtn(icon_std, tip, slot, size=(42, 34), accent=False, icon=None):
             b = _api.QPushButton(self.bar)
@@ -202,7 +201,9 @@ class FullscreenVideo(_api.QWidget):
         self._hide_timer.setInterval(2500)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self._hide_bar)
-        # Клавиши (Esc/пробел/стрелки), пойманные окном панели, шлём в это окно.
+        # Панель — отдельное окно, поэтому ей тоже нужен общий набор сочетаний.
+        self.edit.register_shortcuts(self)
+        self.edit.register_shortcuts(self.bar)
         self.bar.installEventFilter(self)
 
     @staticmethod
@@ -257,7 +258,7 @@ class FullscreenVideo(_api.QWidget):
         self.bar.setGeometry(tl.x(), tl.y(), self.width(), bar_h)
         if self.bar.isVisible():
             self.bar.raise_()   # поверх оверлея субтитров
-        # self.bar — WA_TranslucentBackground + WindowType.Tool получает нативный
+        # self.bar — WindowType.Tool получает нативный
         # хэндл сразу при создании (до первого setGeometry), поэтому его QScreen
         # застревает на том экране, где он появился на свет (обычно первичный
         # монитор) — даже когда полноэкранное окно реально открыто на ДРУГОМ
@@ -349,7 +350,7 @@ class FullscreenVideo(_api.QWidget):
         self.edit.exit_fullscreen()
 
     def eventFilter(self, obj, ev):
-        # Esc/стрелки, нажатые когда активно окно панели, перенаправляем сюда.
+        # Физические клавиши и Esc из активного окна панели перенаправляем сюда.
         if obj is self.bar and ev.type() == _api.QEvent.Type.KeyPress:
             self.keyPressEvent(ev)
             if ev.isAccepted():
@@ -381,28 +382,14 @@ class FullscreenVideo(_api.QWidget):
         self._tip.show()
         self._tip.raise_()
 
-    _VK_F = 0x46
-
     def keyPressEvent(self, ev):
-        k = ev.key()
-        # F — по физической клавише через nativeVirtualKey, независимо от
-        # раскладки: на кириллице event.key() для физической F даёт код
-        # буквы «А», и один только `k == Qt.Key.Key_F` молча не срабатывает
-        # (тот же баг, что и с Ctrl+Z/Y/WASD — см. EditTab.keyPressEvent).
-        try:
-            vk = ev.nativeVirtualKey()
-        except Exception:
-            vk = 0
-        if k == _api.Qt.Key.Key_Escape or k == _api.Qt.Key.Key_F or vk == self._VK_F:
+        if ev.key() == _api.Qt.Key.Key_Escape:
             self.edit.exit_fullscreen()
-        elif k == _api.Qt.Key.Key_Space:
-            self.edit.toggle_play()
-        elif k == _api.Qt.Key.Key_Left:
-            self.edit.step_frame_scrub(-1)
-        elif k == _api.Qt.Key.Key_Right:
-            self.edit.step_frame_scrub(1)
+            ev.accept()
         else:
-            super().keyPressEvent(ev)
+            # WASD/F/I/O и Ctrl+буква учитывают раскладку и модификаторы
+            # ровно так же, как в обычном режиме вкладки.
+            self.edit.keyPressEvent(ev)
 
     def closeEvent(self, ev):
         # Панель — отдельное окно: прячем явно, чтобы не зависла на экране.

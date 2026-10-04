@@ -146,7 +146,8 @@ def _request(batch):
         "Названия и метки относятся только к изображению с тем же id; "
         "не сравнивай разные изображения между собой. Верни results: "
         "по одному вердикту с целочисленным id для каждого изображения. "
-        "Для манги mixed_anime=false: эта проверка относится к артам Pixiv.") }]
+        "Для манги и кадров mixed_anime=false: эта проверка относится к артам Pixiv. "
+        "Наличие персонажей в кадре не влияет на accept.") }]
     properties, required = {}, {"id"}
     for index, job in enumerate(batch):
         parts.append({"type": "text", "text": f"Изображение id={index}"})
@@ -176,6 +177,7 @@ def _verdicts(response, batch):
                 or type(row.get("has_title_text")) is not bool
                 or not isinstance(row.get("reason"), str)
                 or ("mixed_anime" in row and type(row["mixed_anime"]) is not bool)
+                or ("has_characters" in row and type(row["has_characters"]) is not bool)
                 or not set(batch[index].schema["required"]).issubset(row)):
             raise GeminiError("Gemini вернула неверные id или поля вердиктов")
         found[index] = {key: value for key, value in row.items() if key != "id"}

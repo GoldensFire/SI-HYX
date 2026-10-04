@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--crf", type=int, default=ap.VIDEO_CRF)
     parser.add_argument("--preset", type=int, default=10)
     parser.add_argument("--catalog", type=Path, help="Use an existing AnisongDB snapshot as input")
+    parser.add_argument("--no-ai-fallback", action="store_true", help="Require authored ASS/TTML only")
     parser.add_argument("--allow-title-repeats", action="store_true",
                         help="Allow distinct songs from the same anime or franchise")
     args = parser.parse_args()
@@ -41,7 +42,7 @@ def main():
         song_level_avg=args.average, song_level_min=1, song_level_max=15,
         level_avg=0, pct_songs=100, random_source="shikimori",
         karaoke_enabled=True, karaoke_percent=100, karaoke_translations=False,
-        karaoke_ai_fallback=False, karaoke_crf=args.crf, karaoke_preset=args.preset,
+        karaoke_ai_fallback=not args.no_ai_fallback, karaoke_crf=args.crf, karaoke_preset=args.preset,
         dup_anime=args.allow_title_repeats, dup_franchise=args.allow_title_repeats,
         audio_cut=20, images=False, parallel=args.parallel, sort_by_index=False)
     problems = settings.validate()
@@ -94,7 +95,7 @@ def main():
     if len(rows) != args.count:
         raise RuntimeError(f"Получилось {len(rows)} из {args.count}; см. generation.log.")
     summary["verification"] = verify_package(result.path, ap.FFPROBE, generator._run_capture,
-                                              expected=args.count)
+                                              expected=args.count, require_authored=args.no_ai_fallback)
     (output / "verification.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     log(f"Готово: {len(rows)} песен, средняя сложность {actual:.2f}; {result.path}")
 

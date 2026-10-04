@@ -24,7 +24,7 @@ datas = [('icon.ico', '.'), ('open-file.svg', '.')]
 datas += [(str(p), 'karaoke/fonts') for p in Path('karaoke/fonts').glob('*')]
 # Standalone source for the isolated ML interpreter; torch stays excluded.
 datas += [(str(p), 'chiptune') for p in Path('chiptune').glob('*.py')]
-datas += [('karaoke/asr_worker.py', 'karaoke')]
+datas += [(str(p), 'karaoke') for p in Path('karaoke').glob('*.py')]
 binaries = []
 # numpy/lxml тянутся лениво (волны/LUFS/разбор .siq), siquester — внутри try/except,
 # поэтому пакет включаем целиком. soundfile несёт нативный libsndfile (collect_all).

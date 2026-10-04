@@ -69,8 +69,10 @@ def rebuild(args):
                 print(f"READY {number}/{len(candidates)}: {candidate.song_name}", flush=True)
         if sum(c.level for c in candidates) != settings.song_level_avg * len(candidates):
             raise ValueError("Фактическая средняя изменилась после подготовки медиа.")
-        path = generator.write_package(candidates, str(output / "Аниме-Песни-12-Средняя-4.siq"))
-        report = verify_package(path, ap.FFPROBE, generator._run_capture, expected=len(candidates))
+        name = f"Аниме-Песни-{len(candidates)}-Средняя-{settings.song_level_avg}.siq"
+        path = generator.write_package(candidates, str(output / name))
+        report = verify_package(path, ap.FFPROBE, generator._run_capture, expected=len(candidates),
+                                require_authored=not settings.karaoke_ai_fallback)
         rows = [{"song": c.song_name, "anime": c.title_ru, "level": c.level,
                  "mal": c.mal_id, "kind": c.kind, "file": c.video_out,
                  "highlight": c.karaoke["highlight_colour"]} for c in candidates]

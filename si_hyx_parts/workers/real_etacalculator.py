@@ -3,6 +3,8 @@
 # See LICENSE and the public module for attribution and API.
 """RealETACalculator. Public namespace: workers."""
 import workers as _api
+from .download_network import is_network_error, network_hint
+from .download_process import stop_process
 
 
 class RealETACalculator:
@@ -151,6 +153,10 @@ class InfoWorker(_api.QThread):
         self.cancelled = False
         self._proc = None
 
+    def cancel(self):
+        self.cancelled = True
+        stop_process(self._proc)
+
     @staticmethod
     def _parse_sub_langs(raw: str) -> list:
         """Языки РУЧНЫХ субтитров из JSON-поля subtitles (%(subtitles)j).
@@ -194,6 +200,7 @@ class InfoWorker(_api.QThread):
             cmd = base + [
                 "--no-playlist", "--no-warnings", "--skip-download",
                 "--socket-timeout", "15", "--no-check-certificate",
+                "--extractor-retries", "2", "--retry-sleep", "1",
                 # Каждая строка с префиксом-маркером — парсим по нему, не по позиции
                 # (JSON-строки могут быть длинными). subtitles/formats нужны, чтобы
                 # заполнить списки «Суб.»/«Язык» реально доступными дорожками.
@@ -218,7 +225,7 @@ class InfoWorker(_api.QThread):
             # перезапускаем процесс до 12 раз (только TikTok). Иначе превью/метаданные
             # так же мигали бы ошибкой.
             is_tt = _api.host_matches(self.url, 'tiktok.com')
-            max_tries = 12 if is_tt else 1
+            max_tries = 12 if is_tt else 2
             duration, thumb = 0, ""
             sub_langs, audio_langs = [], []
             for attempt in range(max_tries):
@@ -227,7 +234,16 @@ class InfoWorker(_api.QThread):
                     cmd, stdout=_api.subprocess.PIPE, stderr=_api.subprocess.PIPE,
                     text=True, encoding="utf-8", errors="replace",
                     creationflags=_api.CREATE_NO_WINDOW, env=_api.subprocess_env())
-                out, err = self._proc.communicate(timeout=60)
+                if self.cancelled:
+                    stop_process(self._proc)
+                    self._proc.communicate(timeout=5)
+                    return
+                try:
+                    out, err = self._proc.communicate(timeout=60)
+                except _api.subprocess.TimeoutExpired:
+                    stop_process(self._proc)
+                    out, err = self._proc.communicate(timeout=5)
+                    err = "Таймаут запроса информации (60 сек.).\n" + (err or "")
                 if self.cancelled: return
 
                 for line in (out or "").splitlines():
@@ -246,20 +262,29 @@ class InfoWorker(_api.QThread):
                 # Пусто. Повторяем на ЛЮБОЙ флапающей ошибке извлечения TikTok
                 # (rehydration / universal data / unexpected response).
                 low = (err or "").lower()
-                if not (is_tt and attempt + 1 < max_tries
-                        and ("rehydration" in low or "universal data" in low
-                             or "unexpected response" in low)):
+                flaky_tiktok = is_tt and any(token in low for token in (
+                    "rehydration", "universal data", "unexpected response"))
+                if not (attempt + 1 < max_tries
+                        and (flaky_tiktok or is_network_error(err))):
                     break
+                for _ in range(20):
+                    if self.cancelled: return
+                    _api.time.sleep(0.1)
 
             if duration or thumb or sub_langs or audio_langs:
                 self.success.emit(duration, thumb, sub_langs, audio_langs)
             else:
-                self.error.emit("Не удалось извлечь информацию.")
+                detail = (err or "").strip()[-1500:]
+                message = "Не удалось извлечь информацию."
+                if detail:
+                    message += "\n" + detail
+                if is_network_error(detail):
+                    message += "\n" + network_hint()
+                self.error.emit(message)
         except _api.subprocess.TimeoutExpired:
-            try: self._proc.kill()
-            except Exception: pass
+            stop_process(self._proc)
             if not self.cancelled:
-                self.error.emit("Таймаут запроса информации.")
+                self.error.emit("Таймаут запроса информации. " + network_hint())
         except Exception as e:
             if not self.cancelled:
                 self.error.emit(str(e))
