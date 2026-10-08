@@ -1,4 +1,5 @@
 """Compressed AMQ containers use FFmpeg before loading an expensive model."""
+import os
 from pathlib import Path
 import subprocess
 
@@ -10,6 +11,7 @@ from config import FFMPEG
 from karaoke import input_audio, roformer
 
 
+@pytest.mark.skipif(not os.path.exists(FFMPEG), reason="нет bundled ffmpeg (внешний ассет)")
 def test_aac_under_generic_audio_name_decodes_with_sample_rate_and_stereo(tmp_path):
     source = tmp_path / "source.audio"
     subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i",

@@ -141,7 +141,7 @@ class TestGlobalResult:
         main.UnifiedWindow._position_progress_button(window)
         assert button.parent() is bar
         assert button.text() == ""
-        assert button.pos().x() == 279
+        assert button.pos().x() == 277
         assert button.pos().y() == 1
 
         main.UnifiedWindow.set_global_result(window, str(result))
