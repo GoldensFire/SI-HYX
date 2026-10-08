@@ -296,6 +296,14 @@ class PackSettings:
     # Общая средняя книгам не годится по той же причине, что и общая рамка:
     # шкала у них своя. 0 — не следить.
     manga_level_avg: int = 0
+    # Свои рамка и средняя у манхвы и маньхуа (поля манги выше — у японской
+    # манги). Старые настройки их не знали: при загрузке они повторяют мангу.
+    manhwa_level_min: int = 1
+    manhwa_level_max: int = 15
+    manhwa_level_avg: int = 0
+    manhua_level_min: int = 1
+    manhua_level_max: int = 15
+    manhua_level_avg: int = 0
     # Типы изданий (kind у Manga): манга, манхва, манхуа, ранобэ и т.п.
     manga_kinds: dict = _api.field(
         default_factory=lambda: {k: k in ("manga", "manhwa", "manhua")
@@ -636,7 +644,8 @@ class PackSettings:
     У книг и артов рамка своя (просьба пользователя), у всего остального —
     общая «Сложность пака». Ключ None — та самая общая рамка."""
         general = (int(self.level_min), int(self.level_max))
-        manga = (int(self.manga_level_min), int(self.manga_level_max))
+        from .manga_editions import span
+        manga = span(self)
         art = (int(self.art_level_min), int(self.art_level_max))
         plot = (int(self.plot_level_min), int(self.plot_level_max))
         out = {None: general, _api.MANGA_KIND: manga, _api.PLOT_KIND: plot}
@@ -876,13 +885,8 @@ class PackSettings:
         if self.songs_percent and song_low > song_high:
             problems.append("Сложность аниме у песен: «от» больше, чем «до».")
         if self.manga_percent:
-            if self.manga_level_min > self.manga_level_max:
-                problems.append("Сложность манги: «от» больше, чем «до».")
-            avg = int(getattr(self, "manga_level_avg", 0) or 0)
-            if avg and not (self.manga_level_min <= avg <= self.manga_level_max):
-                problems.append(
-                    f"Средняя сложность манги {avg} не попадает в рамки "
-                    f"«от {self.manga_level_min} до {self.manga_level_max}».")
+            from .manga_editions import validate_levels
+            problems.extend(validate_levels(self))
             if int(self.manga_pct_manhwa or 0) + int(self.manga_pct_manhua or 0) > 100:
                 problems.append("Доли манхвы и маньхуа в сумме больше сотни — "
                                 "на японскую мангу мест не остаётся.")
@@ -1093,8 +1097,9 @@ class PackSettings:
         s.cover_langs = [k for k in (s.cover_langs or ()) if k in COVER_LANGUAGE_KEYS]
         if str(s.cover_lang_mode or "") not in ("allow", "exclude"):
             s.cover_lang_mode = "allow"
-        from .manga_editions import migrate
+        from .manga_editions import migrate, migrate_levels
         migrate(s, d)
+        migrate_levels(s, d)
         try:
             s.karaoke_ai_timeout = max(60, min(3600, int(s.karaoke_ai_timeout)))
         except (TypeError, ValueError):

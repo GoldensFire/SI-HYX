@@ -191,6 +191,10 @@ def priority(generator, candidate, kind=None):
     if kind not in aims:
         aims[kind] = aim_level(generator, kind, desired_level(generator, kind, questions))
     aim = aims[kind]
+    if kind == ap.MANGA_KIND:
+        # У манги, манхвы и маньхуа средние свои: прицел сдвигается по изданию.
+        from .manga_editions import aim as edition_aim
+        aim = edition_aim(generator.s, candidate.anime, aim)
     return abs(candidate.level - aim) if aim is not None else 0
 
 

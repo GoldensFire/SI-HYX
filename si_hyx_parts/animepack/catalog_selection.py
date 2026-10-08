@@ -92,6 +92,11 @@ class CatalogPlan:
         bands = {gen.s.level_range(k) for k in relevant}
         # Different ranges/catalogues are checked by the ordinary quota
         # projection; this finite-stock check is exact for a shared band.
+        if ap.MANGA_KIND in relevant:
+            # Своя рамка у каждого издания книг: общий запас по одной полосе
+            # тут неточен.
+            from .manga_editions import active, level_range
+            bands |= {level_range(gen.s, k) for k in active(gen.s)}
         if (not target or len(bands) != 1 or any(k not in self.kinds for k in relevant)
                 or gen.s.char_level_avg and ap.CHAR_KIND in relevant
                 or kind == ap.MANGA_KIND and gen.s.manga_strict_targets):
@@ -122,10 +127,15 @@ class CatalogPlan:
         for kind in self.kinds:
             if not spare and used[kind] >= quotas.get(kind, 0):
                 continue
-            low, high = self.generator.s.level_range(kind)
+            wanted = aims.get(kind)
+            if kind == ap.MANGA_KIND:
+                from .manga_editions import aim, card_range
+                low, high = card_range(self.generator.s, candidate.anime)
+                wanted = aim(self.generator.s, candidate.anime, wanted)
+            else:
+                low, high = self.generator.s.level_range(kind)
             if not low <= level <= high:
                 continue
-            wanted = aims.get(kind)
             distance = abs(level - wanted) if wanted is not None else 0
             fit = spare or fits(self.generator, candidate, [], kind, selected=questions)
             stock = spare or self._attainable(level, kind, questions, quotas)

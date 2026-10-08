@@ -57,6 +57,10 @@ def level_bucket(kind) -> _api.Optional[str]:
 
 def level_avg_target(settings, bucket) -> int:
     """Просимая средняя для корзины (0 — не следить)."""
+    if bucket == MANGA_BUCKET:
+        # У манги, манхвы и маньхуа средние свои; книжная — их смесь по долям.
+        from .manga_editions import average_target
+        return average_target(settings)
     field = BUCKET_FIELDS.get(bucket)
     if field is None:
         return int(getattr(settings, "level_avg", 0) or 0)

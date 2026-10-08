@@ -13,7 +13,12 @@ ANTONYM_KINDS = ("tv", "movie")
 
 def _level_ok(settings, cand: _api.SongCandidate, kind: str) -> bool:
     """Проходит ли тайтл рамку сложности ИМЕННО этого рода вопросов."""
-    low, high = settings.level_range(kind)
+    if kind == _api.MANGA_KIND:
+        # У книг рамка своя для манги, манхвы и маньхуа.
+        from .manga_editions import card_range
+        low, high = card_range(settings, cand.anime)
+    else:
+        low, high = settings.level_range(kind)
     return low <= cand.level <= high
 
 

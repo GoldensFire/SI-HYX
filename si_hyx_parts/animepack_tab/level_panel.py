@@ -27,7 +27,9 @@ BLOCKS = (
     ("studio", "Студии", "studio_level_range", "sp_studio_level_avg"),
     ("chars", "Персонажи", "char_level_range", "sp_char_avg"),
     ("art", "Арты", "art_level_range", "sp_art_level_avg"),
-    ("manga", "Комиксы", "manga_level_range", "sp_manga_level_avg"),
+    ("manga", "Манга", "manga_level_range", "sp_manga_level_avg"),
+    ("manhwa", "Манхва", "manhwa_level_range", "sp_manhwa_level_avg"),
+    ("manhua", "Маньхуа", "manhua_level_range", "sp_manhua_level_avg"),
     ("plot", "Сюжет", "plot_level_range", "sp_plot_level_avg"),
 )
 
@@ -98,8 +100,10 @@ def _on(tab, key: str) -> bool:
         return checked("chars")
     if key == "art":
         return checked("ai_art") or checked("pixiv_art")
-    if key == "manga":
-        return checked("manga")
+    if key in ("manga", "manhwa", "manhua"):
+        # Рамка издания видна, пока у него есть доля в книжной части.
+        bar = getattr(tab, "manga_edition_bar", None)
+        return checked("manga") and (bar is None or bool(bar.values().get(key)))
     if key == "plot":
         return checked("plot")
     return True

@@ -118,10 +118,11 @@ def test_validated_remote_success_needs_no_complete_transfer(remote_generator, t
     generator, gate = remote_generator
     target = tmp_path / "clip.mp4"
 
+    # Под шлюзом только копия отрезка из сети; AV1 кодируется уже с диска.
     def run(command, **kw):
-        assert gate.active and "-request_size" in command
+        assert gate.active is ("-request_size" in command)
         assert command[command.index("-ss") + 1] == "20"
-        target.write_bytes(b"x" * (ap.MIN_VIDEO_BYTES + 1))
+        Path(command[-1]).write_bytes(b"x" * (ap.MIN_VIDEO_BYTES + 1))
         return 0, ""
     generator._run_killable = run
     expected = []

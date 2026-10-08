@@ -3,7 +3,7 @@ from collections import deque
 
 import animepack as ap
 
-from .manga_editions import edition
+from .manga_editions import edition, level_avg, level_range
 from .ru_popularity_store import RuPopularityStore, service
 
 
@@ -18,13 +18,18 @@ def order(generator, pairs):
     store = RuPopularityStore(cache, existing.clients, existing.config, persist=False)
     favored = cache.memo_group("manga_favorites")
     low, high = settings.level_range(ap.MANGA_KIND)
-    target = settings.manga_level_avg or settings.level_avg or (low + high) / 2
+    target = (ap.level_avg_target(settings, ap.MANGA_BUCKET) or settings.level_avg
+              or (low + high) / 2)
     mix = generator._manga_mix
     quotas = {"manga": mix.kind_target[""], "manhwa": mix.kind_target["manhwa"],
               "manhua": mix.kind_target["manhua"]}
+    bands = {key: level_range(settings, key) for key in quotas}
     desired = {"manga": target, "manhwa": min(high, target + .75),
                "manhua": min(high, target + 1.5)}
-    if quotas["manga"]:
+    # Своя средняя издания важнее прикидки «вебтуны чуть труднее манги».
+    own = {key: level_avg(settings, key) for key in quotas if level_avg(settings, key)}
+    desired.update(own)
+    if quotas["manga"] and "manga" not in own:
         desired["manga"] = max(low, min(high, (target * sum(quotas.values())
             - quotas["manhwa"] * desired["manhwa"]
             - quotas["manhua"] * desired["manhua"]) / quotas["manga"]))
@@ -57,7 +62,7 @@ def order(generator, pairs):
             candidate.franchise_index = max(candidate.franchise_index,
                                             ap.branch_franchise_index(card, franchise))
         level = candidate.level
-        if not low <= level <= high:
+        if not bands[key][0] <= level <= bands[key][1]:
             # Missing screen metadata can later make this book easier.
             if any(str(i) not in anime for i in ids):
                 unknown.append(pair)

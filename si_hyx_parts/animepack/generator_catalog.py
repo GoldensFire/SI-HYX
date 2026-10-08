@@ -945,7 +945,8 @@ class GeneratorCatalogMixin:
             # Экранизованная книга меряется узнаваемостью своего АНИМЕ: по книжной
             # шкале её вопрос вышел бы вдесятеро труднее, чем он на самом деле.
             _api.apply_adaptation(probe, adapted or {})
-            low, high = self.s.level_range(_api.MANGA_KIND)
+            from .manga_editions import card_range
+            low, high = card_range(self.s, anime)
             note = "рамки сложности манги"
         else:
             # Род вопроса ещё не выбран, поэтому рамка тут самая широкая из

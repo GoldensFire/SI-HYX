@@ -16,6 +16,9 @@ def build(tab):
         "относятся к доле манги. При выключенном строгом режиме и нехватке "
         "кандидатов доли могут перераспределиться между включёнными типами.")
     tab.manga_edition_bar.changed.connect(tab._recount)
+    # Рамки сложности изданий с нулевой долей прячутся.
+    from .level_panel import refresh
+    tab.manga_edition_bar.changed.connect(lambda *a: refresh(tab))
     tab._manga_strict_targets = False
     saver = getattr(getattr(tab, "main", None), "_save_settings_soon", None)
     if saver:

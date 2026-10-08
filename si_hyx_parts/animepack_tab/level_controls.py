@@ -2,6 +2,8 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 """Отдельные рамки сложности: арты и книги. Namespace: animepack_tab.
 
+У книг рамок три — манга, манхва и маньхуа, у каждой своя средняя.
+
 Общая «Сложность пака» годится кадрам, песням и персонажам, но не всему. Арт с
 Pixiv — это не кадр из аниме: по фанатскому рисунку тайтл узнают куда хуже, и
 под арты обычно берут заметные тайтлы, даже когда остальной пак собран из
@@ -30,6 +32,15 @@ MANGA_TIP = ("Насколько узнаваемы КНИГИ в паке. Шк
              "Манга С АНИМЕ-ЭКРАНИЗАЦИЕЙ поэтому и считается по сериалу: ей "
              "засчитывается узнаваемость самого аниме, и стоит такой вопрос "
              "на два очка дороже вопроса-кадра по тому же тайтлу.")
+
+
+# Свои рамки у корейских и китайских изданий: их читают другие люди, и
+# узнаваемость у них своя (просьба пользователя).
+EDITION_TIPS = {
+    "manga": "Рамка японской МАНГИ (ваншоты и додзинси — тоже здесь).\n",
+    "manhwa": "Рамка МАНХВЫ — корейских комиксов.\n",
+    "manhua": "Рамка МАНЬХУА — китайских комиксов.\n",
+}
 
 
 PLOT_TIP = ("Насколько узнаваемы тайтлы, по которым спрашивают СЮЖЕТ. Рамка "
@@ -146,12 +157,14 @@ def build_char(tab):
 
 
 def build_manga(tab):
-    """Рамка сложности книг и доли внутри книжной части."""
-    tab.manga_level_range = _range(MANGA_TIP)
-    tab._new_level_bar = tab.manga_level_range
-    tab.sp_manga_level_from = tab.manga_level_range.low_control
-    tab.sp_manga_level_to = tab.manga_level_range.high_control
-    tab.sp_manga_level_avg = _avg(tab, AVG_TIP)
+    """Рамки сложности манги, манхвы и маньхуа и доли внутри книжной части."""
+    for key in ("manga", "manhwa", "manhua"):
+        bar = _range(EDITION_TIPS[key] + MANGA_TIP)
+        tab._new_level_bar = bar
+        setattr(tab, f"{key}_level_range", bar)
+        setattr(tab, f"sp_{key}_level_from", bar.low_control)
+        setattr(tab, f"sp_{key}_level_to", bar.high_control)
+        setattr(tab, f"sp_{key}_level_avg", _avg(tab, AVG_TIP))
     from .manga_adaptation_control import AdaptationPercent
     tab.sp_manga_adapted = AdaptationPercent()
     tab.sp_manga_adapted.setValue(50)
@@ -197,10 +210,11 @@ def collect(tab, settings):
     settings.plot_level_avg = tab.sp_plot_level_avg.value()
     settings.art_level_min = tab.sp_art_level_from.value()
     settings.art_level_max = tab.sp_art_level_to.value()
-    settings.manga_level_min = tab.sp_manga_level_from.value()
-    settings.manga_level_max = tab.sp_manga_level_to.value()
+    for key in ("manga", "manhwa", "manhua"):
+        setattr(settings, f"{key}_level_min", getattr(tab, f"sp_{key}_level_from").value())
+        setattr(settings, f"{key}_level_max", getattr(tab, f"sp_{key}_level_to").value())
+        setattr(settings, f"{key}_level_avg", getattr(tab, f"sp_{key}_level_avg").value())
     settings.art_level_avg = tab.sp_art_level_avg.value()
-    settings.manga_level_avg = tab.sp_manga_level_avg.value()
     settings.manga_adapted_percent = tab.sp_manga_adapted.value()
     from .manga_edition_controls import collect as collect_editions
     collect_editions(tab, settings)
@@ -236,11 +250,13 @@ def apply_controls(tab, settings):
         clamp(getattr(settings, "plot_level_avg", 0), 0))
     tab.art_level_range.set_range(clamp(settings.art_level_min),
                                   clamp(settings.art_level_max))
-    tab.manga_level_range.set_range(clamp(settings.manga_level_min),
-                                    clamp(settings.manga_level_max))
+    for key in ("manga", "manhwa", "manhua"):
+        getattr(tab, f"{key}_level_range").set_range(
+            clamp(getattr(settings, f"{key}_level_min")),
+            clamp(getattr(settings, f"{key}_level_max")))
+        getattr(tab, f"sp_{key}_level_avg").setValue(
+            clamp(getattr(settings, f"{key}_level_avg", 0), 0))
     tab.sp_art_level_avg.setValue(clamp(getattr(settings, "art_level_avg", 0), 0))
-    tab.sp_manga_level_avg.setValue(
-        clamp(getattr(settings, "manga_level_avg", 0), 0))
     adapted = int(settings.manga_adapted_percent)
     tab.sp_manga_adapted.setValue(max(-1, min(100, adapted)))
     from .manga_edition_controls import apply_controls as apply_editions

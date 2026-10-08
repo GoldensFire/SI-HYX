@@ -352,7 +352,8 @@ memo/история — [ru_popularity_store](si_hyx_parts/animepack/ru_populari
 [manga_pack_verify.py](tools/manga_pack_verify.py).
 Одна полоса долей манги/манхвы/маньхуа —
 [manga_edition_controls](si_hyx_parts/animepack_tab/manga_edition_controls.py);
-перенос старых настроек без ранобэ и романов —
+перенос старых настроек без ранобэ и романов, а также свои рамка и средняя
+сложности у каждого издания (книжная средняя — их смесь по долям) —
 [manga_editions](si_hyx_parts/animepack/manga_editions.py).
 
 Строгие квоты и итоговая средняя —

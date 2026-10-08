@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Появление из меню монтажа: доступность, экспорт и отмена."""
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,11 @@ import edit_tab as editor
 from image_entrance import EFFECTS, EDITOR_ONLY_EFFECTS
 from si_hyx_parts.edit_tab.entrance_dialog import EntranceDialog
 from si_hyx_parts.edit_tab.entrance_worker import EntranceWorker
+
+# На раннере CI нет bundled ffmpeg (внешний ассет): без него воркер падает, а
+# EditTab показывает модальное окно ошибки и прогон висит до таймаута.
+needs_ffmpeg = pytest.mark.skipif(not os.path.exists(editor.FFMPEG),
+                                  reason="нет bundled ffmpeg (внешний ассет)")
 
 
 def _menu(qapp, source):
@@ -90,6 +96,7 @@ def _run(command):
     return result.stdout
 
 
+@needs_ffmpeg
 @pytest.mark.parametrize("is_image", [True, False])
 def test_editor_worker_exports_effect_and_preserves_source(qapp, tmp_path, is_image):
     source = tmp_path / ("исходник.png" if is_image else "исходник.mp4")
@@ -145,6 +152,7 @@ def test_cancelled_worker_publishes_no_output(qapp, tmp_path):
     assert not list(tmp_path.glob("_entrance_*"))
 
 
+@needs_ffmpeg
 def test_create_entrance_from_initialized_editor(qapp, tmp_path, monkeypatch):
     from si_hyx_parts.edit_tab import entrance_actions
     monkeypatch.setattr(editor, "EDITOR_SETTINGS_PATH", str(tmp_path / "settings.json"))

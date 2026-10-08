@@ -83,7 +83,7 @@ def test_studio_level_has_an_independent_band_and_average(tab):
 def test_every_level_band_lives_in_the_anime_group(tab):
     anime_group = tab.settings_columns._groups[2]
     assert anime_group.title() == "Аниме"
-    for key in ("song", "studio", "chars", "art", "manga", "plot"):
+    for key in ("song", "studio", "chars", "art", "manga", "manhwa", "manhua", "plot"):
         _label, bar = tab._level_blocks[key]
         assert bar.parent() is anime_group
         assert bar.avg_control.parent() is bar
@@ -92,7 +92,8 @@ def test_every_level_band_lives_in_the_anime_group(tab):
     assert tab.song_diff_range.parent() is anime_group
     assert tab.ost_diff_range.parent() is anime_group
     assert not hasattr(tab, "lbl_diff_bands")
-    assert tab._level_blocks["manga"][0].text() == "Комиксы"
+    assert [tab._level_blocks[k][0].text() for k in ("manga", "manhwa", "manhua")] == [
+        "Манга", "Манхва", "Маньхуа"]
 
 
 def test_lists_stay_in_the_middle_column(tab):
