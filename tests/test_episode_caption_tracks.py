@@ -17,7 +17,7 @@ def fixed_scene_start(monkeypatch):
 
 
 def generator(files, translate=None):
-    return SimpleNamespace(s=api.PackSettings(episode_ru_subtitles=True),
+    return SimpleNamespace(s=api.PackSettings(episode_ru_subtitles=True, episode_scene_check=False),
         stopped=lambda: False, rng=SimpleNamespace(uniform=lambda *a: 100),
         kuhi=SimpleNamespace(captions=lambda *a: files),
         gemini=SimpleNamespace(generate_json=translate) if translate else None,
@@ -58,7 +58,8 @@ def test_missing_track_does_not_use_an_unaligned_external_release():
 
 def test_english_hardsub_is_the_fallback_and_ru_hardsub_is_preserved():
     gen = generator([])
-    english = stream("english", "sub", hardsub=True)
+    gen.s.episode_subtitle_mode = "preferred"
+    english = stream("english", "sub", hardsub=True, subtitle_language="en")
     assert captions.allowed(gen, english)
     assert captions.prepare(gen, english, info(duration=1400), scope()) == (100, [])
     assert english["_caption_output_language"] == "en"
@@ -76,6 +77,7 @@ def test_english_timed_captions_survive_missing_or_failed_translation(failure):
             raise failure
         return failure
     gen = generator([(VTT, "captions.vtt")], translate if failure is not None else None)
+    gen.s.episode_subtitle_mode = "preferred"
     source = stream("soft", "sub", subtitles=[{"url": "https://soft/sub.vtt", "srclang": "en"}])
     assert captions.prepare(gen, source, info(duration=1400), scope()) == (
         100, [(0, 3, "Hello!"), (10, 15, "How are you?")])
@@ -85,14 +87,15 @@ def test_english_timed_captions_survive_missing_or_failed_translation(failure):
 
 def test_russian_track_has_priority_over_english_without_spending_translation():
     calls = []
-    data = "1\n00:01:39,500 --> 00:01:43,000\nПривет!\n".encode()
+    data = "1\n00:01:39,500 --> 00:01:45,000\nПривет! Мне очень приятно тебя снова видеть.\n".encode()
     gen = generator([])
     def load(selected, scope):
         calls.append(selected["subtitles"][0]["srclang"])
         return [(data, "ru.srt")]
     gen.kuhi.captions = load
     source = stream("soft", "sub", subtitles=[{"srclang": "en"}, {"srclang": "ru"}])
-    assert captions.prepare(gen, source, info(duration=1400), scope()) == (100, [(0, 3, "Привет!")])
+    assert captions.prepare(gen, source, info(duration=1400), scope()) == (
+        100, [(0, 5, "Привет! Мне очень приятно тебя снова видеть.")])
     assert calls == ["ru"] and source["_caption_output_language"] == "ru"
 
 
@@ -104,12 +107,13 @@ def test_partial_english_or_missing_translated_lines_are_rejected():
 
 
 def test_native_ru_track_is_used_without_translation():
-    data = "1\n00:01:39,500 --> 00:01:43,000\nПривет!\n".encode("cp1251")
+    data = "1\n00:01:39,500 --> 00:01:45,000\nПривет! Мне очень приятно тебя снова видеть.\n".encode("cp1251")
     gen = generator([])
     gen.episode_ru = SimpleNamespace(captions=lambda *a: [(data, "episode.srt")])
     source = stream("animelib", "sub", ru_subtitles=True, hardsub=False,
                     subtitles=[{"url": "https://lib/sub.srt"}])
-    assert captions.prepare(gen, source, info(duration=1400), scope()) == (100, [(0, 3, "Привет!")])
+    assert captions.prepare(gen, source, info(duration=1400), scope()) == (
+        100, [(0, 5, "Привет! Мне очень приятно тебя снова видеть.")])
 
 
 def test_disabled_ru_does_not_add_or_request_captions():
@@ -122,10 +126,11 @@ def test_disabled_ru_does_not_add_or_request_captions():
 @pytest.mark.parametrize("hard", [False, True])
 def test_english_fallback_reaches_the_finished_clip_with_honest_language_metadata(tmp_path, monkeypatch, hard):
     gen = generator([(VTT, "captions.vtt")])
+    gen.s.episode_subtitle_mode = "preferred"
     gen.episode_ru = None
     gen.log = lambda *a: None
     source = stream("english", "sub", hardsub=hard, source_height=1080,
-                    subtitles=[] if hard else [{"srclang": "en"}])
+                    subtitle_language="en", subtitles=[] if hard else [{"srclang": "en"}])
     source["_probe_info"] = info(duration=1400)
     final = tmp_path / "clip.mp4"
     written = []

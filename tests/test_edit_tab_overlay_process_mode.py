@@ -13,6 +13,7 @@
   • _execute_cut_and_process кладёт PNG и формат в элемент очереди;
   • process_media собирает из них -vf, ставя накладку ПЕРЕД своей цепочкой.
 """
+import inspect
 import os
 from types import SimpleNamespace
 
@@ -186,7 +187,8 @@ def _video_worker(tmp_path, monkeypatch, settings):
                  '_build_video_filters', '_overlay_vf', '_av1_encoder_args',
                  '_choose_pix_fmt', '_source_has_alpha', '_bt709_color_args',
                  '_wants_metric_score', '_make_metric_sample', '_scale_vf'):
-        setattr(st, name, ProcessWorker.__dict__[name].__get__(st, ProcessWorker))
+        setattr(st, name, inspect.getattr_static(ProcessWorker, name).__get__(
+            st, ProcessWorker))
     return st, cmds
 
 

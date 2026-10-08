@@ -46,6 +46,7 @@ class Track:
     aliases: list[str] = field(default_factory=list)
     version: str = ""
     payload: bytes = b""
+    artist_groups: list[str] = field(default_factory=list)
 
 
 def validate(lines):
@@ -69,7 +70,8 @@ def validate(lines):
                     or unit.end > line.end + .015):
                 raise ValueError("Тайминги слогов выходят за границы строки.")
             cursor = unit.end
-        if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", line.text):
+        # Japanese punctuation (notably ・) is valid between Roman words.
+        if re.search(r"[\u3041-\u3096\u309d-\u309f\u30a1-\u30fa\u30fd-\u30ff\u3400-\u9fff]", line.text):
             raise ValueError("Основная строка должна быть romaji.")
     return lines
 

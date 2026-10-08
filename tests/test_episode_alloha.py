@@ -1,10 +1,12 @@
 """Alloha selection and live-session proxy correctness without external services."""
 import asyncio
 import time
+import httpx
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 
 from si_hyx_parts.animepack.episode_alloha_proxy import Bridge, rewrite_hls
+from si_hyx_parts.animepack.episode_alloha_transport import MediaTransport
 from si_hyx_parts.animepack.episode_ru_alloha import sources
 from si_hyx_parts.kuhi._transport import RequestScope
 
@@ -53,24 +55,22 @@ def test_alloha_playlist_rewrites_external_audio_key_and_relative_segments():
 
 def test_bridge_keeps_controls_but_never_replays_one_time_nonce_or_stale_range():
     calls = []
-    class Response:
-        ok = True
-        status = 200
-        headers = {"content-type": "application/vnd.apple.mpegurl"}
-        async def body(self):
-            return b"#EXTM3U\n#EXTINF:4,\nsegment.ts\n"
-        async def dispose(self):
-            calls.append("disposed")
-    async def get(url, **kwargs):
-        calls.append(kwargs["headers"])
-        return Response()
+    def get(request):
+        calls.append(dict(request.headers))
+        return httpx.Response(200, content=b"#EXTM3U\n#EXTINF:4,\nsegment.ts\n",
+                              headers={"content-type": "application/vnd.apple.mpegurl"})
+    async def cookies(urls):
+        return [{"name": "session", "value": "live", "domain": "cdn.test", "path": "/"}]
     async def run():
         scope = RequestScope(lambda: False, time.monotonic() + 10)
-        bridge = Bridge(SimpleNamespace(request=SimpleNamespace(get=get)), scope, "https://alloha.yani.tv/")
+        context = SimpleNamespace(cookies=cookies)
+        client = httpx.AsyncClient(transport=httpx.MockTransport(get))
+        bridge = Bridge(context, scope, "https://alloha.yani.tv/",
+                        transport=MediaTransport(context, scope, client=client))
         try:
             bridge.headers.update({"accepts-controls": "renewed", "authorizations": "session",
                                    "borth": "one-time", "range": "bytes=0-10", "user-agent": "Chrome"})
-            target = "https://cdn/dir/episode.m3u8"
+            target = "https://cdn.test/dir/episode.m3u8"
             local = bridge.url(target)
             assert parse_qs(urlsplit(local).query)["url"] == [target]
             body, _type = await bridge.fetch(target)
@@ -78,5 +78,10 @@ def test_bridge_keeps_controls_but_never_replays_one_time_nonce_or_stale_range()
         finally:
             await bridge.close()
     asyncio.run(run())
-    assert calls == [{"accepts-controls": "renewed", "authorizations": "session", "user-agent": "Chrome",
-                      "referer": "https://alloha.yani.tv/"}, "disposed"]
+    assert len(calls) == 1
+    assert calls[0]["accepts-controls"] == "renewed"
+    assert calls[0]["authorizations"] == "session"
+    assert calls[0]["user-agent"] == "Chrome"
+    assert calls[0]["referer"] == "https://alloha.yani.tv/"
+    assert calls[0]["cookie"] == "session=live"
+    assert "borth" not in calls[0] and "range" not in calls[0]

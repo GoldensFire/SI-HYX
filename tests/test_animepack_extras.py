@@ -96,7 +96,9 @@ def test_prefer_music_keeps_the_list_on_songs():
     quotas = s.question_quotas
     counts, inflight = Counter(), Counter()
     music = make_candidate(); music.users = ["m"]
-    plain = make_candidate(); plain.users = ["other"]
+    # Без песни: тайтл с песней держится за незаполненное песенное место
+    # (так песни не уходят в кадры), а здесь проверяется сам выбор списка.
+    plain = make_candidate(); plain.users = ["other"]; plain.song = {}
     # Опенингов набрано почти по квоте, кадров — ни одного: обычному кандидату
     # достаётся кадр (он сильнее отстаёт), а «музыкальному» — последнее
     # песенное место.

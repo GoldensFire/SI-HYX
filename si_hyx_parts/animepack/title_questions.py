@@ -35,8 +35,9 @@ definitions — только на русском.
 """
 
 
-def generate_titles(generator, candidates):
-    pending = [(i, cand) for i, cand in enumerate(candidates) if cand.kind in KINDS]
+def generate_titles(generator, candidates, _attempt=0):
+    pending = [(i, cand) for i, cand in enumerate(candidates)
+               if cand.kind in KINDS and not cand.plot_question]
     if not pending:
         return candidates
     valid = set()
@@ -80,7 +81,12 @@ def generate_titles(generator, candidates):
             valid.add(i)
     missing = len(pending) - len(valid)
     if missing and not generator.stopped():
+        if not _attempt:
+            retry = [cand for i, cand in pending if i not in valid]
+            generator.log(f"Повторяю только неготовые загадки: {len(retry)}.")
+            generate_titles(generator, retry, _attempt=1)
+            return candidates
         raise RuntimeError(
             f"Gemini не вернул корректные загадки для {missing} названий. "
             "Пак не сохранён: повторите генерацию или измените состав.")
-    return [cand for i, cand in enumerate(candidates) if cand.kind not in KINDS or i in valid]
+    return [cand for cand in candidates if cand.kind not in KINDS or cand.plot_question]

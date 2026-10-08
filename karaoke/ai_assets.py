@@ -46,6 +46,10 @@ def download(url, target, sha):
 
 
 def kim_model():
+    from .separator_health import kim_disabled
+
+    if kim_disabled():
+        raise RuntimeError("Kim отключён на этом компьютере после проверки памяти; используйте HTDemucs.")
     custom = os.environ.get("SI_HYX_KIM_ONNX")
     if custom:
         path = Path(custom)

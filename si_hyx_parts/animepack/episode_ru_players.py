@@ -135,9 +135,15 @@ async def animelib(row):
             for quality in qualities:
                 target = str(quality.get("href") or "")
                 if target:
+                    # Заявленное качество (файл …_360.mp4) отсекает 360p/720p без
+                    # ffprobe по сети: в живом прогоне на них ушло 268 проверок.
+                    # 1080p всё равно меряется ffprobe — подпись не доказательство.
+                    claimed = integer(quality.get("quality"))
                     result.append(stream_from(row, str(server["url"]).rstrip("/") + "/" + target.lstrip("/"),
                                               "mp4", referer=row["referer"], hardsub=False,
-                                              subtitles=native_subtitles(payload, str(server["url"]))))
+                                              subtitles=native_subtitles(payload, str(server["url"])),
+                                              server=server.get("id"),
+                                              **({"manifest_height": claimed} if claimed else {})))
         return result
     targets = native_urls(payload)
     if not targets and row["embed"]:

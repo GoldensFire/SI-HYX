@@ -47,11 +47,7 @@ def build_controls(tab, grid, row: int) -> None:
         "OCR проверяет латиницу и кириллицу на компьютере. При неясном "
         "результате может обратиться к Gemini, если есть ключ.")
     box.addWidget(tab.cb_manga_title_mode)
-    box.addWidget(tab.cb_manga_gemini_model)
     def refresh():
-        tab.cb_manga_gemini_model.setEnabled(
-            tab.chk_manga_character_crop.isChecked()
-            or tab.chk_manga_gemini.isChecked())
         tab.cb_manga_title_mode.setEnabled(tab.chk_manga_gemini.isChecked())
 
     tab.chk_manga_gemini.toggled.connect(refresh)

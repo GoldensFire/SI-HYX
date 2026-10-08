@@ -6,12 +6,12 @@ from si_hyx_parts.animepack_api.shikimori_catalog import page_batch_size
 
 
 def iter_catalog_pages(client, max_pages, stopped, *, manga=False,
-                       population=False, **filters):
+                       population=False, start_page=1, **filters):
     fetch_batch = getattr(client, "catalog_pages", None)
     for name in ("kinds", "genres", "genres_exclude", "studios"):
         if name in filters:
             filters[name] = tuple(filters[name])
-    page = 1
+    page = max(1, int(start_page))
     while page <= max_pages and not stopped():
         if callable(fetch_batch):
             count = min(page_batch_size(client, manga, population), max_pages - page + 1)

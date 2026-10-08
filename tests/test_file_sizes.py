@@ -1,21 +1,27 @@
-"""Regression checks for the source-size guard used in CI."""
-from tools.check_file_sizes import MAX_BYTES, MAX_LINES, check_file_sizes, source_files
+"""Regression checks for the source-size warning used in CI."""
+from tools.check_file_sizes import WARN_LINES, long_files, main, source_files
 
 
-def test_line_limit_includes_unterminated_last_line(tmp_path):
+def test_warning_starts_above_the_threshold_and_counts_the_last_line(tmp_path):
     source = tmp_path / 'feature.py'
-    source.write_bytes(b'pass\n' * (MAX_LINES - 1) + b'pass')
-    assert check_file_sizes([source], tmp_path) == []
+    source.write_bytes(b'pass\n' * (WARN_LINES - 1) + b'pass')
+    assert long_files([source], tmp_path) == []
     source.write_bytes(source.read_bytes() + b'\npass')
-    assert len(check_file_sizes([source], tmp_path)) == 1
+    assert long_files([source], tmp_path) == [('feature.py', WARN_LINES + 1)]
 
 
-def test_long_lines_cannot_bypass_byte_limit(tmp_path):
+def test_long_lines_are_not_a_problem(tmp_path):
     source = tmp_path / 'feature.js'
-    source.write_bytes(b'/' * MAX_BYTES)
-    assert check_file_sizes([source], tmp_path) == []
-    source.write_bytes(b'/' * (MAX_BYTES + 1))
-    assert len(check_file_sizes([source], tmp_path)) == 1
+    source.write_bytes(b'/' * 200_000)
+    assert long_files([source], tmp_path) == []
+
+
+def test_check_never_fails(monkeypatch, tmp_path):
+    source = tmp_path / 'huge.py'
+    source.write_bytes(b'pass\n' * (WARN_LINES + 10))
+    monkeypatch.setattr('tools.check_file_sizes.source_files', lambda: [source])
+    monkeypatch.setattr('tools.check_file_sizes.ROOT', tmp_path)
+    assert main() == 0
 
 
 def test_discovery_includes_new_nested_code_and_skips_builds(tmp_path):

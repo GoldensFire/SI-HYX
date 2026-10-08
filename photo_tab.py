@@ -67,7 +67,7 @@ except Exception:                 # pragma: no cover
     RMBGProcessRemover = None
     _HAS_RMBG = False
 
-from si_hyx_parts.photo_tab.np_bgr_to_qimage import (
+from si_hyx_parts.photo_tab.image_convert import (
     np_bgr_to_qimage,
     qimage_to_np_bgr,
     np_bgra_to_qimage,
@@ -90,11 +90,8 @@ from si_hyx_parts.photo_tab.pan_dir_from_event import _pan_dir_from_event
 
 from si_hyx_parts.photo_tab.photo_merger_tab import PhotoMergerTab
 
-from si_hyx_parts.photo_tab.inpaint_canvas import (
-    InpaintCanvas,
-    _WarmupWorker,
-    InpaintWorker,
-    BgRemoveWorker,
-)
+from si_hyx_parts.photo_tab.inpaint_canvas import InpaintCanvas
+from si_hyx_parts.photo_tab.workers import _WarmupWorker, InpaintWorker, BgRemoveWorker
 
-from si_hyx_parts.photo_tab.inpaint_tab import InpaintTab, _PhotoModeSwitch, PhotoTab
+from si_hyx_parts.photo_tab.inpaint_tab import InpaintTab
+from si_hyx_parts.photo_tab.photo_tab import _PhotoModeSwitch, PhotoTab

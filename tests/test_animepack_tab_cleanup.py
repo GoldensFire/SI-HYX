@@ -97,10 +97,11 @@ def test_character_bounds_are_checked_after_the_hero_is_picked(tmp_path):
     assert candidate(100, 0).char_level == candidate(100, 9_000).char_level
 
     def fits(cand, low, high):
+        # Рамка рода вопросов проверяется в отборе (_level_ok); средняя
+        # персонажей (_char_level_fits) от рамки не зависит.
+        from si_hyx_parts.animepack.generator_selection import _level_ok
         settings = ap.PackSettings(char_level_min=low, char_level_max=high)
-        gen = ap.AnimePackGenerator(settings,
-                                    frames_history_path=str(tmp_path / "f.json"))
-        return gen._char_level_fits(cand)
+        return _level_ok(settings, cand, ap.CHAR_KIND)
 
     assert fits(known, known.char_level, known.char_level)
     assert not fits(obscure, known.char_level, known.char_level)

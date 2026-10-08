@@ -66,10 +66,10 @@ C = {
     "text3": "#6c7086", "green": "#a6e3a1", "yellow": "#f9e2af", "red": "#f38ba8",
 }
 
-from si_hyx_parts.animepack_upgrade_tab.no_wheel import (
+from si_hyx_parts.animepack_upgrade_tab.upgrade_tab import (
     _no_wheel,
     _UpgradeSignals,
     _UpgradeTask,
-    _UpgradePage,
     AnimePackUpgradeTab,
 )
+from si_hyx_parts.animepack_upgrade_tab.upgrade_page import _UpgradePage

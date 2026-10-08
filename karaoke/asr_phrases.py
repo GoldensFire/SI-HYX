@@ -9,7 +9,7 @@ def key(text):
     return "".join(c for c in unicodedata.normalize("NFKC", text).casefold() if c.isalnum())
 
 
-def phrases(segments, lyrics, *, indices=False):
+def phrases(segments, lyrics, *, indices=False, normalizer=key):
     """Split on known text anchors, retaining ASR times and never filling gaps.
 
     Whisper often returns a 20-second stanza as one segment. The aligner's
@@ -22,10 +22,10 @@ def phrases(segments, lyrics, *, indices=False):
              if word.get("word") and float(word["end"]) > float(word["start"])]
     transcription, owners = [], []
     for index, word in enumerate(words):
-        text = key(word["word"])
+        text = normalizer(word["word"])
         transcription.append(text)
         owners.extend([index] * len(text))
-    source = [key(line) for line in lyrics]
+    source = [normalizer(line) for line in lyrics]
     matcher = SequenceMatcher(None, "".join(source), "".join(transcription), autojunk=False)
     mapping = {}
     for block in matcher.get_matching_blocks():

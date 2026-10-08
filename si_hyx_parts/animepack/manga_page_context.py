@@ -11,16 +11,22 @@ def is_webtoon(cand):
 
 
 def download(generator, cand, url, *, cache=None):
+    from .manga_budget import check
+    check(generator, cand)
     cand._manga_context_urls = [url]
     client = getattr(cand, "_manga_page_client", None)
     info = getattr(cand, "_manga_page_info", {})
     def fetch(address, metadata):
+        check(generator, cand)
+        def action():
+            if client is None:
+                return generator._get_bytes(address), generator._url_ext(address, ".png")
+            return client.download_page(address, metadata)
+        if callable(getattr(cache, "fetch", None)):
+            return cache.fetch(address, action)
         if cache is not None and address in cache:
             return cache[address]
-        if client is None:
-            result = (generator._get_bytes(address), generator._url_ext(address, ".png"))
-        else:
-            result = client.download_page(address, metadata)
+        result = action()
         if cache is not None:
             cache[address] = result
         return result

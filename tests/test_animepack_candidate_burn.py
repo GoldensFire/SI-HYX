@@ -74,8 +74,11 @@ def test_failed_selection_stops_and_joins_running_workers(tmp_path, monkeypatch)
 
     class Pool:
         def submit(self, _fn, _cand):
+            # Загрузка отвечает отказом: отбор дожидается начатых задач и
+            # только потом сообщает о сломанном источнике.
             future = Future()
             assert future.set_running_or_notify_cancel()
+            future.set_result(False)
             return future
 
         def shutdown(self, *, wait, cancel_futures):
@@ -89,7 +92,7 @@ def test_failed_selection_stops_and_joins_running_workers(tmp_path, monkeypatch)
     monkeypatch.setattr(gen, "iter_candidates", candidates)
     monkeypatch.setattr(gen, "stop_processes", lambda: stopped.append(True))
 
-    with pytest.raises(ValueError, match="сломанный поток"):
+    with pytest.raises(animepack.AnimePackError, match="сломанный поток"):
         gen.select_songs()
 
     assert stopped == [True]
@@ -102,6 +105,7 @@ def test_a_spent_catalog_gives_its_slots_away(tmp_path, monkeypatch):
     Мангой может стать только карточка из своего каталога, и пока её доля
     висела неисполнимой, цикл требовал кандидатов до последнего тайтла базы."""
     gen = _generator(tmp_path, monkeypatch)
+    gen.s.preserve_composition = False      # иначе доли не перекладываются
     quotas = dict(gen.s.question_quotas)
     assert quotas[MANGA_KIND] == 2 and quotas[SAKUGA_KIND] == 2
     gen._spend_kind(MANGA_KIND)

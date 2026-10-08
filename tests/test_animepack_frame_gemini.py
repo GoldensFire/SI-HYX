@@ -171,13 +171,13 @@ def test_switches_round_trip_and_gemini_options_are_visible_for_either_kind(qapp
         tab.chk_pixel_gemini.setChecked(False)
         settings = tab.collect()
         assert settings.frame_gemini_check and not settings.pixel_gemini_check
-        assert tab.box_frames.isVisibleTo(tab) and tab.box_plot.isVisibleTo(tab)
+        assert tab.box_frames.isVisibleTo(tab) and tab.group_gemini.isVisibleTo(tab)
         tab.apply_settings(api.PackSettings.from_dict(settings.to_dict()))
         assert tab.chk_frame_gemini.isChecked() and not tab.chk_pixel_gemini.isChecked()
         tab.chk_frames.setChecked(False)
         assert not tab.box_frames.isVisibleTo(tab)
         tab.chk_pixel_gemini.setChecked(True)
-        assert tab.box_plot.isVisibleTo(tab)
+        assert tab.group_gemini.isVisibleTo(tab)
     finally:
         tab.cleanup()
 

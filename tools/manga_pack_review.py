@@ -79,6 +79,7 @@ def main():
 
     def review(row):
         title, name = row["title"], row["frame"]
+        webtoon = row.get("kind") in ("manhwa", "manhua")
         original_data = (root / "frames" / name).read_bytes()
         fingerprint = hashlib.sha256(original_data).hexdigest() + MEMO_GROUP + algorithm_key
         checkpoint = progress / (hashlib.sha256(name.encode()).hexdigest() + ".json")
@@ -100,9 +101,20 @@ def main():
         with generator._runtime.worker():
             with Image.open(root / "frames" / name) as opened:
                 original = opened.convert("RGB")
-            frame = trim(original, max_ratio=1.6)
-            good, reason = check(generator, frame, title)
-            good = good and not has_large_gap(frame)
+            if webtoon:
+                frame = trim(original, max_ratio=1.6)
+                good, reason = check(generator, frame, title)
+                good = good and not has_large_gap(frame)
+            else:
+                # Japanese comic pages remain complete, including every panel.
+                frame = original
+                from si_hyx_parts.animepack.manga_visual_check import check as check_page
+                card = cards.get(int(row["mal"]))
+                if not card:
+                    raise RuntimeError(f"Нет карточки для проверки страницы: {title}")
+                candidate = ap.SongCandidate({}, card, kind=ap.MANGA_KIND, media="manga")
+                good, reason = check_page(generator, candidate, original_data,
+                                         Path(name).suffix)
             if title in forced:
                 good, reason = False, "замена по результату ручного просмотра"
             changed = frame.size != original.size
@@ -195,7 +207,7 @@ def main():
                 if answer.text == previous["chapter"]:
                     answer.text = current["chapter"]
         updates["content.xml"] = ET.tostring(xml, encoding="utf-8", xml_declaration=True)
-        final_pack = root / "Проверка манга 48 — проверено.siq"
+        final_pack = root / f"{original_pack.stem} — проверено.siq"
         staging_pack = final_pack.with_suffix(".reviewing.siq")
         with zipfile.ZipFile(original_pack) as source, zipfile.ZipFile(
                 staging_pack, "w", compression=zipfile.ZIP_DEFLATED) as target:

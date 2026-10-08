@@ -86,6 +86,8 @@ async def _scrape_episode_watch(anilist_id: int, audio: str, ep_num: int, ctx: d
     )
     html = (list_json.get("result") if isinstance(list_json, dict) else None) or ""
     target = None
+    wanted_mal = int((ctx.get("media") or {}).get("idMal") or 0)
+    foreign = False
     for m in re.finditer(r"<a\s+[^>]*data-id=\"[^\"]*\"[^>]*>", html, re.IGNORECASE):
         tag = m.group(0)
         try:
@@ -93,10 +95,16 @@ async def _scrape_episode_watch(anilist_id: int, audio: str, ep_num: int, ctx: d
         except ValueError:
             continue
         if num == provider_ep:
+            published = _api._data_attr(tag, "mal")
+            if wanted_mal and published.isdigit() and int(published) not in (0, wanted_mal):
+                foreign = True
+                continue
             target = {"ids": _api._data_attr(tag, "ids"), "mal": _api._data_attr(tag, "mal"),
                       "slug": _api._data_attr(tag, "slug"), "timestamp": _api._data_attr(tag, "timestamp")}
             break
     if not target or not target["ids"]:
+        if foreign:
+            raise RuntimeError("Anikoto: MAL id выбранной серии не совпадает с тайтлом")
         raise RuntimeError(f"Episode {provider_ep} not found for show: {series['title']}")
 
     async def _servers():

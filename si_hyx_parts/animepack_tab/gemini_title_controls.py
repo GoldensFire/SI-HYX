@@ -23,7 +23,7 @@ def build_controls(tab):
         "определения.\n"
         "Отдельная от сюжета и диалогов: там модель пересказывает живой "
         "текст, а здесь подбирает слова к сотне названий за один запрос.\n"
-        "Ключ Gemini общий — он задаётся выше, у сюжетных вопросов.")
+        "Ключ Gemini общий — он задаётся в блоке «Модели ИИ · Gemini».")
     tab.cb_gemini_title_think = api.QComboBox()
     for level in api.GEMINI_THINKING_LEVELS:
         tab.cb_gemini_title_think.addItem(api.GEMINI_THINKING_LABELS[level],

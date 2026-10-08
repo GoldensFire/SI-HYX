@@ -60,8 +60,7 @@ def test_no_single_checkbox_collapses_columns(tab, qapp):
 def test_all_checkboxes_on_keep_columns(tab, qapp):
     columns = tab.settings_columns._columns
     # Режим «по спискам людей» с парой карточек — тоже часть «всего сразу».
-    tab.chk_random.setChecked(False)
-    tab.chk_random_shiki.setChecked(False)
+    tab.src_switch.btn_lists.click()
     tab._add_user_card()
     tab._add_user_card()
     # Несколько проходов: часть галочек появляется только внутри раскрытых

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from difflib import SequenceMatcher
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -116,12 +117,13 @@ def sheets(pictures, out):
         canvas.save(out / f"contact-{batch + 1}.jpg")
 
 
-def audit(package, out, expected, ocr):
+def audit(package, out, expected, ocr, release_years=None):
     out.mkdir(parents=True, exist_ok=True)
     reader = SimpleNamespace(stopped=lambda: False, log=print, _ocr_models=None,
         db_cache=SimpleNamespace(memo=lambda *a: None, remember_memo=lambda *a: None))
     report = {"package": str(package.resolve()), "expected": expected, "questions": [], "errors": []}
     pictures = []
+    hashes = {}
     with zipfile.ZipFile(package) as archive:
         xml = ET.fromstring(archive.read("content.xml"))
         rows = json.loads(archive.read("episodes.json"))
@@ -138,19 +140,29 @@ def audit(package, out, expected, ocr):
             folder.mkdir(exist_ok=True)
             video = folder / "clip.mp4"
             try:
-                video.write_bytes(archive.read("Video/" + row["file"]))
+                payload = archive.read("Video/" + row["file"])
+                digest = hashlib.sha256(payload).hexdigest()
+                checked["sha256"] = digest
+                if digest in hashes:
+                    raise ValueError(f"Видео полностью повторяет вопрос {hashes[digest]}")
+                hashes[digest] = index
+                video.write_bytes(payload)
                 info = json.loads(run([api.FFPROBE, "-v", "error", "-show_streams", "-show_format",
                                        "-of", "json", str(video)]))
                 if not valid_clip(info):
                     raise ValueError("Неверная длительность или дорожки")
                 streams = {stream["codec_type"]: stream for stream in info["streams"]}
-                if streams["video"]["codec_name"] != "av1" or streams["video"]["height"] != 720:
-                    raise ValueError("Ожидалось AV1 720p")
+                output_height = min(720, int(row.get("source_height") or 720))
+                if streams["video"]["codec_name"] != "av1" or streams["video"]["height"] != output_height:
+                    raise ValueError(f"Ожидалось AV1 {output_height}p без увеличения исходника")
                 if streams["audio"]["codec_name"] != "opus":
                     raise ValueError("Ожидалось аудио Opus")
                 english = row.get("subtitle_language") == "en" and not row.get("ru_subtitles")
-                if row.get("source_height", 0) < 1080 or not (row.get("ru_subtitles") or english):
-                    raise ValueError("Не подтверждён источник ≥1080p с RU/EN-субтитрами")
+                year = (release_years or {}).get(row["file"])
+                minimum = 480 if year and int(year) <= 2005 else 1080
+                if row.get("source_height", 0) < minimum or not (row.get("ru_subtitles") or english):
+                    raise ValueError(f"Не подтверждён источник ≥{minimum}p с RU/EN-субтитрами")
+                checked["release_year"] = year
                 for cue in row.get("subtitle_cues") or []:
                     language_ok = (bool(re.search("[a-zA-Z]", cue["text"])) if english
                                    else russian(cue["text"]))

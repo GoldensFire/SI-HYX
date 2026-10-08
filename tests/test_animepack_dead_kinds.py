@@ -83,7 +83,7 @@ def test_dead_kind_without_a_client_is_noticed_at_once():
 def test_slots_of_a_dead_kind_go_to_the_living_ones():
     gen = _gen(pct_songs=0, pack_anagram=True, pct_anagram=50,
                pack_plot=True, pct_plot=50, gemini_key="k",
-               rounds=1, themes=1, questions=48)
+               rounds=1, themes=1, questions=48, preserve_composition=False)
     quotas = gen.s.question_quotas
     assert quotas[PLOT_KIND] == 24 and quotas[ANAGRAM_KIND] == 24
     counts, inflight = Counter(), Counter()
@@ -113,7 +113,7 @@ def test_a_dead_kind_is_never_picked_again():
 def test_nothing_to_share_with_is_said_out_loud():
     lines = []
     gen = _gen(pct_songs=0, pack_plot=True, pct_plot=100, gemini_key="k",
-               rounds=1, themes=1, questions=10)
+               rounds=1, themes=1, questions=10, preserve_composition=False)
     gen._log = lines.append
     quotas = gen.s.question_quotas
     gen._drop_kind(PLOT_KIND)
@@ -125,7 +125,7 @@ def test_nothing_to_share_with_is_said_out_loud():
 def test_a_dead_only_kind_is_closed_once_despite_inflight_workers():
     lines = []
     gen = _gen(pct_songs=0, pack_plot=True, pct_plot=100, gemini_key="k",
-               rounds=1, themes=1, questions=96)
+               rounds=1, themes=1, questions=96, preserve_composition=False)
     gen._log = lines.append
     quotas = gen.s.question_quotas
     counts, inflight = Counter(), Counter({PLOT_KIND: 7})
@@ -136,6 +136,27 @@ def test_a_dead_only_kind_is_closed_once_despite_inflight_workers():
     assert quotas[PLOT_KIND] == 0
     notices = [line for line in lines if "переложить их не на кого" in line]
     assert len(notices) == 1 and "96 шт." in notices[0]
+
+
+def test_preserved_composition_closes_a_dead_kind_without_stopping():
+    """«Сохранять состав»: места умершего рода пустеют, но пак не рвётся.
+
+    Раньше здесь летела ошибка, и недоступный Pixiv обрывал пак на третьем
+    вопросе из 144."""
+    lines = []
+    gen = _gen(pct_songs=0, pack_anagram=True, pct_anagram=50,
+               pack_plot=True, pct_plot=50, gemini_key="k",
+               rounds=1, themes=1, questions=48, preserve_composition=True)
+    gen._log = lines.append
+    quotas = gen.s.question_quotas
+    counts, inflight = Counter({PLOT_KIND: 2}), Counter({PLOT_KIND: 1})
+    gen._drop_kind(PLOT_KIND)
+    gen._share_out_dead(quotas, counts, inflight)
+    assert quotas[PLOT_KIND] == 3 and quotas[ANAGRAM_KIND] == 24
+    assert gen._closed_kinds == {PLOT_KIND: 21}
+    assert any("остальной пак набираю дальше" in line for line in lines)
+    from si_hyx_parts.animepack.shortage_report import short_reason
+    assert "21 мест" in short_reason(gen)
 
 
 # ── своя средняя сложности у сюжета ──────────────────────────────────────────

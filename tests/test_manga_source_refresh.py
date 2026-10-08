@@ -50,13 +50,24 @@ def test_source_selection_retains_other_snapshots_and_never_calls_other_sites(tm
 def test_generator_routes_each_part_to_its_own_popularity_source(tmp_path, monkeypatch, part, expected):
     from si_hyx_parts.animepack import ru_popularity_refresh
     calls = []
-    monkeypatch.setattr(ru_popularity_refresh, "refresh_ru_popularity",
-                        lambda gen, sources=None: calls.append(sources))
+    def refresh(current, sources=None):
+        calls.append(sources)
+        for source in sources:
+            current.db_cache.remember_memo(SNAPSHOT_GROUP, source,
+                {"complete": True, "timestamp": time.time()})
+            current.db_cache.remember_memo("ru_population_refresh_status_v1", source,
+                {"status": "NORMAL", "timestamp": time.time()})
+    monkeypatch.setattr(ru_popularity_refresh, "refresh_ru_popularity", refresh)
     cache = ap.ShikimoriDbCache(str(tmp_path / "cache.json"))
     gen = ap.AnimePackGenerator(ap.PackSettings(), db_cache=cache)
     # Любой случайный запрос чужого каталога вызовет ошибку, а не сеть.
     gen.shikimori = SimpleNamespace()
-    gen.fetch_full_catalog = lambda **kw: []
+    def catalog(manga=False, **kwargs):
+        from si_hyx_parts.animepack.db_settings import database_settings
+        cache.mark_complete("manga" if manga else "anime",
+                            ap.shiki_cache_signature(database_settings(), manga))
+        return []
+    gen.fetch_full_catalog = catalog
     gen.refresh_db((part,))
     assert calls == [expected]
 
@@ -105,4 +116,4 @@ def test_menu_dispatches_source_and_manga_block_can_stop_it(qapp, tmp_path, part
 def test_refresh_parts_keep_explicit_source_and_whole_base_has_both():
     assert ap.db_refresh_parts("mangalib") == ("mangalib",)
     assert ap.db_refresh_parts("remanga") == ("remanga",)
-    assert ap.db_refresh_parts(None) == ("anime", "manga", "remanga", "mangalib", "franchises")
+    assert ap.db_refresh_parts(None) == ("anime", "manga", "remanga", "mangalib", "favorites", "franchises")

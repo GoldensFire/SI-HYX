@@ -3,12 +3,17 @@
 # See LICENSE and the public module for attribution and API.
 """DraggableTreeWidget. Public namespace: widgets."""
 import widgets as _api
+from PyQt6.QtGui import QRegion
 from .info_tip_frame import source_is_current
 
 
 class DraggableTreeWidget(_api.QTreeWidget):
     """QTreeWidget с поддержкой drag-and-drop файлов наружу (по tooltip = полный
     путь) и текстом-подсказкой по центру, когда список пуст."""
+
+    # viewportEvent selects different hints for the image, filename and badge.
+    # The application filter must not replace them with the cell's file path.
+    _custom_item_tooltips = True
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
@@ -93,7 +98,8 @@ class DraggableTreeWidget(_api.QTreeWidget):
                     tip = item.toolTip(col) or item.toolTip(0)
                 if tip:
                     _api._InfoTipPopup.instance().show_at(
-                        e.globalPos(), tip, owner=self.viewport())
+                        e.globalPos(), tip, owner=self.viewport(),
+                        region=self._tip_region(e.pos(), idx))
                 else:
                     _api._InfoTipPopup.instance().hide_for(self.viewport())
                 e.accept()
@@ -106,6 +112,26 @@ class DraggableTreeWidget(_api.QTreeWidget):
         except Exception:
             pass
         return super().viewportEvent(e)
+
+    def _tip_region(self, pos, index):
+        """Keep image, filename, and compare badge hints in their own areas."""
+        rect = self.visualRect(index)
+        region = QRegion(rect)
+        if index.column() != 0:
+            return region
+        if not index.data(_api.ITEM_AUDIO_ROLE):
+            name_rect = _api.QRect(rect)
+            name_rect.setTop(rect.bottom() - self.fontMetrics().height() - 8)
+            region = (QRegion(name_rect) if self._over_name_region(pos, index)
+                      else region.subtracted(QRegion(name_rect)))
+        delegate = self.itemDelegateForColumn(0)
+        if (index.data(_api.ITEM_COMPARE_ROLE)
+                and hasattr(delegate, '_badge_rect')):
+            badge = delegate._badge_rect(rect, self.fontMetrics())
+            if badge.contains(pos):
+                return QRegion(badge)
+            region = region.subtracted(QRegion(badge))
+        return region
 
     def paintEvent(self, e):
         super().paintEvent(e)

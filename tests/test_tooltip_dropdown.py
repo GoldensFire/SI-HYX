@@ -71,11 +71,11 @@ def test_dropdown_hides_tip_and_rejects_delayed_help(combo, qapp, editable, open
     assert popup.isVisible() and popup.text() == combo.toolTip()
 
 
-def test_opening_dropdown_cancels_a_queued_tip_reveal(combo, qapp):
+def test_opening_dropdown_hides_a_just_shown_tip(combo, qapp):
     popup = _InfoTipPopup.instance()
     QCursor.setPos(combo.mapToGlobal(combo.rect().center()))
     popup.show_for(combo, combo.toolTip())
-    assert popup.windowOpacity() == 0
+    assert popup.isVisible()
     combo.showPopup()
     QTest.qWait(80)
     assert not popup.isVisible()

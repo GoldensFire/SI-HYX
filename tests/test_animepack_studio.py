@@ -40,6 +40,20 @@ def _studio_card(number, studio="Madhouse"):
         studios=[{"id": 11, "name": studio}])
 
 
+class _FrameCheck:
+    """Gemini для кадров: кадр студии без него не берётся (нужны персонажи)."""
+    model = "gemini-test"
+
+    def generate_json(self, parts, schema, temperature=0):
+        row = {"accept": True, "has_title_text": False,
+               "has_characters": True, "reason": "персонажи без названия"}
+        if "results" in schema.get("properties", {}):
+            count = sum(str(part.get("text", "")).startswith("Проверка id=")
+                        for part in parts)
+            return {"results": [dict(row, id=i) for i in range(count)]}
+        return row
+
+
 @pytest.fixture
 def generator(tmp_path, monkeypatch):
     monkeypatch.setattr(animepack, "CONFIG_DIR", str(tmp_path))
@@ -63,6 +77,7 @@ def generator(tmp_path, monkeypatch):
         gen, "_poster_bytes",
         lambda cand, _url: (_png((100, 150), colors[cand.mal_id]), ".png"))
     monkeypatch.setattr(gen, "_get_bytes", lambda url, **kw: _png())
+    gen.gemini_frames = _FrameCheck()
     gen.prepare_dirs()
     yield gen
     gen.cleanup()

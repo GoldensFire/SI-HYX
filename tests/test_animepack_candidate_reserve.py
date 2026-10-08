@@ -6,9 +6,7 @@ import animepack as ap
 from si_hyx_parts.animepack.candidate_reserve import CandidateReserve, clean_copy
 from si_hyx_parts.animepack.quota_balance import rebalance
 from si_hyx_parts.animepack.candidate_options import available_kinds
-from si_hyx_parts.animepack.anime_pack_generator__iter_picture_candidates import (
-    _franchise_marks,
-)
+from si_hyx_parts.animepack.generator_catalog import _franchise_marks
 from test_animepack_mixed_streams import _generator, make_anime, make_song
 
 
@@ -68,8 +66,10 @@ def test_easy_titles_fill_characters_before_broad_frames(tmp_path, monkeypatch):
 
 
 def test_failed_plot_can_become_a_frame_and_fill_reassigned_slot(tmp_path, monkeypatch):
+    # Перекладывать доли можно только без «сохранять состав».
     gen = _gen(tmp_path, monkeypatch, questions=2, pct_chars=0,
-               pack_plot=True, pct_plot=50, plot_level_min=1, plot_level_max=5)
+               pack_plot=True, pct_plot=50, plot_level_min=1, plot_level_max=5,
+               preserve_composition=False)
     _source(gen, monkeypatch, [_candidate(1), _candidate(2)])
     tries = []
 
@@ -94,7 +94,7 @@ def test_failed_plot_can_become_a_frame_and_fill_reassigned_slot(tmp_path, monke
 
 
 def test_candidates_without_slots_return_after_quota_redistribution(tmp_path, monkeypatch):
-    gen = _gen(tmp_path, monkeypatch)
+    gen = _gen(tmp_path, monkeypatch, preserve_composition=False)
     _source(gen, monkeypatch, [_candidate(1), _candidate(2, 7),
                                _candidate(3, 7), _candidate(4, 7)])
     lines = []

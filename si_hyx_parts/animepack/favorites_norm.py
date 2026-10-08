@@ -40,6 +40,7 @@ FAV_MIN_COUNT = 5
 
 _LOCK = threading.Lock()
 _NORMS: dict = {}
+_VERSION = 0
 
 
 class FavoritesNorm:
@@ -105,15 +106,24 @@ def install_favorites_norms(db_cache) -> None:
             pairs.append((cand.own_index, fav))
         if len(pairs) >= FAV_NORM_MIN_POINTS:
             built[target] = FavoritesNorm(pairs)
+    global _VERSION
     with _LOCK:
         _NORMS.clear()
         _NORMS.update(built)
+        _VERSION += 1
 
 
 def clear_favorites_norms() -> None:
     """Забыть соседей (тестам: вернуть прежнюю планку)."""
+    global _VERSION
     with _LOCK:
         _NORMS.clear()
+        _VERSION += 1
+
+
+def favorites_norms_version() -> int:
+    """Номер набора соседей: кэш индекса кандидата сверяется с ним."""
+    return _VERSION
 
 
 def title_favorites_factor(index: float, base: float, favorites,
@@ -137,8 +147,8 @@ def title_favorites_factor(index: float, base: float, favorites,
     return max(1.0, min(_shiki._INDEX_FAVORITES_MAX, factor))
 
 
-for _name in ("FavoritesNorm", "install_favorites_norms",
-              "clear_favorites_norms", "title_favorites_factor"):
+for _name in ("FavoritesNorm", "install_favorites_norms", "clear_favorites_norms",
+              "favorites_norms_version", "title_favorites_factor"):
     _obj = globals()[_name]
     _obj.__module__ = _api.__name__
     setattr(_api, _name, _obj)

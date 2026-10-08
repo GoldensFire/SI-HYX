@@ -59,11 +59,11 @@ def hard_subbed(stream):
         return True
     if stream.get("audio") == "raw" or stream.get("subtitles") or "soft" in variant:
         return False
-    # Kuhi's unlabelled sub streams may have burned captions; treat conservatively.
-    return True
+    # The word 'sub' does not prove that captions are burned into this video.
+    return bool(stream.get("_observed_hardsub"))
 
 
-def playable(streams):
+def playable(streams, episode=None):
     seen, result = set(), []
     for stream in streams:
         url = str(stream.get("url") or "")
@@ -74,7 +74,7 @@ def playable(streams):
         key = (url, stream.get("audio"), str(stream.get("headers")), stream.get("referer"))
         if key not in seen:
             seen.add(key)
-            result.append(stream)
+            result.append(dict(stream, episode=episode) if episode is not None else stream)
     return sorted(result, key=lambda s: (hard_subbed(s), s.get("audio") != "raw",
                                         -float(s.get("priority") or 0)))
 

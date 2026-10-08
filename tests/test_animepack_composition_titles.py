@@ -19,37 +19,39 @@ def tab(qapp):
 
 def test_only_checked_sliders_and_total(tab):
     tab.chk_manga.setChecked(True)
-    tab.chk_anagram.setChecked(True)
+    tab.chk_titles.setChecked(True)
     tab.chk_songs.setChecked(False)
-    assert tab.mix.keys() == ["manga", "anagram"]
+    assert tab.mix.keys() == ["manga", "titles"]
     tab.mix.sliders["manga"].setValue(37)
-    assert tab.mix.shares()["anagram"] == 63
+    assert tab.mix.shares()["titles"] == 63
     assert sum(tab.mix.shares().values()) == 100
-    assert all(row.isHidden() == (key not in ("manga", "anagram"))
+    assert all(row.isHidden() == (key not in ("manga", "titles"))
                for key, row in tab.mix.rows.items())
     tab.chk_manga.setChecked(False)
-    assert tab.mix.shares()["anagram"] == 100
-    tab.chk_anagram.setChecked(False)
+    assert tab.mix.shares()["titles"] == 100
+    tab.chk_titles.setChecked(False)
     assert not any(tab.mix.shares().values())
     assert "Выберите хотя бы одну часть пака." in tab.collect().validate()
 
 
 def test_title_settings_roundtrip_and_shared_gemini(tab):
     assert not tab.box_text_cps.isVisibleTo(tab)
+    tab.chk_titles.setChecked(True)
+    tab.chk_anagram.setChecked(False)
     tab.chk_synonyms.setChecked(True)
     tab.chk_ukrainian.setChecked(True)
     tab.chk_songs.setChecked(False)
-    tab.mix.sliders["synonyms"].setValue(70)
+    tab.title_mix.sliders["synonyms"].setValue(70)
     data = tab.get_settings()
     tab.apply_settings(data)
-    assert tab.mix.shares()["synonyms"] == 70
-    assert tab.mix.shares()["ukrainian"] == 30
+    assert tab.title_mix.shares()["synonyms"] == 70
+    assert tab.title_mix.shares()["ukrainian"] == 30
     assert not tab.chk_songs.isChecked()
-    assert tab.box_plot.isVisibleTo(tab)
+    assert tab.group_gemini.isVisibleTo(tab)
     assert tab.box_text_cps.isVisibleTo(tab)
     tab.chk_plot.setChecked(True)
     tab.chk_plot.setChecked(False)
-    assert tab.box_plot.isVisibleTo(tab)
+    assert tab.group_gemini.isVisibleTo(tab)
 
 
 def test_thinking_level_is_saved_with_the_model(tab):
@@ -73,10 +75,13 @@ def test_panel_width_does_not_follow_toggles(tab, qapp):
     tab.show()
     qapp.processEvents()
     width = tab.right_col.width()
-    for key in tab.mix.KEYS:
-        tab.composition_checks[key].setChecked(True)
+    for checkbox in tab.composition_checks.values():
+        checkbox.setChecked(True)
         qapp.processEvents()
         assert tab.right_col.width() == width
+    tab.chk_video.setChecked(True)
+    qapp.processEvents()
+    assert tab.right_col.width() == width
 
 
 def candidates(count=10):

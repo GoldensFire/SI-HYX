@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 # -I excludes the script directory; publish only this project's package root.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -19,14 +21,29 @@ def separate(source, target, device):
     if target.is_file():
         return
     target.parent.mkdir(parents=True, exist_ok=True)
-    directory = target.parent / "stems"
-    subprocess.run([sys.executable, "-I", "-m", "demucs", "-n", "htdemucs",
-                    "--two-stems", "vocals", "--shifts", "0", "-d", device,
-                    "-o", str(directory), str(source)], check=True)
-    vocals = directory / "htdemucs" / Path(source).stem / "vocals.wav"
-    temporary = target.with_suffix(".tmp.wav")
-    shutil.copyfile(vocals, temporary)
-    temporary.replace(target)
+    with tempfile.TemporaryDirectory(prefix="demucs-", dir=target.parent) as directory:
+        work = Path(directory).resolve()
+        if work.parent != target.parent.resolve():
+            raise ValueError("Demucs temporary directory escaped its target directory")
+        subprocess.run([sys.executable, "-I", "-m", "demucs", "-n", "htdemucs",
+                        "--two-stems", "vocals", "--shifts", "0", "-d", device,
+                        "-o", str(work), str(source)], check=True,
+                       env={**os.environ, 'OMP_NUM_THREADS': str(cpu_threads(12)),
+                            'MKL_NUM_THREADS': str(cpu_threads(12))})
+        vocals = work / "htdemucs" / Path(source).stem / "vocals.wav"
+        temporary = target.with_suffix(".tmp.wav")
+        shutil.copyfile(vocals, temporary)
+        temporary.replace(target)
+
+
+def cpu_threads(default=4):
+    """Demucs benefits from 12 threads here; ASR retains its separate default."""
+    available = os.cpu_count() or 1
+    try:
+        requested = int(os.environ.get('SI_HYX_ML_THREADS', default))
+    except ValueError:
+        requested = default
+    return max(1, min(available, requested))
 
 
 def transcribe(source, target, device, compute, language=None, model_name="medium", backend="faster-whisper"):
@@ -45,7 +62,7 @@ def transcribe(source, target, device, compute, language=None, model_name="mediu
 
 def faster_transcribe(source, device, compute, language, model_name):
     from faster_whisper import WhisperModel
-    model = WhisperModel(model_name, device=device, compute_type=compute)
+    model = WhisperModel(model_name, device=device, compute_type=compute, cpu_threads=cpu_threads())
     # Five-beam search and conditioning on prior sung verses can spend minutes
     # repeating hallucinated lyrics. Every resulting line still passes acoustic
     # anchors and the app's mandatory 80% coverage check.
@@ -70,13 +87,14 @@ def main():
     parser.add_argument("--backend", default="faster-whisper")
     parser.add_argument("--language", default="auto")
     parser.add_argument("--model", default="medium")
+    parser.add_argument("--ffmpeg", default="ffmpeg")
     args = parser.parse_args()
     if args.action == "devices":
         print(json.dumps(devices()))
     elif args.action == "separate":
         if args.backend == "kim-onnx":
             from karaoke.roformer import separate as kim_separate
-            kim_separate(args.source, args.target, args.device)
+            kim_separate(args.source, args.target, args.device, ffmpeg=args.ffmpeg)
         else:
             separate(args.source, args.target, args.device)
     elif args.action == "languages":

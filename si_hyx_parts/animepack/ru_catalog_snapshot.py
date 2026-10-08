@@ -13,7 +13,9 @@ PROGRESS_SECONDS = 30
 
 def _snapshot(client, config, titles):
     distributions = {kind: [] for kind in (*KINDS, "all_types")}
-    fallback = any(not row["kind"] for row in titles)
+    eligible = [row for row in titles if row["status"] == "NORMAL"
+                and row["raw_metric"] is not None]
+    fallback = any(not row["kind"] for row in eligible)
     for row in titles:
         if row["status"] != "NORMAL" or row["raw_metric"] is None:
             continue

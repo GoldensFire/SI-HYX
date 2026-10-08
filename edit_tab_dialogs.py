@@ -38,8 +38,6 @@ from si_hyx_parts.edit_tab_dialogs.video_mask_dialog import _VideoMaskDialog
 
 from si_hyx_parts.edit_tab_dialogs.track_attach_dialog import _TrackAttachDialog
 
-from si_hyx_parts.edit_tab_dialogs.subtitle_edit_dialog import (
-    SubtitleEditDialog,
-    SubtitleCreatorDialog,
-    _PixelizeDialog,
-)
+from si_hyx_parts.edit_tab_dialogs.subtitle_edit_dialog import SubtitleEditDialog
+from si_hyx_parts.edit_tab_dialogs.subtitle_creator_dialog import SubtitleCreatorDialog
+from si_hyx_parts.edit_tab_dialogs.pixelize_dialog import _PixelizeDialog

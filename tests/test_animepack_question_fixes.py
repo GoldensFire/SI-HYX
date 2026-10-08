@@ -9,7 +9,7 @@ from animepack import PackSettings, SongCandidate
 from animepack_api import SakugaApi
 import pixiv_art_api
 from pixiv_art_api import PixivArtClient
-from si_hyx_parts.animepack.anime_pack_generator_select_songs import _busy
+from si_hyx_parts.animepack.generator_selection import _busy
 
 
 # ── Sakugabooru: тег тайтла ──────────────────────────────────────────────────

@@ -14,7 +14,7 @@ QToolTip: синюю всплывашку пользователь не выно
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import QEvent, QObject, Qt
+from PyQt6.QtCore import QEvent, QObject, QRect, Qt
 from si_hyx_parts.widgets.info_tip_frame import source_is_current
 
 # Роль, в которой текст подсказки лежит прямо в ячейке: item.clone() уносит
@@ -185,7 +185,8 @@ class _TipWatcher(QObject):
                 text = self._row_text(item.row())
         if text:
             _InfoTipPopup.instance().show_at(
-                event.globalPos(), str(text), owner=self._table.viewport())
+                event.globalPos(), str(text), owner=self._table.viewport(),
+                region=self._table.visualItemRect(item))
         else:
             _InfoTipPopup.instance().hide_for(self._table.viewport())
         return True
@@ -222,7 +223,9 @@ class _HeadWatcher(QObject):
         text = self._hints.get(item.text() if item is not None else "")
         if text:
             _InfoTipPopup.instance().show_at(
-                event.globalPos(), str(text), owner=header)
+                event.globalPos(), str(text), owner=header,
+                region=QRect(header.sectionViewportPosition(column), 0,
+                             header.sectionSize(column), header.height()))
         else:
             _InfoTipPopup.instance().hide_for(header)
         return True

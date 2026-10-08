@@ -64,16 +64,20 @@ def build_controls(tab):
     grid.setContentsMargins(0, 0, 0, 0)
     grid.setHorizontalSpacing(8)
     grid.setVerticalSpacing(8)
-    grid.addWidget(tab._lab("Отрезок песни"), 0, 0)
-    grid.addWidget(tab.sp_cut, 0, 1, 1, 3)
-    grid.addWidget(tab.chk_images, 1, 0, 1, 3)
-    grid.addWidget(tab.sp_images_time, 1, 3)
+    grid.addWidget(tab.chk_video, 1, 0, 1, 4)
+    grid.addWidget(tab.box_video_opts, 2, 0, 1, 4)
+    grid.addWidget(tab._lab("Отрезок песни"), 3, 0)
+    grid.addWidget(tab.sp_cut, 3, 1, 1, 3)
+    grid.addWidget(tab.chk_images, 4, 0, 1, 3)
+    grid.addWidget(tab.sp_images_time, 4, 3)
     from .music_effect_controls import build_controls as build_chiptune
-    grid.addWidget(build_chiptune(tab), 2, 0, 1, 4)
+    grid.addWidget(build_chiptune(tab), 5, 0, 1, 4)
     from .cover_controls import build_controls as build_cover
-    grid.addWidget(build_cover(tab), 3, 0, 1, 4)
+    grid.addWidget(build_cover(tab), 6, 0, 1, 4)
     from .karaoke_controls import build_controls as build_karaoke
-    grid.addWidget(build_karaoke(tab), 4, 0, 1, 4)
+    grid.addWidget(build_karaoke(tab), 7, 0, 1, 4)
+    from .song_presentation_controls import build as build_presentations
+    grid.addWidget(build_presentations(tab), 0, 0, 1, 4)
     for column in (1, 3):
         grid.setColumnStretch(column, 1)
     return tab.box_audio_opts

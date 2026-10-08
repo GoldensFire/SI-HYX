@@ -45,7 +45,7 @@ def setup(tab):
                 # Найденные модели дописываем в ОБА списка: у загадок по
                 # названию модель своя (см. gemini_title_controls).
                 for name in ("cb_gemini_model", "cb_gemini_title_model",
-                             "cb_pixiv_gemini_model", "cb_manga_gemini_model"):
+                             "cb_gemini_image_model"):
                     box = getattr(tab, name, None)
                     if box is None:
                         continue
@@ -57,7 +57,7 @@ def setup(tab):
                         box.setCurrentText(selected)
                 state["next"] = float("inf") if models else time.monotonic() + 300
         key = credentials()
-        visible = (tab.box_plot.isVisibleTo(tab)
+        visible = (getattr(tab, "group_gemini", tab.box_plot).isVisibleTo(tab)
                    or getattr(tab, "box_pixiv_art", tab).isVisibleTo(tab)
                    or getattr(tab, "box_manga", tab).isVisibleTo(tab))
         if (visible and key

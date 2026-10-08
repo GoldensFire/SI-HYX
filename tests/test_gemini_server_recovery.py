@@ -134,21 +134,24 @@ def test_all_busy_models_raise_terminal_down_error(
     assert len(session.calls) == calls
 
 
-def test_high_thinking_uses_fallback_on_generate_content(
+def test_high_thinking_falls_back_to_interactions_when_generate_content_is_busy(
         fake_session, fake_response, monkeypatch):
-    def route(url, **kwargs):
+    """Высокое рассуждение идёт через GenerateContent; его 5xx — повод
+    перейти на Interactions той же моделью, а не сжигать её квоту."""
+    def generate(url, **kwargs):
         assert kwargs["json"]["generationConfig"]["thinkingConfig"] == {
             "thinkingLevel": "HIGH"}
-        if "gemini-3.8-flash:" in url:
-            return fake_response(503, text="high demand")
-        return fake_response(json_data={"candidates": [{"content": {
-            "parts": [{"text": '{"ok": true}'}]}}]})
+        return fake_response(503, text="high demand")
 
-    session = fake_session([("generateContent", route)])
+    session = fake_session([("generateContent", generate),
+                            ("interactions", fake_response(json_data=_ok()))])
     client = _client(session, monkeypatch, model="gemini-3.8-flash", thinking="high")
     assert client.generate_json("вопрос", SCHEMA) == {"ok": True}
-    assert len(session.calls) == 3
-    assert session.calls[-1][1].endswith("/gemini-3.5-flash-lite:generateContent")
+    assert session.calls[0][1].endswith("/gemini-3.8-flash:generateContent")
+    assert session.calls[-1][1].endswith("/interactions")
+    assert session.calls[-1][2]["json"]["model"] == "gemini-3.8-flash"
+    assert len(session.calls) == 2
+    assert client.prefer_interactions is True
 
 
 def test_queued_request_skips_model_marked_unavailable(
@@ -193,8 +196,8 @@ def test_plot_is_disabled_when_all_models_are_down_and_stats_are_kept(monkeypatc
     assert not generator.make_plot_question(candidate)
     assert model.calls == 1
     generator.log_gemini_spent()
-    assert "HTTP-попыток за прогон 10" in lines[-1]
-    assert "503: 10" in lines[-1]
+    assert any("HTTP-попыток за прогон 10" in line for line in lines)
+    assert any("503: 10" in line for line in lines)
 
 
 def test_repeated_read_timeouts_do_not_resubmit_same_request(

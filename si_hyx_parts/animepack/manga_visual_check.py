@@ -77,18 +77,31 @@ def _gemini_check(generator, cand, data: bytes, ext: str, manga_titles=()):
         "переводчиков или реклама с названием. Это раскрывает ответ. "
         "Имена персонажей, реплики, звуки и номер главы без названия "
         "допустимы. Причину напиши кратко по-русски.")
-    key = (f"{model}:{hashlib.sha256(data).hexdigest()}:"
-           f"{hashlib.sha256(prompt.encode()).hexdigest()}")
-    cached = generator.db_cache.memo(MEMO_GROUP, key)
-    if isinstance(cached, dict) and "accept" in cached:
-        return bool(cached["accept"]), str(cached.get("reason") or "")
+    digests = (f"{hashlib.sha256(data).hexdigest()}:"
+               f"{hashlib.sha256(prompt.encode()).hexdigest()}")
+    # Вердикт запасной Gemma годится так же, как вердикт основной модели.
+    lane = getattr(generator, "_visual_spare", None)
+    models = [model] + ([str(lane.client.model)] if lane is not None else [])
+    for name in models:
+        cached = generator.db_cache.memo(MEMO_GROUP, f"{name}:{digests}")
+        if isinstance(cached, dict) and "accept" in cached:
+            return bool(cached["accept"]), str(cached.get("reason") or "")
     mime, payload = _prepare(data, ext)
     parts = [
         {"type": "text", "text": prompt},
         {"type": "image", "mime_type": mime,
          "data": base64.b64encode(payload).decode("ascii")},
     ]
-    verdict = request(generator, client, parts, SCHEMA)
+    # Проверка простая, как у кадров: при занятой или перегруженной (503)
+    # основной модели её берёт Gemma со своей квотой. В прогоне Flash-Lite
+    # отказала 16 раз подряд, и хвост пака стоял на манге.
+    from .visual_spare import verdict as spare_verdict
+    verdict = spare_verdict(generator, client, parts, SCHEMA, _valid)
+    if verdict is not None:
+        model = models[-1]
+    else:
+        verdict = request(generator, client, parts, SCHEMA)
+    key = f"{model}:{digests}"
     if not isinstance(verdict, dict):
         verdict = {"accept": False, "reason": "Gemini не вернула вердикт"}
     accept = (bool(verdict.get("accept"))
@@ -98,6 +111,13 @@ def _gemini_check(generator, cand, data: bytes, ext: str, manga_titles=()):
              "reason": str(verdict.get("reason") or "")}
     generator.db_cache.remember_memo(MEMO_GROUP, key, saved)
     return accept, saved["reason"]
+
+
+def _valid(verdict) -> bool:
+    return (isinstance(verdict, dict)
+            and all(type(verdict.get(key)) is bool
+                    for key in ("accept", "has_title_text"))
+            and isinstance(verdict.get("reason"), str))
 
 
 def titles(card: dict) -> list[str]:

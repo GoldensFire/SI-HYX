@@ -3,9 +3,10 @@ from contextlib import closing
 import time
 
 from .episode_sources import episode_catalog, playable
+from .episode_quality_policy import minimum
 
 
-def native(generator, candidate, aid, ctx, final, scope, batches):
+def native(generator, candidate, aid, ctx, final, scope, batches, tally=None):
     from .episode_generation import EPISODE_ATTEMPTS, _verified, _try_cut, _finish
     selected = []
     for batch in batches:
@@ -23,7 +24,8 @@ def native(generator, candidate, aid, ctx, final, scope, batches):
             with closing(generator.kuhi.stream_batches(aid, episode, ctx, catalog[episode], scope)) as sources:
                 for streams in sources:
                     generator.log(f"Kuhi / AniList {aid}, серия {episode}: готовы потоки {len(streams)}.")
-                    for stream in _verified(generator, playable(streams), final, scope):
+                    for stream in _verified(generator, playable(streams, episode), final, scope,
+                                            candidate.mal_id, tally, minimum(candidate)):
                         if generator.stopped() or time.monotonic() >= scope.deadline:
                             return False
                         start = _try_cut(generator, candidate, stream, final, scope)

@@ -80,29 +80,23 @@ def test_each_effect_reaches_generator_and_survives_reload(tab, effect):
     assert tab.collect().frame_effects == ["tiles", "zoom"]
     assert tab.collect().frame_effect_strength == 75
     assert tab.box_frame_effects.isVisibleTo(tab) == (effect == "random")
-    assert "каждые 2 с" in tab.lbl_pixel_steps.text()
 
 
-def test_random_selection_controls_relevant_strength_fields(tab):
+def test_timing_fields_are_not_shown(tab):
+    """Длительность, кадры/с, ступени, сила и блок убраны из панели (просьба
+    пользователя); значения остаются только в сохранённых настройках."""
+    tab.chk_pixel.setChecked(True)
     tab.cb_frame_effect.setCurrentIndex(tab.cb_frame_effect.findData("random"))
-    for check in tab.frame_effect_checks.values():
-        check.setChecked(False)
-    assert "хотя бы один эффект" in tab.lbl_pixel_steps.text()
-    assert not tab.sp_pixel_block.isEnabled()
-    assert not tab.sp_frame_effect_strength.isEnabled()
-    tab.frame_effect_checks["tiles"].setChecked(True)
-    assert tab.sp_frame_effect_strength.isEnabled()
-    assert not tab.sp_pixel_block.isEnabled()
-    tab.frame_effect_checks["pixelize"].setChecked(True)
-    assert tab.sp_pixel_block.isEnabled()
+    for spin in (tab.sp_pixel_sec, tab.sp_pixel_fps, tab.sp_pixel_steps,
+                 tab.sp_frame_effect_strength, tab.sp_pixel_block):
+        assert not spin.isVisibleTo(tab)
+    assert not hasattr(tab, "lbl_pixel_steps")
 
 
 def test_fps_and_legacy_one_step_cannot_remove_clean_final_stage(tab):
     tab.apply_settings({"pack_pixel": True, "pixel_seconds": 2,
                         "pixel_fps": 1, "pixel_steps": 1})
     assert tab.sp_pixel_steps.value() == 2
-    assert tab.sp_pixel_steps.maximum() == 2
-    assert "чистый кадр на 1 с" in tab.lbl_pixel_steps.text()
 
 
 def test_reset_restores_two_second_steps_and_original_pixel_mode(tab):
@@ -177,7 +171,6 @@ def test_dvd_folder_is_shown_only_for_dvd_and_survives_reload(tab, tmp_path):
     assert not tab.box_dvd_folder.isVisibleTo(tab)
     tab.cb_frame_effect.setCurrentIndex(tab.cb_frame_effect.findData("dvd"))
     assert tab.box_dvd_folder.isVisibleTo(tab)
-    assert "30 кадров/с" in tab.lbl_pixel_steps.text()
     tab.ed_dvd_folder.setText(str(tmp_path))
     saved = tab.get_settings()
     tab.apply_settings(PackSettings().to_dict())
@@ -194,7 +187,6 @@ def test_dvd_fps_choice_is_shown_for_dvd_and_survives_reload(tab):
     assert tab.cb_dvd_fps.isVisibleTo(tab)
     assert tab.collect().frame_dvd_fps == 30          # по умолчанию как было
     tab.cb_dvd_fps.setCurrentIndex(tab.cb_dvd_fps.findData(60))
-    assert "60 кадров/с" in tab.lbl_pixel_steps.text()
     saved = tab.get_settings()
     tab.apply_settings(PackSettings().to_dict())
     assert tab.cb_dvd_fps.currentData() == 30

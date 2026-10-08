@@ -6,14 +6,15 @@
 # Свободное ПО: GNU GPL v3 (или новее). БЕЗ ВСЯКИХ ГАРАНТИЙ. См. LICENSE.
 # edit_tab.py — публичный API вкладки «Монтаж» и standalone-entry main().
 #
-# Реализация каждого слоя разложена на небольшие модули в si_hyx_parts/;
-# навигация — CODE_MAP.md. Публичные модули сохраняют общее состояние и импорты:
+# Слои «Монтажа» — отдельные публичные модули; навигация — CODE_MAP.md:
 #   edit_tab_base    — константы, палитра, чистые хелперы (время, ffprobe, ASS)
 #   edit_tab_workers — фоновые QThread-воркеры (резка, прокси, волна, субтитры)
 #   edit_tab_widgets — виджеты (волна, холст видео, полный экран, превью)
 #   edit_tab_dialogs — диалоги (маска, редактор/конструктор субтитров, пикселизация)
 #   edit_tab_frames  — покадровая сетка и предекодирование кадров вокруг плейхеда
-#   edit_tab.py      — экспорт EditTab и main(); реализация — si_hyx_parts/edit_tab/
+#   edit_tab.py      — экспорт EditTab и main(); класс и его миксины
+#                      (layout, tracks, playback, timeline, effects, export) —
+#                      в si_hyx_parts/edit_tab/
 #
 # ВАЖНО: edit_tab_base стоит первым в цепочке — он выставляет env-переменные
 # Qt-бэкенда (QSG_RHI_BACKEND/QT_MEDIA_BACKEND) ДО создания QApplication, что

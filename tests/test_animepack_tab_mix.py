@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """Ползунок состава пака во вкладке «Генерация аниме-пака».
 
-Долей теперь четыре: песни / ролики / кадры / персонажи. Часть «Ролики»
-появляется в полосе только с галочкой «Вопрос — ролик», а снятая галочка
-возвращает её проценты песням (ролик — та же песня, только видео).
+Видео — способ подачи песни под её галочкой. Прежняя доля роликов
+при загрузке настроек переходит в песни.
 """
 import pytest
 from PyQt6.QtCore import Qt
@@ -36,13 +35,17 @@ def tab(qapp):
     widget.cleanup()
 
 
-def test_video_part_appears_only_with_the_checkbox(tab):
+def test_video_checkbox_does_not_change_composition(tab):
     assert tab.mix.percents() == (100, 0, 0, 0, 0)
     tab.chk_video.setChecked(True)
     songs, video, frames, chars, manga = tab.mix.percents()
-    assert video > 0 and songs + video + frames + chars + manga == 100
+    assert (songs, video, frames, chars, manga) == (100, 0, 0, 0, 0)
+    assert "video" not in tab.mix.keys()
+    assert "video" not in tab.composition_checks
+    assert tab.chk_video.parentWidget() is tab.box_audio_opts
+    assert tab.box_video_opts.parentWidget() is tab.box_audio_opts
     assert tab.collect().percents == (songs, video, frames, chars, manga)
-    # Настройки ролика показываются вместе с долей.
+    # Настройки ролика показываются внутри песен.
     assert tab.box_video_opts.isVisibleTo(tab)
     tab.chk_video.setChecked(False)
     assert tab.mix.percents() == (100, 0, 0, 0, 0)
@@ -52,10 +55,37 @@ def test_mix_survives_save_and_load(tab):
     tab.chk_video.setChecked(True)
     tab.mix.set_percents(40, 20, 30, 10)
     data = tab.get_settings()
-    assert data["pct_videos"] == 20
+    assert data["pct_videos"] == 0
     tab.apply_settings(data)
-    assert tab.mix.percents() == (40, 20, 30, 10, 0)
-    assert tab.collect().question_quotas[VIDEO_KIND] > 0
+    assert tab.mix.percents() == (60, 0, 30, 10, 0)
+    assert tab.collect().question_quotas[VIDEO_KIND] == 0
+    assert tab.collect().song_video
+
+
+def test_old_video_only_selection_becomes_songs(tab):
+    tab.apply_settings({"song_video": True, "pct_songs": 0,
+                        "pct_videos": 100, "composition_enabled": ["video"]})
+    settings = tab.collect()
+    assert tab.chk_songs.isChecked()
+    assert tab.chk_video.isChecked()
+    assert settings.percents == (100, 0, 0, 0, 0)
+    assert settings.composition_enabled == ["songs"]
+    assert settings.has_songs
+    assert sum(settings.question_quotas.values()) == settings.total_questions
+
+
+def test_video_follows_song_visibility_without_adding_questions(tab):
+    tab.chk_video.setChecked(True)
+    before = tab.collect().question_quotas
+    tab.chk_video.setChecked(False)
+    assert tab.collect().question_quotas == before
+    tab.chk_video.setChecked(True)
+    tab.chk_songs.setChecked(False)
+    assert not tab.chk_video.isVisibleTo(tab)
+    assert not tab.collect().has_songs
+    tab.chk_songs.setChecked(True)
+    assert tab.chk_video.isVisibleTo(tab)
+    assert tab.chk_video.isChecked()
 
 
 def test_video_share_keeps_song_settings_on_screen(tab):
@@ -121,8 +151,9 @@ def test_counts_line_lists_every_kind(tab):
     tab._recount()
     text = tab.lbl_left.text()
     for word in ("Кадров", "Опенингов", "Эндингов", "OST", "Персонажей",
-                 "Видео", "Манги"):
+                 "Манги"):
         assert word in text
+    assert "Видео" not in text
     quotas = tab.collect().question_quotas
     assert f"Кадров — {quotas['frame']}" in text
     assert f"Манги — {quotas[MANGA_KIND]}" in text
@@ -130,7 +161,7 @@ def test_counts_line_lists_every_kind(tab):
 
 def test_list_cards_carry_target_and_music(tab):
     """У карточки списка есть раздел (аниме/манга) и пометка «музыка»."""
-    tab.chk_random_shiki.setChecked(False)
+    tab.src_switch.btn_lists.click()
     card = tab._add_user_card(UserList("m", "shikimori", ["completed"]))
     assert card.value().target == "anime"
     card.btn_target.setChecked(True)
@@ -158,7 +189,7 @@ def test_saved_users_can_be_forgotten_by_right_click(tab, qapp):
 
 
 def test_list_shares_split_evenly_and_survive_reload(tab):
-    tab.chk_random_shiki.setChecked(False)
+    tab.src_switch.btn_lists.click()
     for nick in ("a", "b", "c"):
         tab._add_user_card(UserList(nick, "shikimori", ["completed"]))
     tab.chk_shares.setChecked(True)
@@ -175,44 +206,42 @@ def test_list_shares_split_evenly_and_survive_reload(tab):
 
 # ── Новые настройки вкладки ─────────────────────────────────────────────────
 def test_new_settings_survive_save_and_load(tab):
-    """Средняя сложность персонажей, картинка в ответе и отметки списков
+    """Средняя сложность персонажей, картинка в ответе и источник тайтлов
     доезжают до settings.json и обратно."""
     tab.sp_char_avg.setValue(6)
     tab.sp_answer_img.setValue(0)              # «без ограничения»
-    tab.chk_mark_owners.setChecked(True)
+    tab.src_switch.btn_lists.click()
     tab.chk_manga.setChecked(True)
     data = tab.get_settings()
     assert data["char_level_avg"] == 6
     assert data["answer_image_time"] == 0
-    assert data["mark_owners"] is True and data["pack_manga"] is True
+    assert data["random_mode"] is False and data["pack_manga"] is True
 
     tab.apply_settings(PackSettings().to_dict())
     assert tab.sp_char_avg.value() == 0 and tab.sp_answer_img.value() == 3
     tab.apply_settings(data)
     assert tab.sp_char_avg.value() == 6
     assert tab.sp_answer_img.value() == 0
-    assert tab.chk_mark_owners.isChecked() and tab.chk_manga.isChecked()
+    assert tab.src_switch.is_lists() and tab.chk_manga.isChecked()
     assert "manga" in tab.mix.keys()
 
 
-def test_marking_owners_brings_the_user_cards_back(tab):
-    """С общей базой карточки списков спрятаны, но отметки «у кого есть» их
-    возвращают: списки нужны, чтобы подписать готовые вопросы."""
-    tab.chk_random_shiki.setChecked(True)
+def test_source_switch_shows_user_cards_only_for_lists(tab):
+    """База Shikimori прячет карточки списков, «Из списков пользователя» —
+    показывает их вместе с совпадением «есть у N человек»."""
+    tab.src_switch.btn_shiki.click()
+    assert not tab.src_switch.is_lists()
     assert not tab.box_users.isVisibleTo(tab)
-    assert tab.chk_mark_owners.isVisibleTo(tab)
-    tab.chk_mark_owners.setChecked(True)
+    tab.src_switch.btn_lists.click()
     assert tab.box_users.isVisibleTo(tab)
-    # Совпадение «есть у N человек» к отметкам отношения не имеет.
-    assert not tab.box_similar.isVisibleTo(tab)
-    tab.chk_mark_owners.setChecked(False)
-    assert not tab.box_users.isVisibleTo(tab)
+    assert tab.box_similar.isVisibleTo(tab)
+    assert tab.collect().random_mode is False
 
 
 def test_refresh_db_button_belongs_to_the_shikimori_base(tab):
-    tab.chk_random_shiki.setChecked(True)
+    tab.src_switch.btn_shiki.click()
     assert tab.btn_refresh_db.isVisibleTo(tab)
-    tab.chk_random.setChecked(True)            # база AMQ — кнопка не про неё
+    tab.src_switch.btn_lists.click()           # списки — кнопка не про них
     assert not tab.btn_refresh_db.isVisibleTo(tab)
 
 
@@ -234,6 +263,7 @@ def test_refresh_db_can_be_stopped_midway(tab):
 
 
 def test_anagram_length_limit_survives_save_and_load(tab):
+    tab.chk_titles.setChecked(True)
     tab.chk_anagram.setChecked(True)
     tab.sp_anagram_max.setValue(25)
     assert tab.collect().anagram_max_chars == 25
@@ -295,10 +325,9 @@ def test_answer_image_time_is_capped_at_five(tab):
     assert tab.sp_answer_img.value() == 5
 
 
-# ── Анаграммы, пиксели и сюжет ──────────────────────────────────────────────
 @pytest.mark.parametrize("attr,part,box", [
     ("chk_pixel", "pixel", "box_pixel"),
-    ("chk_anagram", "anagram", "box_anagram"),
+    ("chk_titles", "titles", "box_titles"),
     ("chk_plot", "plot", "box_plot"),
 ])
 def test_new_kinds_need_their_checkbox_to_reach_the_slider(tab, attr, part, box):
@@ -310,12 +339,12 @@ def test_new_kinds_need_their_checkbox_to_reach_the_slider(tab, attr, part, box)
     assert part in tab.mix.keys()
     assert getattr(tab, box).isVisibleTo(tab)
     assert tab.mix.shares()[part] > 0
-    # Снятая галочка возвращает долю песням.
     getattr(tab, attr).setChecked(False)
     assert tab.mix.percents() == (100, 0, 0, 0, 0)
 
 
 def test_new_shares_reach_pack_settings_and_survive_reload(tab):
+    tab.chk_titles.setChecked(True)
     tab.chk_pixel.setChecked(True)
     tab.chk_anagram.setChecked(True)
     tab.chk_plot.setChecked(True)
@@ -336,32 +365,19 @@ def test_new_shares_reach_pack_settings_and_survive_reload(tab):
     assert tab.mix.shares()["pixel"] == 20
     assert tab.sp_pixel_sec.value() == 12 and tab.sp_pixel_steps.value() == 8
     assert tab.cb_anagram_lang.currentData() == "romaji"
-    # Ключ во вкладке не хранится: он общий для программы (Настройки → «Ключи
-    # API»), поэтому и в сохранённые настройки вкладки не попадает.
     assert "gemini_key" not in data
     assert s.gemini_key == "secret"
 
 
 def test_counts_line_mentions_the_new_kinds(tab):
+    tab.chk_titles.setChecked(True)
     tab.chk_pixel.setChecked(True)
     tab.chk_anagram.setChecked(True)
     tab.chk_plot.setChecked(True)
     tab._recount()
     text = tab.lbl_left.text()
-    for word in ("Кадров с эффектами", "Анаграмм", "По сюжету"):
+    for word in ("Кадров с эффектами", "По названию", "По сюжету"):
         assert word in text
-
-
-def test_pixel_hint_shows_the_same_blocks_as_the_effect(tab):
-    """Подсказка о ступенях считается той же функцией, что и сам эффект."""
-    from pixelize import block_sequence
-    tab.chk_pixel.setChecked(True)
-    tab.sp_pixel_block.setValue(64)
-    tab.sp_pixel_steps.setValue(6)
-    text = tab.lbl_pixel_steps.text()
-    for block in block_sequence(64, 6)[:-1]:
-        assert f"{block}px" in text
-    assert "чётко" in text
 
 
 def test_an_empty_composition_says_so_instead_of_a_lone_dot(tab):

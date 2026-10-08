@@ -41,16 +41,15 @@ from PyQt6.QtWidgets import (QAbstractScrollArea, QSizePolicy, QAbstractButton,
                              QLineEdit, QScrollBar, QStyleOptionSlider)
 from PyQt6.QtCore import QUrl
 
-from si_hyx_parts.widgets.status_color_delegate import (
-    StatusColorDelegate,
-    PreviewNameDelegate,
+from si_hyx_parts.widgets.delegates import StatusColorDelegate, PreviewNameDelegate
+from si_hyx_parts.widgets.inputs import (
     LatinKeySequenceEdit,
     InvertedWheelComboBox,
     ZeroSpinBox,
     SpeedSpinBox,
 )
 
-from si_hyx_parts.widgets.info_tip_popup import (
+from si_hyx_parts.widgets.hover_tips import (
     _InfoTipPopup,
     _enable_clear_button,
     HoverTipManager,
@@ -64,6 +63,8 @@ from si_hyx_parts.widgets.info_badge import (
     combo_set_value,
     label_with_info,
     row_with_info,
+)
+from si_hyx_parts.widgets.thumbnail_runnables import (
     LocalThumbnailRunnable,
     RemoteThumbnailRunnable,
 )
@@ -86,7 +87,7 @@ _THUMB_CACHE_DIR = os.path.join(CONFIG_DIR, "thumb_cache")
 _THUMB_CACHE_LIMIT = 600       # записей; лишние (самые старые) удаляются
 _thumb_cache_trimmed = False   # уборку делаем один раз за запуск
 
-from si_hyx_parts.widgets.thumb_cache_key import (
+from si_hyx_parts.widgets.thumb_cache import (
     _thumb_cache_key,
     _thumb_cache_read,
     _thumb_cache_write,
@@ -96,7 +97,7 @@ from si_hyx_parts.widgets.thumb_cache_key import (
 
 _FFMPEG_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)")
 
-from si_hyx_parts.widgets.duration_from_ffmpeg_log import (
+from si_hyx_parts.widgets.recent_thumb_worker import (
     _duration_from_ffmpeg_log,
     _fmt_duration,
     _RecentThumbWorker,
@@ -108,7 +109,7 @@ from si_hyx_parts.widgets.recent_files_strip import RecentFilesStrip
 
 from si_hyx_parts.widgets.draggable_tree_widget import DraggableTreeWidget, PhotoDragList
 
-from si_hyx_parts.widgets.paint_checkerboard import (
+from si_hyx_parts.widgets.image_viewer import (
     _paint_checkerboard,
     _ZoomImageLabel,
     ImageFullscreenViewer,
@@ -154,10 +155,9 @@ from si_hyx_parts.widgets.compare_proxy_worker import _CompareProxyWorker, _Zoom
 
 from si_hyx_parts.widgets.video_compare_viewer import VideoCompareViewer
 
-from si_hyx_parts.widgets.show_video_compare import (
-    show_video_compare,
+from si_hyx_parts.widgets.video_compare import show_video_compare, _JumpSlider
+from si_hyx_parts.widgets.tab_scroll_arrows import (
     TabScrollArrows,
     install_tab_scroll_arrows,
     _icon_btn,
-    _JumpSlider,
 )

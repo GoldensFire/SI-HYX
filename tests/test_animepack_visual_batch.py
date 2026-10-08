@@ -22,6 +22,8 @@ def _verdict(index):
     return {"id": index, "accept": index % 2 == 0,
             "has_characters": index % 2 == 0,
             "has_title_text": index % 2 != 0, "mixed_anime": False,
+            "very_poor_drawing": False, "matches_expected_anime": True,
+            "identified_source": "", "visible_text": "",
             "reason": f"picture {index}"}
 
 
@@ -45,6 +47,28 @@ class _Client:
             return _verdict(int(images[0]["data"]))
         return {"results": [dict(_verdict(int(p["data"])), id=index)
                             for index, p in reversed(list(enumerate(images)))]}
+
+
+def test_multi_image_jobs_respect_total_image_budget():
+    client = _Client({"results": [_verdict(0), _verdict(1)]})
+    batcher = batch.VisualCheckBatcher(client, max_images=4, collect_seconds=1)
+    gate = threading.Barrier(4)
+    def check(index):
+        gate.wait(timeout=3)
+        return batcher.check(_parts(index) + _parts(index), FRAME_SCHEMA)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        rows = [future.result(timeout=5) for future in [pool.submit(check, i) for i in range(4)]]
+    assert len(rows) == 4 and len(client.calls) == 2
+    assert all(sum(part.get("type") == "image" for part in parts) == 4 for parts, _ in client.calls)
+
+
+def test_nested_scene_schemas_never_use_flat_verdict_batch_protocol():
+    client = _Client({"scenes": []})
+    schema = {"type": "object", "properties": {"scenes": {"type": "array", "items": {"type": "integer"}}},
+              "required": ["scenes"]}
+    batcher = batch.VisualCheckBatcher(client, max_images=2, collect_seconds=0.01)
+    rows = _together(batcher, count=2, schema=schema)
+    assert rows == [{"scenes": []}, {"scenes": []}] and len(client.calls) == 2
 
 
 def _together(batcher, count=4, schema=PIXIV_SCHEMA):

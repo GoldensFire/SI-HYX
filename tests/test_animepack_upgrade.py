@@ -1,452 +1,443 @@
-# -*- coding: utf-8 -*-
 """Вкладка «Апгрейд пака»: спецвопросы, варианты названий и картинки.
 
 Сеть не трогается вовсе: вместо ShikimoriApi подставляется FakeApi, считающий
 запросы (кэш «один тайтл — один запрос» — часть поведения, а не оптимизация).
 ffmpeg тоже не зовётся: кодирование картинки подменяется _fake_avif.
 """
-# Resolve deferred class annotations through the public namespace.
-import sys as _sys
-_api = _sys.modules[__name__]
-
-import os
-import threading
-import xml.etree.ElementTree as ET
-import zipfile
 
 import pytest
 
-from animepack_upgrade import (KNOWN_LABELS, LOOSE_THRESHOLD,
-                               PackUpgrader, SPECIAL_LABELS,
-                               UpgradeError, UpgradeSettings, answer_queries,
-                               answer_query, audio_filter_chain, copy_zip_entry,
-                               entry_basename, example_lines, is_media_entry,
-                               iter_questions, iter_themes, known_labels_in,
-                               loudnorm_filter,
-                               match_score, media_jobs, nearest_bitrate,
-                               nearest_height, normalize_profile,
-                               norm_title, parse_content, parse_probe_codec,
-                               parse_probe_kbps,
-                               pick_card, referenced_names, remove_poster,
-                               card_names, character_hit,
-                               looks_like_character_name, read_pack_info,
-                               is_book_theme, is_typo, matched_by_typo,
-                               merge_text_with_audio,
-                               recased, retarget_refs, spelling_names,
-                               strip_year, synonym_only, tag_fn, title_variants,
-                               unused_entries)
-from filenames import escape_uri_string
-
-from si_hyx_parts.tests.test_animepack_upgrade.pack import _pack, _q5, _q4, _siq
-
-
-NARUTO = {
-    "id": 20, "malId": 20, "russian": "Наруто", "name": "Naruto",
-    "english": "Naruto", "japanese": "ナルト",
-    "licenseNameRu": "Наруто. Книга первая",
-    "synonyms": ["NARUTO -ナルト-", "Наруто ТВ-1"],
-}
-BLEACH = {"id": 269, "malId": 269, "russian": "Блич", "name": "Bleach",
-          "english": "Bleach", "synonyms": [], "licenseNameRu": ""}
-
-from si_hyx_parts.tests.test_animepack_upgrade.fake_api import (
-    FakeApi,
-    _run,
-    _out_root,
-    test_v5_special_types_are_removed,
-    test_v5_special_params_are_removed_but_question_survives,
-    test_v4_type_element_is_removed,
-    test_simple_questions_are_left_alone,
-    test_secret_no_question_is_skipped_by_default,
-    test_secret_no_question_converted_when_asked,
-    test_question_without_content_is_skipped,
-    test_specials_untouched_when_function_is_off,
-    test_answer_query_strips_song_year_and_quotes,
-    test_answer_queries_try_the_title_before_the_dash,
-    test_answer_queries_use_other_answers_and_dedupe,
-    test_answer_queries_are_capped_and_filtered,
-    test_title_found_by_a_later_answer,
-    test_other_answers_are_not_searched_when_switched_off,
-    test_variants_are_appended_to_answers,
-    test_variant_already_written_in_the_pack_is_not_repeated,
-    test_year_is_never_written_into_the_answer,
-    test_strip_year_leaves_the_name_alone,
-    test_cjk_variants_are_never_added,
-    test_existing_answers_are_not_duplicated,
-    test_all_variant_kinds_are_always_added,
-    test_max_variants_caps_the_list,
-    test_unknown_answer_is_left_alone,
-    test_short_and_numeric_answers_are_not_searched,
-    test_same_title_is_queried_once,
-    test_titles_untouched_when_function_is_off,
+from animepack_upgrade import (
+    SPECIAL_LABELS,
+    UpgradeSettings,
+    answer_queries,
+    answer_query,
+    example_lines,
+    iter_questions,
+    match_score,
+    pick_card,
+    is_typo,
+    matched_by_typo,
+    strip_year,
+    tag_fn,
 )
-
-from si_hyx_parts.tests.test_animepack_upgrade.test_failed_search_does_not_break_the_run import (
-    test_failed_search_does_not_break_the_run,
-    test_strict_match_needs_exact_name,
-    test_loose_match_accepts_close_names,
-)
-
-
-# Живой случай пользователя: в паке «Gokukoku no Brunhildr», на Shikimori —
-# «Brynhildr». Из-за одной буквы пропадали и постер, и все варианты названия.
-BRYNHILDR = {"id": 21, "malId": 21, "name": "Gokukoku no Brynhildr",
-             "russian": "Тёмная кровь Брунгильды", "english": None,
-             "licenseNameRu": "", "synonyms": [], "kind": "tv"}
-
-from si_hyx_parts.tests.test_animepack_upgrade.test_typo_in_the_answer_still_finds_the_title import (
-    test_typo_in_the_answer_still_finds_the_title,
-    test_typo_is_the_same_title,
-    test_typo_does_not_swallow_other_titles,
-    test_typo_titles_are_counted_and_reported,
-)
-
-
-# «Tegami bachi» в паке — «Tegamibachi» на Shikimori: то же слово, разбитое на
-# слоги по вкусу писавшего.
-TEGAMI = {"id": 22, "malId": 22, "name": "Tegamibachi",
-          "russian": "Почтовая пчела", "english": None, "licenseNameRu": "",
-          "synonyms": [], "kind": "tv"}
-
-from si_hyx_parts.tests.test_animepack_upgrade.test_extra_space_in_the_answer_is_the_same_title import (
-    test_extra_space_in_the_answer_is_the_same_title,
-    test_short_names_are_not_glued_together,
-)
-
-
-# Ответ «Shelter»: так зовут и знаменитый клип Porter Robinson, и никому не
-# известный фильм 2015 года — в пак вставлялась обложка фильма.
-SHELTER_CLIP = {"id": 31, "malId": 31, "name": "Shelter (Music)",
-                "russian": "Убежище", "english": "Shelter",
-                "licenseNameRu": "", "synonyms": [], "kind": "music",
-                "popularity": 221562.0}
-SHELTER_MOVIE = {"id": 32, "malId": 32, "name": "Shelter", "russian": None,
-                 "english": None, "licenseNameRu": "", "synonyms": [],
-                 "kind": "movie", "popularity": 832.0}
-
-from si_hyx_parts.tests.test_animepack_upgrade.test_famous_clip_beats_an_unknown_namesake import (
-    test_famous_clip_beats_an_unknown_namesake,
-    test_clip_without_a_namesake_is_still_not_an_answer,
-    test_clip_takes_the_answer_only_with_a_huge_edge,
-    test_clip_matched_by_a_synonym_is_ignored_as_before,
-    test_match_score_is_one_for_any_of_the_names,
-    test_title_variants_keep_generator_order,
-    test_source_pack_is_never_modified,
-    test_media_entries_are_copied_as_is,
-    test_namespace_survives_the_rewrite,
-    test_out_dir_setting_is_honoured,
-    test_second_run_does_not_overwrite_the_first,
-    test_capitalized_content_xml_is_found,
-    test_broken_archive_is_reported,
-    test_archive_without_content_xml_is_reported,
-    test_pack_without_questions_is_reported,
-    test_all_functions_off_is_rejected,
-    test_image_limit_above_threshold_is_rejected,
-    test_entity_declarations_are_refused,
-    test_stop_writes_nothing,
-    _fake_avif,
-    _img_settings,
-)
-
-
-HEAVY = b"J" * 200_000                  # «тяжёлая» картинка для тестов
-HEAVY_KB = len(HEAVY)
-
-from si_hyx_parts.tests.test_animepack_upgrade.q5_image import (
-    _q5_image,
-    test_heavy_image_becomes_avif_and_ref_follows,
-    test_light_images_and_other_media_are_left_alone,
-    test_image_that_got_heavier_is_kept_as_is,
-    test_percent_encoded_v4_reference_is_retargeted,
-    test_brackets_in_name_survive_reencoding,
-    test_brackets_survive_even_when_the_name_is_taken,
-    test_escape_uri_string_matches_dotnet,
-    test_taken_avif_name_does_not_clobber_the_neighbour,
-    test_retarget_refs_touches_only_media_elements,
-    test_images_untouched_when_function_is_off,
-    test_source_pack_survives_image_compression,
-    test_examples_show_three_of_each,
-    test_examples_say_so_when_nothing_changed,
-    test_examples_show_compressed_images,
-    test_changes_are_reported_in_pack_order,
-    _answers,
-    test_case_is_fixed_to_shikimori_spelling,
-    test_case_fix_handles_shouting_and_keeps_song_after_dash,
-    test_case_fix_changes_only_letters_case,
-    test_case_fix_can_be_switched_off,
-    test_case_fix_needs_exact_match,
-)
-
-
-# ── Постер тайтла в ответе ───────────────────────────────────────────────────
-POSTERED = dict(BLEACH, poster={"originalUrl": "https://shikimori/x.jpg"})
-
-from si_hyx_parts.tests.test_animepack_upgrade.fake_poster import (
-    _fake_poster,
-    _poster_settings,
-    test_poster_goes_into_the_answer,
-    test_one_poster_file_per_title,
-    test_poster_is_not_added_over_existing_picture,
-    test_poster_is_not_added_over_existing_media,
-    test_poster_still_goes_next_to_answer_text,
-    test_poster_is_not_added_over_v4_media_after_marker,
-    test_poster_can_be_switched_off,
-    test_poster_needs_exact_match,
-    test_title_without_poster_is_skipped,
-    test_poster_in_v4_goes_after_the_marker,
-    test_poster_name_does_not_overwrite_existing_file,
-    test_poster_temp_files_are_cleaned_up,
-    test_read_pack_info_returns_name_author_and_themes,
-    test_read_pack_info_survives_a_pack_without_info,
-    test_special_labels_match_siquester_wording,
-    test_examples_show_recased_and_posters,
-)
-
-
-# ── Клипы и промо — не тайтлы ────────────────────────────────────────────────
-# Живой случай: ответ «Mumei» (имя героя) находил вокалоид-клип «Mumei», а
-# «Teto Kasane» — клип «Yababaina», у которого это лежит в синонимах.
-CLIP_MUMEI = {"id": 56886, "malId": 56886, "name": "Mumei", "russian": "Мумэй",
-              "english": None, "japanese": "mumei", "licenseNameRu": None,
-              "synonyms": [], "kind": "music",
-              "poster": {"originalUrl": "https://shikimori/m.jpg"}}
-CLIP_YABA = {"id": 58640, "malId": 58640, "name": "Yababaina", "russian": None,
-             "english": None, "licenseNameRu": None, "kind": "music",
-             "synonyms": ["YABABAINA - Satapan P feat.Miku Hatsune",
-                          "Teto Kasane", "Zundamon"]}
-
-from si_hyx_parts.tests.test_animepack_upgrade.test_music_and_promo_are_not_titles import (
-    test_music_and_promo_are_not_titles,
-    test_every_clip_kind_is_refused,
-    test_real_kinds_and_unknown_ones_pass,
-    test_synonym_only_match_is_refused,
-    test_synonym_match_counts_when_the_title_is_in_the_answer,
-    test_case_is_not_taken_from_the_japanese_field,
-    test_leading_capital_is_never_lowered,
-    test_which_answers_are_worth_a_character_query,
-    test_character_hit_compares_latin_names_only,
+from animepack_upgrade_test_helpers import (
+    BRYNHILDR,
     CharApi,
+    FakeApi,
+    LOOSE_CARD,
+    NARUTO,
+    TEGAMI,
+    UENO,
+    _answers,
+    _out_root,
+    _pack,
+    _q4,
+    _q5,
+    _run,
 )
 
 
-# Тайтл, который сам по себе на ответ не похож: совпадение приходит близостью
-# строк, и вот тут мнение базы персонажей уже что-то значит.
-LOOSE_CARD = {"id": 7, "malId": 7, "russian": None, "name": "Teto Kasanee",
-              "english": None, "licenseNameRu": "", "synonyms": [], "kind": "tv"}
+# ── Функция 1: спецвопросы → обычные ─────────────────────────────────────────
+def test_v5_special_types_are_removed(tmp_path):
+    """Тип вопроса снимается со ВСЕХ спецвопросов формата v5."""
+    content = _pack("".join(
+        _q5(p, qtype=t) for p, t in ((100, "stake"), (200, "secret"),
+                                     (300, "noRisk"), (400, "forAll"),
+                                     (500, "stakeAll"))))
+    result = _run(tmp_path, content, UpgradeSettings(add_titles=False))
+    assert len(result.specials) == 5
+    root, _ns = _out_root(result)
+    assert all(q.get("type") is None for _r, _t, q in iter_questions(root))
 
-from si_hyx_parts.tests.test_animepack_upgrade.test_character_answer_is_left_alone import (
-    test_character_answer_is_left_alone,
-    test_exact_title_is_not_second_guessed,
-    test_character_check_can_be_switched_off,
-    test_same_character_is_asked_once,
-    test_skipped_characters_are_reported,
-    _q5_items,
-    _shot,
-)
+def test_v5_special_params_are_removed_but_question_survives(tmp_path):
+    """Убирается ровно то, что делало вопрос особым: тема и цена «кота» и режим
+    выбора. Сам вопрос, ответ и цена вопроса остаются на месте."""
+    params = ('<param name="theme">Чужая тема</param>'
+              '<param name="price" type="numberSet"><numberSet minimum="50"/></param>'
+              '<param name="selectionMode">exceptCurrent</param>')
+    content = _pack(_q5(400, answer="Блич", qtype="secret", params=params))
+    result = _run(tmp_path, content, UpgradeSettings(add_titles=False))
+    root, ns = _out_root(result)
+    tag = tag_fn(ns)
+    q = root.find(f'.//{tag("question")}')
+    assert q.get("price") == "400"              # цена вопроса не тронута
+    assert q.get("type") is None
+    names = {p.get("name") for p in q.findall(f'{tag("params")}/{tag("param")}')}
+    assert names == {"question"}
+    assert q.find(f'{tag("right")}/{tag("answer")}').text == "Блич"
+
+def test_v4_type_element_is_removed(tmp_path):
+    """Формат v4 держит тип дочерним <type name="cat"> — вместе с параметрами."""
+    content = _pack(_q4(200, qtype="cat") + _q4(300, qtype="auction"))
+    result = _run(tmp_path, content, UpgradeSettings(add_titles=False))
+    assert [c.before for c in result.specials] == ["с секретом", "со ставкой"]
+    root, ns = _out_root(result)
+    tag = tag_fn(ns)
+    assert root.find(f'.//{tag("type")}') is None
+    assert len(root.findall(f'.//{tag("scenario")}')) == 2
+
+def test_simple_questions_are_left_alone(tmp_path):
+    content = _pack(_q5(100) + _q5(200, qtype="simple") + _q4(300))
+    result = _run(tmp_path, content, UpgradeSettings(add_titles=False))
+    assert result.specials == [] and result.total == 0
+
+def test_secret_no_question_is_skipped_by_default(tmp_path):
+    """«С секретом без вопроса» (secretNoQuestion) — это выдача денег сразу:
+    самого вопроса в нём нет, обычным его не сделать."""
+    content = _pack(_q5(100, qtype="secretNoQuestion"))
+    result = _run(tmp_path, content, UpgradeSettings(add_titles=False))
+    assert result.specials == []
+    assert len(result.skipped_specials) == 1
+    assert result.skipped_specials[0].before == SPECIAL_LABELS["secretnoquestion"]
+    root, ns = _out_root(result)
+    assert root.find(f'.//{tag_fn(ns)("question")}').get("type") == "secretNoQuestion"
+
+def test_secret_no_question_converted_when_asked(tmp_path):
+    content = _pack(_q5(100, qtype="secretNoQuestion"))
+    result = _run(tmp_path, content,
+                  UpgradeSettings(add_titles=False, strip_no_question=True))
+    assert len(result.specials) == 1 and not result.skipped_specials
+
+def test_question_without_content_is_skipped(tmp_path):
+    """Пустой спецвопрос обычным делать нечем — о нём просто пишется в отчёт."""
+    content = _pack('<question price="100" type="secret">'
+                    "<right><answer>Ответ</answer></right></question>")
+    result = _run(tmp_path, content,
+                  UpgradeSettings(add_titles=False, strip_no_question=True))
+    assert result.specials == [] and len(result.skipped_specials) == 1
+    assert "нет самого вопроса" in result.skipped_specials[0].after
+
+def test_specials_untouched_when_function_is_off(tmp_path):
+    content = _pack(_q5(100, answer="Наруто", qtype="secret"))
+    result = _run(tmp_path, content,
+                  UpgradeSettings(strip_specials=False, add_titles=True))
+    root, ns = _out_root(result)
+    assert root.find(f'.//{tag_fn(ns)("question")}').get("type") == "secret"
+    assert result.specials == [] and len(result.titles) == 1
+
+# ── Функция 2: варианты названий ─────────────────────────────────────────────
+def test_answer_query_strips_song_year_and_quotes():
+    assert answer_query("Наруто OP1 (2002) — 『Go!!!』") == "Наруто"
+    assert answer_query("«Блич» (аниме)") == "Блич"
+    # Косую черту answer_query не трогает («Fate/Zero» — целое название);
+    # разбирает её answer_queries, и только вторым заходом.
+    assert answer_query("Наруто / Naruto") == "Наруто / Naruto"
+    assert answer_query("  Стальной алхимик  ") == "Стальной алхимик"
+
+def test_answer_queries_try_the_title_before_the_dash():
+    """Живые паки пишут «Название - Песня» обычным дефисом: голое название
+    получается только вторым заходом."""
+    assert answer_queries(["Эхо террора - Trigger"]) == [
+        "Эхо террора - Trigger", "Эхо террора"]
+    # Тире БЕЗ пробелов — часть названия, резать его нельзя.
+    assert answer_queries(["Жожо-2"]) == ["Жожо-2"]
+
+def test_answer_queries_use_other_answers_and_dedupe():
+    answers = ["Корона грешника - My Dearest", "Корона грешника",
+               "Guilty Crown"]
+    assert answer_queries(answers) == [
+        "Корона грешника - My Dearest", "Корона грешника", "Guilty Crown"]
+    assert answer_queries(answers, use_others=False) == [
+        "Корона грешника - My Dearest", "Корона грешника"]
+
+def test_answer_queries_are_capped_and_filtered():
+    answers = ["Раз - Два", "Три", "Да", "1945", "Четыре", "Пять"]
+    queries = answer_queries(answers)
+    assert len(queries) == 4                      # MAX_QUERIES_PER_QUESTION
+    assert "Да" not in queries and "1945" not in queries
+
+def test_title_found_by_a_later_answer(tmp_path):
+    """Первый ответ — «Название - Песня», второй — голое название: тайтл всё
+    равно должен опознаться."""
+    api = FakeApi()
+    content = _pack(_q5(100, right="<right><answer>Наруто - Go!!!</answer>"
+                                   "<answer>Наруто</answer></right>"))
+    result = _run(tmp_path, content, UpgradeSettings(strip_specials=False),
+                  api=api)
+    assert len(result.titles) == 1
+    assert "Naruto" in result.titles[0].added
+    # Первый вариант ответа в отчёте остаётся тем, что видит ведущий.
+    assert result.titles[0].before == "Наруто - Go!!!"
+
+def test_other_answers_are_not_searched_when_switched_off(tmp_path):
+    api = FakeApi()
+    content = _pack(_q5(100, right="<right><answer>Ерунда какая-то</answer>"
+                                   "<answer>Наруто</answer></right>"))
+    result = _run(tmp_path, content,
+                  UpgradeSettings(strip_specials=False,
+                                  use_other_answers=False), api=api)
+    assert result.titles == [] and "Наруто" not in api.calls
+
+def test_variants_are_appended_to_answers(tmp_path):
+    content = _pack(_q5(100, answer="Наруто (2002)"))
+    result = _run(tmp_path, content, UpgradeSettings(strip_specials=False))
+    assert len(result.titles) == 1
+    root, ns = _out_root(result)
+    tag = tag_fn(ns)
+    answers = [a.text for a in root.findall(
+        f'.//{tag("right")}/{tag("answer")}')]
+    assert answers[0] == "Наруто (2002)"        # исходный ответ не тронут
+    assert "Naruto" in answers
+    assert "Наруто. Книга первая" in answers
+    # «Наруто» в паке уже написано (внутри первого ответа) — второй раз не идёт.
+    assert "Наруто" not in answers
+
+def test_variant_already_written_in_the_pack_is_not_repeated(tmp_path):
+    """Живой пак пишет «Название - Песня»: голое название там уже есть, и
+    дописывать его отдельной строкой незачем (просьба пользователя)."""
+    content = _pack(_q5(100, answer="Наруто - Go!!!"))
+    result = _run(tmp_path, content, UpgradeSettings(strip_specials=False))
+    added = result.titles[0].added
+    assert "Наруто" not in added and "Naruto" in added
+
+def test_year_is_never_written_into_the_answer(tmp_path):
+    """Год Shikimori держит прямо в названии у части тайтлов — в ответ он не
+    идёт ни в каком виде."""
+    atom = dict(NARUTO, russian="Могучий Атом (2003)", name="Tetsuwan Atom",
+                english="Astro Boy (2003)", licenseNameRu="",
+                synonyms=["Астробой [2003]"])
+    content = _pack(_q5(100, answer="Могучий Атом"))
+    result = _run(tmp_path, content, UpgradeSettings(strip_specials=False),
+                  api=FakeApi([atom]))
+    added = result.titles[0].added
+    assert added == ["Tetsuwan Atom", "Astro Boy", "Астробой"]
+
+def test_strip_year_leaves_the_name_alone():
+    assert strip_year("Могучий Атом (2003)") == "Могучий Атом"
+    assert strip_year("Астробой [2003]") == "Астробой"
+    assert strip_year("Ковбой Бибоп") == "Ковбой Бибоп"
+    # Год не в хвосте — часть названия, резать нельзя.
+    assert strip_year("2001 год: Космическая одиссея") == \
+        "2001 год: Космическая одиссея"
+
+def test_cjk_variants_are_never_added(tmp_path):
+    """Японское название и иероглифические синонимы в ответ не идут: ведущему
+    их не прочитать, игроку не набрать."""
+    content = _pack(_q5(100, answer="Наруто"))
+    result = _run(tmp_path, content, UpgradeSettings(strip_specials=False))
+    assert all("ナルト" not in v for v in result.titles[0].added)
+
+def test_existing_answers_are_not_duplicated(tmp_path):
+    content = _pack(_q5(100, right="<right><answer>Наруто</answer>"
+                                   "<answer>Naruto</answer></right>"))
+    result = _run(tmp_path, content, UpgradeSettings(strip_specials=False))
+    root, ns = _out_root(result)
+    tag = tag_fn(ns)
+    answers = [a.text for a in root.findall(f'.//{tag("right")}/{tag("answer")}')]
+    assert answers.count("Naruto") == 1
+
+def test_all_variant_kinds_are_always_added(tmp_path):
+    """Выбора видов названий больше нет: дописываются все сразу (просьба
+    пользователя), а иероглифика не берётся вовсе."""
+    content = _pack(_q5(100, answer="Наруто"))
+    result = _run(tmp_path, content, UpgradeSettings(strip_specials=False))
+    added = result.titles[0].added
+    assert added == ["Naruto", "Наруто. Книга первая", "Наруто ТВ-1"]
+    assert not any("ナ" in v for v in added)
+
+def test_max_variants_caps_the_list(tmp_path):
+    content = _pack(_q5(100, answer="Наруто"))
+    result = _run(tmp_path, content,
+                  UpgradeSettings(strip_specials=False, max_variants=1))
+    assert len(result.titles[0].added) == 1
+
+def test_unknown_answer_is_left_alone(tmp_path):
+    content = _pack(_q5(100, answer="Столица Франции"))
+    result = _run(tmp_path, content, UpgradeSettings(strip_specials=False))
+    assert result.titles == [] and result.not_found == 1
+    root, ns = _out_root(result)
+    tag = tag_fn(ns)
+    assert len(root.findall(f'.//{tag("right")}/{tag("answer")}')) == 1
+
+def test_short_and_numeric_answers_are_not_searched(tmp_path):
+    """Ответы вроде «Да» и «1945» на Shikimori не ищутся вовсе."""
+    api = FakeApi()
+    content = _pack(_q5(100, answer="Да") + _q5(200, answer="1945"))
+    result = _run(tmp_path, content, UpgradeSettings(strip_specials=False),
+                  api=api)
+    assert api.calls == [] and result.checked_answers == 0
+
+def test_same_title_is_queried_once(tmp_path):
+    """Один тайтл на пак — один запрос: Shikimori держит 5 запросов в секунду."""
+    api = FakeApi()
+    content = _pack(_q5(100, answer="Наруто (2002)")
+                    + _q5(200, answer="наруто")
+                    + _q5(300, answer="Блич"))
+    _run(tmp_path, content, UpgradeSettings(strip_specials=False), api=api)
+    assert len(api.calls) == 2
+
+def test_titles_untouched_when_function_is_off(tmp_path):
+    api = FakeApi()
+    content = _pack(_q5(100, answer="Наруто", qtype="stake"))
+    result = _run(tmp_path, content,
+                  UpgradeSettings(add_titles=False), api=api)
+    assert api.calls == [] and result.titles == []
+    assert len(result.specials) == 1
 
 
-# Известные подписи тут выключены нарочно: ниже проверяется ОБЩЕЕ правило
-# («текст стоит в каждом вопросе темы»), и «Назвать аниме» взято как обычный
-# короткий текст. Списочные подписи проверяются отдельно, см. KNOWN_REPEATS.
-ONLY_REPEATS = UpgradeSettings(strip_specials=False, add_titles=False,
-                               compress_images=False,
-                               strip_known_labels=False)
-KNOWN_REPEATS = UpgradeSettings(strip_specials=False, add_titles=False,
-                                compress_images=False)
+def test_failed_search_does_not_break_the_run(tmp_path):
+    class Broken(FakeApi):
+        def search_animes_by_name(self, name, limit=0):
+            raise RuntimeError("Shikimori лёг")
 
-from si_hyx_parts.tests.test_animepack_upgrade.themes import (
-    _themes,
-    test_repeated_text_is_removed_from_every_question,
-    test_repeated_text_left_alone_if_one_question_lacks_it,
-    test_repeats_are_counted_per_theme,
-    test_theme_of_one_question_is_not_touched,
-    test_question_is_never_emptied,
-    test_long_text_is_not_a_caption,
-    test_repeat_matching_ignores_case_and_punctuation,
-    test_v4_repeat_is_removed_before_the_marker,
-    test_repeats_can_be_switched_off,
-    test_repeats_are_reported,
-)
+    content = _pack(_q5(100, answer="Наруто"))
+    result = _run(tmp_path, content, UpgradeSettings(strip_specials=False),
+                  api=Broken())
+    assert result.titles == [] and result.path        # пак всё равно записан
+
+# ── Опознание тайтла ─────────────────────────────────────────────────────────
+def test_strict_match_needs_exact_name():
+    cards = [NARUTO]
+    assert pick_card("наруто!", cards, strict=True) is NARUTO   # знаки не в счёт
+    assert pick_card("Наруто: Ураганные хроники", cards, strict=True) is None
+
+def test_loose_match_accepts_close_names():
+    """С выключенной строгостью засчитывается опечатка, но не другой тайтл."""
+    assert pick_card("Нарутоо", [NARUTO], strict=False) is NARUTO
+    assert pick_card("Блич", [NARUTO], strict=False) is None
 
 
-# ── Ответ, записанный двумя названиями через косую черту ─────────────────────
-UENO = {"id": 37920, "malId": 37920, "russian": "Неуклюжая Уэно",
-        "name": "Ueno-san wa Bukiyou", "english": "How Clumsy you are, Miss Ueno",
-        "synonyms": ["Уэно-сан, какая же Вы неуклюжая"], "licenseNameRu": ""}
+def test_typo_in_the_answer_still_finds_the_title():
+    """Опечатка в букву — тот же тайтл, и строгость этому не мешает."""
+    assert pick_card("Gokukoku no Brunhildr", [BRYNHILDR], strict=True) is BRYNHILDR
+    assert match_score("Gokukoku no Brunhildr", BRYNHILDR) == 1.0
+    assert matched_by_typo("Gokukoku no Brunhildr", BRYNHILDR) is True
+    assert matched_by_typo("Gokukoku no Brynhildr", BRYNHILDR) is False
 
-from si_hyx_parts.tests.test_animepack_upgrade.test_slash_answer_is_split_into_both_names import (
-    test_slash_answer_is_split_into_both_names,
-    test_whole_answer_is_tried_before_its_parts,
-    test_slash_answer_finds_the_title,
-    test_slash_answer_counts_as_an_exact_match,
-    _stats,
-)
+@pytest.mark.parametrize("a, b", [
+    ("gokukoku no brunhildr", "gokukoku no brynhildr"),   # та самая буква
+    ("overlord", "overload"),
+    ("gochuumon wa usagi desu ka", "gochuumon wa usagi des ka"),  # длинное: две
+])
+def test_typo_is_the_same_title(a, b):
+    assert is_typo(a, b) is True
 
+@pytest.mark.parametrize("a, b", [
+    ("air", "aria"),                        # короткие — только слово в слово
+    ("naruto", "naruto ураганные хроники"),  # слов не поровну
+    ("hellsing", "hellsing ultimate"),
+    ("sword art online ii", "sword art online iii"),   # номер сезона
+    ("yuru camp 2", "yuru camp 3"),
+    ("bakemonogatari", "nisemonogatari"),   # разница в три буквы
+])
+def test_typo_does_not_swallow_other_titles(a, b):
+    assert is_typo(a, b) is False
 
-KYOUKAI = {"id": 18153, "malId": 18153, "russian": "По ту сторону границы",
-           "name": "Kyoukai no Kanata", "english": "Beyond the Boundary",
-           "synonyms": ["За гранью", "Beyond the Horizon"], "licenseNameRu": "",
-           "kind": "tv", "statusesStats": _stats(1264006)}
-SWEAT = {"id": 1072, "malId": 1072, "russian": "За гранью", "name": "Sweat Punch",
-         "english": "Sweat Punch", "synonyms": ["Комедия", "Kigeki"],
-         "licenseNameRu": "", "kind": "ova", "statusesStats": _stats(52878)}
+def test_typo_titles_are_counted_and_reported(tmp_path):
+    class Fuzzy(FakeApi):
+        """Shikimori опечатку в запросе переживает и тайтл всё-таки отдаёт
+        (проверено живым запросом) — подстрочный поиск FakeApi так не умеет."""
 
-from si_hyx_parts.tests.test_animepack_upgrade.test_popular_synonym_beats_an_obscure_own_name import (
-    test_popular_synonym_beats_an_obscure_own_name,
-    test_close_popularity_still_prefers_the_own_name,
-    test_synonym_only_match_without_popularity_is_still_refused,
-    test_the_more_popular_of_two_own_names_wins,
-    RawApi,
-    test_kyoukai_no_kanata_is_found_in_a_pack,
-    test_book_themes_are_recognised,
-    test_other_themes_are_not_book_themes,
-)
+        def search_animes_by_name(self, name, limit=0):
+            self.calls.append(name)
+            return list(self.cards)
 
-
-AKAME_MANGA = {"id": 25132, "malId": 25132, "russian": "Убийца Акамэ!",
-               "name": "Akame ga Kill!", "english": "Akame ga Kill!",
-               "synonyms": ["Akame ga Kiru!"], "licenseNameRu": "",
-               "kind": "manga", "poster": {"originalUrl": "http://x/m.jpg"}}
-AKAME_ANIME = {"id": 22199, "malId": 22199, "russian": "Убийца Акамэ!",
-               "name": "Akame ga Kill!", "english": "Akame ga Kill!",
-               "synonyms": ["Красноглазый убийца"], "licenseNameRu": "",
-               "kind": "tv", "poster": {"originalUrl": "http://x/a.jpg"}}
-
-from si_hyx_parts.tests.test_animepack_upgrade.book_api import (
-    BookApi,
-    _book_pack,
-    test_book_theme_asks_shikimori_for_the_manga,
-    test_ordinary_theme_still_asks_for_the_anime,
-    test_book_theme_falls_back_to_the_anime_for_names,
-    test_book_theme_takes_no_poster_from_the_anime,
-    test_book_theme_can_be_switched_off,
-)
+    api = Fuzzy([BRYNHILDR])
+    content = _pack(_q5(100, answer="Gokukoku no Brunhildr"))
+    result = _run(tmp_path, content,
+                  UpgradeSettings(strip_specials=False, add_poster=False,
+                                  check_characters=False), api=api)
+    assert result.typo_titles == 1 and len(result.titles) == 1
+    assert "Gokukoku no Brynhildr" in result.titles[0].added
+    assert any("опечаткой" in line for line in example_lines(result))
 
 
-# ── Функция «Текст под звук» ─────────────────────────────────────────────────
-ONLY_MERGE = UpgradeSettings(strip_specials=False, add_titles=False,
-                             compress_images=False, strip_repeated_text=False,
-                             drop_empty_questions=False, compress_audio=False,
-                             drop_unused=False)
+def test_extra_space_in_the_answer_is_the_same_title():
+    assert pick_card("Tegami bachi", [TEGAMI], strict=True) is TEGAMI
+    assert match_score("Tegami bachi", TEGAMI) == 1.0
+    assert matched_by_typo("Tegami bachi", TEGAMI) is True
 
-from si_hyx_parts.tests.test_animepack_upgrade.sound import (
-    _sound,
-    _items_of,
-    test_text_before_audio_plays_together,
-    test_text_before_a_picture_is_left_alone,
-    test_already_merged_text_is_not_touched,
-    test_merge_can_be_switched_off,
-    test_v4_text_before_audio_gets_time_minus_one,
-    test_merge_is_reported_in_the_table,
-    test_merge_leaves_the_text_in_place,
-    test_merge_helper_needs_the_audio_right_after,
-)
+def test_short_names_are_not_glued_together():
+    """«K-On!» склеенное — это «kon», уже другое слово: пробелы прощаются
+    только длинным названиям."""
+    kon = dict(TEGAMI, name="Kon", russian=None)
+    assert pick_card("K-On!", [kon], strict=True) is None
 
 
-# ── Функция «Удалить пустые вопросы» ─────────────────────────────────────────
-ONLY_EMPTY = UpgradeSettings(strip_specials=False, add_titles=False,
-                             compress_images=False, strip_repeated_text=False,
-                             compress_audio=False)
+def test_character_answer_is_left_alone(tmp_path):
+    api = CharApi([LOOSE_CARD], chars=[{"name": "Teto Kasane", "russian": "Тето Касанэ"}])
+    content = _pack(_q5(100, answer="Teto Kasane"))
+    result = _run(tmp_path, content,
+                  UpgradeSettings(strip_specials=False, strict_match=False),
+                  api=api)
+    assert api.char_calls == ["Teto Kasane"]
+    assert result.titles == [] and result.posters == []
+    assert len(result.skipped_titles) == 1
+    assert result.skipped_titles[0].kind == "character"
+    assert _answers(result) == ["Teto Kasane"]
 
-from si_hyx_parts.tests.test_animepack_upgrade.q5_empty import (
-    _q5_empty,
-    test_empty_question_is_deleted_even_with_an_answer,
-    test_question_without_params_at_all_is_deleted,
-    test_v4_question_with_only_the_answer_after_marker_is_deleted,
-    test_question_with_media_only_is_not_empty,
-    test_theme_left_without_questions_goes_too,
-    test_pack_of_only_empty_questions_is_left_alone,
-    test_empty_questions_survive_when_the_function_is_off,
-    test_empty_questions_are_reported,
-)
+def test_exact_title_is_not_second_guessed(tmp_path):
+    """«Shiki», «Monster», «Goblin Slayer» — настоящие аниме, у которых герой
+    зовётся так же, и точный персонаж там находится всегда. Раз собственное
+    название совпало точь-в-точь, спрашивать про персонажа незачем."""
+    card = {"id": 8, "malId": 8, "russian": "Усопшие", "name": "Shiki",
+            "english": "Corpse Demon", "licenseNameRu": "", "synonyms": [],
+            "kind": "tv"}
+    api = CharApi([card], chars=[{"name": "Shiki", "russian": "Сики"}])
+    content = _pack(_q5(100, answer="Shiki"))
+    result = _run(tmp_path, content, UpgradeSettings(strip_specials=False),
+                  api=api)
+    assert api.char_calls == []                 # лишнего запроса не было
+    assert result.titles and result.skipped_titles == []
+    assert "Усопшие" in _answers(result)
 
+def test_character_check_can_be_switched_off(tmp_path):
+    api = CharApi([LOOSE_CARD], chars=[{"name": "Teto Kasane", "russian": "Тето Касанэ"}])
+    content = _pack(_q5(100, answer="Teto Kasane"))
+    result = _run(tmp_path, content,
+                  UpgradeSettings(strip_specials=False, strict_match=False,
+                                  check_characters=False), api=api)
+    assert api.char_calls == [] and result.skipped_titles == []
+    assert result.titles
 
-# ── Функция «Сжать тяжёлое аудио» ────────────────────────────────────────────
-BIG_AUDIO = b"S" * 300_000              # «тяжёлая» дорожка для тестов
+def test_same_character_is_asked_once(tmp_path):
+    api = CharApi([LOOSE_CARD], chars=[{"name": "Teto Kasane", "russian": "Тето Касанэ"}])
+    content = _pack(_q5(100, answer="Teto Kasane") + _q5(200, answer="Teto Kasane"))
+    _run(tmp_path, content,
+         UpgradeSettings(strip_specials=False, strict_match=False), api=api)
+    assert api.char_calls == ["Teto Kasane"]
 
-from si_hyx_parts.tests.test_animepack_upgrade.aud_settings import (
-    _aud_settings,
-    _fake_opus,
-    _q5_audio,
-    test_heavy_audio_becomes_opus_and_ref_follows,
-    test_audio_that_is_already_quiet_enough_is_left_alone,
-    test_unknown_bitrate_is_recoded_anyway,
-    test_light_audio_and_video_are_left_alone,
-    test_audio_that_got_heavier_is_kept_as_is,
-    test_taken_opus_name_does_not_clobber_the_neighbour,
-    test_audio_untouched_when_function_is_off,
-    test_audio_and_images_do_not_fight_for_names,
-    test_audio_is_reported,
-    test_probe_kbps_takes_the_stream_bitrate_first,
-    test_probe_kbps_falls_back_to_size_and_duration,
-    test_probe_kbps_gives_up_quietly,
-    test_nearest_bitrate_snaps_to_the_list,
-    test_media_keeps_its_compression_and_bytes,
-    test_media_survives_when_the_fast_copy_gives_up,
-    test_fast_copy_leaves_no_garbage_when_it_gives_up,
-    test_encrypted_entry_is_not_touched_by_the_fast_copy,
-    test_media_jobs_never_exceeds_the_cores,
-    test_images_keep_pack_order_when_encoded_in_parallel,
-    test_tracks_keep_pack_order_when_encoded_in_parallel,
-    test_a_track_that_failed_does_not_shift_the_others,
-    test_poster_size_reaches_the_report,
-)
-
-from si_hyx_parts.tests.test_animepack_upgrade.test_poster_that_never_arrives_leaves_no_dangling_ref import (
-    test_poster_that_never_arrives_leaves_no_dangling_ref,
-    test_failed_poster_is_taken_out_of_a_v4_question,
-    test_failed_download_does_not_break_the_run,
-    test_remove_poster_takes_the_picture_out_of_both_formats,
-    test_poster_threads_do_not_outlive_the_run,
-    test_stop_in_the_middle_of_media_leaves_nothing_behind,
-    test_stop_during_posters_closes_the_threads,
-    test_no_temp_files_are_left_behind,
-    test_known_label_goes_even_if_one_question_lacks_it,
-    test_known_label_can_be_switched_off,
-    test_known_label_never_empties_a_question,
-    test_known_labels_are_matched_without_case_and_punctuation,
-    test_known_label_and_repeated_text_live_together,
-)
+def test_skipped_characters_are_reported(tmp_path):
+    api = CharApi([LOOSE_CARD], chars=[{"name": "Teto Kasane", "russian": "Тето Касанэ"}])
+    content = _pack(_q5(100, answer="Teto Kasane"))
+    result = _run(tmp_path, content,
+                  UpgradeSettings(strip_specials=False, strict_match=False),
+                  api=api)
+    lines = example_lines(result)
+    assert any("пропущено как имена персонажей: 1" in l for l in lines)
 
 
-# ── Неиспользуемые файлы ─────────────────────────────────────────────────────
-ONLY_UNUSED = UpgradeSettings(strip_specials=False, add_titles=False,
-                              compress_images=False, strip_repeated_text=False,
-                              drop_empty_questions=False, compress_audio=False,
-                              drop_unused=True)
+def test_slash_answer_is_split_into_both_names():
+    """«Ueno-san wa Bukiyou/ Неуклюжая Уэно» — это одно и то же название двумя
+    строками: Shikimori и сам показывает тайтл так."""
+    assert answer_queries(["Ueno-san wa Bukiyou/ Неуклюжая Уэно"]) == [
+        "Ueno-san wa Bukiyou/ Неуклюжая Уэно", "Ueno-san wa Bukiyou",
+        "Неуклюжая Уэно"]
 
-from si_hyx_parts.tests.test_animepack_upgrade.test_unused_media_is_dropped_and_referenced_survives import (
-    test_unused_media_is_dropped_and_referenced_survives,
-    test_pack_logo_is_not_garbage,
-    test_service_files_are_never_garbage,
-    test_all_media_unused_touches_nothing,
-    test_recoded_image_is_not_counted_as_garbage,
-    test_percent_encoded_name_is_matched_to_its_reference,
-    test_unused_helpers_are_pure,
-    test_unused_is_reported,
-    test_loudnorm_is_off_unless_asked,
-    test_loudnorm_string_is_the_one_from_the_process_tab,
-    test_norm_recodes_even_a_track_that_is_quiet_enough,
-    test_norm_keeps_the_track_even_if_it_got_heavier,
-    test_norm_goes_into_the_ffmpeg_line,
-)
+def test_whole_answer_is_tried_before_its_parts():
+    """«Fate/Zero» — цельное название, и находится оно раньше, чем дело дойдёт
+    до разбиения по черте."""
+    assert answer_queries(["Fate/Zero"])[0] == "Fate/Zero"
 
+def test_slash_answer_finds_the_title(tmp_path):
+    """Строкой целиком тайтл не опознаётся, а каждой частью — да."""
+    api = FakeApi([UENO])
+    content = _pack(_q5(100, answer="Ueno-san wa Bukiyou/ Неуклюжая Уэно"))
+    result = _run(tmp_path, content, UpgradeSettings(strip_specials=False),
+                  api=api)
+    assert len(result.titles) == 1
+    assert "Уэно-сан, какая же Вы неуклюжая" in _answers(result)
+    assert "How Clumsy you are, Miss Ueno" in _answers(result)
 
-# ── Сжатие видео ─────────────────────────────────────────────────────────────
-BIG_VIDEO = b"V" * 400_000              # «тяжёлый» ролик для тестов
-
-from si_hyx_parts.tests.test_animepack_upgrade.vid_settings import (
-    _vid_settings,
-    _fake_av1,
-    _q5_video,
-    test_heavy_video_becomes_av1_and_ref_follows,
-    test_light_non_av1_video_is_recoded_only_with_the_checkbox,
-    test_light_av1_video_is_left_alone,
-    test_heavy_av1_video_is_recoded_anyway,
-    test_video_that_got_heavier_stays_as_it_was,
-    test_images_and_audio_are_not_video,
-    test_video_ffmpeg_line_is_the_one_from_the_process_tab,
-    test_video_report_and_helpers,
-    test_video_is_reported,
-    test_profile_name_is_sanitised,
-)
+def test_slash_answer_counts_as_an_exact_match(tmp_path):
+    """Совпала часть — значит, совпало точно: постер и написание тут уместны."""
+    kokoro = dict(UENO, id=11887, malId=11887, russian="Связь сердец",
+                  name="Kokoro Connect", english="Kokoro Connect",
+                  synonyms=["Kokoroco"])
+    content = _pack(_q5(100, answer="Kokoro Connect/Связь сердец"))
+    result = _run(tmp_path, content,
+                  UpgradeSettings(strip_specials=False, add_poster=False),
+                  api=FakeApi([kokoro]))
+    assert result.exact_titles == 1
+    assert "Kokoroco" in _answers(result)

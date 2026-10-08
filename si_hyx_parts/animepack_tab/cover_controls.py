@@ -73,8 +73,7 @@ def build_controls(tab):
     tab.sp_cover_percent.setRange(1, 100)
     tab.sp_cover_percent.setSuffix(" % аудиовопросов")
     tab.sp_cover_percent.setValue(25)
-    inner.addWidget(tab._lab("Доля каверов"), 0, 0)
-    inner.addWidget(tab.sp_cover_percent, 0, 1, 1, 3)
+    tab.sp_cover_percent.hide()
 
     tab.chk_cover_similarity = _api.QCheckBox(
         "Фильтровать по проценту схожести")
@@ -87,7 +86,10 @@ def build_controls(tab):
     tab.cover_similarity_range = DifficultyRange(0, 100, suffix=" %")
     tab.sp_cover_amq_from = tab.cover_similarity_range.low_control
     tab.sp_cover_amq_to = tab.cover_similarity_range.high_control
-    tab.cover_similarity_range.setMinimumWidth(240)
+    # 200, а не 240: рамка стоит в колонке рядом с подписью, и с отступом
+    # коробки 240 px делали «Каверы» шире самой широкой коробки «Состава пака»
+    # (349 px) — настройки сжимались из трёх колонок в две.
+    tab.cover_similarity_range.setMinimumWidth(200)
     tab.cover_similarity_range.setToolTip(LEVEL_TIP)
     tab.lbl_cover_similarity = tab._lab("Допустимая схожесть")
     inner.addWidget(tab.lbl_cover_similarity, 2, 0)

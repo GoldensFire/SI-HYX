@@ -1,4 +1,4 @@
-"""Russian captions with an English fallback from the selected video."""
+"""Caption policy and timed tracks belonging to the selected video."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -10,6 +10,8 @@ from .episode_caption_text import cropped, parse, russian
 from .episode_media import number, video_track
 from .episode_sources import choose_start, hard_subbed
 from .episode_subtitles import srt, TRANSLATION_SCHEMA
+from .episode_caption_policy import mode, dialogue_window
+from .generation_diagnostics import measuring
 
 
 def language(row):
@@ -18,16 +20,21 @@ def language(row):
         return "ru"
     if re.search(r"\b(en|eng|english)\b", value, re.I):
         return "en"
-    return "other"
+    declared = str(row.get("srclang") or row.get("language") or "").casefold().split("-")[0]
+    return declared if declared in ("ar", "ja", "zh", "fr", "de", "es", "pt") else "und"
 
 
 def wanted(generator, stream):
-    return bool(generator.s.episode_ru_subtitles or stream.get("ru_subtitles"))
+    return mode(generator.s) != "none"
 
 
 def allowed(generator, stream):
-    return (not wanted(generator, stream) or not hard_subbed(stream)
-            or hard_language(stream) in ("ru", "en"))
+    if not hard_subbed(stream):
+        return True
+    lang, requested = hard_language(stream), mode(generator.s)
+    if requested == "none":
+        return lang != "ru"
+    return lang == "ru" if requested == "required" else lang in ("ru", "en", "und")
 
 
 def hard_language(stream):
@@ -36,8 +43,7 @@ def hard_language(stream):
     explicit = stream.get("subtitle_language") or stream.get("subtitleLanguage")
     if explicit:
         return language({"language": explicit})
-    # Kuhi's unlabelled sub releases come from English subtitle providers.
-    return "en" if stream.get("audio") == "sub" else "other"
+    return "und"
 
 
 def load(generator, stream, scope):
@@ -49,13 +55,19 @@ def load(generator, stream, scope):
             break
         try:
             selected = {**stream, "subtitles": [track]}
-            files = client.captions(selected, scope)
+            with measuring(generator, "загрузка субтитров"):
+                files = client.captions(selected, scope)
             for data, name in files:
                 lang = language(track)
-                if lang == "other" and stream.get("ru_subtitles"):
+                if lang == "und" and stream.get("ru_subtitles"):
                     lang = "ru"
                 rows = parse(data, name, ru=lang == "ru")
                 if rows:
+                    text = " ".join(row[2] for row in rows)
+                    if russian(text):
+                        lang = "ru"
+                    elif len(re.findall(r"[\u0600-\u06ff]", text)) > len(re.findall("[a-zA-Z]", text)):
+                        lang = "ar"
                     return rows, lang
         except Exception as error:
             from .episode_generation import error_text
@@ -64,16 +76,19 @@ def load(generator, stream, scope):
 
 
 def translate(generator, rows):
+    if getattr(rows, "ass_russian", False):
+        return rows
     original = [text for _, _, text in rows]
     if all(russian(text) for text in original):
         return rows
-    if generator.gemini is None:
+    client = getattr(generator, "gemini_episode", None) or generator.gemini
+    if client is None:
         return []
     prompt = ("Переведи реплики субтитров аниме на естественный русский, точно сохраняя "
               "смысл, имена, порядок и число реплик. Не сокращай, не добавляй пояснений. "
               "Каждой исходной реплике соответствует ровно одна строка lines.\n"
               + api.json.dumps(original, ensure_ascii=False))
-    result = generator.gemini.generate_json(prompt, TRANSLATION_SCHEMA)
+    result = client.generate_json(prompt, TRANSLATION_SCHEMA)
     shown = result.get("lines") if isinstance(result, dict) else None
     if (not isinstance(shown, list) or len(shown) != len(rows)
             or not all(isinstance(text, str) and russian(text) for text in shown)):
@@ -92,6 +107,11 @@ def prepare(generator, stream, info, scope):
         if wanted(generator, stream) and start is not None:
             stream["_caption_output_language"] = hard_language(stream)
         return (start, []) if start is not None else None
+    if (mode(generator.s) == "preferred" and not stream.get("subtitles")
+            and stream.get("audio") == "sub"):
+        # Unknown hardsub can only be accepted after inspecting the encoded video.
+        start = choose_start(duration, stream, generator.rng)
+        return (start, []) if start is not None else None
     rows, lang = load(generator, stream, scope)
     if not rows:
         generator._log_rare("Субтитры отрывка", "Нет синхронной дорожки субтитров у выбранного видео")
@@ -101,15 +121,17 @@ def prepare(generator, stream, info, scope):
         if start is None or generator.stopped() or time.monotonic() >= scope.deadline:
             return None
         clip = cropped(rows, start)
-        if clip and sum(right - left for left, right, _ in clip) >= 1:
+        if dialogue_window(clip):
             try:
-                shown = translate(generator, clip)
+                with measuring(generator, "перевод субтитров моделью"):
+                    shown = translate(generator, clip)
             except Exception as error:  # noqa: BLE001 — оставляем EN резерв
                 from .episode_generation import error_text
                 generator._log_rare("Перевод субтитров отрывка", error_text(error))
                 shown = []
             output_language = "ru"
-            if not shown and lang == "en" and not generator.stopped():
+            if (not shown and lang == "en" and mode(generator.s) == "preferred"
+                    and not generator.stopped()):
                 shown, output_language = clip, "en"
             if not shown:
                 return None
@@ -125,6 +147,10 @@ def prepare(generator, stream, info, scope):
 def write(final, rows):
     if not rows:
         return None
+    if getattr(rows, "ass_document", "") and getattr(rows, "ass_russian", False):
+        path = Path(final).with_suffix(".ass")
+        path.write_text(rows.ass_document, encoding="utf-8")
+        return path
     path = Path(final).with_suffix(".srt")
     path.write_text(srt(rows), encoding="utf-8")
     return path

@@ -162,7 +162,9 @@ def test_average_counts_candidates_still_downloading(tmp_path):
         return SimpleNamespace(kind=ap.FRAME_KIND, level=level)
 
     hard = cand(6)
+    # Без загрузок «в полёте» шестёрка — допустимый разброс вокруг четвёрки.
     assert gen._level_fits(hard, levels, ap.FRAME_KIND) is True
+    assert gen._level_fits(cand(4), levels, ap.FRAME_KIND) is True
     flying = [cand(7), cand(7), cand(7)]
     assert gen._level_fits(hard, levels, ap.FRAME_KIND, flying) is False
     assert gen._level_fits(cand(2), levels, ap.FRAME_KIND, flying) is True

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 import threading
 import time
@@ -21,6 +21,7 @@ class GenerationDiagnostics:
         self.started = 0
         self.downloads = Counter()
         self.download_bytes = Counter()
+        self.current = Counter()
 
     def transfer(self, size=None):
         stage = getattr(self.local, "stage", "прочее")
@@ -34,10 +35,26 @@ class GenerationDiagnostics:
     def stage(self, name):
         previous = getattr(self.local, "stage", "прочее")
         self.local.stage = name
+        self._move_active(previous, name)
         try:
             yield
         finally:
             self.local.stage = previous
+            self._move_active(name, previous)
+
+    def _move_active(self, old, new):
+        """Innermost stage of every thread, for the live progress label."""
+        with self.lock:
+            if old != "прочее":
+                self.current[old] -= 1
+                if self.current[old] <= 0:
+                    del self.current[old]
+            if new != "прочее":
+                self.current[new] += 1
+
+    def active_stages(self):
+        with self.lock:
+            return self.current.most_common()
 
     @contextmanager
     def measure(self, operation):
@@ -148,12 +165,26 @@ def operation(name):
     return decorate
 
 
+def measuring(generator, name):
+    """Замер вложенной операции генератора; без трекера — пустой контекст."""
+    tracker = getattr(generator, "_diagnostics", None)
+    return tracker.measure(name) if tracker is not None else nullcontext()
+
+
 def process_label(args, kwargs):
     command = args[0] if args else kwargs.get("cmd", [])
-    if any(str(value).startswith(("http://", "https://")) for value in command):
-        return "обработка с чтением из сети"
     executable = str(command[0]).casefold() if command else ""
-    return "анализ медиа" if "ffprobe" in executable else "кодирование"
+    network = any(str(value).startswith(("http://", "https://")) for value in command)
+    # ffprobe источника и кодирование с чтением из сети — разные узкие места.
+    if "ffprobe" in executable:
+        return "ffprobe по сети" if network else "анализ медиа"
+    # Копия куска без перекодирования — это сеть, а не кодировщик: под старой
+    # подписью она выглядела как AV1, ждущий сеть.
+    copied = any(flag in ("-c", "-codec") and value == "copy"
+                 for flag, value in zip(command, command[1:]))
+    if network and copied:
+        return "копия отрезка из сети"
+    return "кодирование с чтением из сети" if network else "кодирование"
 
 
 @contextmanager

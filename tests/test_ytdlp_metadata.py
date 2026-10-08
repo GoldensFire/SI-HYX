@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 import workers
+from si_hyx_parts.workers.download_network import network_hint
 from si_hyx_parts.workers.download_process import stop_process
 
 
@@ -45,7 +46,7 @@ def test_repeated_reset_preserves_the_cause_and_zapret_hint(metadata, monkeypatc
     assert not metadata.successes
     assert "10054" in metadata.errors[0]
     assert "zapret-discord-youtube" in metadata.errors[0]
-    assert "googlevideo.com" in metadata.errors[0]
+    assert network_hint() in metadata.errors[0]
 
 
 def test_timeout_kills_and_drains_process_before_retry(metadata, monkeypatch):

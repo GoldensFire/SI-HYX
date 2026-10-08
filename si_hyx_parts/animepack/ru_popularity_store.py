@@ -9,6 +9,11 @@ from .ru_popularity_math import (KINDS, SNAPSHOT_GROUP, OBSERVATION_GROUP,
 from si_hyx_parts.animepack_api.ru_title_matching import (
     match_title, normalized, title_names)
 
+# При обходе всего каталога (prefetch … flush) наблюдения пишутся пачками:
+# по одной каждая запись в SQLite — своя транзакция с fsync, и план книг
+# переписывал устаревшие (их срок — шесть часов) больше четырёх минут.
+SAVE_BATCH = 2000
+
 
 class RuPopularityStore:
     def __init__(self, cache, clients, config=None, clock=time.time, *, persist=True):
@@ -17,8 +22,20 @@ class RuPopularityStore:
         self.clock = clock
         self.persist = persist
         self.snapshots = cache.memo_group(SNAPSHOT_GROUP)
+        from .ru_snapshot_repair import repair_snapshot
+        for source in ("remanga", "mangalib"):
+            row = self.snapshots.get(source)
+            repaired = repair_snapshot(row, source, self.config, self.clock)
+            if repaired is not row:
+                self.snapshots[source] = repaired
+                if persist:
+                    cache.remember_memo(SNAPSHOT_GROUP, source, repaired)
         self._disabled = set()
         self._observations = {}
+        # Предзагруженные строки базы (prefetch): None — наблюдения нет.
+        self._stored = {}
+        self._unsaved = {}
+        self._bulk = False
         self._title_indexes = {}
         self._validated_snapshots = {}
         self._lock = threading.Lock()
@@ -30,12 +47,12 @@ class RuPopularityStore:
         metric = getattr(self.clients.get(source), "metric", None)
         if metric and row.get("metric") != metric:
             return {}
-        timestamp = number(row.get("timestamp"))
+        timestamp = number(row.get("catalog_timestamp", row.get("timestamp")))
         if (not row.get("complete") or row.get("version") != 1
                 or timestamp is None
                 or self.clock() - timestamp > self.config.snapshot_ttl):
             return {}
-        key = (source, timestamp)
+        key = (source, row.get("timestamp"))
         if key not in self._validated_snapshots:
             groups = ("readership", "book_index") if source == "shikimori" else ("distributions",)
             valid = True
@@ -72,12 +89,51 @@ class RuPopularityStore:
             rows.extend(cached[1].get(normalized(name), []))
         return rows
 
+    def prefetch(self, cards):
+        """Сохранённые наблюдения многих карточек — одним проходом по базе.
+
+        План книг оценивает весь каталог, и запрос к SQLite на каждую пару
+        «источник, карточка» (127 тысяч) стоил больше, чем сама оценка."""
+        many = getattr(self.cache, "memo_many", None)
+        if many is None:
+            return
+        keys = [source + ":" + str(card.get("id") or "") for card in cards
+                if card.get("kind") in KINDS for source in self.clients]
+        with self._lock:
+            keys = [k for k in keys if k not in self._observations and k not in self._stored]
+        found = many(OBSERVATION_GROUP, keys)
+        with self._lock:
+            self._bulk = True
+            for key in keys:
+                self._stored.setdefault(key, found.get(key))
+
+    def flush(self):
+        """Конец обхода: записать накопленное, дальше писать сразу."""
+        with self._lock:
+            self._save()
+            self._bulk = False
+            self._stored.clear()
+
+    def _save(self):
+        values, self._unsaved = self._unsaved, {}
+        if not values:
+            return
+        many = getattr(self.cache, "remember_memo_many", None)
+        if many is not None:
+            many(OBSERVATION_GROUP, values)
+            return
+        for key, record in values.items():
+            self.cache.remember_memo(OBSERVATION_GROUP, key, record)
+
     def observe(self, source, card, network=True):
         ident = str(card.get("id") or "")
         key = source + ":" + ident
         if key in self._observations:
             return self._observations[key]
-        previous = self.cache.memo(OBSERVATION_GROUP, key) or {}
+        if key in self._stored:
+            previous = self._stored.pop(key) or {}
+        else:
+            previous = self.cache.memo(OBSERVATION_GROUP, key) or {}
         if not isinstance(previous, dict):
             previous = {}
         snapshot = self._snapshot(source)
@@ -128,7 +184,11 @@ class RuPopularityStore:
             record.pop("last_normal", None)
         if historical.get("type") and historical["type"] != record["type"]:
             record.pop("last_normal", None)
-        if self.persist:
+        if self.persist and self._bulk:
+            self._unsaved[key] = record
+            if len(self._unsaved) >= SAVE_BATCH:
+                self._save()
+        elif self.persist:
             self.cache.remember_memo(OBSERVATION_GROUP, key, record)
         self._observations[key] = record
         return record

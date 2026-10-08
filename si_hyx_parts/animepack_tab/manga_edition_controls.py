@@ -13,9 +13,10 @@ def build(tab):
     tab.manga_edition_bar.setToolTip(
         "Доли среди вопросов по комиксам. Перетаскивайте границы: сумма "
         "всегда 100%. Нулевая доля исключает этот тип. Ваншоты и додзинси "
-        "относятся к доле манги. Если кандидатов не хватит, ненулевые доли "
-        "могут перераспределиться между включёнными типами.")
+        "относятся к доле манги. При выключенном строгом режиме и нехватке "
+        "кандидатов доли могут перераспределиться между включёнными типами.")
     tab.manga_edition_bar.changed.connect(tab._recount)
+    tab._manga_strict_targets = False
     saver = getattr(getattr(tab, "main", None), "_save_settings_soon", None)
     if saver:
         tab.manga_edition_bar.changed.connect(saver)
@@ -25,12 +26,14 @@ def collect(tab, settings):
     values = tab.manga_edition_bar.values()
     settings.manga_pct_manhwa = values["manhwa"]
     settings.manga_pct_manhua = values["manhua"]
+    settings.manga_strict_targets = tab._manga_strict_targets
     settings.manga_kinds.update({k: values[k] > 0 for k in KEYS})
     if not values["manga"]:
         settings.manga_kinds.update(one_shot=False, doujin=False)
 
 
 def apply_controls(tab, settings):
+    tab._manga_strict_targets = bool(settings.manga_strict_targets)
     values = shares(settings)
     tab.manga_edition_bar.set_values(values if any(values.values())
                                      else dict.fromkeys(KEYS, 1))

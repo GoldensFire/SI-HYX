@@ -407,8 +407,7 @@ def test_a_book_reserves_the_franchise_of_its_anime():
     аниме-экранизации оно есть. Без этого «Покемон XY: Хупа и столкновение
     веков» (манга) и «Покемон: Хроники приключений» (аниме) спокойно попадали
     в один пак (просьба пользователя)."""
-    from si_hyx_parts.animepack.anime_pack_generator__iter_picture_candidates \
-        import _franchise_marks
+    from si_hyx_parts.animepack.generator_catalog import _franchise_marks
 
     book = {"id": 1, "malId": 1, "franchise": "",
             "russian": "Покемон XY: Хупа и столкновение веков"}
@@ -424,8 +423,7 @@ def test_a_book_reserves_the_franchise_of_its_anime():
 
 def test_an_anime_from_the_same_series_is_then_refused(monkeypatch):
     """Ключ экранизации и правда закрывает серию для потока аниме."""
-    from si_hyx_parts.animepack.anime_pack_generator__iter_picture_candidates \
-        import _franchise_marks
+    from si_hyx_parts.animepack.generator_catalog import _franchise_marks
 
     book_marks = _franchise_marks(
         {"id": 1, "malId": 1, "franchise": "",

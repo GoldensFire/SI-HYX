@@ -46,7 +46,7 @@ def selected_hls(variant, base):
     return "\n".join(["#EXTM3U", *audio, variant["tag"], variant["url"], ""])
 
 
-def dash_variant(text, base):
+def dash_variant(text, base, min_height=MIN_HEIGHT):
     root = ET.fromstring(text)
     ns = "{urn:mpeg:dash:schema:mpd:2011}"
     heights = []
@@ -58,7 +58,7 @@ def dash_variant(text, base):
     if not heights:
         return None
     height, bandwidth, ident = max(heights)
-    if height < MIN_HEIGHT:
+    if height < min_height:
         return {"height": height, "bandwidth": bandwidth}
     chosen = deepcopy(root)
     for adaptation in list(chosen.iter(ns + "AdaptationSet")):
@@ -90,7 +90,7 @@ async def variants(stream):
     response = await get(stream["url"], headers=request_headers(stream))
     base = str(response.url)
     if stream["type"] == "dash":
-        selected = dash_variant(response.text, base)
+        selected = dash_variant(response.text, base, stream.get("min_height") or MIN_HEIGHT)
         if selected is None:
             return [dict(stream)]
         return [{**stream, "manifest_height": selected["height"],
@@ -101,4 +101,4 @@ async def variants(stream):
     return [{**stream, "url": row["url"] if not row["audio_group"] else base,
              "manifest": selected_hls(row, base) if row["audio_group"] else None,
              "manifest_height": row["height"], "bandwidth": row["bandwidth"]}
-            for row in rows if not row["height"] or row["height"] >= MIN_HEIGHT]
+            for row in rows if not row["height"] or row["height"] >= (stream.get("min_height") or MIN_HEIGHT)]

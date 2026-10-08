@@ -2,13 +2,13 @@
 import asyncio
 import importlib
 import time
+import logging
 
 from si_hyx_parts.kuhi._media import build_ctx
+from .provider_health import HEALTH, network_failure
+from .provider_policy import ACTIVE_NATIVE, enabled
 
-RANKING = [
-    "anineko", "anizone", "anikoto", "reanime", "aniwaves",
-    "kaa", "anibd", "animegg", "mkissa", "animeonsen",
-]
+RANKING = list(ACTIVE_NATIVE)
 
 WATCH_TIMEOUT = 75.0
 EPISODES_TIMEOUT = 60.0
@@ -25,13 +25,15 @@ def _load(name):
     try:
         return importlib.import_module(f"si_hyx_parts.kuhi.{name}")
     except Exception as e:
-        print(f"[RACE] provider {name} unavailable: {e}")
+        logging.getLogger(__name__).warning("[RACE] provider %s unavailable: %s", name, e)
         return None
 
 
 def providers():
     mods = []
     for name in RANKING:
+        if not enabled(name):
+            continue
         mod = _load(name)
         if mod is not None:
             mods.append((name, mod))
@@ -49,9 +51,8 @@ def record_latency(name: str, seconds: float, ok: bool, kind: str = "watch"):
 
 
 def default_provider():
-    if not _latency:
-        return RANKING[0]
-    return sorted(_latency.items(), key=lambda kv: kv[1])[0][0]
+    ready = [(name, latency) for name, latency in _latency.items() if name in RANKING and enabled(name)]
+    return min(ready, key=lambda row: row[1])[0] if ready else RANKING[0]
 
 
 def latency_table() -> dict:
@@ -62,15 +63,22 @@ def latency_table() -> dict:
 
 
 async def _watch_one(mod, name, anilist_id, ep, audio, ctx):
+    if not enabled(name, ctx):
+        return name, None, 0.0, False
+    if HEALTH.paused(name, "media"):
+        return name, None, 0.0, False
     key = (name, anilist_id, ep, audio)
     hit = _watch_cache.get(key)
     if hit and hit[0] > time.time():
         return name, hit[1], 0.0, True
+    if not HEALTH.allow(name, "watch"):
+        return name, None, 0.0, False
     t0 = time.time()
     try:
         streams = await asyncio.wait_for(mod.watch(anilist_id, audio, ep, ctx), WATCH_TIMEOUT)
         dt = round(time.time() - t0, 3)
         if streams:
+            HEALTH.result(name, "watch", ok=True)
             if len(_watch_cache) >= WATCH_CACHE_LIMIT:
                 now = time.time()
                 for old in [k for k, value in _watch_cache.items() if value[0] <= now]:
@@ -79,8 +87,14 @@ async def _watch_one(mod, name, anilist_id, ep, audio, ctx):
                     _watch_cache.pop(next(iter(_watch_cache)))
             _watch_cache[key] = (time.time() + WATCH_CACHE_TTL, streams)
             return name, streams, dt, True
+        HEALTH.result(name, "watch")
         return name, None, dt, False
+    except asyncio.CancelledError:
+        HEALTH.cancelled(name, "watch")
+        raise
     except Exception as e:
+        if HEALTH.result(name, "watch", error=e):
+            logging.getLogger(__name__).warning("[RACE] %s watch: network failures, paused for 120 seconds", name)
         return name, None, round(time.time() - t0, 3), False
 
 
@@ -144,15 +158,29 @@ async def race_watch(anilist_id: int, ep: int, audio: str = "sub",
 
 
 async def _episodes_one(mod, name, anilist_id, ctx):
+    if not enabled(name, ctx):
+        return name, None
+    if not HEALTH.allow(name, "episodes"):
+        return name, None
     t0 = time.time()
     try:
         data = await asyncio.wait_for(mod.get_episodes(anilist_id, ctx), EPISODES_TIMEOUT)
         eps = (data.get("episodes") or {})
         count = sum(len(v) for v in eps.values() if isinstance(v, list))
+        HEALTH.result(name, "episodes", ok=count > 0)
         record_latency(name, time.time() - t0, count > 0, kind="episodes")
         return name, data if count > 0 else None
+    except asyncio.CancelledError:
+        HEALTH.cancelled(name, "episodes")
+        raise
     except Exception as e:
-        print(f"[RACE] {name} episodes failed: {type(e).__name__}: {str(e)[:120]}")
+        paused = HEALTH.result(name, "episodes", error=e)
+        if paused:
+            logging.getLogger(__name__).warning("[RACE] %s episodes: network failures, paused for 120 seconds", name)
+        counts = HEALTH.snapshot().get((name, "episodes"), {})
+        if paused or counts.get("network", 0) + counts.get("missing", 0) <= 3:
+            level = logging.WARNING if network_failure(e) else logging.INFO
+            logging.getLogger(__name__).log(level, "[RACE] %s episodes failed: %s: %s", name, type(e).__name__, str(e)[:120])
         record_latency(name, time.time() - t0, False, kind="episodes")
         return name, None
 

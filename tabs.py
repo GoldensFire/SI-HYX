@@ -50,6 +50,8 @@ from widgets import (
 )
 from workers import (InfoWorker, ProcessWorker, YtdlpWorker)
 
-from si_hyx_parts.tabs.ytdlp_tab import YtdlpTab, MediaTab, Base64Tab
+from si_hyx_parts.tabs.ytdlp_tab import YtdlpTab
+from si_hyx_parts.tabs.media_tab import MediaTab
+from si_hyx_parts.tabs.base64_tab import Base64Tab
 
 from si_hyx_parts.tabs.prompt_tab import PromptTab

@@ -51,8 +51,11 @@ def _is_clip(card) -> bool:
     return str((card or {}).get("kind") or "").strip().lower() in CLIP_KINDS
 
 
-def _first_season_card(self, anime: dict) -> dict:
-    """Карточка ПЕРВОЙ части франшизы (или та же самая, если она и есть первая).
+class PixivArtMixin:
+    """Генератор: арт Pixiv — первый сезон тайтла, поиск и загрузка."""
+
+    def _first_season_card(self, anime: dict) -> dict:
+        """Карточка ПЕРВОЙ части франшизы (или та же самая, если она и есть первая).
 
     Нужна поиску артов на Pixiv. Теги там висят на названии оригинала:
     рисунок по «Магической битве 2» подписан 呪術廻戦, а не 呪術廻戦2, и по
@@ -66,55 +69,117 @@ def _first_season_card(self, anime: dict) -> dict:
     самый ранний год, а при равных годах — самую популярную часть (части
     приходят по убыванию популярности). Полную карточку (с японским и
     английским названием) достаём через общий кэш карточек аниме."""
-    anime = anime or {}
-    key = str(anime.get("franchise") or "").strip()
-    if not key:
-        return anime
-    known = self._first_season.get(key)
-    if known is not None:
-        return known or anime
-    self._first_season[key] = {}          # больше одного раза не спрашиваем
-    best, best_year = None, None
-    for row in (self.db_cache.franchise(key) or []):
-        if not isinstance(row, dict):
-            continue
-        # Ролики и заставки — не тайтлы: самой ранней частью франшизы обычно
-        # оказывается именно PV, и ответом вопроса становилось «Подземелье
-        # вкусностей PV (2017)» (просьба пользователя). У старых кэшей поля
-        # kind нет вовсе — там отсеет уже проверка полной карточки ниже.
-        if "kind" in row and _is_clip(row):
-            continue
-        if _api.is_announced(row):          # анонс — не тайтл для ответа
-            continue
+        anime = anime or {}
+        key = str(anime.get("franchise") or "").strip()
+        if not key:
+            return anime
+        known = self._first_season.get(key)
+        if known is not None:
+            return known or anime
+        self._first_season[key] = {}          # больше одного раза не спрашиваем
+        best, best_year = None, None
+        for row in (self.db_cache.franchise(key) or []):
+            if not isinstance(row, dict):
+                continue
+            # Ролики и заставки — не тайтлы: самой ранней частью франшизы обычно
+            # оказывается именно PV, и ответом вопроса становилось «Подземелье
+            # вкусностей PV (2017)» (просьба пользователя). У старых кэшей поля
+            # kind нет вовсе — там отсеет уже проверка полной карточки ниже.
+            if "kind" in row and _is_clip(row):
+                continue
+            if _api.is_announced(row):          # анонс — не тайтл для ответа
+                continue
+            try:
+                year = int((row.get("airedOn") or {}).get("year") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not year:
+                continue
+            if best_year is None or year < best_year:
+                best, best_year = row, year
+        if not best:
+            return anime
         try:
-            year = int((row.get("airedOn") or {}).get("year") or 0)
+            mal = int(best.get("malId") or best.get("id") or 0)
         except (TypeError, ValueError):
-            continue
-        if not year:
-            continue
-        if best_year is None or year < best_year:
-            best, best_year = row, year
-    if not best:
-        return anime
-    try:
-        mal = int(best.get("malId") or best.get("id") or 0)
-    except (TypeError, ValueError):
-        mal = 0
-    try:
-        own = int(anime.get("malId") or anime.get("id") or 0)
-    except (TypeError, ValueError):
-        own = 0
-    if not mal or mal == own:
-        return anime
-    try:
-        cards = self._animes_by_ids([mal])
-    except _api.AnimePackApiError:
-        return anime
-    card = cards[0] if cards else {}
-    if not isinstance(card, dict) or not card or _is_clip(card):
-        return anime
-    self._first_season[key] = card
-    return card
+            mal = 0
+        try:
+            own = int(anime.get("malId") or anime.get("id") or 0)
+        except (TypeError, ValueError):
+            own = 0
+        if not mal or mal == own:
+            return anime
+        try:
+            cards = self._animes_by_ids([mal])
+        except _api.AnimePackApiError:
+            return anime
+        card = cards[0] if cards else {}
+        if not isinstance(card, dict) or not card or _is_clip(card):
+            return anime
+        self._first_season[key] = card
+        return card
+
+    def download_pixiv_art(self, cand):
+        if self.stopped():
+            return False
+        if _api.PIXIV_ART_KIND in self._dead_kinds or self.pixiv is None:
+            cand.rejected = True
+            self._drop_kind(_api.PIXIV_ART_KIND)
+            return False
+        searched = cand.title_ru
+        try:
+            # Ищем по первому сезону франшизы, а своё название тайтла
+            # оставляем запасным: на Pixiv тег обычно у оригинала.
+            first = self._first_season_card(cand.anime)
+            also = () if first is cand.anime else (cand.anime,)
+            searched = _searched_title(first, cand)
+            for _ in range(VISUAL_TRIES):
+                data, ext, url, matched, art_link, illust = _pick_art(
+                    self, first, also)
+                if self.stopped():
+                    return False
+                # Ответом становится тот тайтл, по ТЕГУ которого арт и нашёлся:
+                # рисунок по «Магической битве 2» подписан названием первого
+                # сезона, и спрашивать по нему второй сезон было неправильно —
+                # ответ не сходился с картинкой (просьба пользователя). Имена
+                # файлов считаем заново, до сохранения: иначе они остались бы от
+                # прежнего названия.
+                if (isinstance(matched, dict) and matched
+                        and matched is not cand.anime):
+                    cand.anime = matched
+                    cand.media_base = self._media_base(cand)
+                cand.art_link = art_link
+                from .early_repeat import reserve
+                if not reserve(self, cand):
+                    return False
+                verdict = _visual_ok(self, cand, data, ext, illust)
+                if verdict is None:
+                    return False
+                if verdict:
+                    break
+            else:
+                return False
+            name = self._save_image(data, f"{cand.file_base}_pixiv_art", ext)
+            if not name:
+                return False
+            cand.frame_url = url
+            cand.frame_name = name
+            cand.art_link = art_link
+            cand.has_frame = True
+            self.log(f"Pixiv-арт «{cand.title_ru}»: добавлен.")
+            return True
+        except PixivArtUnavailable as exc:
+            self.log(str(exc))
+            self._drop_kind(_api.PIXIV_ART_KIND)
+            cand.rejected = True
+            return False
+        except (PixivArtError, OSError) as exc:
+            from pixiv_auth import PixivNetworkError
+            if isinstance(exc, PixivNetworkError):
+                from .media_transfer import trouble_mark
+                trouble_mark()
+            self._log_rare("Pixiv-арты", f"Pixiv-арт «{searched}»: {exc}")
+            return False
 
 
 def _searched_title(first: dict, cand) -> str:
@@ -183,6 +248,9 @@ def _visual_ok(self, cand, data, ext, illust):
         approved, reason = check(self, cand, data, ext, illust)
     except Exception as exc:  # noqa: BLE001 — типы gemini_api
         name = type(exc).__name__
+        if name == "GeminiCoolingError":
+            from .media_transfer import trouble_mark
+            trouble_mark()      # модель на паузе — тайтл повторится позже
         # GeminiDownError — сервер подряд не отвечает (visual_batch): ждать
         # его на каждом арте значит держать рабочие потоки минутами.
         if name in ("GeminiAuthError", "GeminiQuotaError", "GeminiDownError"):
@@ -203,62 +271,3 @@ def _visual_ok(self, cand, data, ext, illust):
             f"({reason or 'название или персонажи другого аниме'}), "
             f"берётся другой арт того же тайтла")
     return approved
-
-
-def download_pixiv_art(self, cand):
-    if self.stopped():
-        return False
-    if _api.PIXIV_ART_KIND in self._dead_kinds or self.pixiv is None:
-        cand.rejected = True
-        self._drop_kind(_api.PIXIV_ART_KIND)
-        return False
-    searched = cand.title_ru
-    try:
-        # Ищем по первому сезону франшизы, а своё название тайтла
-        # оставляем запасным: на Pixiv тег обычно у оригинала.
-        first = self._first_season_card(cand.anime)
-        also = () if first is cand.anime else (cand.anime,)
-        searched = _searched_title(first, cand)
-        for _ in range(VISUAL_TRIES):
-            data, ext, url, matched, art_link, illust = _pick_art(
-                self, first, also)
-            if self.stopped():
-                return False
-            # Ответом становится тот тайтл, по ТЕГУ которого арт и нашёлся:
-            # рисунок по «Магической битве 2» подписан названием первого
-            # сезона, и спрашивать по нему второй сезон было неправильно —
-            # ответ не сходился с картинкой (просьба пользователя). Имена
-            # файлов считаем заново, до сохранения: иначе они остались бы от
-            # прежнего названия.
-            if (isinstance(matched, dict) and matched
-                    and matched is not cand.anime):
-                cand.anime = matched
-                cand.media_base = self._media_base(cand)
-            cand.art_link = art_link
-            from .early_repeat import reserve
-            if not reserve(self, cand):
-                return False
-            verdict = _visual_ok(self, cand, data, ext, illust)
-            if verdict is None:
-                return False
-            if verdict:
-                break
-        else:
-            return False
-        name = self._save_image(data, f"{cand.file_base}_pixiv_art", ext)
-        if not name:
-            return False
-        cand.frame_url = url
-        cand.frame_name = name
-        cand.art_link = art_link
-        cand.has_frame = True
-        self.log(f"Pixiv-арт «{cand.title_ru}»: добавлен.")
-        return True
-    except PixivArtUnavailable as exc:
-        self.log(str(exc))
-        self._drop_kind(_api.PIXIV_ART_KIND)
-        cand.rejected = True
-        return False
-    except (PixivArtError, OSError) as exc:
-        self._log_rare("Pixiv-арты", f"Pixiv-арт «{searched}»: {exc}")
-        return False

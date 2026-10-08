@@ -46,10 +46,10 @@ from si_hyx_parts.edit_tab_workers.track_overlay_worker import TrackOverlayWorke
 
 from si_hyx_parts.edit_tab_workers.proxy_worker import ProxyWorker
 
-from si_hyx_parts.edit_tab_workers.audio_waveform_loader import (
+from si_hyx_parts.edit_tab_workers.waveform_loaders import (
     AudioWaveformLoader,
     AudioSegmentWaveformLoader,
-    SubtitleExtractor,
 )
+from si_hyx_parts.edit_tab_workers.subtitle_extractor import SubtitleExtractor
 
 from si_hyx_parts.edit_tab_workers.ass_extractor import AssExtractor, _SeekThumbnailer

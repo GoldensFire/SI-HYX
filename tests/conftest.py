@@ -112,6 +112,37 @@ def qapp():
     yield app
 
 
+@pytest.fixture(autouse=True)
+def drop_test_windows():
+    """Удаляет окна верхнего уровня, оставленные тестом.
+
+    Тесты вкладок не удаляли свои AnimePackTab (около тысячи виджетов каждый)
+    и их всплывающие окна без родителя: к середине полного прогона копились
+    десятки тысяч живых виджетов, и Qt падал нативно (access violation /
+    Aborted) в случайном следующем тесте. Синглтоны (класс хранит экземпляр
+    в `_instance`) остаются: их держат модули программы."""
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6 import sip
+
+    def present():
+        app = QApplication.instance()
+        return {sip.unwrapinstance(w) for w in app.topLevelWidgets()} if app else set()
+
+    before = present()
+    yield
+    app = QApplication.instance()
+    if app is None:
+        return
+    from PyQt6.QtCore import QEvent
+    for widget in app.topLevelWidgets():
+        if (sip.unwrapinstance(widget) in before
+                or getattr(type(widget), "_instance", None) is widget):
+            continue
+        widget.close()
+        widget.deleteLater()
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
+
+
 # ── Изоляция настроек приложения ─────────────────────────────────────────────
 @pytest.fixture(autouse=True)
 def isolate_settings(tmp_path, monkeypatch):

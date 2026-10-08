@@ -28,7 +28,15 @@ from config import (
     SETTINGS_FILE, TEMP_DIR, USER_AGENT, _requests, http_get
 )
 
-from si_hyx_parts.utils.getattr import __getattr__
+
+def __getattr__(name):
+    # requests подключается лениво (см. config._requests): на старте он никому не
+    # нужен, а стоил ~240 мс до появления окна. Хук оставляет привычным
+    # `utils.requests` — им пользуются тесты, подменяя requests.Session.
+    # Внутри самого utils зовите _requests(), а не глобальное имя.
+    if name == "requests":
+        return _requests()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ── Маскировка JS в HTML под VK ──────────────────────────────────────────────
@@ -61,7 +69,7 @@ _B64_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAA
 # 120 — с запасом ниже 184. Дробится и payload (data-si), и сам загрузчик (onload).
 _B64_CHUNK = 120
 
-from si_hyx_parts.utils.mask_html_js import mask_html_js
+from si_hyx_parts.utils.html_mask import mask_html_js
 
 
 # ── Лёгкая маскировка (доп-режим) ────────────────────────────────────────────
@@ -96,7 +104,7 @@ _LITE_HOIST_MIN = 512
 _LITE_ASSET_INNER_RX = re.compile(
     r'(?:data:[\w.+/;=-]*?base64,)?[A-Za-z0-9+/=]+')
 
-from si_hyx_parts.utils.lite_hoist_assets import _lite_hoist_assets
+from si_hyx_parts.utils.html_mask import _lite_hoist_assets
 
 
 # Loader lite: как в mask_html_js плюс тип элемента 'r' — сырой ассет, который
@@ -121,7 +129,7 @@ _LITE_LOADER = (
     r"else{var s=document.createElement('script');"
     r"s.textContent=D(v);document.body.appendChild(s);n();}}n();")
 
-from si_hyx_parts.utils.mask_html_js_lite import mask_html_js_lite, ensure_deno_on_path
+from si_hyx_parts.utils.html_mask import mask_html_js_lite, ensure_deno_on_path
 
 
 # Включаем Deno в PATH при старте — нужно для скачивания с YouTube
@@ -138,7 +146,9 @@ _RE_LUFS    = re.compile(r'\{[\s\S]*?\}')  # нежадный — не захв�
 
 _RE_DIGITS  = re.compile(r'(\d+)')
 
-from si_hyx_parts.utils.clean_ansi import clean_ansi
+
+def clean_ansi(text: str) -> str:
+    return _RE_ANSI.sub('', text)
 
 
 # ── Настройки: чтение и запись, переживающие любой сбой ──────────────────────
@@ -155,7 +165,7 @@ from si_hyx_parts.utils.clean_ansi import clean_ansi
 _SETTINGS_HISTORY = 5            # сколько снимков храним сверх .bak
 _SETTINGS_SNAPSHOT_INTERVAL = 600.0   # не чаще одного снимка в 10 минут
 
-from si_hyx_parts.utils.settings_history_paths import (
+from si_hyx_parts.utils.settings_store import (
     _settings_history_paths,
     _settings_candidates,
     _read_settings_file,
@@ -166,18 +176,16 @@ from si_hyx_parts.utils.settings_history_paths import (
     _snapshot_settings_history,
     save_settings,
     save_json_atomic,
-    human_size,
+)
+from si_hyx_parts.utils.media_info import human_size
+from si_hyx_parts.utils.web import (
     url_host,
     host_matches,
     parse_youtube_start_seconds,
     get_cookies_path,
 )
 
-from si_hyx_parts.utils.cookie_matches_domain import (
-    _cookie_matches_domain,
-    is_direct_cdn_video,
-    download_cdn_direct,
-)
+from si_hyx_parts.utils.web import _cookie_matches_domain, is_direct_cdn_video, download_cdn_direct
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -199,7 +207,7 @@ _KODIK_HOST_RE = re.compile(
     r'(?:https?:)?//[\w.-]*(?:kodik|aniqit|anivod|kodikplayer)[\w.-]*'
     r'/(?:seria|serial|video|episode)/[^\s"\'<>\\]+', re.I)
 
-from si_hyx_parts.utils.kodik_decode import (
+from si_hyx_parts.utils.kodik import (
     _kodik_decode,
     is_embed_candidate,
     _find_kodik_iframe,
@@ -218,17 +226,12 @@ from si_hyx_parts.utils.kodik_decode import (
     kodik_get_info,
 )
 
-from si_hyx_parts.utils.resolve_kodik import (
-    resolve_kodik,
-    parse_version,
-    default_download_dir,
-    clean_url,
-    check_ffmpeg,
-    pretty_audio_codec,
-    fmt_bitrate_with_codec,
-)
+from si_hyx_parts.utils.kodik import resolve_kodik
+from si_hyx_parts.utils.ffmpeg_tools import parse_version, check_ffmpeg
+from si_hyx_parts.utils.web import default_download_dir, clean_url
+from si_hyx_parts.utils.media_info import pretty_audio_codec, fmt_bitrate_with_codec
 
-from si_hyx_parts.utils.get_media_info import (
+from si_hyx_parts.utils.media_info import (
     get_media_info,
     csv_fields,
     csv_first,
@@ -245,24 +248,19 @@ _CODEC_LABELS = {
     'mpeg4': 'MPEG-4', 'mpeg2video': 'MPEG-2',
 }
 
-from si_hyx_parts.utils.codec_label import (
-    codec_label,
-    get_video_codec_label,
-    get_pix_fmt,
+from si_hyx_parts.utils.media_info import codec_label, get_video_codec_label, get_pix_fmt
+from si_hyx_parts.utils.ffmpeg_tools import (
     overlay_chroma_format,
     escape_filter_path,
     overlay_filter_graph,
     measure_loudness,
+)
+from si_hyx_parts.utils.desktop import (
     play_done_sound,
     rasterize_svg,
     open_image_any,
     load_pixmap_any,
 )
 
-from si_hyx_parts.utils.pil_to_qicon import (
-    pil_to_qicon,
-    reveal_in_explorer,
-    move_to_trash,
-    detect_ffmpeg_encoders,
-    require_svt,
-)
+from si_hyx_parts.utils.desktop import pil_to_qicon, reveal_in_explorer, move_to_trash
+from si_hyx_parts.utils.ffmpeg_tools import detect_ffmpeg_encoders, require_svt

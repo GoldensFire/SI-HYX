@@ -2,6 +2,7 @@
 from contextlib import nullcontext
 from types import SimpleNamespace
 import base64
+from urllib.parse import urlsplit
 import zipfile
 import xml.etree.ElementTree as ET
 import pytest
@@ -51,6 +52,7 @@ def test_package_contains_narration_file(tmp_path):
     (folder / "Audio" / cand.audio_out).write_bytes(b"ID3sample")
     gen = object.__new__(ap.AnimePackGenerator)
     gen.s, gen.folder = settings, str(folder)
+    gen._byte_budget = 150 * 1024 * 1024
     target = gen.write_package([cand], str(tmp_path / "audio.siq"))
     with zipfile.ZipFile(target) as package:
         assert package.read(f"Audio/{cand.audio_out}") == b"ID3sample"
@@ -169,7 +171,8 @@ def test_google_quota_switches_back_to_eleven():
     speech._google_headers = lambda: {}
     assert speech.synthesize("narration") == (b"ID3eleven", "mp3")
     assert speech.synthesize("narration") == (b"ID3eleven", "mp3")
-    assert sum("texttospeech.googleapis.com" in url for url in session.urls) == 1
+    assert sum(urlsplit(url).hostname == "texttospeech.googleapis.com"
+               for url in session.urls) == 1
 
 
 def test_google_failure_tries_gemini_before_eleven():
@@ -178,7 +181,7 @@ def test_google_failure_tries_gemini_before_eleven():
     class Session:
         def post(self, url, **kwargs):
             calls.append(url)
-            assert "generativelanguage.googleapis.com" in url
+            assert urlsplit(url).hostname == "generativelanguage.googleapis.com"
             return SimpleNamespace(status_code=200, json=lambda: {
                 "steps": [{"content": [{"type": "audio", "data":
                     base64.b64encode(b"RIFFtestWAVE").decode()}]}]})

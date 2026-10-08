@@ -57,7 +57,7 @@ class AniZipApi:
         try:
             data = self._mappings(mal)
         except Exception:  # noqa: BLE001 — вспомогательный источник
-            data = {}
+            return {}  # Обрыв не доказывает, что тайтл отсутствует.
         with self._lock:
             self._data_cache[mal] = dict(data)
         return dict(data)
@@ -141,7 +141,8 @@ class AniZipApi:
                 if url:
                     out.append(str(url))
         with self._lock:
-            self._cache[mal] = list(out)
+            if mal in self._data_cache:
+                self._cache[mal] = list(out)
         return out
 
 AniZipApi.__module__ = _api.__name__

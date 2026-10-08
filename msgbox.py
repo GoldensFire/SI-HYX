@@ -13,6 +13,24 @@ from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 
+class _CopyableBox(QMessageBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.copy_button = None
+        self._copy_requested = False
+        self.buttonClicked.connect(self._remember_click)
+
+    def _remember_click(self, button):
+        self._copy_requested = button is self.copy_button
+
+    def done(self, result):
+        if self._copy_requested:
+            self._copy_requested = False
+            QGuiApplication.clipboard().setText(self.text())
+            return
+        super().done(result)
+
+
 def _center_over_parent(box, parent):
     # Qt НЕ центрирует QDialog/QMessageBox над родителем сам по себе на Windows —
     # без этого диалог всплывал там, где ОС решит (по факту — в левом верхнем
@@ -38,27 +56,21 @@ def _center_over_parent(box, parent):
 
 
 def _selectable_box(icon, parent, title, text, buttons, default_button, copyable=False):
-    # copyable=True добавляет кнопку «Копировать» (текст ошибки — в буфер обмена,
-    # для багрепортов). У QMessageBox нет штатного способа оставить диалог
-    # открытым после клика по кнопке (закрывается ЛЮБАЯ, включая ActionRole) —
-    # поэтому копирование переоткрывает то же окно вместо закрытия.
-    while True:
-        box = QMessageBox(parent)
-        box.setIcon(icon)
-        box.setWindowTitle(title)
-        box.setText(text)
-        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        box.setStandardButtons(buttons)
-        if default_button is not None:
-            box.setDefaultButton(default_button)
-        copy_btn = box.addButton("Копировать", QMessageBox.ButtonRole.ActionRole) if copyable else None
-        _center_over_parent(box, parent)
-        box.exec()
-        clicked = box.clickedButton()
-        if copyable and clicked is copy_btn:
-            QGuiApplication.clipboard().setText(text)
-            continue
-        return box.standardButton(clicked) if clicked is not None else QMessageBox.StandardButton.NoButton
+    box = _CopyableBox(parent) if copyable else QMessageBox(parent)
+    box.setIcon(icon)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    box.setStandardButtons(buttons)
+    if default_button is not None:
+        box.setDefaultButton(default_button)
+    if copyable:
+        box.copy_button = box.addButton('Копировать', QMessageBox.ButtonRole.ActionRole)
+        box.copy_button.setAutoDefault(False)
+    _center_over_parent(box, parent)
+    box.exec()
+    clicked = box.clickedButton()
+    return box.standardButton(clicked) if clicked is not None else QMessageBox.StandardButton.NoButton
 
 
 def msgbox_critical(parent, title, text,

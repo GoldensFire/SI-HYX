@@ -24,12 +24,14 @@ class Sheet:
 
 def clean_lines(lines):
     """Site expanders and musical separators are not sung lyric lines."""
-    return [line.strip() for line in lines if any(char.isalnum() for char in line)]
+    placeholders = {"na", "notavailable", "lyricsnotavailable", "kanjinotavailable"}
+    return [line.strip() for line in lines if any(char.isalnum() for char in line)
+            and normalize(line) not in placeholders]
 
 
 def text_lines(node, *, short):
     node = html.fromstring(html.tostring(node))
-    for unwanted in node.xpath('.//script|.//style|.//button'):
+    for unwanted in node.xpath('.//script|.//style|.//button|.//rt|.//rp'):
         unwanted.drop_tree()
     for br in node.xpath('.//br|.//hr'):
         br.tail = "\n" + (br.tail or "")
@@ -55,31 +57,70 @@ def parse_html(payload):
 
 
 class LyricSites:
-    def __init__(self, http, log=lambda _: None):
+    def __init__(self, http, log=lambda _: None, *, audit=None):
         self.http, self.log = http, log
+        self.audit = audit
         self._blocked = set()
 
+    def _record(self, provider, status, title, artist, **details):
+        if self.audit:
+            name = provider.__name__
+            if name == "uta_net":
+                if status in ("sheet", "no_match"):
+                    return  # UtaNet records these with publication identity details.
+                name = "Uta-Net Global"
+            self.audit.record(name, status, title, artist, **details)
+
     def search(self, title, artist, *, duration, context=None):
-        # AnimeLyrics first. It may be unavailable behind its challenge page.
-        providers = (self.animelyrics, self.animesonglyrics)
+        return self.lookup(title, artist, duration=duration, context=context)[0]
+
+    def available(self, title, artist, *, duration, context=None):
+        """Original lyrics before the recording is downloaded: True/False, or
+        None when a provider failed and absence is not proven."""
+        sheet, uncertain = self.lookup(title, artist, duration=duration, context=context)
+        if sheet is not None and sheet.original:
+            return True
+        return None if uncertain else False
+
+    def lookup(self, title, artist, *, duration, context=None):
+        # Prefer reachable plain-text providers. AnimeLyrics challenges and
+        # failed CDN addresses must not delay every otherwise available song.
+        providers = (self.animesonglyrics, self.uta_net, self.animelyrics)
         partial = None
+        uncertain = False
         for provider in providers:
             if provider.__name__ in self._blocked:
+                # Blocked for the rest of the run: resolve() cannot use it either.
+                self._record(provider, "blocked", title, artist)
                 continue
+            self._record(provider, "searched", title, artist)
             try:
                 visited = set()
-                for query in queries(title, artist, context):
+                planned = [title] if provider.__name__ == "uta_net" else queries(title, artist, context)
+                for query in planned:
                     result = provider(title, artist, duration < 150, query=query,
                                       context=context, visited=visited)
                     if result:
+                        self._record(provider, "sheet" if result.original else "romaji_only",
+                                     title, artist, url=result.url, lines=len(result.original))
                         if result.original:
-                            return result
+                            return result, False
                         partial = partial or result
+                self._record(provider, "no_match", title, artist)
             except Exception as error:
-                if getattr(getattr(error, "response", None), "status_code", 0) == 403:
+                import requests
+                if (getattr(getattr(error, "response", None), "status_code", 0) == 403
+                        or isinstance(error, (requests.ConnectionError, requests.Timeout))):
                     self._blocked.add(provider.__name__)
                 self.log(f"Караоке: {provider.__name__}: {str(error)[:140]}")
-        return partial
+                self._record(provider, "error", title, artist, reason=str(error)[:300])
+                uncertain = True
+        return partial, uncertain
+
+    def uta_net(self, title, artist, short, *, query=None, context=None, visited=None):
+        from .source_audit import SourceAudit
+        from .uta_net import UtaNet
+        return UtaNet(self.http, self.audit or SourceAudit()).search(title, artist, context)
 
     def animelyrics(self, title, artist, short, *, query=None, context=None, visited=None):
         base = "https://www.animelyrics.com"
@@ -137,6 +178,11 @@ class LyricSites:
             roman, native, english = extract("romaji"), extract("kanji"), extract("english")
             native = [re.sub(r"(?<=[\u3400-\u9fff])[（(][\u3040-\u30ffー]+[）)]", "", line).strip("\ufeff ")
                       for line in native]
+            if not native and roman and roman == english:
+                native = list(roman)
+            if short and native and roman:
+                from .lyric_versions import native_version
+                native = native_version(native, roman)
             if roman or native:
                 return Sheet(title, artist, page, native, roman,
                              {"en": english} if english else {})

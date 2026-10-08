@@ -19,7 +19,7 @@ def filter_kinds(cards, kinds=None) -> list:
     return [c for c in cards if str((c or {}).get("kind") or "") in allowed]
 
 
-def title_rows(cache, target: str = "anime", kinds=None) -> list[dict]:
+def title_rows(cache, target: str = "anime", kinds=None, *, cards=None) -> list[dict]:
     """Тайтлы каталога: название, год, оценка, индекс и сложность.
 
     Индекс считается ровно тем же кодом, что и в паке (SongCandidate), — иначе
@@ -27,19 +27,24 @@ def title_rows(cache, target: str = "anime", kinds=None) -> list[dict]:
     франшизы тоже берётся из кэша: у сиквела она и решает и индекс, и цену.
 
     kinds — собственный фильтр типов в окне базы (None — все). Настройки
-    генерации на содержимое этого окна не влияют."""
+    генерации на содержимое этого окна не влияют.
+
+    cards — только эти карточки базы (ShikimoriHYX считает индекс найденных
+    тайтлов, а не всего каталога); None — весь раздел."""
     manga = str(target) == "manga"
     favorites = _favorites(cache, manga)
+    access = cache.memo_group("favorites_access_status_v1")
     # Надбавка «в избранном» меряется по соседям по индексу — теми же, что у
     # генератора, иначе панель показывала бы другие уровни (favorites_norm).
     ap.install_favorites_norms(cache)
-    cards = filter_kinds(cache.all_cards(target), kinds)
+    cards = filter_kinds(cache.all_cards(target) if cards is None else cards, kinds)
     fr_index = _franchise_indexes(cache, cards)
     screens = _adaptation_indexes(cache, cards) if manga else {}
     ru = None
     if manga:
         from si_hyx_parts.animepack.ru_popularity_store import RuPopularityStore
         ru = RuPopularityStore(cache, {"remanga": None, "mangalib": None}, persist=False)
+        ru.prefetch(cards)
     rows = []
     for card in cards:
         try:
@@ -84,6 +89,8 @@ def title_rows(cache, target: str = "anime", kinds=None) -> list[dict]:
             "score": cand.score,
             "base": cand.own_base,
             "favorites": fav,
+            "favorites_status": ("NORMAL" if fav >= 0 else
+                                 (access.get(f"{target}:{shiki_id}") or {}).get("status", "UNKNOWN")),
             "index": index,
             "level": ap.index_level(index),
             # Карточка и франшиза нужны подсказке «из чего сложился индекс»:

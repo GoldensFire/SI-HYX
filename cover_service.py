@@ -77,6 +77,7 @@ def ytdlp_command(base=None):
     cmd = list(base if base is not None else _base_cmd() or [])
     if not cmd:
         return cmd
+    cmd += ["--encoding", "utf-8"]  # вывод декодируем как UTF-8
     path = youtube_cookie_file()
     if path:
         cmd += ["--cookies", path]

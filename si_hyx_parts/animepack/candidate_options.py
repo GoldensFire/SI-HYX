@@ -4,7 +4,7 @@ import animepack as ap
 
 
 def available_kinds(generator, candidate, quotas):
-    from .anime_pack_generator__media_base import _level_ok, _antonyms_ok
+    from si_hyx_parts.animepack.generator_selection import _level_ok, _antonyms_ok
     from .title_selection import TITLE_QUESTION_KINDS, short_title
 
     origin = getattr(candidate, "_origin_kind", candidate.kind)
@@ -39,6 +39,12 @@ def available_kinds(generator, candidate, quotas):
         from .studio_question import studio_possible
         if not studio_possible(candidate.anime):
             free.remove(ap.STUDIO_KIND)
+    if ap.SAKUGA_KIND in free:
+        # Прошлые паки уже выяснили, что вырезок у тайтла нет: сакугой его
+        # не предлагаем, он достаётся другим родам вопросов.
+        from .sakuga_generation import known_absent
+        if known_absent(generator, candidate.anime):
+            free.remove(ap.SAKUGA_KIND)
     return free
 
 

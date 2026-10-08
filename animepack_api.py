@@ -145,7 +145,7 @@ MANGA_KINDS = ("manga", "manhwa", "manhua", "one_shot", "doujin")
 MANGA_KIND_LABELS = {"manga": "Манга", "manhwa": "Манхва", "manhua": "Манхуа",
                      "one_shot": "Ваншот", "doujin": "Додзинси"}
 
-from si_hyx_parts.animepack_api.anime_pack_api_error import (
+from si_hyx_parts.animepack_api.music_clients import (
     AnimePackApiError,
     RateLimiter,
     make_session,
@@ -197,6 +197,6 @@ _EPISODE_LIST = re.compile(r"^(list of|список)|guide$|episodes$",
 # Заголовок раздела: «== Summary ==», «===Plot===».
 _HEADING = re.compile(r"^(=+)\s*(.+?)\s*\1\s*$", re.MULTILINE)
 
-from si_hyx_parts.animepack_api.wiki_slugs import wiki_slugs, plot_section, strip_wikitext
+from si_hyx_parts.animepack_api.wiki_text import wiki_slugs, plot_section, strip_wikitext
 
 from si_hyx_parts.animepack_api.shikimori_api import ShikimoriApi

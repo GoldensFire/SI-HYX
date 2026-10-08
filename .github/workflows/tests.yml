@@ -64,3 +64,10 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
         run: python tools/check_hygiene.py
+
+      - name: Длина файлов (предупреждение)
+        # Файлы длиннее 1500 строк отмечаются аннотацией ::warning — повод
+        # посмотреть на связность, но не причина ронять прогон.
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tools/check_file_sizes.py

@@ -5,6 +5,13 @@ from pathlib import Path
 import animepack as ap
 from animepack import SongCandidate
 from test_animepack_manga_sakuga import generator, make_anime  # noqa: F401
+from si_hyx_parts.animepack import theme_video
+
+
+def _local_source(gen, monkeypatch):
+    monkeypatch.setattr(theme_video, "remote_encode", lambda *a: (False, "HTTP 503"))
+    monkeypatch.setattr(theme_video, "source_file", lambda *a: None)
+    monkeypatch.setattr(gen, "_video_seconds", lambda *a: 90)
 
 
 def _candidate():
@@ -14,6 +21,7 @@ def _candidate():
 
 def test_large_partial_video_is_removed_and_falls_back_to_audio(generator, monkeypatch):
     gen = generator
+    _local_source(gen, monkeypatch)
     monkeypatch.setattr(gen, "_theme_video", lambda c: "https://v/op.webm")
     monkeypatch.setattr(gen, "_video_start", lambda *a: 20)
     monkeypatch.setattr(ap.time, "sleep", lambda *a: None)
@@ -30,6 +38,7 @@ def test_large_partial_video_is_removed_and_falls_back_to_audio(generator, monke
     assert gen.download_video(cand) is False
     assert len(commands) == ap.VIDEO_RETRIES + 1
     assert not cand.has_video
+    assert not cand.theme_video_ready
     assert not Path(commands[-1][-1]).exists()
     assert "поток AnimeThemes оборвался" in logs[-1]
     assert "беру аудио песни" in logs[-1]
@@ -37,6 +46,8 @@ def test_large_partial_video_is_removed_and_falls_back_to_audio(generator, monke
 
 def test_complete_retry_is_accepted(generator, monkeypatch):
     gen = generator
+    _local_source(gen, monkeypatch)
+    monkeypatch.setattr(theme_video, "complete_output", lambda *a: (True, ""))
     monkeypatch.setattr(gen, "_theme_video", lambda c: "https://v/op.webm")
     monkeypatch.setattr(gen, "_video_start", lambda *a: 20)
     monkeypatch.setattr(ap.time, "sleep", lambda *a: None)
@@ -52,3 +63,13 @@ def test_complete_retry_is_accepted(generator, monkeypatch):
     cand = _candidate()
     assert gen.download_video(cand)
     assert cand.has_video and len(commands) == 2
+    assert cand.theme_video_ready
+
+
+def test_missing_video_is_reported(generator, monkeypatch):
+    monkeypatch.setattr(generator, "_theme_video", lambda c: "")
+    logs = []
+    generator.log = logs.append
+    assert not generator.download_video(_candidate())
+    assert "не найден на AnimeThemes" in logs[-1]
+    assert "беру аудио песни" in logs[-1]

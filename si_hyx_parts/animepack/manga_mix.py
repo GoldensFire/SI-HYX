@@ -123,6 +123,14 @@ class MangaMix:
         self._benched.clear()
         if not bench:
             return []
+        if getattr(self.s, "manga_strict_targets", False):
+            bench = [cand for cand in bench
+                     if all(self._used[key] < (self.adapted_target if key[0] == "adapted"
+                                              else self.kind_target).get(key[1], 0)
+                            for key in self._keys(cand))]
+            self._log("Строгие доли комиксов: возвращаю отложенных кандидатов "
+                      "с сохранением квот изданий.")
+            return bench
         self.off = True
         self._log(f"Доли манги: подходящих книг в каталоге не хватило — беру "
                   f"отложенные ({len(bench)} шт.), чтобы пак не остался "

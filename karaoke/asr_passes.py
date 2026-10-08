@@ -4,20 +4,28 @@ from difflib import SequenceMatcher
 from .asr_phrases import key
 
 
-def combine(primary, secondary, original):
-    chosen = {}
+def combine(primary, secondary, original, *, normalizer=key):
+    """Choose a maximum-coverage monotone chain of existing word anchors."""
     def score(row):
-        expected = key(original[row["line_index"]])
-        return SequenceMatcher(None, expected, key(row["text"]), autojunk=False).ratio()
-    for row in [*primary, *secondary]:
-        index = row["line_index"]
-        if index not in chosen or score(row) > score(chosen[index]):
-            chosen[index] = row
-    result, previous = [], -1
-    for index in sorted(chosen):
-        row = chosen[index]
-        if row["start"] < previous:
-            continue
-        result.append(row)
-        previous = row["end"]
-    return result
+        expected = normalizer(original[row["line_index"]])
+        return SequenceMatcher(None, expected, normalizer(row["text"]), autojunk=False).ratio()
+    rows = sorted([*primary, *secondary], key=lambda row: (row["line_index"], row["start"]))
+    best, previous = [], []
+    for i, row in enumerate(rows):
+        weight = score(row)
+        value, parent = (1, weight), -1
+        for j in range(i):
+            if rows[j]["line_index"] < row["line_index"] and rows[j]["end"] <= row["start"]:
+                candidate = (best[j][0] + 1, best[j][1] + weight)
+                if candidate > value:
+                    value, parent = candidate, j
+        best.append(value)
+        previous.append(parent)
+    if not rows:
+        return []
+    index = max(range(len(rows)), key=lambda i: best[i])
+    result = []
+    while index >= 0:
+        result.append(rows[index])
+        index = previous[index]
+    return result[::-1]

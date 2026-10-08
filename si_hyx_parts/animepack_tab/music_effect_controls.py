@@ -26,7 +26,7 @@ def build_controls(tab):
     grid.setContentsMargins(0, 0, 0, 0)
     grid.setHorizontalSpacing(8)
     grid.setVerticalSpacing(6)
-    tab.chk_chiptune = _api.QCheckBox("Chiptune — мелодия синтезатором")
+    tab.chk_chiptune = _api.QCheckBox("Chiptune (не работает)")
     tab.chk_chiptune.setToolTip(
         "Вокал превращается в ноты и звучит простым синтезатором. "
         "Плохой результат заменяется другим кандидатом. Обработка медленная.")
@@ -42,8 +42,7 @@ def build_controls(tab):
     tab.sp_chiptune_percent.setSuffix(" % аудиовопросов")
     tab.sp_chiptune_percent.setValue(25)
     tab.sp_chiptune_percent.setToolTip(PERCENT_TIP)
-    inner.addWidget(tab._lab("Доля Chiptune"), 0, 0)
-    inner.addWidget(tab.sp_chiptune_percent, 0, 1)
+    tab.sp_chiptune_percent.hide()
     tab.sp_chiptune_seed = _api.QSpinBox()
     tab.sp_chiptune_seed.setRange(0, 2147483647)
     tab.sp_chiptune_seed.setToolTip(SEED_TIP)

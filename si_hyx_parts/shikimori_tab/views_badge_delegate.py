@@ -163,13 +163,10 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
         painter.restore()
 
         # «Индекс популярности» (значок-огонёк + число) — слева от просмотров.
-        # Это та же величина, по которой сортирует режим «По индексу
-        # популярности»: просмотры, взвешенные на свежесть выхода.
+        # Та же величина, по которой сортирует режим «По индексу популярности»
+        # и считается сложность в генераторе аниме-пака (pack_index).
         try:
-            a = self._tab._anime_by_id.get(aid)
-            idx_when = (a.air_date or a.year) if a else None
-            base = self._tab._index_base_cache.get(aid, 0.0)
-            idx_val = _api._popularity_index(base, idx_when, a.score if a else 0.0)
+            idx_val = float(self._tab._index_cache.get(aid, 0.0))
         except Exception:
             idx_val = 0
         if idx_val and idx_val > 0:
@@ -210,7 +207,7 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
                 tip = self._tab._index_tooltip_for(aid)
                 if tip:
                     _api._InfoTipPopup.instance().show_at(
-                        event.globalPos(), tip, owner=view.viewport())
+                        event.globalPos(), tip, owner=view.viewport(), region=rect)
                     return True
             _api._InfoTipPopup.instance().hide_for(view.viewport())
             return False

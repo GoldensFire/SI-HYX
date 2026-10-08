@@ -21,8 +21,7 @@ def build_controls(tab):
     tab.sp_karaoke_percent.setRange(1, 100)
     tab.sp_karaoke_percent.setValue(25)
     tab.sp_karaoke_percent.setSuffix(" % песен")
-    inner.addWidget(tab._lab("Доля караоке"), 0, 0)
-    inner.addWidget(tab.sp_karaoke_percent, 0, 1)
+    tab.sp_karaoke_percent.hide()
     tab.chk_karaoke_translations = ap.QCheckBox("Показывать перевод — RU, иначе EN")
     tab.chk_karaoke_translations.setToolTip(
         "По умолчанию только romaji. Перевод показывается при наличии проверенного соответствия строк.")
@@ -72,11 +71,32 @@ def build_controls(tab):
     inner.addWidget(tab._hint("CRF и пресет действуют только на караоке. "
                              "Готовый ASS/TTML используется без распознавания."), 8, 0, 1, 2)
     inner.addWidget(tab.chk_karaoke_translations, 9, 0, 1, 2)
+    tab.sp_karaoke_ai_minutes = ap.QSpinBox()
+    tab.sp_karaoke_ai_minutes.setRange(1, 60)
+    tab.sp_karaoke_ai_minutes.setValue(5)
+    tab.sp_karaoke_ai_minutes.setSuffix(" мин")
+    tab.sp_karaoke_ai_minutes.setToolTip(
+        "Общий срок ожидания и распознавания одной песни. После него выбирается другая песня.")
+    inner.addWidget(tab._lab("Лимит распознавания"), 10, 0)
+    inner.addWidget(tab.sp_karaoke_ai_minutes, 10, 1)
+    tab.cb_karaoke_separator = ap.QComboBox()
+    from karaoke.separator_health import kim_disabled
+    disabled_kim = kim_disabled()
+    for label, value in (("Автоматически", "auto"), ("Kim", "kim"), ("HTDemucs", "htdemucs")):
+        if value == "kim" and disabled_kim:
+            continue
+        tab.cb_karaoke_separator.addItem(label, value)
+    tab.cb_karaoke_separator.setToolTip(
+        "На этом компьютере используется HTDemucs: Kim не прошёл проверку памяти."
+        if disabled_kim else "Автоматически: Kim на видеокарте, HTDemucs на CPU или после сбоя Kim.")
+    inner.addWidget(tab._lab("Разделение вокала"), 11, 0)
+    inner.addWidget(tab.cb_karaoke_separator, 11, 1)
     grid.addWidget(tab.box_karaoke, 1, 0, 1, 2)
     inner.setColumnStretch(1, 1)
     grid.setColumnStretch(1, 1)
     tab.chk_karaoke.toggled.connect(lambda _: refresh(tab))
     tab.cb_karaoke_effect.currentIndexChanged.connect(lambda _: refresh(tab))
+    tab.chk_karaoke_ai.toggled.connect(lambda _: refresh(tab))
     refresh(tab)
     return box
 
@@ -87,6 +107,9 @@ def refresh(tab):
     tab.sp_karaoke_tempo.setEnabled(effect == "tempo")
     tab.sp_karaoke_pitch.setEnabled(effect == "pitch")
     tab.chk_karaoke_ai.setEnabled(effect != "reverse")
+    enabled = tab.chk_karaoke_ai.isChecked() and effect != "reverse"
+    tab.sp_karaoke_ai_minutes.setEnabled(enabled)
+    tab.cb_karaoke_separator.setEnabled(enabled)
     if getattr(tab, "settings_columns", None) is not None:
         tab._fit_settings_width()
 
@@ -96,6 +119,8 @@ def collect_controls(tab, settings):
     settings.karaoke_translations = tab.chk_karaoke_translations.isChecked()
     settings.karaoke_percent = tab.sp_karaoke_percent.value()
     settings.karaoke_ai_fallback = tab.chk_karaoke_ai.isChecked()
+    settings.karaoke_ai_timeout = tab.sp_karaoke_ai_minutes.value() * 60
+    settings.karaoke_separator = tab.cb_karaoke_separator.currentData() or "auto"
     settings.karaoke_effect = tab.cb_karaoke_effect.currentData() or "original"
     settings.karaoke_tempo = tab.sp_karaoke_tempo.value()
     settings.karaoke_pitch = tab.sp_karaoke_pitch.value()
@@ -109,6 +134,8 @@ def apply_controls(tab, settings):
     tab.chk_karaoke_translations.setChecked(settings.karaoke_translations)
     tab.sp_karaoke_percent.setValue(settings.karaoke_percent)
     tab.chk_karaoke_ai.setChecked(settings.karaoke_ai_fallback)
+    tab.sp_karaoke_ai_minutes.setValue(max(1, (settings.karaoke_ai_timeout + 59) // 60))
+    tab.cb_karaoke_separator.setCurrentIndex(max(0, tab.cb_karaoke_separator.findData(settings.karaoke_separator)))
     tab.cb_karaoke_effect.setCurrentIndex(max(0, tab.cb_karaoke_effect.findData(settings.karaoke_effect)))
     tab.sp_karaoke_tempo.setValue(settings.karaoke_tempo)
     tab.sp_karaoke_pitch.setValue(settings.karaoke_pitch)

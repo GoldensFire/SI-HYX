@@ -4,6 +4,7 @@
 """MangaDexApi. Public namespace: animepack_api."""
 from __future__ import annotations
 import animepack_api as _api
+from network_attempt import single_attempt_session
 
 
 # Страницы в начале и в конце главы пропускаем: там титул с названием тайтла,
@@ -129,10 +130,15 @@ class MangaDexApi:
         return out
 
     def _get(self, path: str, params: dict, limiter=None) -> dict:
-        (limiter or self.limiter).acquire()
+        deadline = getattr(self, "deadline", None)
+        if deadline is None:
+            (limiter or self.limiter).acquire()
+        else:
+            (limiter or self.limiter).acquire(deadline=deadline)
         try:
-            resp = self.session.get(f"{_api.MANGADEX_BASE}{path}",
-                                    params=params, timeout=(10, 45))
+            with single_attempt_session(self.session) as session:
+                resp = session.get(f"{_api.MANGADEX_BASE}{path}",
+                                   params=params, timeout=(5, 10))
             if resp.status_code == 404:
                 return {}
             resp.raise_for_status()

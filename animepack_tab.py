@@ -108,17 +108,17 @@ from si_hyx_parts.animepack_tab.settings_box import (SettingsBox,
 
 from si_hyx_parts.animepack_tab.no_wheel import _no_wheel, _ShareBar
 
-from si_hyx_parts.animepack_tab.mix_slider import (
-    _MixSlider,
+from si_hyx_parts.animepack_tab.mix_slider import _MixSlider, _NumItem
+from si_hyx_parts.animepack_tab.background_tasks import (
     _GenSignals,
     _GenTask,
     _RefreshDbSignals,
     _RefreshDbTask,
     _GenresSignals,
     _GenresTask,
-    _NumItem,
 )
 
 from si_hyx_parts.animepack_tab.user_card import _UserCard
 
-from si_hyx_parts.animepack_tab.saved_users_dialog import _SavedUsersDialog, AnimePackTab
+from si_hyx_parts.animepack_tab.saved_users_dialog import _SavedUsersDialog
+from si_hyx_parts.animepack_tab.anime_pack_tab import AnimePackTab

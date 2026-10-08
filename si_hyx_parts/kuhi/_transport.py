@@ -127,6 +127,7 @@ class AsyncClient:
                 scope.remaining -= 1
                 scope.requests += 1
             headers_only = kwargs.pop("headers_only", False)
+            limit = kwargs.pop("max_bytes", MAX_RESPONSE_BYTES)
             async with self.client.stream(method, url, **kwargs) as response:
                 chunks, size = [], 0
                 if not headers_only:
@@ -134,8 +135,8 @@ class AsyncClient:
                         if scope:
                             scope.check(budget=False)
                         size += len(chunk)
-                        if size > MAX_RESPONSE_BYTES:
-                            raise RuntimeError("Kuhi: ответ превысил 4 МиБ")
+                        if size > limit:
+                            raise RuntimeError(f"Kuhi: ответ превысил {limit // (1024 * 1024)} МиБ")
                         chunks.append(chunk)
                 if response.status_code == 429:
                     try:

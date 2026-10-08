@@ -30,6 +30,8 @@ def crop_pages(generator, cand, pages):
     """Return (selected page index, encoded crop), with at most two AI calls."""
     if not pages or generator.stopped():
         return None
+    from .manga_budget import check
+    check(generator, cand)
     client = generator.gemini_manga
     if client is None:
         raise RuntimeError("Gemini для выбора сцены с персонажами недоступна")
@@ -48,7 +50,8 @@ def crop_pages(generator, cand, pages):
     for index, page in enumerate(pages):
         with Image.open(io.BytesIO(page["data"])) as opened:
             picture = opened.convert("RGB")
-        regions = _windows(*picture.size, max_tiles=limit)
+        from .manga_scene_prefilter import windows as drawing_windows
+        regions = drawing_windows(picture, limit) or _windows(*picture.size, max_tiles=limit)
         windows.append(regions)
         for tile_index, region in enumerate(regions):
             tile = picture.crop(region)
@@ -65,6 +68,7 @@ def crop_pages(generator, cand, pages):
     key = f"{client.model}:{hashlib.sha256(payload.encode()).hexdigest()}"
     response = generator.db_cache.memo(MEMO_GROUP, key)
     if response is None:
+        check(generator, cand)
         response = request(generator, client, parts, BATCH_SCHEMA)
         if isinstance(response, dict):
             generator.db_cache.remember_memo(MEMO_GROUP, key, response)
@@ -94,6 +98,7 @@ def crop_pages(generator, cand, pages):
                             f"{len(pages)} страниц отклонена: {reason or 'нет цельной сцены'}")
         return None
     expected = " / ".join(titles(cand.anime or {}) + names)
+    check(generator, cand)
     verdicts = check_many(generator, [(f, c) for _, f, c in prepared], expected)
     for (index, frame, _), (good, _) in zip(prepared, verdicts):
         if good:

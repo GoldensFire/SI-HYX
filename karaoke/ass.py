@@ -20,6 +20,7 @@ def read_ass(payload):
     lines, native, translations = [], [], []
     fields = []
     section = ""
+    events = []
     for raw in text.splitlines():
         if raw.startswith("["):
             section = raw.strip().lower()
@@ -30,14 +31,20 @@ def read_ass(payload):
         if not raw.startswith("Dialogue:") or not fields or fields[-1] != "text":
             continue
         values = raw.split(":", 1)[1].lstrip().split(",", len(fields) - 1)
-        if len(values) != len(fields):
-            continue
-        event = dict(zip(fields, values))
+        if len(values) == len(fields):
+            events.append(dict(zip(fields, values)))
+    # Furigana duplicates the pronunciation of a lyric line and lies inside
+    # its time. Main lyrics merely styled "*-furigana" (Shayou: all 17 lines;
+    # another song: main lines over a separate "Second" backing layer) stay.
+    primary = [(seconds(e["start"]) - .05, seconds(e["end"]) + .05) for e in events
+               if "furigana" not in e.get("style", "").lower() and K.search(e["text"])]
+    for event in events:
         start, end = seconds(event["start"]), seconds(event["end"])
         body = event["text"]
         style = event.get("style", "").lower()
-        # Furigana is a duplicate pronunciation layer, not another lyric line.
-        if "furigana" in style or re.search(r"\\p[1-9]", body):
+        if re.search(r"\\p[1-9]", body):
+            continue
+        if "furigana" in style and any(s <= start and end <= e for s, e in primary):
             continue
         chunks = re.split(r"(\{[^}]*\})", body)
         units, cursor, pending = [], start, None

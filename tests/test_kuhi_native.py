@@ -13,7 +13,7 @@ from si_hyx_parts.kuhi.client import KuhiClient
 
 def test_all_native_providers_are_importable():
     assert [name for name, _ in _race.providers()] == _race.RANKING
-    assert len(_race.providers()) == 10
+    assert len(_race.providers()) == 5
 
 
 @pytest.mark.parametrize("provider", [anikoto, reanime])
@@ -79,8 +79,9 @@ def test_race_keeps_later_providers_and_never_requests_dub(monkeypatch):
     monkeypatch.setattr(_race, "_watch_cache", {})
     streams = asyncio.run(_race.all_watch(1, 1, {"media": {}},
                          {"fast": ["sub", "dub"], "slow": ["sub"], "mkissa": ["raw", "sub"]}))
-    assert len(streams) == 4
-    assert ("slow", "sub") in calls and ("mkissa", "raw") in calls
+    assert len(streams) == 2
+    assert ("slow", "sub") in calls
+    assert not any(name == "mkissa" for name, _ in calls)
     assert all(audio != "dub" for _, audio in calls)
 
 

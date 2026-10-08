@@ -49,6 +49,9 @@ from taskbar import TaskbarProgress
 from PyQt6.QtCore import qInstallMessageHandler, QSize, QTranslator, QLibraryInfo, QLocale
 from PyQt6.QtWidgets import QTabBar
 import hashlib
+from diagnostic_logging import install as install_diagnostic_logging
+
+install_diagnostic_logging()
 
 
 # QtMultimedia с FFmpeg-бэкендом (плеер вкладки «Монтаж») при каждой смене
@@ -73,7 +76,7 @@ _QT_LOG_NOISE = (
     "must be a top level window",
 )
 
-from si_hyx_parts.main.qt_message_filter import (
+from si_hyx_parts.main.unified_window import (
     _qt_message_filter,
     UnifiedWindow,
     _install_crash_handler,

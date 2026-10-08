@@ -64,6 +64,7 @@ def rows_from_json(data):
 
 
 def transcribe(source, language, model="medium"):
+    import os
     import numpy as np
     import soundfile as sf
     from scipy.signal import resample_poly
@@ -83,7 +84,8 @@ def transcribe(source, language, model="medium"):
     sf.write(str(mono), np.asarray(audio), 16000, subtype="PCM_16")
     output = source.with_name("whisper-" + (language or "auto"))
     command = [str(binary), "-m", str(weights), "-f", str(mono), "-l", language or "auto",
-               "-ojf", "-of", str(output), "-ml", "1", "-sow", "-bs", "1", "-bo", "1", "-mc", "0"]
+               "-ojf", "-of", str(output), "-ml", "1", "-sow", "-bs", "1", "-bo", "1", "-mc", "0",
+               "-t", str(max(1, int(os.environ.get('SI_HYX_ML_THREADS', '4'))))]
     # stdout/stderr stay in the cancellable worker's log; inspect GPU activation
     # before accepting the output so a CPU-only binary is retried as CPU int8.
     flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0

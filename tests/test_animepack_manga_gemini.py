@@ -174,7 +174,7 @@ def test_tab_keeps_the_manga_check_and_its_model(qapp):
         tab.chk_manga_gemini.setChecked(False)
         assert tab.cb_manga_gemini_model.isEnabled()  # выбор сцены тоже требует модель
         tab.chk_manga_character_crop.setChecked(False)
-        assert not tab.cb_manga_gemini_model.isEnabled()
+        assert tab.cb_gemini_image_model.isEnabled()
         box = tab.cb_manga_gemini_model
         other = [box.itemText(i) for i in range(box.count())
                  if box.itemText(i) != box.currentText()][0]

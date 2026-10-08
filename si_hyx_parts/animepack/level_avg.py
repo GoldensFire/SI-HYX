@@ -75,12 +75,14 @@ def own_bucket(settings, kind) -> _api.Optional[str]:
 
 
 def short_pack_average_error(settings, songs) -> str:
-    """Не выдавать маленький полный пак за попадание в заданную среднюю."""
-    if len(songs) != settings.total_questions or len(songs) > 3:
-        return ""
+    """Check every requested average before publishing any complete pack."""
+    from .manga_targets import final_error
+    strict_error = final_error(settings, songs)
+    if strict_error:
+        return strict_error
     groups: dict[str | None, list[int]] = {}
     for cand in songs:
-        groups.setdefault(own_bucket(settings, cand.kind), []).append(int(cand.level))
+        groups.setdefault(own_bucket(settings, cand.kind), []).append(question_level(cand))
     for bucket, values in groups.items():
         target = level_avg_target(settings, bucket)
         if target and sum(values) != target * len(values):
@@ -88,7 +90,18 @@ def short_pack_average_error(settings, songs) -> str:
             actual = sum(values) / len(values)
             return (f"Средняя сложность {where}: {actual:.1f}, просили {target}. "
                     "Подходящих вопросов не нашлось; пакет не создан.")
+    target = int(getattr(settings, 'char_level_avg', 0) or 0)
+    characters = [int(c.char_level) for c in songs if getattr(c, 'is_character', False)] if target else []
+    if target and characters and sum(characters) != target * len(characters):
+        return (f'Средняя сложность персонажей: {sum(characters) / len(characters):.1f}, '
+                f'просили {target}. Готовые вопросы сохраняются для точечного добора.')
     return ""
+
+
+def question_level(candidate):
+    """The selected question's level, before optional presentation substitutions."""
+    value = getattr(candidate, 'selection_level', None)
+    return int((getattr(candidate, 'level', 0) if value is None else value) or 0)
 
 
 level_bucket.__module__ = _api.__name__

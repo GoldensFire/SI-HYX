@@ -12,10 +12,13 @@ from urllib.parse import urlsplit
 import animepack as api
 from si_hyx_parts.kuhi._http import UA
 from .episode_sources import CUT_SECONDS, choose_start
-from .episode_stream_quality import MIN_HEIGHT
+from .episode_quality_policy import floor, output_height
 
 PROBE_TIMEOUT = 35
 ENCODE_TIMEOUT = 300
+# Запас копии после конца отрывка: ключевой кадр до start копия и так
+# захватывает, а хвост нужен, чтобы точная резка не упёрлась в конец файла.
+FETCH_TAIL = 2
 
 
 def request_headers(stream):
@@ -59,6 +62,8 @@ def probe(generator, url, stream=None, timeout=PROBE_TIMEOUT):
         "-of", "json", str(url)]
     code, output, error = generator._run_capture(cmd, timeout=timeout)
     if code:
+        if stream:
+            stream["_probe_error"] = re.sub(r"https?://\S+", "[URL]", error or "таймаут")[-180:]
         if stream and hasattr(generator, "_log_rare"):
             status = re.search(r"(?:HTTP error|Server returned)\s+\d{3}[^\r\n]*", error or "")
             reason = status.group(0)[:100] if status else "источник не читается или истёк таймаут"
@@ -110,18 +115,26 @@ def prepared(stream, final):
 
 
 def inspect_stream(generator, stream, final, deadline):
-    if stream.get("manifest_height") and stream["manifest_height"] < MIN_HEIGHT:
+    """ffprobe-сведения годного потока либо {}; причина отказа — в stream["_reject"]:
+    "low" — дорожка проверена и не подходит, "pause" — источник не ответил."""
+    minimum = floor(stream)
+    if stream.get("manifest_height") and stream["manifest_height"] < minimum:
+        stream["_reject"] = "low"
         return {}
     with prepared(stream, final) as source:
         remaining = min(PROBE_TIMEOUT, max(1, deadline - time.monotonic()))
         info = probe(generator, source["url"], source, remaining)
+    if not info:
+        stream["_reject"] = "pause"
+        return {}
     video = video_track(info)
-    if video is None or number(video.get("height")) < MIN_HEIGHT or audio_track(
+    if video is None or number(video.get("height")) < minimum or audio_track(
             info, source_language=stream.get("audio_language")) is None:
         if hasattr(generator, "_log_rare"):
             height = int(number((video or {}).get("height")))
             generator._log_rare("Качество отрывка", f"{stream.get('provider', 'Kuhi')}: "
-                                f"{height}p или нет японского аудио; требуется ≥1080p")
+                                f"{height}p или нет японского аудио; требуется ≥{minimum}p")
+        stream["_reject"] = "low"
         return {}
     stream["source_height"] = int(number(video["height"]))
     stream["bandwidth"] = int(number(video.get("bit_rate"))) or stream.get("bandwidth", 0)
@@ -139,13 +152,22 @@ def valid_clip(info):
                for s in (video, audio))
 
 
-def encode_args(generator, subtitles=None):
+def encode_args(generator, subtitles=None, height=720, subtitle_start=None):
     args = generator.video_encode_args()
+    if height < 720:
+        at = args.index("-vf") + 1
+        args[at] = f"scale=-2:{height}:flags=lanczos,setsar=1"
     if subtitles:
         # -vf is already provided by the common scaler. Append the burn filter.
         path = Path(subtitles).as_posix().replace(":", "\\:").replace("'", "\\'")
         at = args.index("-vf") + 1
-        args[at] = "setpts=PTS-STARTPTS," + args[at] + f",subtitles=filename='{path}':charenc=UTF-8"
+        clock = "setpts=PTS-STARTPTS"
+        native_ass = subtitle_start is not None and Path(subtitles).suffix.lower() in (".ass", ".ssa")
+        if native_ass:
+            clock += f"+{float(subtitle_start):.3f}/TB"
+        args[at] = clock + "," + args[at] + f",subtitles=filename='{path}':charenc=UTF-8"
+        if native_ass:
+            args[at] += ",setpts=PTS-STARTPTS"
     return args
 
 
@@ -162,10 +184,11 @@ def _cut(generator, candidate, stream, final, *, subtitles=None, start=None, inf
         return None
     video = video_track(info)
     audio = audio_track(info, source_language=stream.get("audio_language"))
-    if video is None or number(video.get("height")) < MIN_HEIGHT or audio is None:
+    if video is None or number(video.get("height")) < floor(stream) or audio is None:
         if hasattr(generator, "_log_rare"):
-            generator._log_rare("Дорожки отрывка", f"{stream.get('provider', 'Kuhi')}: нет видео ≥1080p с японской дорожкой")
+            generator._log_rare("Дорожки отрывка", f"{stream.get('provider', 'Kuhi')}: нет видео ≥{floor(stream)}p с японской дорожкой")
         return None
+    stream["source_height"] = int(number(video["height"]))
     duration = number((info.get("format") or {}).get("duration"))
     if not duration:
         duration = number(video.get("duration"))
@@ -173,16 +196,56 @@ def _cut(generator, candidate, stream, final, *, subtitles=None, start=None, inf
         start = choose_start(duration, stream, generator.rng)
     if start is None or generator.stopped():
         return None
-    # Input seek makes MP4 range requests and jumps to HLS/DASH segments.
-    cmd = [api.FFMPEG, "-y", "-loglevel", "error"] + input_args(stream) + [
-        "-ss", f"{start:.3f}", "-i", stream["url"], "-t", str(CUT_SECONDS),
-        "-map", f"0:{video['index']}", "-map", f"0:{audio['index']}",
-        "-sn", "-dn", "-metadata:s:a:0", "language=jpn"] + encode_args(generator, subtitles) + generator.opus_args(CUT_SECONDS) + [
-        "-movflags", "+faststart", str(final)]
-    timeout = min(ENCODE_TIMEOUT, max(1, deadline - time.monotonic())) if deadline else ENCODE_TIMEOUT
-    code, _error = generator._run_killable(cmd, timeout=timeout)
+    local = Path(final).with_name(Path(final).stem + ".source.mkv")
+    try:
+        if _fetch(generator, stream, video, audio, start, local, deadline):
+            # Копия хранит исходные метки: -seek_timestamp режет ровно с start,
+            # и отрывок совпадает с прямой резкой из сети кадр в кадр.
+            source = ["-seek_timestamp", "1", "-ss", f"{start:.3f}", "-i", str(local),
+                      "-t", str(CUT_SECONDS), "-map", "0:0", "-map", "0:1"]
+        else:
+            # Input seek makes MP4 range requests and jumps to HLS/DASH segments.
+            source = input_args(stream) + [
+                "-ss", f"{start:.3f}", "-i", stream["url"], "-t", str(CUT_SECONDS),
+                "-map", f"0:{video['index']}", "-map", f"0:{audio['index']}"]
+        cmd = [api.FFMPEG, "-y", "-loglevel", "error"] + source + [
+            "-sn", "-dn", "-metadata:s:a:0", "language=jpn"] + encode_args(
+                generator, subtitles, output_height(stream), subtitle_start=start) + generator.opus_args(CUT_SECONDS) + [
+            "-movflags", "+faststart", str(final)]
+        timeout = min(ENCODE_TIMEOUT, max(1, deadline - time.monotonic())) if deadline else ENCODE_TIMEOUT
+        code, _error = generator._run_killable(cmd, timeout=timeout)
+    finally:
+        local.unlink(missing_ok=True)
     remaining = min(PROBE_TIMEOUT, max(1, deadline - time.monotonic())) if deadline else PROBE_TIMEOUT
     if code == 0 and valid_clip(probe(generator, final, timeout=remaining)):
         return start
     Path(final).unlink(missing_ok=True)
     return None
+
+
+def _fetch(generator, stream, video, audio, start, local, deadline=None) -> bool:
+    """Кусок серии на диск без перекодирования, с исходными метками времени.
+
+    Кодировщик AV1, читая прямо из сети, ждал каждый сегмент: в пакете из 100
+    отрывков кодирование заняло 31 мин. Копия качается на полной скорости
+    сети, а кодируется уже с диска. Не вышло — режем напрямую, как раньше."""
+    if generator.stopped():
+        return False
+    # -t до -i: при -copyts выходной -t считал бы от нуля и отрезал всё.
+    cmd = [api.FFMPEG, "-y", "-loglevel", "error"] + input_args(stream) + [
+        "-ss", f"{start:.3f}", "-t", str(CUT_SECONDS + FETCH_TAIL), "-i", stream["url"],
+        "-map", f"0:{video['index']}", "-map", f"0:{audio['index']}",
+        "-c", "copy", "-sn", "-dn", "-copyts", "-start_at_zero", str(local)]
+    timeout = min(ENCODE_TIMEOUT, max(1, deadline - time.monotonic())) if deadline else ENCODE_TIMEOUT
+    code, error = generator._run_killable(cmd, timeout=timeout)
+    if code == 0 and local.is_file() and local.stat().st_size:
+        return True
+    local.unlink(missing_ok=True)
+    if hasattr(generator, "_log_rare") and not generator.stopped():
+        # Последняя строка stderr без префикса «[out#0/matroska @ 0x…]»: срез
+        # хвоста резал слово посередине и тащил в журнал переносы строк.
+        lines = [line.strip() for line in str(error or "").splitlines() if line.strip()]
+        reason = re.sub(r"^\[[^\]]*@\s*[0-9a-fA-Fx]+\]\s*", "", lines[-1]) if lines else "таймаут"
+        reason = re.sub(r"https?://\S+", "[URL]", reason)[-120:]
+        generator._log_rare("Копия отрывка", f"{stream.get('provider', 'Kuhi')}: {reason}; режу напрямую")
+    return False

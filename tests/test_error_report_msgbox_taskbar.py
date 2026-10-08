@@ -259,25 +259,28 @@ class TestMsgbox:
 
     def test_critical_has_copy_button(self, qapp, monkeypatch):
         # msgbox_critical/msgbox_warning получают кнопку «Копировать» — клик по
-        # ней копирует текст ошибки в буфер обмена и НЕ закрывает диалог
-        # (переоткрывает то же окно), в отличие от остальных кнопок.
+        # ней копирует текст ошибки в буфер обмена и НЕ закрывает диалог: то
+        # же окно остаётся открытым до клика по обычной кнопке.
         import msgbox
         from PyQt6.QtWidgets import QMessageBox, QApplication
 
-        calls = {"n": 0}
+        calls = {"n": 0, "closed_by_copy": None}
+        finished = []
 
         def fake_exec(self):
             calls["n"] += 1
-            if calls["n"] == 1:
-                copy_btn = next(b for b in self.buttons() if b.text() == "Копировать")
-                copy_btn.click()
-            else:
-                self.button(QMessageBox.StandardButton.Ok).click()
+            self.finished.connect(finished.append)
+            copy_btn = next(b for b in self.buttons() if b.text() == "Копировать")
+            copy_btn.click()
+            calls["closed_by_copy"] = bool(finished)
+            self.button(QMessageBox.StandardButton.Ok).click()
             return QMessageBox.StandardButton.Ok
         monkeypatch.setattr(QMessageBox, "exec", fake_exec)
 
         result = msgbox.msgbox_critical(None, "Ошибка", "текст ошибки для копирования")
-        assert calls["n"] == 2  # диалог реально переоткрылся после клика «Копировать»
+        assert calls["n"] == 1
+        assert calls["closed_by_copy"] is False  # «Копировать» окно не закрыл
+        assert finished                          # а «ОК» — закрыл
         assert QApplication.clipboard().text() == "текст ошибки для копирования"
         assert result == QMessageBox.StandardButton.Ok
 

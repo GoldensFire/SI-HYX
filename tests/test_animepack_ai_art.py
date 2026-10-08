@@ -109,20 +109,26 @@ def test_failed_art_has_no_empty_question(generator, monkeypatch):
 def test_quota_does_not_scan_the_rest_of_the_catalog(generator, monkeypatch):
     gen, _, _ = generator
     gen.prepare_dirs()
-    seen = []
+    from si_hyx_parts.animepack.candidate_source import WINDOW
+    seen, calls = [], []
 
     def candidates():
-        for i in range(20):
+        for i in range(WINDOW * 5):
             seen.append(i)
             yield SongCandidate({}, make_anime(malId=i + 1), kind=AI_ART_KIND)
 
     def unavailable(*args):
+        calls.append(args)
         raise CloudflareArtUnavailable("quota")
 
     monkeypatch.setattr(gen, "iter_candidates", candidates)
     monkeypatch.setattr(gen.art_service, "generate", unavailable)
     assert gen.select_songs() == []
-    assert len(seen) <= 2  # at most the initial media prefetch, then stop
+    # Источник кандидатов заранее читает одно окно (без запросов): окно,
+    # взятый кандидат и тот, на котором ждёт производитель. После смерти
+    # рода генерации больше не просят и каталог дальше не листают.
+    assert len(calls) <= 2
+    assert len(seen) <= WINDOW + 2
 
 
 def test_art_and_other_kinds_share_quotas_and_recover(generator):
@@ -130,6 +136,7 @@ def test_art_and_other_kinds_share_quotas_and_recover(generator):
     gen.s.pct_ai_art = 50
     gen.s.pack_anagram = True
     gen.s.pct_anagram = 50
+    gen.s.preserve_composition = False      # иначе доли не перекладываются
     quotas = gen.s.question_quotas
     assert quotas[AI_ART_KIND] == 2 and quotas[ANAGRAM_KIND] == 2
     cand = SongCandidate({}, make_anime(), kind=ANAGRAM_KIND)

@@ -88,9 +88,10 @@ def test_queue_snapshots_settings_and_excludes_finished_pack(tab, tmp_path, qapp
 
     path = tmp_path / "first.siq"
     path.write_bytes(b"pack")
-    tab._db_task = object()  # обновление базы началось в паузе между заданиями
+    # Обновление базы началось в паузе между заданиями.
+    tab._db_task = SimpleNamespace(stop=lambda: None, signals=SimpleNamespace())
     tab._on_finished(SimpleNamespace(
-        songs=[], path=str(path), elapsed=1.0, cancelled=False,
+        songs=[], path=str(path), elapsed=1.0, cancelled=False, aborted=False,
         requested=0, pack_number=1))
     qapp.processEvents()
     assert len(pool.jobs) == 1

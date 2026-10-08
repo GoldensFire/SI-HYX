@@ -28,17 +28,19 @@ def test_removed_title_modes_are_not_exposed():
 def test_controls_roundtrip_and_key_requirement(qapp, kind):
     tab = animepack_tab.AnimePackTab()
     try:
+        tab.chk_titles.setChecked(True)
+        tab.chk_anagram.setChecked(False)
         getattr(tab, "chk_" + kind).setChecked(True)
         tab.chk_songs.setChecked(False)
         saved = tab.get_settings()
         tab.apply_settings(saved)
-        assert tab.mix.keys() == [kind]
-        assert tab.mix.shares()[kind] == 100
+        assert tab.mix.keys() == ["titles"]
+        assert tab.title_mix.shares()[kind] == 100
         settings = tab.collect()
         assert getattr(settings, "pack_" + kind)
         settings.gemini_key = ""
         assert any("Gemini" in p for p in settings.validate())
-        assert tab.box_plot.isVisibleTo(tab)
+        assert tab.group_gemini.isVisibleTo(tab)
     finally:
         tab.cleanup()
 

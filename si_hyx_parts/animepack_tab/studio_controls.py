@@ -10,22 +10,15 @@ def build_controls(tab):
     tab.chk_studio = _api.QCheckBox("Студия")
     tab.chk_studio.setToolTip(
         "Вопрос — три кадра из трёх разных аниме одной студии. Назвать нужно "
-        "только СТУДИЮ. Перед каждым кадром надпись «Назовите студию» "
-        "показывается 1 секунду, затем кадр — 4 секунды.\n"
-        "Стоит такой вопрос столько же, сколько обычный вопрос-кадр по тому "
-        "же аниме.")
+        "только СТУДИЮ. Каждый кадр показывается 4 секунды вместе с надписью "
+        "«Назовите студию». Gemini выбирает только кадры с персонажами "
+        "и без видимого названия аниме. Нужен ключ Gemini.")
     tab.box_studio = _api.SettingsBox()
-    layout = _api.QGridLayout(tab.box_studio)
-    layout.setContentsMargins(16, 0, 0, 0)
-    layout.setHorizontalSpacing(8)
-    layout.addWidget(tab._lab("Надпись — 1 с, каждый кадр — 4 с"), 0, 0, 1, 2)
-    layout.setColumnStretch(1, 1)
     tab.box_studio.setVisible(False)
     tab.chk_studio.toggled.connect(lambda value: toggle(tab, value))
 
 
 def toggle(tab, checked):
-    tab.box_studio.setVisible(checked)
     tab.mix.set_studio(checked)
     tab._refresh_song_opts()
 

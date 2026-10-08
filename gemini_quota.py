@@ -28,6 +28,10 @@ _QUOTA_MARKS = ("quota", "resource_exhausted")
 _DAY_MARKS = ("perday", "per day")
 _MINUTE_MARKS = ("perminute", "per minute", "requests per minute")
 SERVER_FAILURE_LIMIT = 2
+# Перегрузка (5xx, таймауты) у Google проходит за минуты. Раньше модель
+# выключалась до конца прогона, и к концу долгого пака генератор спускался
+# по всем тяжёлым моделям подряд, хотя первая давно ожила.
+UNAVAILABLE_COOLDOWN = 300.0
 # «… limit: 20 …» — сам сервер называет потолок, гадать не нужно.
 _LIMIT = re.compile(r"limit[:=]?\s*'?\"?(\d{1,6})", re.IGNORECASE)
 
@@ -81,20 +85,32 @@ class QuotaBoard:
         self._next_at: dict[str, float] = {}
         self._dead: set[str] = set()
         self._server_failures: dict[str, int] = {}
-        self._unavailable: set[str] = set()
+        # Модель → момент (monotonic), до которого она считается перегруженной.
+        self._unavailable: dict[str, float] = {}
 
     def unavailable(self, model: str) -> bool:
-        """Перегрузка помнится только этой доской, не переносится на завтра."""
+        """Перегрузка помнится только этой доской и только UNAVAILABLE_COOLDOWN."""
         with self._lock:
-            return model in self._unavailable
+            return self._cooling(model)
+
+    def _cooling(self, model: str) -> bool:
+        until = self._unavailable.get(model)
+        if until is None:
+            return False
+        if time.monotonic() < until:
+            return True
+        # Пауза прошла: модель снова пробуем, счёт сбоев начинается заново.
+        self._unavailable.pop(model, None)
+        self._server_failures.pop(model, None)
+        return False
 
     def note_server_failure(self, model: str) -> bool:
         with self._lock:
             count = self._server_failures.get(model, 0) + 1
             self._server_failures[model] = count
-            if count >= SERVER_FAILURE_LIMIT:
-                self._unavailable.add(model)
-            return model in self._unavailable
+            if count >= SERVER_FAILURE_LIMIT and not self._cooling(model):
+                self._unavailable[model] = time.monotonic() + UNAVAILABLE_COOLDOWN
+            return self._cooling(model)
 
     def note_response(self, model: str) -> None:
         with self._lock:
@@ -118,6 +134,11 @@ class QuotaBoard:
             wait = next_at - now
             self._next_at[model] = max(next_at, now) + interval
         return wait
+
+    def wait_time(self, model: str) -> float:
+        """Сколько ждать до свободного слота модели, ничего не занимая."""
+        with self._lock:
+            return max(0.0, self._next_at.get(model, 0.0) - time.monotonic())
 
     # ── исчерпанные модели ───────────────────────────────────────────────
     def exhausted(self, model: str) -> bool:

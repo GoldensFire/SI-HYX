@@ -239,8 +239,8 @@ def _map_track(track: dict, source: str) -> dict:
     default = track.get("default")
     return {
         "url": track.get("file"),
-        "label": label or "English",
-        "srclang": _api.LANG_MAP.get(lang_key, "en"),
+        "label": label or "Unknown",
+        "srclang": _api.LANG_MAP.get(lang_key, "und"),
         "default": default if default is not None else False,
         "source": source,
     }

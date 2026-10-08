@@ -38,13 +38,18 @@ class SongDownloads:
 
 
 def prefetch(generator, candidate):
+    from .song_video import requested as wants_video
     if (not candidate.audio_file or candidate.music_effect not in {"original", "karaoke", "chiptune"}
-            or candidate.is_video):
+            or wants_video(generator.s, candidate)):
         return
     # Karaoke's shared source queue also serves ordinary/chiptune slots in a mix.
     if not generator.s.karaoke_enabled:
         return
     if candidate.music_effect == "karaoke":
+        # The worker first checks authored timing availability. Prefetching
+        # here would still download every rejected song in the background.
+        if not generator.s.karaoke_ai_fallback and generator.s.karaoke_effect != "reverse":
+            return
         from .karaoke_processing import known_rejection
         if known_rejection(generator, candidate):
             return
@@ -55,6 +60,14 @@ def prefetch(generator, candidate):
 
 
 def source_bytes(generator, candidate):
+    from .song_audio_fallback import load
+    try:
+        return _source_bytes(generator, candidate)
+    except Exception as error:
+        return load(generator, candidate, error)
+
+
+def _source_bytes(generator, candidate):
     future = getattr(candidate, "_audio_download", None)
     if future is not None:
         try:

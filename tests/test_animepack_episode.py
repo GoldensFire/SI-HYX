@@ -63,12 +63,12 @@ def test_only_existing_sub_or_raw_episodes_are_sampled():
     assert episode_catalog(result) == {7: {"mkissa": ["raw"]}, 3: {"anineko": ["sub"]}, 9: {"anineko": ["sub"]}}
 
 
-def stream(provider="mkissa", audio="raw", **kwargs):
+def stream(provider="fixture", audio="raw", **kwargs):
     return {"provider": provider, "audio": audio, "type": "hls", "url": f"https://{provider}/clip.m3u8", **kwargs}
 
 
 def test_streams_prefer_raw_then_softsub_and_never_embed_or_dub():
-    hard = stream("hard", "sub")
+    hard = stream("hard", "sub", hardsub=True)
     soft = stream("soft", "sub", subtitles=[{"url": "https://soft/sub.vtt"}])
     raw = stream()
     assert playable([hard, stream("dub", "dub"), soft, raw, stream(type="embed")]) == [raw, soft, hard]
@@ -88,24 +88,35 @@ def test_cut_seeks_input_forwards_headers_and_checks_result(tmp_path):
                           opus_args=lambda seconds: ["-c:a", "libopus"])
     source = stream(headers={"Origin": "https://custom", "User-Agent": "required"}, referer="https://site/watch")
     assert media.cut(gen, None, source, tmp_path / "clip.mp4") is not None
+    # Сначала из сети копируется только нужный кусок (seek и длина — опции
+    # входа), затем локальный файл кодируется с точной обрезкой.
     cmd = calls[0]
-    assert cmd.index("-ss") < cmd.index("-i") < cmd.index("-t")
+    assert cmd.index("-ss") < cmd.index("-i") and cmd.index("-t") < cmd.index("-i")
+    assert cmd[cmd.index("-c") + 1] == "copy"
     assert "Referer: https://site/watch\r\n" in cmd[cmd.index("-headers") + 1]
     assert "User-Agent: required\r\n" in cmd[cmd.index("-headers") + 1]
     assert "Origin: https://custom\r\n" in cmd[cmd.index("-headers") + 1]
-    assert cmd[cmd.index("-t") + 1] == "15.0"
+    encode = calls[-1]
+    assert "-headers" not in encode
+    assert encode.index("-ss") < encode.index("-i") < encode.index("-t")
+    assert encode[encode.index("-t") + 1] == "15.0"
 
 
 @pytest.fixture
 def generator(tmp_path, monkeypatch):
     settings = api.PackSettings(pack_episode=True, pct_episode=100, pct_songs=0,
-                                rounds=1, themes=1, questions=5, mark_owners=False)
+                                rounds=1, themes=1, questions=5, mark_owners=False,
+                                episode_scene_check=False)
     anizip = SimpleNamespace(info=lambda _: {"mappings": {"anilist_id": 1}})
     gen = api.AnimePackGenerator(settings, anizip=anizip, session=object(),
                                 amq=object(), anisong=object(), mal=object(), shikimori=object(),
                                 anilist=object(), kitsu=object(), themes=object(), tmdb=object(),
                                 rng=random.Random(2))
     gen.prepare_dirs()
+    from si_hyx_parts.animepack.episode_suitability import Suitability
+    from si_hyx_parts.kuhi.provider_health import ProviderHealth
+    gen._episode_suitability = Suitability(str(tmp_path / "suitability.json"))
+    monkeypatch.setattr(generation, "HEALTH", ProviderHealth())
     # Unit fixtures don't contact real catalogues or probe imaginary hosts.
     gen.episode_ru.close()
     gen.episode_ru = None
@@ -129,7 +140,7 @@ def test_failed_stream_provider_and_episode_fallback(generator, monkeypatch):
     monkeypatch.setattr(generation, "cut", cut)
     candidate = api.SongCandidate({}, make_anime(), kind=api.EPISODE_KIND)
     assert gen.download_episode(candidate)
-    assert calls == ["mkissa", "soft", "hard", "mkissa", "soft"]
+    assert calls == ["fixture", "soft", "hard", "fixture", "soft"]
     assert candidate.episode_clip["episode"] == 3
     assert candidate.has_video and candidate.is_silent
 

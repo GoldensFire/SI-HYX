@@ -170,16 +170,41 @@ def _advice(gen, got: int, total: int) -> list[str]:
     return tips
 
 
-def _log_shortage(self, got: int, total: int, quotas=None, counts=None) -> None:
-    """Почему кандидатов не хватило — цифрами, а не «кандидаты кончились»."""
-    self.log(f"Кандидаты кончились: набрано {got} вопросов из {total}.")
-    _catalogs(self)
-    _fates(self, got)
-    _kinds(self, quotas, counts)
-    tips = _advice(self, got, total)
-    if tips:
-        self.log("Что делать: " + "; ".join(tips) + ".")
-    else:
-        self.log("Что делать: подходящих карточек в каталоге по этим "
-                 "настройкам почти не осталось — ослабьте фильтры или "
-                 "уменьшите пак.")
+class ShortageReportMixin:
+    """Генератор: отчёт, почему кандидатов не хватило."""
+
+    def _log_shortage(self, got: int, total: int, quotas=None, counts=None) -> None:
+        """Почему кандидатов не хватило — цифрами, а не «кандидаты кончились»."""
+        self.log(f"Недобор: набрано {got} вопросов из {total} — {short_reason(self)}.")
+        _catalogs(self)
+        _fates(self, got)
+        _kinds(self, quotas, counts)
+        tips = _advice(self, got, total)
+        if tips:
+            self.log("Что делать: " + "; ".join(tips) + ".")
+        else:
+            self.log("Что делать: подходящих карточек в каталоге по этим "
+                     "настройкам почти не осталось — ослабьте фильтры или "
+                     "уменьшите пак.")
+
+
+def short_reason(gen) -> str:
+    """Настоящая причина недобора — для строки «вопросов будет N, а не M».
+
+    Раньше там всегда стояло «кандидаты кончились», даже когда пак упёрся в
+    потолок размера или род вопросов отвалился из-за сети."""
+    end = getattr(gen, "_selection_end", None) or {}
+    parts = []
+    closed = getattr(gen, "_closed_kinds", None) or {}
+    if closed:
+        parts.append("не получились " + ", ".join(
+            f"«{_api.KIND_TITLES.get(kind, kind).lower()}» ({num} мест)"
+            for kind, num in closed.items()))
+    if end.get("over_budget"):
+        parts.append("пак упёрся в потолок размера")
+    if end.get("exhausted"):
+        network = sum(num for reason, num in gen._late.items()
+                      if reason.startswith("временн"))
+        parts.append("подходящие кандидаты кончились" + (
+            f" (сетевых сбоев по пути: {network})" if network else ""))
+    return "; ".join(parts) or "кандидаты кончились"

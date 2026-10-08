@@ -112,6 +112,30 @@ def test_partial_review_response_cannot_approve_other_scenes():
     assert crop_pages(gen(client), cand(), pages()) is None
 
 
+def test_denied_initial_pool_gets_one_fallback_after_reader_health_updates(monkeypatch):
+    import threading
+    from si_hyx_parts.animepack import manga_page_batch as module
+    from si_hyx_parts.animepack import manga_panel
+    counter = [0]
+    candidate = SimpleNamespace(title_ru="Comic", source_link="", _manga_page_client=None,
+        _manga_page_info={}, _manga_context_urls=[])
+    generator = SimpleNamespace(stopped=lambda: False, _log_rare=lambda *args: None,
+        _manga_lock=threading.Lock(), gemini_manga=object())
+    def pick(*args):
+        counter[0] += 1
+        return f"page-{counter[0]}", "chapter", ["Comic"]
+    def download(generator, candidate, url, **kwargs):
+        if int(url.split("-")[-1]) <= 4:
+            raise RuntimeError("CDN refused initial pool")
+        return b"page", ".png"
+    monkeypatch.setattr(manga_panel, "_pick_page", pick)
+    monkeypatch.setattr(module, "reserve", lambda *args: True)
+    monkeypatch.setattr(module, "download", download)
+    monkeypatch.setattr(module, "crop_pages", lambda *args: (0, (b"crop", ".png")))
+    result = module.prepare(generator, candidate)
+    assert result[0] == "page-5" and counter[0] == 8
+
+
 @pytest.mark.parametrize("height", [2400, 20000, 100000])
 def test_batch_tile_budget_covers_long_pages_without_gaps(height):
     regions = _windows(400, height, max_tiles=6)

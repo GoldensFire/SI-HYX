@@ -19,6 +19,7 @@ import re
 from collections import Counter
 
 from .test_packs import TEST_LIMIT
+from .level_avg import question_level
 
 
 def numbered_title(title: str, number) -> str:
@@ -49,7 +50,7 @@ def average_level(songs) -> float:
     журнале («Средняя сложность всего пака»): по всем вопросам пака. Целым
     числом её больше не округляем (просьба пользователя): «7» у пака со
     средней 6.6 и у пака со средней 7.4 ничего не говорило."""
-    levels = [int(getattr(cand, "level", 0) or 0) for cand in songs or ()]
+    levels = [question_level(cand) for cand in songs or ()]
     levels = [value for value in levels if value > 0]
     if not levels:
         return 0
@@ -94,7 +95,7 @@ def composition_text(songs, settings, kind_titles: dict,
                              f"до {_number(max(amq))}")
         suffix = f" ({detail})" if detail else ""
         lines.append(f"{kind_titles.get(kind, kind)}: {count}{suffix}")
-    levels = [int(getattr(cand, "level", 0) or 0) for cand in rows]
+    levels = [question_level(cand) for cand in rows]
     levels = [value for value in levels if value > 0]
     if levels:
         lines.append("")
@@ -107,7 +108,7 @@ def _values(rows, attr: str) -> list[float]:
     values = []
     for row in rows:
         try:
-            value = float(getattr(row, attr, 0) or 0)
+            value = float(question_level(row) if attr == 'level' else getattr(row, attr, 0) or 0)
         except (TypeError, ValueError):
             continue
         if value > 0:

@@ -115,6 +115,8 @@ def test_ui_settings_roundtrip_and_reverse_disables_recognition(qapp):
         tab.sp_karaoke_tempo.setValue(1.25)
         tab.sp_karaoke_crf.setValue(31)
         tab.sp_karaoke_preset.setValue(11)
+        tab.sp_karaoke_ai_minutes.setValue(7)
+        tab.cb_karaoke_separator.setCurrentIndex(tab.cb_karaoke_separator.findData("htdemucs"))
         assert not tab.collect().karaoke_translations
         tab.chk_karaoke_translations.setChecked(True)
         settings = tab.get_settings()
@@ -124,9 +126,16 @@ def test_ui_settings_roundtrip_and_reverse_disables_recognition(qapp):
         assert tab.collect().karaoke_percent == 100
         assert tab.collect().karaoke_crf == 31
         assert tab.collect().karaoke_preset == 11
+        assert tab.collect().karaoke_ai_timeout == 420
+        assert tab.collect().karaoke_separator == "htdemucs"
         assert tab.collect().karaoke_translations
         assert tab.collect().video_crf == settings["video_crf"]
         tab.cb_karaoke_effect.setCurrentIndex(tab.cb_karaoke_effect.findData("reverse"))
         assert not tab.chk_karaoke_ai.isEnabled()
     finally:
         tab.cleanup()
+        tab.close()
+        tab.deleteLater()
+        from PyQt6.QtCore import QEvent
+        qapp.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        qapp.processEvents()

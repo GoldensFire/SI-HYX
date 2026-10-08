@@ -33,14 +33,18 @@ def session_for(path, provider):
     return session
 
 
-def separate(source, target, provider):
+def separate(source, target, provider, *, ffmpeg="ffmpeg"):
     import numpy as np
     import soundfile as sf
     from scipy.signal import resample_poly
     from .ai_assets import kim_model
     from .stft import forward, inverse
     from .audio_chunks import pad_context, chunks
+    from .input_audio import read
 
+    mix, source_sr = read(source, ffmpeg)
+    if not len(mix) or not np.isfinite(mix).all():
+        raise ValueError("Аудио пустое или повреждено.")
     session = session_for(kim_model(), provider)
     meta = session.get_modelmeta().custom_metadata_map
     mask_graph = session.get_inputs()[0].name == "spec"
@@ -60,7 +64,6 @@ def separate(source, target, provider):
         normalized = meta["stft_normalized"] == "true"
     if "vocals" not in stems:
         raise ValueError("Kim export must predict a vocals stem")
-    mix, source_sr = sf.read(str(source), dtype="float32", always_2d=True)
     if source_sr != sr:
         factor = gcd(source_sr, sr)
         mix = resample_poly(mix, sr // factor, source_sr // factor, axis=0)

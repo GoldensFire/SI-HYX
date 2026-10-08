@@ -2,8 +2,10 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 """Try enabled page sources without changing the generator's client API."""
 import animepack_api as _api
+import threading
+from .manga_reader_pool import ReaderHealth
 from .manga_reader_base import (
-    SOURCE_LABELS, MangaSourceUnavailable, clean_sources, names)
+    SOURCE_LABELS, MangaSourceBlocked, MangaSourceUnavailable, clean_sources, names)
 
 SOURCE_LANGUAGES = {
     "remanga": ("ru",), "mangalib": ("ru",),
@@ -16,6 +18,13 @@ class MangaPageSources:
     def __init__(self, session=None, *, sources=None, language="",
                  allow_erotica=False, rng=None, clients=None):
         enabled = clean_sources(sources)
+        self._injected = clients is not None
+        self._worker_local = threading.local()
+        self._workers_lock = threading.Lock()
+        self._workers = []
+        self._health = ReaderHealth()
+        self._worker_options = dict(sources=enabled, language=language,
+                                    allow_erotica=allow_erotica, rng=rng)
         self.language = str(language or "").strip()
         options = dict(language=language, allow_erotica=allow_erotica, rng=rng)
         factories = {"mangadex": _api.MangaDexApi,
@@ -32,6 +41,14 @@ class MangaPageSources:
         self.last_titles, self.last_errors, self.last_page_info = [], [], {}
         self.last_client = None
         self.last_language = ""
+
+    def select_page(self, card, excluded=(), *, deadline=None, stopped=lambda: False):
+        from .manga_reader_pool import select_page
+        return select_page(self, card, excluded, deadline, stopped)
+
+    def close(self):
+        from .manga_reader_pool import close
+        close(self)
 
     def _order(self, cache_key):
         languages = [self.language] if self.language else ["ru", "en", "uk"]
@@ -57,7 +74,7 @@ class MangaPageSources:
         cache_key = (str(card.get("malId") or ""), tuple(names(card)))
         failed = set()
         for key, client, language, cursor, group in self._order(cache_key):
-            if key in self._disabled or key in failed:
+            if key in self._disabled or key in failed or not self._health.provider_available(key):
                 continue
             original = getattr(client, "language", "")
             try:
@@ -68,6 +85,13 @@ class MangaPageSources:
                 self._failures[key] = self._failures.get(key, 0) + 1
                 if isinstance(exc, MangaSourceUnavailable) or self._failures[key] >= 3:
                     self._disabled.add(key)
+                    # 403 API выключает источник всем рабочим потокам: прежде
+                    # каждый поток после 90 с паузы снова получал тот же 403
+                    # (Comix.to — 33 отказа за прогон).
+                    if isinstance(exc, MangaSourceBlocked):
+                        self._health.disable_provider(key)
+                    else:
+                        self._health.defer_provider(key)
                 self.last_errors.append(f"{SOURCE_LABELS[key]}: {exc}")
                 continue
             finally:

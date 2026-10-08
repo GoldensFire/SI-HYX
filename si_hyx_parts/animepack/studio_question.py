@@ -89,6 +89,9 @@ def _clean(rows) -> list[str]:
 
 def download_frames(generator, cand) -> bool:
     """Три кадра из трёх аниме одной студии и склейка их постеров."""
+    if _api.STUDIO_KIND in generator._dead_kinds:
+        cand.rejected = True
+        return False
     choices = studio_names(generator, cand)
     if not choices:
         generator.log(f"«{cand.title_ru}» без студии в карточке — беру "
@@ -106,7 +109,8 @@ def download_frames(generator, cand) -> bool:
             continue
         assets = []
         for card in cards:
-            if generator.stopped() or len(assets) >= _api.STUDIO_FRAMES:
+            if (generator.stopped() or len(assets) >= _api.STUDIO_FRAMES
+                    or _api.STUDIO_KIND in generator._dead_kinds):
                 break
             from .studio_reservations import reserve_card, release_card
             if not reserve_card(generator, cand, card):
@@ -196,7 +200,7 @@ def _franchise_marks(card: dict) -> set[str]:
 
 def _pack_marks(card: dict) -> set[str]:
     """Use the same franchise and title-root keys as ordinary pack questions."""
-    from .anime_pack_generator__iter_picture_candidates import _franchise_marks
+    from si_hyx_parts.animepack.generator_catalog import _franchise_marks
     return set(_franchise_marks(card))
 
 
@@ -310,13 +314,15 @@ def _download_one(generator, cand, card: dict, number: int):
         poster_image.load()
     except Exception:  # noqa: BLE001
         return None
-    url = generator._pick_frame_url(probe)
-    if not url:
+    from .frame_visual_check import select
+    selected = select(generator, probe)
+    if selected is None:
         return None
+    frame, ext = selected
+    url = probe.frame_url
     try:
-        frame = generator._cached_bytes(url, "anime-frame")
         name = generator._save_reusable_image(
-            frame, f"{cand.file_base}_studio{number}", generator._url_ext(url),
+            frame, f"{cand.file_base}_studio{number}", ext,
             reuse=False)
     except Exception as exc:  # noqa: BLE001
         _forget_frame(generator, url)

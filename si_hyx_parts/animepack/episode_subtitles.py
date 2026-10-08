@@ -45,13 +45,14 @@ def _jimaku(generator, aid, episode, start):
             continue
         if all(russian(text) for _, _, text in rows):
             return rows
-        if generator.gemini is None:
+        client = getattr(generator, "gemini_episode", None) or generator.gemini
+        if client is None:
             continue
         original = [text for _, _, text in rows]
         prompt = ("Переведи все реплики субтитров на русский. Сохрани порядок и число "
                   "реплик. Не добавляй пояснений и новых реплик. Верни lines.\n"
                   + api.json.dumps(original, ensure_ascii=False))
-        result = generator.gemini.generate_json(prompt, TRANSLATION_SCHEMA)
+        result = client.generate_json(prompt, TRANSLATION_SCHEMA)
         shown = result.get("lines") if isinstance(result, dict) else None
         if (isinstance(shown, list) and len(shown) == len(rows)
                 and all(isinstance(text, str) and russian(text) for text in shown)):

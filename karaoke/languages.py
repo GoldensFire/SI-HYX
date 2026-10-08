@@ -37,15 +37,22 @@ def rank(original, classify):
         remainder.append("".join(other))
     # The full non-CJK corpus stabilizes short monolingual English lines.
     whole = "\n".join(remainder)
-    dominant, _ = classify(whole) if any(c.isalpha() for c in whole) else (None, 0)
+    dominant, confidence = classify(whole) if any(c.isalpha() for c in whole) else (None, 0)
+    if confidence < .9:
+        dominant = None
     for text in remainder:
         for span in text.split("\n"):
             size = sum(c.isalpha() for c in span)
             if not size:
                 continue
             language, probability = classify(span)
-            if size < 12 or probability < .8:
+            if size < 12 or probability < .95:
                 language = dominant
+            # Small interjections and English inserts in Japanese lyrics often
+            # get a confidently wrong langid label (br/sw/fr). Require enough
+            # independent prose for a second non-English language.
+            if japanese and language != "en" and (size < 40 or confidence < .99):
+                language = None
             language = ALIASES.get(language, language)
             if language in SUPPORTED:
                 votes[language] += size

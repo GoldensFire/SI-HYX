@@ -100,8 +100,10 @@ def test_measured_highest_video_is_mapped_and_source_resolution_recorded(tmp_pat
     measured = media.inspect_stream(gen, source, tmp_path / "clip.mp4", time.monotonic() + 60)
     assert measured and source["source_height"] == 1080
     assert media.cut(gen, None, source, tmp_path / "clip.mp4", info=measured) is not None
+    # Лучшая дорожка выбирается уже при копии куска из сети, масштаб — при
+    # локальном кодировании.
     assert calls[0][calls[0].index("-map") + 1] == "0:4"
-    assert "scale=-2:720" in calls[0]
+    assert "scale=-2:720" in calls[-1]
 
 
 def test_restricted_manifest_server_closes_even_when_probe_fails(tmp_path):

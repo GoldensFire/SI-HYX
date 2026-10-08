@@ -22,17 +22,23 @@
 #
 #   3) голые except. Ловят KeyboardInterrupt и SystemExit — из-за этого разбор
 #      тяжёлого .siq нельзя было прервать.
-#   4) большие файлы. Предел 600 строк / 40 КиБ удерживает стоимость контекста
-#      для локальной правки; новые каталоги и ещё не добавленные в git файлы включены.
+#
+#   4) правила CodeQL, уже срабатывавшие на GitHub (проверка URL подстрокой,
+#      ReDoS) — см. tools/check_security.py. Ловим их до пуша, а не после.
+#
+# Длина файлов сюда не входит: tools/check_file_sizes.py только предупреждает
+# о файлах длиннее 1500 строк и запускается в CI отдельным шагом.
 import ast
 import os
 import subprocess
 import sys
 
 if __package__:
-    from .check_file_sizes import check_file_sizes, source_files
+    from .check_file_sizes import source_files
+    from .check_security import check_files as check_security
 else:
-    from check_file_sizes import check_file_sizes, source_files
+    from check_file_sizes import source_files
+    from check_security import check_files as check_security
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -131,7 +137,7 @@ def main():
     for title, fn in (("Импорты (pyflakes)", check_imports),
                       ("Явная кодировка", check_encoding),
                       ("Голые except", check_bare_except),
-                      ("Размер файлов", lambda _: check_file_sizes(source_files(ROOT)))):
+                      ("Безопасность (правила CodeQL)", check_security)):
         problems = fn(files)
         if problems:
             failed = True

@@ -18,7 +18,8 @@
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import QEvent, QObject
+from PyQt6.QtCore import QEvent, QObject, QTimer
+from PyQt6.QtGui import QCursor
 from si_hyx_parts.widgets.info_tip_frame import source_is_current
 
 try:
@@ -39,6 +40,9 @@ class RowTipWatcher(QObject):
         self._page = page
         self._key = None
         self._texts: dict = {}
+        self._follow = QTimer(self)
+        self._follow.setSingleShot(True)
+        self._follow.timeout.connect(self._follow_cursor)
 
     def reset(self) -> None:
         """Строки таблицы сменились — прежние разборы больше не годятся."""
@@ -53,21 +57,37 @@ class RowTipWatcher(QObject):
         if kind == QEvent.Type.ToolTip:
             self._show(event.pos(), event.globalPos())
             return True
-        if kind == QEvent.Type.MouseMove and self._visible():
+        if kind in (QEvent.Type.MouseMove, QEvent.Type.Enter) and self._owns_tip():
+            # Re-entering the viewport may deliver only Enter after another
+            # window intercepted the move. Resume the already active row tip.
             try:
                 pos = event.position().toPoint()
                 gpos = event.globalPosition().toPoint()
             except AttributeError:  # pragma: no cover — старый Qt
                 pos, gpos = event.pos(), event.globalPos()
             self._show(pos, gpos)
+            # Native pointer events can precede QCursor's update. The global
+            # filter has hidden the old cell; retry after the cursor settles.
+            self._follow.start(0)
         elif kind in (QEvent.Type.Leave, QEvent.Type.MouseButtonPress,
                       QEvent.Type.Wheel):
             self._hide()
         return False
 
     def _visible(self) -> bool:
+        return self._owns_tip() and _InfoTipPopup.instance().isVisible()
+
+    def _follow_cursor(self) -> None:
+        viewport = self._page.table.viewport()
+        point = QCursor.pos()
+        if source_is_current(viewport, point):
+            self._show(viewport.mapFromGlobal(point), point)
+
+    def _owns_tip(self) -> bool:
+        # The application filter hides an old cell before this filter receives
+        # MouseMove. Keep following rows while this watcher still owns the tip.
         popup = _InfoTipPopup.instance()
-        return (self._key is not None and popup.isVisible()
+        return (self._key is not None
                 and popup._anchor == id(self._page.table.viewport()))
 
     def _show(self, pos, global_pos) -> None:
@@ -89,10 +109,13 @@ class RowTipWatcher(QObject):
             self._hide()
             return
         self._key = key
+        table = self._page.table
         _InfoTipPopup.instance().show_at(
-            global_pos, text, owner=self._page.table.viewport())
+            global_pos, text, owner=table.viewport(),
+            region=table.visualRect(table.indexAt(pos)))
 
     def _hide(self) -> None:
+        self._follow.stop()
         if self._key is None:
             return
         self._key = None

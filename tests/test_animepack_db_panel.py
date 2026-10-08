@@ -79,11 +79,12 @@ def test_default_parts_are_the_old_whole_base_without_the_tails():
     Каждое число хвостов стоит отдельного запроса и копится генерациями —
     терять их при каждом обновлении каталога незачем."""
     songs = ap.PackSettings(rounds=1, themes=1, questions=5)
-    assert ap.db_refresh_parts(None, songs) == ("anime", "franchises")
+    assert ap.db_refresh_parts(None, songs) == ("anime", "manga", "remanga",
+                                               "mangalib", "favorites", "franchises")
     with_manga = ap.PackSettings(rounds=1, themes=1, questions=5,
                                  pct_songs=50, pct_manga=50, pack_manga=True)
     assert ap.db_refresh_parts(None, with_manga) == ("anime", "manga", "remanga",
-                                                     "mangalib", "franchises")
+                                                     "mangalib", "favorites", "franchises")
     assert ap.db_refresh_parts(("manga",)) == ("manga",)
     assert ap.db_refresh_parts("extras") == ("extras",)
 
@@ -175,7 +176,8 @@ def test_panel_block_asks_the_tab_for_just_that_part(qapp, cache):
         dialog.flush()
         dialog.blocks["manga"].button.click()
         dialog.btn_all.click()
-        assert calls == [("manga",), ("anime", "manga", "remanga", "mangalib", "franchises")]
+        assert calls == [("manga",), ("anime", "manga", "remanga", "mangalib",
+                                     "favorites", "franchises")]
     finally:
         dialog.deleteLater()
 

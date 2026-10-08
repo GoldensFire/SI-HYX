@@ -124,6 +124,8 @@ def main():
         except Exception: pass
         # Сервер не найден — запускаем нормально и загружаем файлы
 
+    from diagnostic_logging import start_file
+    start_file(_api.CONFIG_DIR)
     _api.qInstallMessageHandler(_api._qt_message_filter)
     _api._install_crash_handler()
 

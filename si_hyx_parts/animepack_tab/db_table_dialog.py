@@ -86,7 +86,8 @@ class DbTableDialog(QDialog):
         self._title_rows: dict = {}
         self._filled: set = set()
         self._pending: set = set()
-        self._filter_kinds = {"anime": None, "manga": None}
+        from .db_view_filters import defaults
+        self._filter_kinds = defaults()
         self.setWindowTitle("База Shikimori: что в ней и как её обновить")
         self.resize(1050, 700)
         # Один поток на всю панель: разбор вкладок ходит по одному и тому же
@@ -105,7 +106,8 @@ class DbTableDialog(QDialog):
         layout.addLayout(blocks_row)
         filter_row = QHBoxLayout()
         filter_row.addStretch()
-        self.btn_filters = QPushButton("Фильтры…")
+        self.btn_filters = QPushButton("Фильтры отображения…")
+        self.btn_filters.setToolTip("Только отображение таблиц. Обновление всегда собирает всю базу.")
         self.btn_filters.clicked.connect(self._open_filters)
         filter_row.addWidget(self.btn_filters)
         layout.addLayout(filter_row)
@@ -160,7 +162,8 @@ class DbTableDialog(QDialog):
         # Кнопка обещает обновить ВСЮ базу независимо от текущего состава
         # пака. ``None`` здесь оставляло мангу нетронутой, когда её доля в
         # настройках была нулевой, хотя подпись и подсказка говорили обратное.
-        parts = (("anime", *MANGA_PARTS, "franchises") if part == "all" else
+        from animepack import db_refresh_parts
+        parts = (db_refresh_parts() if part == "all" else
                  MANGA_PARTS if part == "manga_all" else (part,))
         self._tab._refresh_db(parts)
         self.sync_state()
@@ -324,11 +327,17 @@ class DbTableDialog(QDialog):
     def _read_page(self, target: str, kinds):
         from . import db_rows
         if target == "chars":
-            levels = db_rows.title_levels(self._rows_for("anime", kinds),
+            levels = db_rows.title_levels(self._rows_for("anime", None),
                                           "anime")
             levels.update(db_rows.title_levels(
-                self._rows_for("manga", kinds), "manga"))
+                self._rows_for("manga", None), "manga"))
             rows = db_rows.character_rows(self._cache, levels)
+            from .db_view_filters import active
+            if kinds and active(kinds):
+                visible = {(row["media"], row["id"])
+                           for target in ("anime", "manga")
+                           for row in self._rows_for(target, kinds)}
+                rows = [row for row in rows if (row["owner_media"], row["owner_id"]) in visible]
             texts, sorts, hay = build_cells(rows, _char_cells)
             return rows, texts, sorts, hay, CHAR_HEADERS.index("В избранном")
         rows = self._rows_for(target, kinds)
@@ -420,8 +429,9 @@ class DbTableDialog(QDialog):
         if target not in self._title_rows:
             from . import db_rows
             self._title_rows[target] = db_rows.title_rows(
-                self._cache, target, kinds.get(target) if kinds else None)
-        return self._title_rows[target]
+                self._cache, target)
+        from .db_view_filters import title_rows
+        return title_rows(self._title_rows[target], kinds)
 
     def _filters_snapshot(self):
         """Снимок собственных фильтров для расчёта таблиц в рабочем потоке."""
@@ -436,7 +446,8 @@ class DbTableDialog(QDialog):
     def _set_filters(self, filters):
         self._filter_kinds = dict(filters)
         active = any(value is not None for value in filters.values())
-        self.btn_filters.setText("Фильтры (включены)…" if active else "Фильтры…")
+        self.btn_filters.setText("Фильтры отображения (включены)…" if active
+                                 else "Фильтры отображения…")
         self.refresh()
 
 
@@ -461,7 +472,9 @@ def _title_cells(row):
         (f"{row['score']:.2f}" if row["score"] else "", row["score"]),
         (_fmt(row["base"]), row["base"]),
         # −1 значит «не спрашивали»: ноль был бы неправдой.
-        ("—" if fav < 0 else _fmt(fav), fav),
+        ({"AGE_RESTRICTED": "Требуется вход", "NOT_FOUND": "404",
+          "ACCESS_DENIED": "Нет доступа", "ERROR": "Ошибка"}.get(
+              row.get("favorites_status"), "—") if fav < 0 else _fmt(fav), fav),
         (_fmt(row["index"]), row["index"]),
         (str(row["level"]), row["level"]),
         (str(row["price"]), row["price"]),

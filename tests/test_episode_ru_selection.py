@@ -20,6 +20,7 @@ def ru_client(rows, calls):
 
 
 def test_player_priority_failover_ignores_catalogue_order(generator, monkeypatch):
+    generator.s.episode_ru_subtitles = True
     calls, cuts = [], []
     generator.episode_ru = ru_client([{"player": p} for p in ("alloha", "animelib", "aniboom", "cvh")], calls)
     def cut(gen, candidate, stream, *a, **kw):
@@ -28,7 +29,7 @@ def test_player_priority_failover_ignores_catalogue_order(generator, monkeypatch
     monkeypatch.setattr(generation, "cut", cut)
     candidate = api.SongCandidate({}, make_anime(), kind=api.EPISODE_KIND)
     assert generator.download_episode(candidate)
-    assert calls == ["cvh", "aniboom", "animelib"]
+    assert calls == ["animelib"]
     assert cuts == calls
     assert candidate.episode_clip["duration"] == 15
     assert candidate.episode_clip["source_height"] == 1080
@@ -38,6 +39,7 @@ def test_player_priority_failover_ignores_catalogue_order(generator, monkeypatch
 
 
 def test_highest_verified_quality_wins_within_the_same_player(generator, monkeypatch):
+    generator.s.episode_ru_subtitles = True
     calls = []
     generator.episode_ru = ru_client([{"player": "cvh", "height": h} for h in (1080, 1440, 720)], calls)
     def inspect(gen, stream, *a):
@@ -64,12 +66,13 @@ def test_existing_hardsub_does_not_fetch_or_overlay_external_subtitles(generator
 
 
 def test_ru_softsub_failure_tries_next_source(generator, monkeypatch):
+    generator.s.episode_ru_subtitles = True
     calls = []
     client = ru_client([{"player": "aniboom"}, {"player": "animelib"}], calls)
     original = client.streams
     def streams(rows, *a):
         result = original(rows, *a)
-        if rows and rows[0]["player"] == "aniboom":
+        if rows and rows[0]["player"] == "animelib":
             result[0]["hardsub"] = False
         return result
     client.streams = streams
@@ -78,8 +81,8 @@ def test_ru_softsub_failure_tries_next_source(generator, monkeypatch):
     monkeypatch.setattr(generation, "cut", lambda *a, **kw: 100)
     candidate = api.SongCandidate({}, make_anime(), kind=api.EPISODE_KIND)
     assert generator.download_episode(candidate)
-    assert calls == ["aniboom", "animelib"]
-    assert candidate.episode_clip["provider"] == "animelib"
+    assert calls == ["animelib", "aniboom"]
+    assert candidate.episode_clip["provider"] == "aniboom"
 
 
 def test_probe_failure_and_mp4_range_error_do_not_hide_next_release(generator, monkeypatch):
@@ -90,4 +93,41 @@ def test_probe_failure_and_mp4_range_error_do_not_hide_next_release(generator, m
     generator.kuhi = SimpleNamespace(range_supported=lambda *a: (_ for _ in ()).throw(RuntimeError("network")), close=lambda: None)
     monkeypatch.setattr(generation, "inspect_stream", lambda *a: info(duration=1400))
     scope = RequestScope(lambda: False, time.monotonic() + 60)
-    assert generation._verified(generator, [bad, good], Path(generator.folder) / "clip.mp4", scope) == [good]
+    assert list(generation._verified(generator, [bad, good], Path(generator.folder) / "clip.mp4", scope)) == [good]
+
+
+def test_a_release_below_the_floor_is_not_extracted_again_in_other_episodes(generator, monkeypatch):
+    """Разрешение у всех серий релиза одно: проверенный ниже 1080p релиз не
+    добывается заново в следующих сериях (раньше — до 4 минут на тайтл)."""
+    generator.s.episode_ru_subtitles = True
+    calls = []
+    client = ru_client([{"player": "animelib", "height": 480, "release": "Low"}], calls)
+    client.catalogue = lambda *a: {1: [{"player": "animelib", "height": 480, "release": "Low"}],
+                                   2: [{"player": "animelib", "height": 480, "release": "Low"}],
+                                   3: [{"player": "animelib", "height": 480, "release": "Low"}]}
+    generator.episode_ru = client
+
+    def inspect(gen, stream, *a):
+        if stream["source_height"] < 1080:
+            stream["_reject"] = "low"
+            return {}
+        return info(duration=1400)
+
+    monkeypatch.setattr(generation, "inspect_stream", inspect)
+    candidate = api.SongCandidate({}, make_anime(), kind=api.EPISODE_KIND)
+    assert not generator.download_episode(candidate)
+    assert calls == ["animelib"]
+
+
+def test_release_quality_keeps_a_release_with_an_unanswered_variant():
+    from si_hyx_parts.animepack.episode_quality_policy import ReleaseQuality
+    quality = ReleaseQuality()
+    row = {"source": "animego", "player": "alloha", "release": "Sub"}
+    quality.record(dict(row, url="720"), "low")
+    quality.record(dict(row, url="1080"), "pause")
+    assert not quality.low(row)
+    other = dict(row, release="Other")
+    quality.record(other, "low")
+    assert quality.low(other) and quality.skipped == 1
+    quality.record(other, "ok")
+    assert not quality.low(other)

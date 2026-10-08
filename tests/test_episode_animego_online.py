@@ -54,13 +54,15 @@ def test_online_catalogue_uses_relay_and_actual_subtitle_episodes(monkeypatch):
         if url.endswith("controller.php"):
             assert params == {"mod": "player", "id": "872", "slot": "0"}
             return response(data={"status": True, "data": {"kind": "iframe", "src": "https://player.test/?token=x"}})
-        if url.startswith("https://player.test"):
+        if urlsplit(url).hostname == "player.test":
             return response(file_script(serial()))
         return response(page, url=url)
     monkeypatch.setattr(online, "get", get)
     monkeypatch.setattr(alloha, "get", get)
     candidate = SimpleNamespace(mal_id=42, anime={"name": "Original Title"})
-    result = asyncio.run(online.catalogue(candidate, {}))
+    # Alloha holds both seasons; the TVDB numbering from AniZip selects season 1.
+    tvdb = {"anizip": {"episodes": {str(n): {"seasonNumber": 1, "episodeNumber": n} for n in (2, 7)}}}
+    result = asyncio.run(online.catalogue(candidate, tvdb))
     assert set(result) == {2, 7}
     for number, rows in result.items():
         assert len(rows) == 1 and rows[0]["source"] == "animego"

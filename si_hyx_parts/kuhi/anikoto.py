@@ -19,6 +19,8 @@ MAPPER = "https://mapper.nekostream.site/api/mal"
 SPOOF_REF = "https://hianimes.re/"
 
 LANG_MAP = {
+    "ru": "ru", "russian": "ru", "русские": "ru",
+    "ar": "ar", "arabic": "ar", "العربية": "ar",
     "en": "en", "english": "en", "ja": "ja", "japanese": "ja",
     "fr": "fr", "french": "fr", "de": "de", "german": "de",
     "es": "es", "spanish": "es", "pt": "pt", "portuguese": "pt",
@@ -205,6 +207,7 @@ async def scrape_series(slug: str) -> list:
             "title": title or f"Episode {num}",
             "hasSub": _data_attr(tag, "sub") == "1",
             "hasDub": _data_attr(tag, "dub") == "1",
+            "mal_id": _data_attr(tag, "mal"),
         })
     episodes.sort(key=lambda e: e["number"])
     seen, out = set(), []
@@ -217,7 +220,8 @@ async def scrape_series(slug: str) -> list:
 
 async def resolve_series(anilist_id: int, ctx: dict | None = None) -> dict:
     ctx = ctx or await build_ctx(int(anilist_id))
-    key = f"np:anikoto:{int(anilist_id)}"
+    mal = int((ctx.get("media") or {}).get("idMal") or 0)
+    key = f"np:anikoto-id-v2:{int(anilist_id)}:{mal}"
     hit = _cache.cached(key, _cache.SHOW_IDENTITY_TTL)
     if hit is not None:
         return hit
@@ -229,7 +233,14 @@ async def resolve_series(anilist_id: int, ctx: dict | None = None) -> dict:
         offset = await get_prequel_offset(int(anilist_id))
     except Exception:
         offset = 0
-    selected = await select_series(candidates, scrape_series, expected, media.get("status"), offset)
+    async def verified_episodes(slug):
+        rows = await scrape_series(slug)
+        rows = [row for row in rows if not mal or not str(row.get("mal_id") or "").isdigit()
+                or int(row["mal_id"]) in (0, mal)]
+        if not rows:
+            raise RuntimeError("Anikoto: MAL id выбранного сериала не совпадает с тайтлом")
+        return rows
+    selected = await select_series(candidates, verified_episodes, expected, media.get("status"), offset)
     if not selected:
         raise RuntimeError(f"Anikoto match not found for AniList {anilist_id}")
     show_id = await _fetch_show_id(selected["slug"])
@@ -242,6 +253,9 @@ async def resolve_series(anilist_id: int, ctx: dict | None = None) -> dict:
 def _build_lists(anilist_id: int, series: dict, provider_eps: list, ctx: dict, expected) -> dict:
     sub, dub = [], []
     for src in provider_eps:
+        mal = int((ctx.get("media") or {}).get("idMal") or 0)
+        if mal and str(src.get("mal_id") or "").isdigit() and int(src["mal_id"]) not in (0, mal):
+            continue
         number = src["number"] - series["offset"] if series["mode"] == "offset" else src["number"]
         if number < 1:
             continue

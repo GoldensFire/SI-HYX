@@ -15,8 +15,10 @@ import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import FFMPEG
+from config import FFMPEG, CREATE_NO_WINDOW
 from manga_pack_probe import contact_sheets
+import animepack as ap
+from manga_pack_audit import audit
 
 
 def main():
@@ -34,6 +36,9 @@ def main():
         xml = ET.fromstring(archive.read("content.xml"))
     ns = {"s": xml.tag.split("}")[0].lstrip("{")}
     questions = xml.findall(".//s:question", ns)
+    settings = ap.PackSettings.from_dict(json.loads(
+        (root / "settings.json").read_text(encoding="utf-8")))
+    checks = audit(settings, rows, questions, ns)
     if len(questions) != report["requested"] or len(rows) != len(questions):
         raise RuntimeError("Question count does not match the requested pack size")
     folders = {"image": "Images", "video": "Video", "audio": "Audio"}
@@ -64,7 +69,8 @@ def main():
                        "-sseof", "-0.1", "-i", str(source), "-update", "1",
                        "-q:v", "2", str(frames / name)]
             result = subprocess.run(command, capture_output=True, text=True,
-                                    encoding="utf-8", errors="replace", timeout=90)
+                                    encoding="utf-8", errors="replace", timeout=90,
+                                    creationflags=CREATE_NO_WINDOW)
             if result.returncode or not (frames / name).is_file():
                 raise RuntimeError(f"Cannot decode {row['title']}: {result.stderr}")
             return dict(row, frame=name)
@@ -81,7 +87,8 @@ def main():
                              max(row["level"] for row in rows)],
              "mean_level": sum(row["level"] for row in rows) / len(rows),
              "repaired_frames": sum(note["changed"] for note in notes),
-             "replaced_scenes": sum(note["replaced_scene"] for note in notes)}
+             "replaced_scenes": sum(note["replaced_scene"] for note in notes),
+             "checks": checks}
     (root / "verification.json").write_text(
         json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(stats, ensure_ascii=False, indent=2), flush=True)

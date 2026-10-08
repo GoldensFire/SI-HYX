@@ -14,6 +14,7 @@ def no_installs(monkeypatch):
     recognition._FAILED_SEPARATORS.clear()
     monkeypatch.setattr(recognition, "ensure_separator", lambda *a, **k: None)
     monkeypatch.setattr(recognition, "ensure_packages", lambda *a, **k: None)
+    monkeypatch.setattr(recognition, "kim_disabled", lambda: False)
     for variable in ("SI_HYX_KIM_ONNX", "SI_HYX_WHISPER_MODEL"):
         monkeypatch.delenv(variable, raising=False)
 
@@ -114,8 +115,10 @@ def test_cpp_word_segments_keep_actual_millisecond_offsets():
 
 
 def test_kim_out_of_memory_retries_cpu_and_does_not_disable_cpu_for_next_song(tmp_path, monkeypatch):
+    monkeypatch.setattr("config.FFMPEG", "bundled path/ffmpeg.exe")
     calls, messages = [], []
     def run(command, timeout, **kwargs):
+        assert command[command.index("--ffmpeg") + 1] == "bundled path/ffmpeg.exe"
         backend = command[command.index("--backend") + 1]
         device = command[command.index("--device") + 1]
         calls.append((backend, device))

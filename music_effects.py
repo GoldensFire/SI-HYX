@@ -1,6 +1,6 @@
 """Musical presentation settings, independent of opening/ending/insert.
 
-Способов подачи теперь несколько (оригинал, chiptune, кавер), и доля у каждого
+Способов подачи несколько (оригинал, видеоряд, караоке, chiptune, кавер), и доля у каждого
 своя. Раскладка по вопросам одна на все: слоты делятся заранее и перемешиваются
 ОДНИМ зерном (chiptune_seed) — им и раньше решалось, каким вопросам достанется
 эффект, поэтому сохранённые настройки продолжают давать тот же пак.
@@ -14,12 +14,14 @@
 from __future__ import annotations
 
 import random
+import time
 from pathlib import Path
 
 VERSION = "chiptune-2"
 MODEL = "htdemucs-955717e8+rmvpe-5370e71a+crepe-full-0.0.23"
 ORIGINAL = "original"
-EFFECTS = {ORIGINAL: "Оригинал", "chiptune": "Chiptune", "cover": "Кавер", "karaoke": "Караоке"}
+EFFECTS = {ORIGINAL: "Оригинал", "chiptune": "Chiptune", "cover": "Кавер",
+           "karaoke": "Караоке", "video": "Видеоряд"}
 # Эффекты, у которых череда неудач означает неверные настройки, а не пустой
 # результат: такие останавливают генерацию.
 STRICT = {"chiptune": ("Chiptune: слишком много неудачных распознаваний. "
@@ -44,6 +46,16 @@ FAILURES_STREAK = 30
 # восьми, пока остальные семь искали и качали как обычно. Три подряд уже
 # означают, что дело не в минутной осечке, и стоят пака ровно трёх тайтлов.
 FATAL_STRIKES = 3
+# Технические отказы (сеть, источник не ответил) — не приговор ни песне, ни
+# эффекту, и пак из-за них не обрывается. Дюжина подряд ставит эффект на
+# паузу: его слоты ждут, остальные вопросы набираются дальше. Живой прогон
+# с потерями пакетов набирал такую дюжину за две минуты и рвал пак на 119
+# вопросах из 144, хотя кандидатов хватало с запасом.
+TECHNICAL_PAUSE_SECONDS = 120
+# Сколько пауз подряд без единой удачи терпим. Потом источники считаются
+# лежащими до конца прогона, а оставшиеся слоты играют оригиналом: полный
+# пак с предупреждением лучше обрубка.
+TECHNICAL_PAUSES = 3
 
 
 def runtime_python():
@@ -59,6 +71,9 @@ def shares(settings):
         out.append(("cover", int(getattr(settings, "cover_percent", 0))))
     if getattr(settings, "karaoke_enabled", False):
         out.append(("karaoke", int(getattr(settings, "karaoke_percent", 0))))
+    video = getattr(settings, "song_video_percent", None)
+    if getattr(settings, "song_video", False) and video is not None:
+        out.append(("video", int(video)))
     return out
 
 
@@ -68,14 +83,18 @@ def slot_seed(settings):
 
 
 def plan(settings, song_count):
-    """{эффект: сколько аудиовопросов ему достанется}."""
-    counts, left = {}, max(0, int(song_count or 0))
-    for name, percent in shares(settings):
-        if not song_count:
-            counts[name] = 0
-            continue
-        counts[name] = min(left, max(1, (song_count * percent + 50) // 100))
-        left -= counts[name]
+    """Round all presentations together, preserving the requested total."""
+    count = max(0, int(song_count or 0))
+    weights = {name: max(0, percent) for name, percent in shares(settings)}
+    weights[ORIGINAL] = max(0, 100 - sum(weights.values()))
+    total = sum(weights.values()) or 100
+    counts = {name: count * percent // total for name, percent in weights.items()}
+    order = list(weights)
+    random.Random(slot_seed(settings)).shuffle(order)
+    order.sort(key=lambda name: -(count * weights[name] % total))
+    for name in order[:count - sum(counts.values())]:
+        counts[name] += 1
+    counts.pop(ORIGINAL)
     return counts
 
 
@@ -84,9 +103,9 @@ def validate(settings):
     total = 0
     for name, percent in shares(settings):
         total += percent
-        if not 1 <= percent <= 100:
+        if not 0 <= percent <= 100:
             errors.append(f"{EFFECTS[name]}: доля музыкальных вопросов должна "
-                          "быть 1–100%.")
+                          "быть 0–100%.")
     if total > 100:
         errors.append("Доли способов подачи музыки вместе больше 100% — "
                       "последним не хватит вопросов.")
@@ -102,6 +121,10 @@ def validate(settings):
             errors.append("Караоке: CRF должен быть от 0 до 63.")
         if not 0 <= settings.karaoke_preset <= 13:
             errors.append("Караоке: пресет кодирования должен быть от 0 до 13.")
+        if not 60 <= settings.karaoke_ai_timeout <= 3600:
+            errors.append("Караоке: общий лимит распознавания должен быть от 1 до 60 минут.")
+        if settings.karaoke_separator not in ("auto", "kim", "htdemucs"):
+            errors.append("Караоке: неизвестный разделитель вокала.")
     if getattr(settings, "cover_enabled", False):
         low = int(getattr(settings, "cover_amq_from", 0))
         high = int(getattr(settings, "cover_amq_to", 100))
@@ -112,7 +135,7 @@ def validate(settings):
                           "и «от» не может быть больше «до».")
         if not 1 <= int(getattr(settings, "cover_pool", 3)) <= 12:
             errors.append("Каверы: набирать можно от 1 до 12 исполнений на песню.")
-    if not settings.chiptune_enabled:
+    if not settings.chiptune_enabled or not settings.chiptune_percent:
         return errors
     if settings.chiptune_version != VERSION:
         errors.append("Chiptune: неизвестная версия обработки; сбросьте настройки режима.")
@@ -157,11 +180,59 @@ class EffectSlots:
         self.dropped = []
         # Почему эффект сдался — для журнала (читает select_songs).
         self.reasons = {}
+        self.technical = {}
+        # Пауза эффекта после череды технических отказов: {эффект: до когда}.
+        self.paused_until = {}
+        self.pauses = {}
+        # Сообщения для журнала: их выводит главный цикл (select_songs).
+        self.notes = []
+        # Караоке только по готовым таймингам: их наличие у песни проверяется
+        # заранее (candidate_availability.probe). Непроверенная песня — та же
+        # «неизвестно»: кандидаты из запаса пробу не проходят.
+        self.timed_only = (getattr(settings, "karaoke_enabled", False)
+                           and not getattr(settings, "karaoke_ai_fallback", False)
+                           and getattr(settings, "karaoke_effect", "") != "reverse")
+
+    def paused(self, name):
+        """Сколько секунд эффекту ещё стоять на паузе (0 — не стоит)."""
+        return max(0.0, self.paused_until.get(name, 0) - time.monotonic())
 
     def reserve(self, candidate):
-        slot = self.free.pop(0)
+        # Видеослоты — опенингам и эндингам первыми: иначе перемешивание
+        # отдавало бы их OST, даже когда совместимых песен хватает. Без
+        # видеослотов OP/ED выбирают из всех остальных, а не из пустого списка.
+        video_kind = getattr(candidate, "kind", "") in ("opening", "ending")
+        video = [slot for slot in self.free if self.slots[slot] == "video"]
+        pool = (video if video_kind and video else
+                [slot for slot in self.free if self.slots[slot] != "video"] or self.free)
+        # Слот караоке — только песне, у которой готовые тайминги нашлись.
+        # «Неизвестно» (источник не ответил) раньше тоже получало его, а
+        # упавший слот возвращался в начало очереди: все песни подряд шли в
+        # один сломанный слот караоке, обычные простаивали.
+        available = getattr(candidate, "_authored_available",
+                            None if self.timed_only else "any")
+        if not self.timed_only and available is not True:
+            available = "any"  # С AI песня без готовых таймингов тоже годится.
+        karaoke = [slot for slot in pool if self.slots[slot] == "karaoke"]
+        if available is True and karaoke and not self.paused("karaoke"):
+            pool = karaoke
+        elif available is not True and available != "any":
+            pool = [slot for slot in pool if self.slots[slot] != "karaoke"] or pool
+        ready = [slot for slot in pool if not self.paused(self.slots[slot])]
+        slot = (ready or pool)[0]
+        self.free.remove(slot)
         candidate.music_effect = self.slots[slot]
         candidate.music_slot = slot
+
+    def refuses(self, candidate):
+        """Свободны одни слоты караоке, а готовых таймингов у песни нет.
+
+        Такую песню в слот не пускаем: она провалилась бы наверняка, и дюжина
+        таких провалов обрывала пак строгим отказом караоке."""
+        return (self.timed_only
+                and getattr(candidate, "_authored_available", None) is False
+                and bool(self.free)
+                and all(self.slots[slot] == "karaoke" for slot in self.free))
 
     def expand(self, settings, song_count):
         if song_count <= len(self.slots):
@@ -187,10 +258,19 @@ class EffectSlots:
         `candidate.music_failure` — то, что сломалось НЕ в этой песне, а во
         всём эффекте разом (нет yt-dlp, YouTube просит подтвердить, что ты не
         робот). Такое не перебирается кандидатами, поэтому эффект сдаётся после
-        FATAL_STRIKES жалоб подряд, а не через сотни попыток."""
-        self.free.insert(0, candidate.music_slot)
+        FATAL_STRIKES жалоб подряд, а не через сотни попыток.
+
+        Слот уходит в КОНЕЦ очереди: следующей песне достаётся другой."""
+        self.free.append(candidate.music_slot)
         name = candidate.music_effect
         if name == ORIGINAL:
+            return
+        if name in self.dropped:
+            self.give_up(name)
+            return
+        if (getattr(candidate, "_music_temporary", False)
+                or getattr(candidate, "_network_temporary", False)):
+            self._technical(name)
             return
         self.failed[name] = self.failed.get(name, 0) + 1
         self.streak[name] = self.streak.get(name, 0) + 1
@@ -215,13 +295,46 @@ class EffectSlots:
         """Слот возвращается БЕЗ неудачи: вопрос готов, но места ему не нашлось
         (пока качали, квоту заняли другие). Эффект тут ни при чём."""
         self.free.insert(0, candidate.music_slot)
+        if self.slots[candidate.music_slot] in self.dropped:
+            self.slots[candidate.music_slot] = ORIGINAL
 
     def succeed(self, candidate):
         """Вопрос с эффектом дошёл до пака — череда неудач прервана."""
         name = candidate.music_effect
         if name != ORIGINAL:
+            self.technical[name] = 0
+            self.pauses[name] = 0
             self.streak[name] = 0
             self.fatal[name] = 0
+
+    def _technical(self, name):
+        """Технический отказ: источник не ответил, песня тут ни при чём.
+
+        Отказы, пришедшие во время паузы, не считаются: это загрузки,
+        начатые до неё."""
+        if self.paused(name):
+            return
+        self.technical[name] = self.technical.get(name, 0) + 1
+        if self.technical[name] < FAILURES_MIN:
+            return
+        self.technical[name] = 0
+        self.pauses[name] = self.pauses.get(name, 0) + 1
+        title = EFFECTS.get(name, name)
+        if self.pauses[name] > TECHNICAL_PAUSES:
+            reason = (f"источники не отвечали и после {TECHNICAL_PAUSES} пауз "
+                      f"по {TECHNICAL_PAUSE_SECONDS} с")
+            self.reasons.setdefault(name, reason)
+            self.give_up(name)
+            self.notes.append(f"{title}: {reason} — оставшиеся слоты играют оригиналом.")
+            return
+        self.paused_until[name] = time.monotonic() + TECHNICAL_PAUSE_SECONDS
+        self.notes.append(f"{title}: {FAILURES_MIN} технических отказов подряд — источники "
+                          f"не отвечают. Слоты этого способа ждут {TECHNICAL_PAUSE_SECONDS} с, "
+                          "остальные вопросы набираются дальше.")
+
+    def take_notes(self):
+        notes, self.notes = self.notes, []
+        return notes
 
     def quit(self, name, reason):
         """Эффект больше не пробуем. Строгий обрывает пак, остальные уступают."""

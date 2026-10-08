@@ -3,7 +3,7 @@ import animepack_tab as api
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QComboBox, QSizePolicy
 
-from si_hyx_parts.animepack.title_kinds import TITLE_LABELS, GEMINI_TITLE_KINDS
+from si_hyx_parts.animepack.title_kinds import TITLE_LABELS
 
 
 def rebuild(tab, group):
@@ -20,12 +20,10 @@ def rebuild(tab, group):
         tab.mix._set_part(key, chk.isChecked())
         chk.toggled.connect(lambda value, k=key: toggle(tab, k, value))
         tab.composition_checks[key] = chk
-    for key, label in TITLE_LABELS.items():
-        chk = api.QCheckBox(label)
-        setattr(tab, "chk_" + key, chk)
-        chk.toggled.connect(lambda value, k=key: toggle(tab, k, value))
-        tab.composition_checks[key] = chk
-    for key in ("video", "manga", "pixel", "anagram", "dialogue", "plot",
+    from .title_composition import build as build_titles
+    build_titles(tab)
+    tab.composition_checks["titles"] = tab.chk_titles
+    for key in ("manga", "pixel", "dialogue", "plot",
                 "description_audio", "ai_art",
                 "pixiv_art", "sakuga", "studio", "episode"):
         tab.composition_checks[key] = getattr(tab, "chk_" + key)
@@ -56,9 +54,8 @@ def rebuild(tab, group):
     # Строки «Лимит Gemini / сутки» здесь больше нет (просьба пользователя):
     # точный остаток квоты всё равно знает только AI Studio, а заданное руками
     # число лишь притворялось им. Расход запросов самого приложения остался.
-    # Сколько строк занял сам _group_songs — оттуда и продолжаем.
-    row = int(getattr(tab, "_plot_grid_rows", 4))
-    tab.box_plot.layout().addWidget(tab.lbl_gemini_quota, row, 0, 1, 2)
+    from .gemini_groups import build as build_gemini
+    build_gemini(tab)
     tab._gemini_daily_limits = {}
     tab._quota_model = tab.cb_gemini_model.currentText()
     tab.cb_gemini_model.currentTextChanged.connect(lambda: change_quota_model(tab))
@@ -73,24 +70,17 @@ def rebuild(tab, group):
         combo.setMinimumWidth(0)
 
 
-# Настройки каждого рода вопросов — в том порядке, в каком они идут под его
-# галочкой. «Показ текста» общий для всех текстовых вопросов, поэтому стоит
-# под последним из них; настройки Gemini общие для сюжета и загадок по
-# названию — они под «Сюжетом», прямо над этими загадками.
+# Each question kind keeps its options below its checkbox.
 _OPTIONS = {
     "songs": ("box_song_opts",),
-    "video": ("box_video_opts",),
     "frames": ("box_frames",),
     "chars": ("box_chars",),
     "manga": ("box_manga",),
     "pixel": ("box_pixel",),
-    "anagram": ("box_anagram",),
+    "titles": ("box_titles", "box_text_cps"),
     "dialogue": ("box_dialogue",),
     "plot": ("box_plot",),
     "description_audio": ("box_description_audio",),
-    # Под последней загадкой по названию — своя модель Gemini для них
-    # (просьба пользователя) и общий для всех текстовых вопросов показ текста.
-    "definitions": ("box_gemini_titles", "box_text_cps"),
     "ai_art": ("box_ai_art",),
     "pixiv_art": ("box_pixiv_art",),
     "sakuga": ("box_sakuga",),
@@ -100,13 +90,8 @@ _OPTIONS = {
 
 
 def _display_order(tab):
-    """Порядок галочек на панели: загадки по названию идут сразу за «Сюжетом».
-
-    Тогда общий ключ Gemini стоит ровно над теми родами вопросов, которым он и
-    нужен, а своя модель загадок — сразу под ними."""
-    keys = [key for key in tab.mix.KEYS if key not in TITLE_LABELS]
-    at = keys.index("plot") + 1
-    return keys[:at] + list(TITLE_LABELS) + keys[at:]
+    """Order of the outer composition categories."""
+    return [key for key in tab.mix.KEYS if key != "video"]
 
 
 def _indented(tab, name, *widgets):
@@ -144,28 +129,23 @@ def toggle(tab, key, value):
 
 def refresh_gemini(tab):
     from .frame_gemini_controls import refresh as refresh_frames
-    frames = refresh_frames(tab)
-    titles = any(getattr(tab, "chk_" + key).isChecked()
-                 for key in GEMINI_TITLE_KINDS)
-    enabled = (tab.chk_plot.isChecked() or tab.chk_dialogue.isChecked()
-               or tab.chk_description_audio.isChecked() or titles
-               or (tab.chk_episode.isChecked() and tab.chk_episode_ru.isChecked())
-               or frames)
-    tab.box_plot.setVisible(enabled)
-    # Своя модель загадок по названию нужна только при включённых загадках.
+    refresh_frames(tab)
+    tab.box_plot.setVisible(tab.chk_plot.isChecked())
+    # Model controls now live in their own group, outside the composition.
     box = getattr(tab, "box_gemini_titles", None)
     if box is not None:
-        box.setVisible(titles)
+        box.setVisible(False)
+    if hasattr(tab, "group_gemini"):
+        tab.group_gemini.setVisible(True)
     tab.cb_plot_mode.setEnabled(tab.chk_plot.isChecked())
-    # Своя рамка сложности сюжета держится на его галочке: коробка та же, но
-    # показывают её ещё и ради общих настроек Gemini.
+    # Plot difficulty follows the plot checkbox.
     from .level_controls import refresh_plot
     refresh_plot(tab)
 
 
 def refresh_text_timing(tab):
-    keys = ("anagram", "dialogue", "plot") + tuple(TITLE_LABELS)
-    enabled = any(getattr(tab, "chk_" + key).isChecked() for key in keys)
+    enabled = any(getattr(tab, "chk_" + key).isChecked()
+                  for key in ("titles", "dialogue", "plot"))
     tab.box_text_cps.setVisible(enabled)
 
 
@@ -194,9 +174,8 @@ def change_quota_model(tab):
 
 def collect(tab, settings):
     settings.gemini_daily_limits = dict(getattr(tab, "_gemini_daily_limits", {}))
-    for key in TITLE_LABELS:
-        setattr(settings, "pack_" + key, getattr(tab, "chk_" + key).isChecked())
-        setattr(settings, "pct_" + key, tab.mix.shares()[key])
+    from .title_composition import collect as collect_titles
+    collect_titles(tab, settings)
     settings.composition_enabled = tab.mix.keys()
 
 
@@ -208,7 +187,7 @@ def apply(tab, settings):
                    else settings.mix_shares.get({"frames": api.FRAME_KIND, "chars": api.CHAR_KIND}.get(key, key), 0) > 0)
         getattr(tab, "chk_" + key).setChecked(enabled)
         tab.mix._set_part(key, enabled)
-    for key in TITLE_LABELS:
-        getattr(tab, "chk_" + key).setChecked(getattr(settings, "pack_" + key))
+    from .title_composition import apply as apply_titles
+    apply_titles(tab, settings)
     refresh_gemini(tab)
     refresh_text_timing(tab)

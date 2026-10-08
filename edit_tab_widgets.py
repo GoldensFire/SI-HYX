@@ -40,7 +40,7 @@ from si_hyx_parts.edit_tab_widgets.waveform_widget import WaveformWidget
 
 from si_hyx_parts.edit_tab_widgets.subtitle_timeline import _SubtitleTimeline, slider_value_at
 
-from si_hyx_parts.edit_tab_widgets.volume_slider import (
+from si_hyx_parts.edit_tab_widgets.player_widgets import (
     VolumeSlider,
     VolumeLabel,
     InfoCard,

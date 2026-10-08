@@ -55,7 +55,6 @@ def build_controls(tab):
             ("Языки", tab.description_language_box),
             ("", tab.chk_description_voice),
             ("Приоритет озвучки", tab.cb_description_tts_first),
-            ("Модель Gemini TTS", tab.cb_description_gemini_model),
             ("ElevenLabs", tab.btn_elevenlabs_key),
             ("ID голоса", tab.ed_elevenlabs_voice),
             ("Google Cloud", tab.ed_google_tts_credentials))):

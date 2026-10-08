@@ -7,7 +7,8 @@ import time
 
 TTL = 7 * 86400
 VERSION = "karaoke-rejections-v2"  # Old rejects may have counted the site's '+' expanders.
-AI_POLICY = "multilingual-kim-v3"
+AI_POLICY = "multilingual-auto-demucs-budget-v6-windows"
+REFERENCE_POLICY = "reference-validation-v4-edition-span-furigana"
 
 
 class Rejected(ValueError):
@@ -54,4 +55,5 @@ class Rejections:
                                          encoding="utf-8") as stream:
             json.dump({"expires": self.clock() + TTL, "reason": str(reason)[:500]}, stream)
             temporary = Path(stream.name)
-        temporary.replace(target)
+        from .files import replace_file
+        replace_file(temporary, target)

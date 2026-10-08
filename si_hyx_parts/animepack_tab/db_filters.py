@@ -3,18 +3,20 @@
 """Собственные фильтры окна базы, независимые от состава генерации."""
 from PyQt6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QGroupBox, QHBoxLayout, QLabel,
-    QPushButton, QVBoxLayout,
+    QPushButton, QVBoxLayout, QFormLayout, QSpinBox, QDoubleSpinBox, QComboBox,
 )
 
 import animepack_tab as api
+from .db_view_filters import RANGES
 
 
 class DbFiltersDialog(QDialog):
     def __init__(self, filters, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Фильтры базы")
+        self.setWindowTitle("Фильтры отображения базы")
         layout = QVBoxLayout(self)
-        note = QLabel("Фильтры меняют только таблицы этого окна.")
+        note = QLabel("Только отображение таблиц. Обновление всегда собирает полные каталоги.")
+        note.setWordWrap(True)
         layout.addWidget(note)
         groups = QHBoxLayout()
         self.checks = {}
@@ -33,6 +35,27 @@ class DbFiltersDialog(QDialog):
             column.addStretch()
             groups.addWidget(box)
         layout.addLayout(groups)
+        ranges = QFormLayout()
+        self.ranges = {}
+        for field, label, maximum in RANGES:
+            row = QHBoxLayout()
+            for side in ("from", "to"):
+                control = QDoubleSpinBox() if field == "score" else QSpinBox()
+                control.setRange(0, maximum)
+                control.setSpecialValueText("—")
+                control.setValue(filters.get(f"{field}_{side}") or 0)
+                row.addWidget(QLabel("от" if side == "from" else "до"))
+                row.addWidget(control)
+                self.ranges[f"{field}_{side}"] = control
+            ranges.addRow(label, row)
+        self.favorites = QComboBox()
+        for label, value in (("Все", None), ("Известно", "NORMAL"),
+                             ("Неизвестно", "UNKNOWN"), ("Требуется вход 18+", "AGE_RESTRICTED"),
+                             ("Страница не найдена", "NOT_FOUND")):
+            self.favorites.addItem(label, value)
+        self.favorites.setCurrentIndex(max(0, self.favorites.findData(filters.get("favorites_status"))))
+        ranges.addRow("Избранное", self.favorites)
+        layout.addLayout(ranges)
         reset = QPushButton("Показать всё")
         reset.clicked.connect(self.reset)
         layout.addWidget(reset)
@@ -48,6 +71,9 @@ class DbFiltersDialog(QDialog):
         for checks in self.checks.values():
             for check in checks.values():
                 check.setChecked(True)
+        for control in self.ranges.values():
+            control.setValue(0)
+        self.favorites.setCurrentIndex(0)
 
     def values(self):
         result = {}
@@ -55,4 +81,6 @@ class DbFiltersDialog(QDialog):
             selected = tuple(kind for kind, check in checks.items()
                              if check.isChecked())
             result[target] = None if len(selected) == len(checks) else selected
+        result.update({key: control.value() or None for key, control in self.ranges.items()})
+        result["favorites_status"] = self.favorites.currentData()
         return result

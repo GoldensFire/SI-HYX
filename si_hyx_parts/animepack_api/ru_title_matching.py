@@ -1,12 +1,20 @@
 # -*- coding: utf-8 -*-
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 """Conservative matching for Russian sources. No fuzzy-title acceptance."""
+from functools import lru_cache
 import re
 import unicodedata
 
 
 def normalized(value):
-    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return _normalized(value if isinstance(value, str) else str(value or ""))
+
+
+@lru_cache(maxsize=1 << 18)
+def _normalized(text):
+    # План книг сверяет названия ~60 тысяч карточек с каталогами ReManga и
+    # MangaLib: без кэша это были миллионы одинаковых регулярных замен.
+    text = unicodedata.normalize("NFKC", text).casefold()
     return re.sub(r"[\W_]+", " ", text).strip()
 
 

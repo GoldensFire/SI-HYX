@@ -31,9 +31,11 @@ class Mugen:
                 continue
             titles = row.get("titles") or {}
             names = list(titles.values()) + list(row.get("titles_aliases") or [])
-            singers = [tag["name"] for tag in row.get("singers", []) + row.get("singergroups", [])]
+            singers = [tag["name"] for tag in row.get("singers", [])]
+            groups = [tag["name"] for tag in row.get("singergroups", [])]
             yield Track(titles.get("qro") or titles.get(row.get("titles_default_language")) or names[0],
                         singers, float(row.get("duration") or 0), "Karaoke Mugen",
                         BASE + "/downloads/lyrics/" + quote(lyric["filename"], safe=""),
                         BASE + "/downloads/medias/" + quote(row["mediafile"], safe=""),
-                        aliases=names, version=" ".join([*names, *[t["name"] for t in row.get("versions", [])]]))
+                        aliases=names, artist_groups=groups,
+                        version=" ".join([*names, *[t["name"] for t in row.get("versions", [])]]))

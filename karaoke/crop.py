@@ -20,12 +20,13 @@ def word_starts(lines, offset=0.0):
     return sorted(set(starts))
 
 
-def aligned_start(lines, requested, duration, total_duration, *, offset=0.0):
+def aligned_start(lines, requested, duration, total_duration, *, offset=0.0, minimum=0.0):
     if not all(math.isfinite(x) for x in (requested, duration, total_duration, offset)):
         raise ValueError("Неверные границы караоке-отрезка.")
     if requested < 0 or duration <= 0 or total_duration <= 0:
         raise ValueError("Неверные границы караоке-отрезка.")
-    starts = [x for x in word_starts(lines, offset) if 0 <= x < total_duration - 1]
+    # minimum: the start of the part known to match the timed recording.
+    starts = [x for x in word_starts(lines, offset) if max(0.0, minimum) <= x < total_duration - 1]
     complete = [x for x in starts if x + duration <= total_duration]
     choices = complete or starts
     if not choices:

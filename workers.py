@@ -52,10 +52,8 @@ _RE_FFMPEG_FRAME = _re_eta.compile(r"frame=\s*(\d+)")
 # Ставится последним фильтром КАЖДОГО кодирования в libopus (см. _af_arg).
 OPUS_LAYOUT_FIX = "aformat=channel_layouts=mono|stereo|3.0|4.0|quad|5.0|5.1|6.1|7.1"
 
-from si_hyx_parts.workers.real_etacalculator import RealETACalculator, InfoWorker, YtdlpWorker
+from si_hyx_parts.workers.real_eta_calculator import RealETACalculator
+from si_hyx_parts.workers.info_worker import InfoWorker
+from si_hyx_parts.workers.ytdlp_worker import YtdlpWorker
 
-from si_hyx_parts.workers.build_atempo_chain import (
-    _build_atempo_chain,
-    _ImgRunnable,
-    ProcessWorker,
-)
+from si_hyx_parts.workers.process_worker import _build_atempo_chain, _ImgRunnable, ProcessWorker

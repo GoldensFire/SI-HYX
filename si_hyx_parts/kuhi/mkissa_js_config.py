@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import re
 import time
 import unicodedata
@@ -154,7 +155,7 @@ def eval_crypto_chunk(chunk: str):
         if config:
             return config
     except Exception as e:
-        print(f"[mkissa] emulated discovery failed: {str(e)[:150]}")
+        logging.getLogger(__name__).warning("[mkissa] emulated discovery failed: %s", str(e)[:150])
     try:
         config = _api.eval_fragment_crypto_chunk(chunk)
         if config:

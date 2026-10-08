@@ -73,5 +73,13 @@ def test_reload_skips_an_unchanged_file(tmp_path, monkeypatch):
     other.save()                             # базу обновил другой держатель
     cache.reload()
     assert any(c.get("id") == 9 for c in cache.all_cards("anime"))
-    # Один раз прочёл «другой» при своём создании, второй — сам кэш.
-    assert reads == [str(path), str(path)]
+    # Экземпляры одного файла делят разобранную базу (db_cache_shared):
+    # ни «другой», ни сам кэш файл заново не разбирали.
+    assert reads == []
+    # Файл сменил кто-то посторонний — тогда перечитываем.
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["anime"]["sig3"] = {"cards": {"77": {"id": 77}}}
+    path.write_text(json.dumps(data), encoding="utf-8")
+    cache.reload()
+    assert any(c.get("id") == 77 for c in cache.all_cards("anime"))
+    assert reads == [str(path)]

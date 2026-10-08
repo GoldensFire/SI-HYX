@@ -254,7 +254,7 @@ from si_hyx_parts.animepack_upgrade.media_jobs import media_jobs
 # тайтл в паке встречается по нескольку раз, и файл на них нужен один.
 POSTER_DIR = "Images"
 
-from si_hyx_parts.animepack_upgrade.upgrade_error import (
+from si_hyx_parts.animepack_upgrade.upgrade_settings import (
     UpgradeError,
     nearest_bitrate,
     nearest_height,
@@ -264,7 +264,7 @@ from si_hyx_parts.animepack_upgrade.upgrade_error import (
     Change,
 )
 
-from si_hyx_parts.animepack_upgrade.upgrade_result import (
+from si_hyx_parts.animepack_upgrade.pack_content import (
     UpgradeResult,
     _safe_parser,
     parse_content,
@@ -292,10 +292,8 @@ _COPY_CHUNK = 1 << 20
 # (второе мы чиним сами, размеры-то известны из центрального каталога).
 _FLAG_ENCRYPTED, _FLAG_DESCRIPTOR = 0x01, 0x08
 
-from si_hyx_parts.animepack_upgrade.copy_zip_entry import (
-    copy_zip_entry,
-    fmt_size,
-    _temp_dir,
+from si_hyx_parts.animepack_upgrade.zip_entries import copy_zip_entry, fmt_size, _temp_dir
+from si_hyx_parts.animepack_upgrade.question_specials import (
     question_price,
     special_key,
     has_question_content,
@@ -322,7 +320,7 @@ _RE_DASH_TAIL = re.compile(r"\s+[—–-]\s+.*$")
 # вопросов каждый лишний вариант — это лишняя минута ожидания.
 MAX_QUERIES_PER_QUESTION = 4
 
-from si_hyx_parts.animepack_upgrade.answer_query import (
+from si_hyx_parts.animepack_upgrade.answer_queries import (
     answer_query,
     slash_parts,
     answer_queries,
@@ -373,7 +371,7 @@ TYPO_MIN_LEN = 8                 # короче — сравниваем тол�
 TYPO_LONG_LEN = 20               # с этой длины прощаем две ошибки, а не одну
 _RE_ROMAN = re.compile(r"^[ivxlcdm]+$")
 
-from si_hyx_parts.animepack_upgrade.numbering import (
+from si_hyx_parts.animepack_upgrade.title_match import (
     _numbering,
     _edits,
     is_typo,
@@ -418,7 +416,7 @@ from si_hyx_parts.animepack_upgrade.famous_clip import famous_clip, pick_card
 # списке ответов это выглядит как ещё одна почти такая же строка.
 _RE_YEAR_TAIL = re.compile(r"\s*[(\[]\s*(?:19|20)\d{2}\s*[)\]]\s*$")
 
-from si_hyx_parts.animepack_upgrade.strip_year import (
+from si_hyx_parts.animepack_upgrade.answer_variants import (
     strip_year,
     title_variants,
     answers_of,
@@ -435,7 +433,7 @@ from si_hyx_parts.animepack_upgrade.strip_year import (
 # «Naruto-kun», а не «Naruto».
 _RE_CYRILLIC = re.compile(r"[а-яёА-ЯЁ]")
 
-from si_hyx_parts.animepack_upgrade.looks_like_character_name import (
+from si_hyx_parts.animepack_upgrade.character_match import (
     looks_like_character_name,
     character_hit,
     exact_main,
@@ -448,7 +446,7 @@ from si_hyx_parts.animepack_upgrade.looks_like_character_name import (
 # отделено от песни обычным тире (см. _RE_DASH_TAIL).
 _RE_HEAD_TAIL = re.compile(r"^(.*?)(\s+[—–-]\s+.*)$", re.DOTALL)
 
-from si_hyx_parts.animepack_upgrade.not_worse import (
+from si_hyx_parts.animepack_upgrade.answer_case import (
     _not_worse,
     recased,
     fix_answer_case,
@@ -459,7 +457,7 @@ from si_hyx_parts.animepack_upgrade.not_worse import (
 
 ANSWER_MEDIA_KINDS = ("image", "video", "audio", "html")
 
-from si_hyx_parts.animepack_upgrade.has_answer_media import (
+from si_hyx_parts.animepack_upgrade.question_content import (
     has_answer_media,
     add_poster,
     remove_poster,
@@ -482,15 +480,13 @@ AUDIO_KINDS = ("audio", "voice")
 # OnContentReplicText — оба смотрят на waitForFinish).
 TEXT_KINDS = ("text", "say")
 
-from si_hyx_parts.animepack_upgrade.merge_text_with_audio import (
+from si_hyx_parts.animepack_upgrade.question_cleanup import (
     merge_text_with_audio,
     is_empty_question,
     empty_questions,
     drop_empty_themes,
-    entry_basename,
-    referenced_names,
-    is_media_entry,
-    unused_entries,
+)
+from si_hyx_parts.animepack_upgrade.media_jobs import (
     run_hidden,
     parse_probe_kbps,
     parse_probe_codec,
@@ -498,6 +494,12 @@ from si_hyx_parts.animepack_upgrade.merge_text_with_audio import (
     _MediaDone,
     _PosterJob,
     _drop,
+)
+from si_hyx_parts.animepack_upgrade.media_entries import (
+    entry_basename,
+    referenced_names,
+    is_media_entry,
+    unused_entries,
 )
 
 from si_hyx_parts.animepack_upgrade.pack_upgrader import PackUpgrader, _shorten, example_lines

@@ -15,11 +15,18 @@ class _Cache:
         self.rows[(group, key)] = value
 
 
+def _full(verdict):
+    """Полный вердикт по SCHEMA: неполный проверка считает отказом модели."""
+    return {"very_poor_drawing": False, "matches_expected_anime": True,
+            "identified_source": "Kimetsu no Yaiba", "visible_text": "",
+            **verdict}
+
+
 class _Gemini:
     model = "gemini-test"
 
     def __init__(self, verdict):
-        self.verdict = verdict
+        self.verdict = _full(verdict)
         self.calls = []
 
     def generate_json(self, prompt, schema, temperature=0):
@@ -102,8 +109,9 @@ class _Verdicts:
     def generate_json(self, prompt, schema, temperature=0):
         self.calls += 1
         ok = self.verdicts.pop(0)
-        return {"accept": ok, "has_title_text": not ok,
-                "mixed_anime": False, "reason": "видна надпись"}
+        return _full({"accept": ok, "has_title_text": not ok,
+                      "mixed_anime": False, "reason": "видна надпись",
+                      "identified_source": "Death Note"})
 
 
 def _pixiv_gen(tmp_path, monkeypatch, pixiv, verdicts):

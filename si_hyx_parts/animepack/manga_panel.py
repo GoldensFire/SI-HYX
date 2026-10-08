@@ -32,69 +32,106 @@ def init_mangadex_service(self, client=None):
             rng=self.rng)
     self._mangadex_misses = 0
     self._manga_catalog_matches = 0
+    if hasattr(getattr(self, "gemini_manga", None), "image_generate_content"):
+        self.gemini_manga.image_generate_content = True
 
 
-def download_manga_panel(self, cand) -> bool:
-    """Скачивает разворот манги — сам вопрос («ложь» — не вышло).
+class MangaPanelMixin:
+    """Генератор: страница манги для книжного вопроса."""
+
+    def download_manga_panel(self, cand) -> bool:
+        """Скачивает разворот манги — сам вопрос («ложь» — не вышло).
 
     Обложкой больше не спрашиваем: она же лежит в ответе постером, и вопрос
     решался бы сравнением двух одинаковых картинок. Страницу берём из середины
     случайной главы — на титуле стояло бы название тайтла. Если на странице
     всё же видно название (см. manga_visual_check), берётся
     другая страница той же манги, как у артов Pixiv."""
-    if self.stopped():
-        return False
-    if _api.MANGA_KIND in self._dead_kinds or self.mangadex is None:
-        cand.rejected = True
-        self._drop_kind(_api.MANGA_KIND)
-        return False
-    from .manga_page_context import is_webtoon
-    if getattr(self.s, "manga_character_crop", True) and is_webtoon(cand):
-        from .manga_page_batch import prepare
-        chosen = prepare(self, cand)
-        if chosen is None:
-            return False
-        url, page, manga_titles = chosen
-        if not _visual_ok(self, cand, *page, manga_titles=manga_titles):
-            return False
-        return _save_frame(self, cand, url, page)
-    prepared = 0
-    for _ in range(VISUAL_TRIES):
-        try:
-            url, chapter, manga_titles = _pick_page(self, cand)
-        except _api.AnimePackApiError as e:
-            self._log_rare("Источники манги", f"Манга «{cand.title_ru}»: {e}")
-            return False
-        if not url:
-            return _miss(self, cand)
-        # Отпечаток главы известен до скачивания страницы и её проверки.
-        if not cand.source_link:
-            cand.source_link = _api.mangadex_chapter_link(chapter)
-        from .early_repeat import reserve
-        if not reserve(self, cand):
-            return False
+        from .manga_budget import start
+        start(self, cand)
         if self.stopped():
             return False
-        with self._manga_lock:
-            self._mangadex_misses = 0
-        page = _fetch_page(self, cand, url, manga_titles=manga_titles)
-        if page is None:
-            if _api.MANGA_KIND in self._dead_kinds:
+        if _api.MANGA_KIND in self._dead_kinds or self.mangadex is None:
+            cand.rejected = True
+            self._drop_kind(_api.MANGA_KIND, "источники страниц манги не подключены")
+            return False
+        from .manga_page_context import is_webtoon
+        if getattr(self.s, "manga_character_crop", True) and is_webtoon(cand):
+            from .manga_page_batch import prepare
+            chosen = prepare(self, cand)
+            if chosen is None:
                 return False
-            continue
-        prepared += 1
-        if not _visual_ok(self, cand, *page, manga_titles=manga_titles):
-            continue
-        return _save_frame(self, cand, url, page)
-    if not prepared:
-        self._log_rare("Страница манги недоступна",
-                       f"«{cand.title_ru}»: за {VISUAL_TRIES} попытки не удалось "
-                       "загрузить и подготовить страницу — беру следующий тайтл")
-    else:
-        self._log_rare("Страница манги отклонена проверкой",
-                       f"«{cand.title_ru}»: за {VISUAL_TRIES} попытки не нашлось "
-                       "пригодной сцены без названия — беру следующий тайтл")
-    return False
+            url, page, manga_titles = chosen
+            if not _visual_ok(self, cand, *page, manga_titles=manga_titles):
+                return False
+            return _save_frame(self, cand, url, page)
+        from .manga_page_reuse import keep, take
+        prepared = 0
+        for _ in range(VISUAL_TRIES):
+            kept = take(self, cand)
+            if kept and kept[0] == "page":
+                # Повтор после паузы Gemini: та же страница, без поиска и
+                # скачивания (а если уже вырезана — и без выбора сцены).
+                kept = kept[1]
+                url, chapter, manga_titles = kept["url"], kept["chapter"], kept["titles"]
+                cand._manga_page_client, cand._manga_page_info = kept["client"], kept["info"]
+            else:
+                kept = None
+                try:
+                    url, chapter, manga_titles = _pick_page(self, cand)
+                except _api.AnimePackApiError as e:
+                    self._log_rare("Источники манги", f"Манга «{cand.title_ru}»: {e}")
+                    return False
+                if not url:
+                    return _miss(self, cand)
+            # Отпечаток главы известен до скачивания страницы и её проверки.
+            if not cand.source_link:
+                cand.source_link = _api.mangadex_chapter_link(chapter)
+            from .early_repeat import reserve
+            if not reserve(self, cand):
+                return False
+            if self.stopped():
+                return False
+            with self._manga_lock:
+                self._mangadex_misses = 0
+            cand._manga_transient, cand._manga_raw = False, None
+            page = kept.get("page") if kept else None
+            if page is None:
+                page = _fetch_page(self, cand, url, manga_titles=manga_titles,
+                                   raw=kept.get("raw") if kept else None)
+            if page is None:
+                if _api.MANGA_KIND in self._dead_kinds:
+                    return False
+                if cand._manga_transient:
+                    # Пауза модели: следующие попытки сгорели бы так же, а
+                    # скачанная страница дождётся повтора тайтла.
+                    if cand._manga_raw:
+                        keep(self, cand, ("page", dict(
+                            url=url, chapter=chapter, titles=manga_titles,
+                            client=getattr(cand, "_manga_page_client", None),
+                            info=getattr(cand, "_manga_page_info", {}),
+                            raw=cand._manga_raw)))
+                    return False
+                continue
+            prepared += 1
+            if not _visual_ok(self, cand, *page, manga_titles=manga_titles):
+                if cand._manga_transient:
+                    keep(self, cand, ("page", dict(
+                        url=url, chapter=chapter, titles=manga_titles,
+                        client=getattr(cand, "_manga_page_client", None),
+                        info=getattr(cand, "_manga_page_info", {}), page=page)))
+                    return False
+                continue
+            return _save_frame(self, cand, url, page)
+        if not prepared:
+            self._log_rare("Страница манги недоступна",
+                           f"«{cand.title_ru}»: за {VISUAL_TRIES} попытки не удалось "
+                           "загрузить и подготовить страницу — беру следующий тайтл")
+        else:
+            self._log_rare("Страница манги отклонена проверкой",
+                           f"«{cand.title_ru}»: за {VISUAL_TRIES} попытки не нашлось "
+                           "пригодной сцены без названия — беру следующий тайтл")
+        return False
 
 
 def _save_frame(self, cand, url, page):
@@ -115,6 +152,9 @@ def _pick_page(self, cand) -> tuple[str, str, list[str]]:
     Выбор страницы и её резервирование — под одним замком: иначе два рабочих
     потока взяли бы один и тот же разворот. Отклонённая проверкой страница тоже
     остаётся занятой — следующая попытка возьмёт другую."""
+    if callable(getattr(self.mangadex, "select_page", None)):
+        from .manga_parallel_page import pick
+        return pick(self, cand)
     with locked(self, self._manga_lock):
         with self._frames_lock:
             excluded = set(self._frames_used)
@@ -136,13 +176,18 @@ def _pick_page(self, cand) -> tuple[str, str, list[str]]:
 
 
 @operation("подготовка страницы")
-def _fetch_page(self, cand, url: str, *, manga_titles=()):
-    """(байты, расширение, сцена проверена) готовой страницы для вопроса."""
+def _fetch_page(self, cand, url: str, *, manga_titles=(), raw=None):
+    """(байты, расширение, сцена проверена) готовой страницы для вопроса.
+
+    raw — уже скачанная в прошлой попытке страница (manga_page_reuse)."""
     scene_checked = False
     select_scene = False
     try:
         from .manga_page_context import download, is_webtoon
-        if getattr(self.s, "manga_character_crop", True):
+        if raw:
+            data, ext = raw
+            cand._manga_context_urls = [url]
+        elif getattr(self.s, "manga_character_crop", True):
             data, ext = download(self, cand, url)
         else:
             client = getattr(cand, "_manga_page_client", None)
@@ -151,6 +196,7 @@ def _fetch_page(self, cand, url: str, *, manga_titles=()):
                 ext = self._url_ext(url, ".png")
             else:
                 data, ext = client.download_page(url, cand._manga_page_info)
+        cand._manga_raw = data, ext
         from .manga_crop import is_long_page
         if not is_long_page(data) and not (is_webtoon(cand)
                 and getattr(self.s, "manga_character_crop", True)):
@@ -169,11 +215,17 @@ def _fetch_page(self, cand, url: str, *, manga_titles=()):
         if (select_scene
                 and (self.gemini_manga is None or type(e).__name__ in
                      ("GeminiAuthError", "GeminiQuotaError", "GeminiDownError"))):
-            self._drop_kind(_api.MANGA_KIND)
+            self._drop_kind(_api.MANGA_KIND, f"Gemini не выбрал сцену страницы: {e}")
             cand.rejected = True
             self._log_rare("Выбор сцены Gemini",
                            f"Не удалось выбрать сцену с персонажами: {e}")
             return None
+        from .manga_page_batch import gemini_transient, note_wall
+        note_wall(self, e)
+        if select_scene and gemini_transient(e):
+            from .media_transfer import trouble_mark
+            trouble_mark()   # тайтл уйдёт на повтор, см. manga_page_batch
+            cand._manga_transient = True
         self._log_rare("Источники манги", f"Страница «{cand.title_ru}» не скачалась: {e}")
         return None
     if cut:
@@ -198,7 +250,7 @@ def _visual_ok(self, cand, data: bytes, ext: str, scene_checked: bool = False,
         return True
     if (getattr(self.s, "manga_title_check_mode", "gemini") == "gemini"
             and getattr(self, "gemini_manga", None) is None):
-        return True
+        return not getattr(self.s, "manga_strict_targets", False)
     from .manga_visual_check import check
     try:
         approved, reason = check(self, cand, data, ext,
@@ -208,11 +260,18 @@ def _visual_ok(self, cand, data: bytes, ext: str, scene_checked: bool = False,
                                   "GeminiDownError"):
             self.gemini_manga = None
             local = getattr(self.s, "manga_title_check_mode", "gemini") == "local"
+            strict = getattr(self.s, "manga_strict_targets", False)
             self.log("Gemini для страниц манги выключен до конца прогона "
                      f"({exc}). " + ("OCR продолжает работу; сомнительные "
                                     "страницы отклоняются." if local else
+                                    "Непроверенные страницы отклоняются." if strict else
                                     "Страницы берутся без проверки."))
-            return not local
+            return not local and not strict
+        from .manga_page_batch import gemini_transient
+        if gemini_transient(exc):
+            from .media_transfer import trouble_mark
+            trouble_mark()      # пауза модели — тайтл повторится позже
+            cand._manga_transient = True
         self._log_rare("Проверка манги через Gemini",
                        f"Страница «{cand.title_ru}» не прошла проверку "
                        f"Gemini: {exc} — беру другую страницу")
@@ -240,6 +299,6 @@ def _miss(self, cand) -> bool:
         self.log(f"Манга: подряд не нашлось {misses} тайтлов — вопросы "
                  "по манге пропускаю, их места отдам остальным родам "
                  "вопросов. Проверьте язык глав и типы изданий.")
-        self._drop_kind(_api.MANGA_KIND)
+        self._drop_kind(_api.MANGA_KIND, f"подряд {misses} тайтлов без страниц")
         cand.rejected = True
     return False

@@ -2,6 +2,8 @@
 """Отдельные слоты AV1, повторный вход AVIF и общий запуск процессов."""
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import time
+from types import SimpleNamespace
 
 import animepack as ap
 import avif_fit
@@ -44,6 +46,35 @@ def test_nested_avif_runner_uses_one_encoding_slot():
         with runtime.encoding():
             assert runtime.active_encoders == 1
     assert runtime.active_encoders == 0
+
+
+def test_encoder_queue_is_included_in_process_timeout():
+    from si_hyx_parts.animepack.generation_runtime import encoding_operation
+    runtime = GenerationRuntime(ap.PackSettings(generation_priority="low"))
+    executed = []
+    @encoding_operation
+    def _run_capture(generator, cmd, timeout=180):
+        executed.append(True)
+        return 0, "", ""
+    gen = SimpleNamespace(_runtime=runtime)
+    with runtime.encoding(), ThreadPoolExecutor(max_workers=1) as pool:
+        code, _, error = pool.submit(_run_capture, gen, ["libsvtav1"], 0.05).result(timeout=2)
+    assert code == 1 and "кодировщика" in error and not executed
+    assert runtime.active_encoders == 0
+
+
+def test_remaining_process_budget_shrinks_after_encoder_wait():
+    from si_hyx_parts.animepack.generation_runtime import encoding_operation
+    runtime = GenerationRuntime(ap.PackSettings(generation_priority="low"))
+    @encoding_operation
+    def _run_capture(generator, cmd, timeout=180):
+        return timeout
+    gen = SimpleNamespace(_runtime=runtime)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with runtime.encoding():
+            future = pool.submit(_run_capture, gen, ["libsvtav1"], 1)
+            time.sleep(0.05)
+        assert 0 < future.result(timeout=2) < 0.98
 
 
 def test_cancellation_wakes_a_waiting_encoder():

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 edit_tab = pytest.importorskip("edit_tab")
-from si_hyx_parts.edit_tab import edit_tab_audio_off as audio_off  # noqa: E402
+from si_hyx_parts.edit_tab import tracks as audio_off  # noqa: E402
 from si_hyx_parts.edit_tab_workers.smart_cut_worker import SmartCutWorker  # noqa: E402
 
 
@@ -35,23 +35,23 @@ class _Player:
         self.output = output
 
 
-def test_none_entry_mutes_preview_and_comes_back():
+def test_none_entry_mutes_preview_and_comes_back(qapp):
     tab = SimpleNamespace(_audio_entries=[('emb', 0)], cmb_audio=_Combo(),
                           player=_Player(), audio_output="out")
-    audio_off._add_audio_off_entry(tab)
+    audio_off.EditTabTracksMixin._add_audio_off_entry(tab)
     assert tab.cmb_audio.items[-1] == audio_off.AUDIO_OFF_LABEL
     assert tab._audio_entries[-1] == ('none', None)
     # Внешняя озвучка встаёт перед «Нет».
-    assert audio_off._external_audio_insert_at(tab) == 1
-    audio_off._set_audio_disabled(tab, True)
+    assert audio_off.EditTabTracksMixin._external_audio_insert_at(tab) == 1
+    audio_off.EditTabTracksMixin._set_audio_disabled(tab, True)
     assert tab.player.output is None
-    audio_off._set_audio_disabled(tab, False)
+    audio_off.EditTabTracksMixin._set_audio_disabled(tab, False)
     assert tab.player.output == "out"
 
 
 def test_no_entry_without_any_audio():
     tab = SimpleNamespace(_audio_entries=[], cmb_audio=_Combo())
-    audio_off._add_audio_off_entry(tab)
+    audio_off.EditTabTracksMixin._add_audio_off_entry(tab)
     assert tab.cmb_audio.items == []
 
 

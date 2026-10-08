@@ -5,7 +5,7 @@ import re
 import unicodedata
 from .model import normalize
 
-SEARCH_POLICY = "lyrics-search-v2"
+SEARCH_POLICY = "lyrics-search-v5-credited-aliases"
 
 
 def unique(values):
@@ -30,10 +30,19 @@ def values(mapping, keys):
 
 
 def context(song, anime, kind=""):
+    from .performers import credited_lineup
+    lineup = credited_lineup(song)
+    credited = song.get("artists") or []
+    aliases = [name for performer in credited for name in performer.get("names") or []]
+    if len(credited) != 1:
+        aliases = []
+    if len(lineup) == 1:
+        aliases.extend(lineup[0])
     return {
         "titles": unique(values(song, ("songName", "songNameJapanese", "songNameRomaji",
                                        "songNameEnglish", "songAliases"))),
-        "artists": unique(values(song, ("songArtist", "songArtists", "artistAliases"))),
+        "artists": unique(values(song, ("songArtist", "songArtists", "artistAliases")) + aliases),
+        "performer_lineup": lineup,
         "anime": unique(values(anime, ("name", "english", "russian", "japanese", "romaji",
                                       "synonyms", "title")) +
                         values(song, ("animeENName", "animeJPName", "animeAltName"))),

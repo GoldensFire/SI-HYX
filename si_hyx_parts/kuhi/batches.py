@@ -7,10 +7,16 @@ import time
 
 from . import _race
 from ._transport import scoped
+from .provider_policy import START_DELAY
 
 
 async def episode_batches(aid, ctx):
-    jobs = [asyncio.create_task(_race._episodes_one(mod, name, aid, ctx))
+    async def start(mod, name):
+        delay = START_DELAY.get(name, 0)
+        if delay:
+            await asyncio.sleep(delay)
+        return await _race._episodes_one(mod, name, aid, ctx)
+    jobs = [asyncio.create_task(start(mod, name))
             for name, mod in _race.providers()]
     try:
         for done in asyncio.as_completed(jobs):

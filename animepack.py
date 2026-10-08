@@ -251,7 +251,7 @@ ANAGRAM_CPS_MAX = 60.0
 # бы за секунду, и прочитать её не успел бы никто.
 ANAGRAM_MIN_SECONDS = 3
 
-from si_hyx_parts.animepack.anagram_seconds import anagram_seconds
+from si_hyx_parts.animepack.anagram import anagram_seconds
 
 
 # ── Вопрос по сюжету (Fandom + Gemini) ───────────────────────────────────────
@@ -282,6 +282,10 @@ SHIKI_CACHE_FILE = os.path.join(CONFIG_DIR, "animepack_shikimori_db.json")
 # Сколько наборов фильтров держим одновременно: у каждого свой мешок карточек,
 # и без предела файл рос бы с каждым сдвигом года или галочкой типа.
 SHIKI_CACHE_BUCKETS = 4
+# Мешок карточек, которые дозапросила вкладка ShikimoriHYX ради индекса: под
+# фильтры генератора он не разбирается (catalog_superset его пропускает) и в
+# предел SHIKI_CACHE_BUCKETS не входит — чужие мешки из-за него не выбывают.
+SHIKIMORIHYX_BUCKET = "shikimorihyx"
 # Ссылки на кадры/темы и состав персонажей меняются редко, но в отличие от
 # карточек каталога всё же обновляются. Месяц убирает повторные API-запросы и
 # не превращает старую ссылку в вечную.
@@ -299,16 +303,15 @@ from si_hyx_parts.animepack.anime_pack_error import AnimePackError
 _LISTS_CACHE: dict[tuple, list[int]] = {}
 _LISTS_LOCK = threading.Lock()
 
-from si_hyx_parts.animepack.user_list_cache_key import (
+from si_hyx_parts.animepack.user_lists import (
     user_list_cache_key,
     cached_user_list,
     remember_user_list,
     clear_user_list_cache,
-    ShikimoriDbCache,
-    shiki_cache_signature,
     UserList,
     _current_year,
 )
+from si_hyx_parts.animepack.db_cache import ShikimoriDbCache, shiki_cache_signature
 
 from si_hyx_parts.animepack.pack_settings import PackSettings
 
@@ -338,7 +341,7 @@ _CHAR_PRICE_MULT = {True: 1.5, False: 1.8}
 _CHAR_PRICE_STEP = {True: 4, False: 6}
 CHAR_TITLE_PRICE_STEP = 1
 
-from si_hyx_parts.animepack.char_price_mult import char_price_mult
+from si_hyx_parts.animepack.character_pricing import char_price_mult
 
 
 # ── «В избранном» у персонажа ────────────────────────────────────────────────
@@ -350,10 +353,10 @@ CHAR_FAV_LEVELS = (5000, 3000, 2000, 1300, 900, 600, 400, 260, 180, 120,
                    80, 30, 12, 4)
 CHAR_MAX_LEVEL = len(CHAR_FAV_LEVELS) + 1
 
-from si_hyx_parts.animepack.char_fav_level import char_fav_level, char_question_level
+from si_hyx_parts.animepack.character_pricing import char_fav_level, char_question_level
 
 
-from si_hyx_parts.animepack.char_fav_price_shift import char_fav_price_shift
+from si_hyx_parts.animepack.character_pricing import char_fav_price_shift
 # Надбавка за сложность самой песни (просьба пользователя). Цена песенного
 # вопроса складывается из двух частей: база — узнаваемость ТАЙТЛА, ровно та же,
 # что у вопроса-кадра, а сверху — надбавка за сложность угадывания в AMQ.
@@ -375,7 +378,7 @@ PLOT_PRICE_MULT = 1.5
 # назвать любой из них.
 STUDIO_PRICE_MULT = 1.5
 
-from si_hyx_parts.animepack.song_difficulty_bonus import song_difficulty_bonus
+from si_hyx_parts.animepack.pricing import song_difficulty_bonus
 # Сложность кавера складывается со сложностью песни, а не удваивает её.
 from si_hyx_parts.animepack.cover_difficulty import (
     song_hardness, cover_hardness, music_difficulty_bonus)
@@ -389,7 +392,7 @@ from si_hyx_parts.animepack.cover_labels import (
 # из скольких слов состоит ответ.
 _ANAGRAM_LETTER = re.compile(r"[^\W\d_]", re.UNICODE)
 
-from si_hyx_parts.animepack.anagram_source import anagram_source
+from si_hyx_parts.animepack.anagram import anagram_source
 
 
 # Письменность названия. Кириллица и латиница (вместе с диакритикой европейских
@@ -398,12 +401,14 @@ from si_hyx_parts.animepack.anagram_source import anagram_source
 _RE_CYRILLIC = re.compile(r"[Ѐ-ӿ]")
 _RE_LATIN = re.compile(r"[A-Za-zÀ-ɏ]")
 
-from si_hyx_parts.animepack.is_lang_script import (
+from si_hyx_parts.animepack.anagram import (
     _is_lang_script,
     _letters_count,
     _letter_runs,
     make_anagram,
-    _dedup_answers,
+)
+from si_hyx_parts.animepack.answer_variants import _dedup_answers
+from si_hyx_parts.animepack.pricing import (
     _split_total,
     _scale_quotas,
     price_for_difficulty,
@@ -420,7 +425,7 @@ from si_hyx_parts.animepack.is_lang_script import (
 _RE_CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿가-힯"
                      r"豈-﫿＀-￯]")
 
-from si_hyx_parts.animepack.has_cjk import has_cjk
+from si_hyx_parts.animepack.titles import has_cjk
 
 
 # «Сложность пака» 1…15 по индексу популярности: 1 — то, что смотрели все,
@@ -466,7 +471,8 @@ _RE_TITLE_TRAIL_NUM = re.compile(r"[\s.,!?:;\-–—]*\b([IVX]+|\d+)\s*$",
 _RE_TITLE_TRAIL_ABBR = re.compile(r"[\s.,!?:;\-–—]+[A-Z]{1,3}\s*$")
 _RE_TRAIL_PUNCT = re.compile(r"[\s.,!?:;]+$")
 
-from si_hyx_parts.animepack.title_root import title_root, is_plain_title, song_kind
+from si_hyx_parts.animepack.titles import title_root, is_plain_title
+from si_hyx_parts.animepack.song_filters import song_kind
 from si_hyx_parts.animepack.franchise_branch import (
     branch_franchise_index,
     franchise_branch_key,
@@ -479,13 +485,15 @@ _TAG_BY_KIND = {"opening": "OP", "ending": "ED", "insert": "OST"}
 _RE_TAG_NUM = re.compile(r"(\d+)\s*$")
 
 from si_hyx_parts.animepack.announced import is_announced
-from si_hyx_parts.animepack.song_tag import (
+from si_hyx_parts.animepack.song_filters import (
     song_tag,
     _truthy,
     _chunks,
     _genre_ids,
     filter_song,
     filter_anime,
+)
+from si_hyx_parts.animepack.frame_history import (
     frame_url_key,
     load_frame_history,
     save_frame_history,
@@ -500,7 +508,7 @@ _RE_ANSWER_SONG = re.compile(r"\s*[—–-]\s*『.*$")
 _RE_ANSWER_YEAR = re.compile(r"\s*\(\s*\d{4}\s*\)\s*$")
 _RE_ANSWER_TAG = re.compile(r"\s+(OP|ED|OST)\s*\d*\s*$", re.IGNORECASE)
 
-from si_hyx_parts.animepack.answer_title import answer_title, siq_answer_roots, franchise_key
+from si_hyx_parts.animepack.titles import answer_title, siq_answer_roots, franchise_key
 
 
 # ─────────────────────────────────────────────────────────────────────────────

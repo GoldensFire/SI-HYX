@@ -2,6 +2,7 @@
 """Все три источника начинают обход вместе; сбой и остановка не теряют кэш."""
 from types import SimpleNamespace
 import threading
+import time
 
 import pytest
 import animepack as ap
@@ -73,15 +74,18 @@ def test_full_database_and_all_manga_start_external_sources_with_shiki(
     gen.shikimori = SimpleNamespace()
     catalog_calls = []
 
-    def catalog(manga=False):
+    def catalog(manga=False, **kwargs):
         if not catalog_calls:
             barrier.wait(timeout=5)
         catalog_calls.append(manga)
+        from si_hyx_parts.animepack.db_settings import database_settings
+        cache.mark_complete("manga" if manga else "anime",
+                            ap.shiki_cache_signature(database_settings(), manga))
         return []
 
     def shiki(generator, config, stopped=None):
         assert catalog_calls  # Census Shikimori follows its fresh catalog/favorites.
-        return {"complete": True, "source": "shikimori"}
+        return {"complete": True, "source": "shikimori", "timestamp": time.time()}
 
     gen.fetch_full_catalog = catalog
     monkeypatch.setattr(refresh, "shikimori_snapshot", shiki)
@@ -101,7 +105,7 @@ def test_primary_failure_cancels_external_work_and_preserves_old_snapshots(tmp_p
     for source, snapshot in previous.items():
         cache.remember_memo(SNAPSHOT_GROUP, source, snapshot)
 
-    def catalog(manga=False):
+    def catalog(manga=False, **kwargs):
         barrier.wait(timeout=5)
         raise RuntimeError("primary catalog failed")
 

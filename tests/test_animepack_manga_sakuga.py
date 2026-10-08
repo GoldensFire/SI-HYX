@@ -278,7 +278,6 @@ def _check_new_category_controls(tab, fresh):
     tab.chk_sakuga.setChecked(True)
     tab.chk_manga.setChecked(True)
     tab.sp_sakuga_cut.setValue(11)
-    tab.chk_sakuga_safe.setChecked(False)
     tab.sp_sakuga_preset.setValue(6)
     tab.sp_manga_level_avg.setValue(7)
     tab.sp_art_level_avg.setValue(3)

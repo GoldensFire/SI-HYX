@@ -53,7 +53,7 @@ def _catch_sleep(client, monkeypatch) -> list:
 # ── модели ───────────────────────────────────────────────────────────────────
 def test_model_list_contains_new_flash_choices():
     assert gemini_api.MODELS == (
-        "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.6-flash",
+        "gemma-4-26b-a4b-it", "gemma-4-31b-it", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.6-flash",
         "gemini-3.7-flash", "gemini-3.8-flash")
     assert gemini_api.DEFAULT_MODEL == "gemini-3.5-flash-lite"
 
@@ -190,6 +190,7 @@ def test_quota_exhausted_raises_quota_error(fake_session, fake_response,
     assert len(s.calls) == len(MODELS)
     assert [call[2]["json"]["model"] for call in s.calls] == [
         "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+        "gemma-4-31b-it", "gemma-4-26b-a4b-it",
         "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"]
 
 

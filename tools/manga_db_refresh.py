@@ -8,7 +8,6 @@ from collections import Counter
 from datetime import datetime
 import json
 from pathlib import Path
-import shutil
 import sys
 import threading
 import time
@@ -31,7 +30,7 @@ def audit(cache, started, required_sources=("shikimori", "remanga", "mangalib"))
         sources[source] = {
             "complete": row.get("complete") is True,
             "timestamp": row.get("timestamp"),
-            "fresh_this_run": row.get("timestamp", 0) >= started,
+            "fresh_this_run": row.get("catalog_timestamp", row.get("timestamp", 0)) >= started,
             "titles": len(row.get("titles") or []) if source != "shikimori"
             else sum(len(values) for values in groups.values()),
             "samples": {key: len(values) for key, values in groups.items()},
@@ -56,6 +55,7 @@ def verify_generation(generator):
     boosts = Counter()
     examples = []
     cards = generator.db_cache.all_cards("manga")
+    current.prefetch(cards)
     for card in cards:
         if card.get("kind") not in ("manga", "manhwa", "manhua"):
             continue
@@ -72,6 +72,7 @@ def verify_generation(generator):
                 examples.append({"id": card.get("id"), "title": candidate.title_ru,
                                  "kind": card["kind"], "before": before, "after": after,
                                  "sources": result.get("sources")})
+    current.flush()
     generator.db_cache.save()
     return {"cards": len(cards), "matches": {key: dict(value) for key, value in statuses.items()},
             "boosts": dict(boosts), "examples": examples}
@@ -108,8 +109,8 @@ def main():
     if args.verify_only:
         started = 0
     else:
-        if Path(cache.path).exists():
-            shutil.copy2(cache.path, output / "database-before.json.bak")
+        from si_hyx_parts.animepack.db_backup import backup_database
+        backup_database(cache, output)
         log(f"Обновление {', '.join(args.sources)}; база: {cache.path}")
         def catalogs(current, wanted):
             if "manga" in wanted:

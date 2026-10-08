@@ -10,9 +10,17 @@ import re
 from chiptune.runtime import run_process
 from .ai_runtime import ensure_packages, ensure_separator
 from .ai_assets import KIM_SHA
+from .budget import run as budget_run
+from .separator_health import kim_disabled
 
 WORKER = Path(__file__).with_name("asr_worker.py")
 _FAILED_SEPARATORS = set()
+
+
+def kim_allowed(info):
+    policy = info.get("separator_policy", "kim")
+    return (policy != "htdemucs" and not kim_disabled()
+            and not (policy == "auto" and info.get("separator", "cpu") == "cpu"))
 
 
 def separation_error(output):
@@ -53,25 +61,32 @@ def _model_identity(default, variable):
 
 
 def vocal_source(python, source, source_sha, directory, info, *, stopped, log):
+    from config import FFMPEG
+
     command = [str(python), "-I", "-X", "utf8", str(WORKER)]
     identity = _model_identity(KIM_SHA[:16], "SI_HYX_KIM_ONNX")
     base = directory / "vocals"
     kim = base / ("kim-onnx-" + identity) / source_sha / "vocals.wav"
     demucs = base / "htdemucs" / source_sha / "vocals.wav"
-    if kim.is_file():
+    allowed = kim_allowed(info)
+    if allowed and kim.is_file():
         return kim, "kim-onnx-" + identity
-    kim.parent.mkdir(parents=True, exist_ok=True)
     preferred = info.get("separator", "cpu")
-    providers = [preferred] + (["cpu"] if preferred != "cpu" else [])
+    policy = info.get("separator_policy", "kim")
+    providers = ([] if not allowed
+                 else [preferred] + (["cpu"] if preferred != "cpu" and policy == "kim" else []))
     for provider in providers:
         backend_key = (str(python), provider, identity)
         if backend_key in _FAILED_SEPARATORS:
             continue
         try:
+            kim.parent.mkdir(parents=True, exist_ok=True)
             ensure_separator(python, provider, stopped=stopped, log=log)
             log(f"Караоке: MelBand RoFormer Kim отделяет вокал ({provider.upper()})…")
-            code, output = run_process([*command, "separate", str(source), str(kim),
-                                       "--backend", "kim-onnx", "--device", provider], 1800, stopped=stopped)
+            code, output = budget_run("разделение вокала", run_process,
+                                      [*command, "separate", str(source), str(kim),
+                                       "--backend", "kim-onnx", "--device", provider,
+                                       "--ffmpeg", str(FFMPEG)], 1800, stopped=stopped)
             (kim.parent / f"separation-{provider}.txt").write_text(output, encoding="utf-8")
             if code or not kim.is_file():
                 raise ValueError(separation_error(output))
@@ -83,9 +98,9 @@ def vocal_source(python, source, source_sha, directory, info, *, stopped, log):
             if any(token in str(error).casefold() for token in
                    ("onnx", "directml", "cuda", "download", "checksum", "gpu")):
                 _FAILED_SEPARATORS.add(backend_key)
-            if provider != "cpu":
+            if provider != "cpu" and policy == "kim":
                 log("Караоке: повторяю Kim ONNX на CPU.")
-    log("Караоке: Kim ONNX недоступен на GPU и CPU; использую HTDemucs.")
+    log("Караоке: использую HTDemucs для разделения вокала.")
     legacy = [directory / source_sha / "vocals.wav",
               directory.parent / "asr-medium-ja-demucs-v2" / source_sha / "vocals.wav"]
     for path in [demucs, *legacy]:
@@ -95,10 +110,12 @@ def vocal_source(python, source, source_sha, directory, info, *, stopped, log):
     demucs.parent.mkdir(parents=True, exist_ok=True)
     ensure_packages(python, ["demucs"], ["demucs==4.0.1"], stopped=stopped, log=log)
     log(f"Караоке: HTDemucs отделяет вокал ({info['demucs'].upper()})…")
-    code, output = run_process([*command, "separate", str(source), str(demucs),
+    code, output = budget_run("разделение вокала", run_process,
+                              [*command, "separate", str(source), str(demucs),
                                "--backend", "htdemucs", "--device", info["demucs"]], 900, stopped=stopped)
     if code and info["demucs"] == "cuda" and not stopped():
-        code, output = run_process([*command, "separate", str(source), str(demucs),
+        code, output = budget_run("разделение вокала", run_process,
+                                  [*command, "separate", str(source), str(demucs),
                                    "--backend", "htdemucs", "--device", "cpu"], 900, stopped=stopped)
     (demucs.parent / "separation.txt").write_text(output, encoding="utf-8")
     if code or not demucs.is_file():
@@ -129,10 +146,11 @@ def transcribe(python, source, source_sha, directory, *, stopped, log, language=
     if info["asr"] != "cpu":
         attempts.append(("faster-whisper", "cpu", "int8"))
     for engine, device, compute in attempts:
-        for separator in (kim_id, "htdemucs"):
+        for separator in ([kim_id, "htdemucs"] if kim_allowed(info) else ["htdemucs"]):
             identity = model_id if engine == "whisper.cpp" else model
             target = asr_target(directory, source_sha, engine, identity, language, device, compute, separator)
             if target.is_file():
+                info.update(used_separator=separator, used_asr=f"{engine} {device}")
                 return target
     vocals, separator = vocal_source(python, source, source_sha, directory, info, stopped=stopped, log=log)
     command = [str(python), "-I", "-X", "utf8", str(WORKER)]
@@ -140,11 +158,13 @@ def transcribe(python, source, source_sha, directory, *, stopped, log, language=
         identity = model_id if engine == "whisper.cpp" else model
         target = asr_target(directory, source_sha, engine, identity, language, device, compute, separator)
         log(f"Караоке: {engine} {model} распознаёт вокал ({device.upper()}, {language or 'auto'}, beam=1)…")
-        code, output = run_process([*command, "transcribe", str(vocals), str(target),
+        code, output = budget_run("распознавание вокала", run_process,
+                                  [*command, "transcribe", str(vocals), str(target),
                                    "--backend", engine, "--model", model, "--language", language or "auto",
                                    "--device", device, "--compute", compute], 1800, stopped=stopped)
         (target.parent / (source_sha + "-transcription.txt")).write_text(output, encoding="utf-8")
         if not code and target.is_file():
+            info.update(used_separator=separator, used_asr=f"{engine} {device}")
             return target
         if stopped():
             raise RuntimeError("Караоке: остановлено.")

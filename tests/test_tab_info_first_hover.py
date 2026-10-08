@@ -11,8 +11,7 @@ from PyQt6.QtWidgets import QLabel, QTabBar, QTabWidget, QToolTip, QWidget
 def test_badge_hint_uses_current_cursor_not_previous_tab_event(qapp):
     import main  # публичный модуль первым загружает свои части
     from widgets import _InfoTipPopup
-    from si_hyx_parts.main.unified_window__style_tab_scroll_buttons import (
-        _update_tab_tip)
+    _update_tab_tip = main.UnifiedWindow._update_tab_tip
 
     tabs = QTabWidget()
     bar = tabs.tabBar()
@@ -75,8 +74,8 @@ def test_real_badge_hover_ignores_late_enter_and_leave(qapp):
                 _hide_tab_tip=lambda: popup.hide())
             tabs.widget(0).setObjectName("tab::first")
             tabs.widget(1).setObjectName("tab::second")
-            from si_hyx_parts.main.unified_window__style_tab_scroll_buttons import (
-                _update_tab_tip)
+            from main import UnifiedWindow
+            _update_tab_tip = UnifiedWindow._update_tab_tip
             _update_tab_tip(target, bar.mapFromGlobal(QCursor.pos()))
             assert popup.isVisible() and popup.text() == expected
             assert not QToolTip.isVisible()
@@ -99,8 +98,8 @@ def test_real_badge_hover_ignores_late_enter_and_leave(qapp):
 def test_scrolled_or_removed_badge_does_not_keep_old_tip(qapp):
     import main
     from widgets import _InfoTipPopup
-    from si_hyx_parts.main.unified_window__style_tab_scroll_buttons import (
-        _hide_tab_tip, _update_tab_tip)
+    _hide_tab_tip = main.UnifiedWindow._hide_tab_tip
+    _update_tab_tip = main.UnifiedWindow._update_tab_tip
 
     tabs = QTabWidget()
     tabs.resize(220, 120)

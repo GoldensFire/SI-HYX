@@ -82,6 +82,20 @@ def _srt(text: str) -> list[tuple[float, float, str]]:
     return cues
 
 
+def _without_drawings(text: str) -> str:
+    """Убрать векторные фигуры ASS: после {\\p1} идут команды «m 0 0 l …», а не реплика."""
+    parts, drawing = [], False
+    for tag, plain in re.findall(r"(\{[^}]*\})|([^{]+)", str(text or "")):
+        if tag:
+            scale = re.findall(r"\\p(\d+)", tag)
+            if scale:
+                drawing = int(scale[-1]) > 0
+            parts.append(tag)
+        elif not drawing:
+            parts.append(plain)
+    return "".join(parts)
+
+
 def _ass(text: str) -> list[tuple[float, float, str]]:
     cues = []
     fields = ["layer", "start", "end", "style", "name", "marginl",
@@ -103,7 +117,7 @@ def _ass(text: str) -> list[tuple[float, float, str]]:
         if len(values) != len(fields):
             continue
         row = dict(zip(fields, values))
-        body = _clean(row.get("text", ""))
+        body = _clean(_without_drawings(row.get("text", "")))
         if body:
             cues.append((_seconds(row.get("start", "")),
                          _seconds(row.get("end", "")), body))

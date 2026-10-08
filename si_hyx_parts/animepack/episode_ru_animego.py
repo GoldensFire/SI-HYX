@@ -73,7 +73,7 @@ def page_identity(content):
     return row, tree
 
 
-async def page_catalogue(tree, referer):
+async def page_catalogue(tree, referer, ctx=None):
     from .episode_ru_players import subtitle_playlist
     from .episode_alloha_catalog import catalogue as alloha_catalogue
     roots = tree.xpath('//*[@data-player-anime-id]')
@@ -84,7 +84,7 @@ async def page_catalogue(tree, referer):
         label = slot.get("data-player-title", "")
         player = player_name(label, "")
         if not player:
-            return {}  # Kodik's 720p and trailers cannot supply the requested source.
+            return {}  # This player has no supported native-stream resolver.
         data = (await get(RELAY, params={"mod": "player", "id": root.get("data-player-anime-id"),
                                         "slot": slot.get("data-player-slot")},
                           headers={"Referer": referer})).json()
@@ -96,12 +96,14 @@ async def page_catalogue(tree, referer):
                 title_id=data["title_id"], publisher=data["pub_id"], aggregator=data["aggregator"])
         embed = absolute(data.get("src"), referer)
         if player == "alloha" and embed:
-            return await alloha_catalogue(embed, referer, "animego")
+            return await alloha_catalogue(embed, referer, "animego", ctx)
         raise ValueError("AnimeGO.online: неподдерживаемый формат плеера " + label)
 
     results = await asyncio.gather(*(collect(root, slot) for root in roots
         for slot in root.xpath('.//*[@data-player-slot]')), return_exceptions=True)
     catalog, failures = {}, []
+    reasons = [getattr(result, "reason", "") for result in results
+               if not isinstance(result, BaseException)]
     for result in results:
         if isinstance(result, Exception):
             failures.append(error_detail(result))
@@ -112,7 +114,8 @@ async def page_catalogue(tree, referer):
                 catalog.setdefault(number, []).extend(rows)
     if failures and not catalog:
         raise RuntimeError("AnimeGO.online: " + "; ".join(failures))
-    return catalog
+    reason = next((text for text in reasons if text), "")
+    return Catalogue(catalog, reason=reason) if reason and not catalog else catalog
 
 
 async def catalogue(candidate, ctx):
@@ -133,13 +136,14 @@ async def catalogue(candidate, ctx):
                 continue
             found = True
             try:
-                catalog = await page_catalogue(tree, str(getattr(page, "url", row["url"])))
+                catalog = await page_catalogue(tree, str(getattr(page, "url", row["url"])), ctx)
             except Exception as error:
                 failures.append(error_detail(error))
                 continue
             if catalog:
                 return Catalogue(catalog)
-            return Catalogue(reason="тайтл найден; в плеерах нет RU-субтитров; Kodik пропущен")
+            return Catalogue(reason=getattr(catalog, "reason", "")
+                             or "тайтл найден; в плеерах нет RU-субтитров; Kodik пропущен")
         if found:
             break
     if failures:

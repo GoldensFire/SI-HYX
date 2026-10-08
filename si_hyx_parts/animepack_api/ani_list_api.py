@@ -48,6 +48,7 @@ class AniListApi:
         self.limiter = _api.RateLimiter(1.2, per_minute=90)
         self._frames_lock = _api.threading.Lock()
         self._frames_retry_at = 0.0
+        self._frames_strikes = 0
         self._log = log or (lambda message: None)
 
     def _graphql(self, query: str, variables: dict, *, attempts=2,
@@ -142,10 +143,22 @@ class AniListApi:
                 data = self._graphql(self.IMAGES_QUERY, {"idMal": mal_id},
                                      attempts=1, timeout=(5, 15))
             except _api.AnimePackApiError as e:
-                self._frames_retry_at = _api.time.monotonic() + 60
-                self._log(f"{e} Превью AniList пропускаю на минуту; "
-                          "кадры беру из остальных источников.")
+                # Подряд идущие отказы удлиняют паузу (1, 2, 4… до 10 минут),
+                # не короче Retry-After: минутная пауза по кругу давала 429
+                # каждые полторы минуты.
+                self._frames_strikes += 1
+                pause = min(600.0, 60.0 * 2 ** (self._frames_strikes - 1))
+                headers = getattr(getattr(e.__cause__, "response", None), "headers", None) or {}
+                try:
+                    pause = max(pause, min(600.0, float(headers.get("Retry-After") or 0)))
+                except (TypeError, ValueError):
+                    pass
+                self._frames_retry_at = _api.time.monotonic() + pause
+                if self._frames_strikes <= 3:
+                    self._log(f"{e} Превью AniList пропускаю на {int(pause)} с; "
+                              "кадры беру из остальных источников.")
                 return []
+            self._frames_strikes = 0
         finally:
             self._frames_lock.release()
         media = data.get("Media") or {}

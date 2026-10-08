@@ -18,11 +18,13 @@ class DifficultyRange(_api._ShareBar):
     """
 
     def __init__(self, low=0, high=100, parent=None, *, minimum=0,
-                 maximum=100, suffix="", average=False):
+                 maximum=100, suffix="", average=False, formatter=None):
         super().__init__(parent=parent)
         self.minimum = int(minimum)
         self.maximum = max(self.minimum + 1, int(maximum))
         self.suffix = str(suffix or "")
+        # Подпись значения: оценка хранится десятыми, а показывается «7.5».
+        self.formatter = formatter or str
         self._show_average = bool(average)
         self.set_parts([
             ("below", "", "surface3"),
@@ -234,8 +236,24 @@ class DifficultyRange(_api._ShareBar):
         if not self._cuts() or not hasattr(self, "avg_control"):
             return ""
         low, high = self.range_values()
+        low, high = self.formatter(low), self.formatter(high)
         if not self._show_average:
             return f"От {low}{self.suffix} до {high}{self.suffix}"
         avg = self.avg_control.value()
         return (f"От {low}{self.suffix} до {high}{self.suffix} · "
                 f"В среднем: {avg if avg else 'Любая'}")
+
+
+class ScaledBound:
+    """Граница ползунка в единицах настройки: ``value()``/``setValue()`` как у
+    прежнего QDoubleSpinBox, а ручка полосы целая (оценка — в десятых)."""
+
+    def __init__(self, control, scale: int):
+        self.control = control
+        self.scale = int(scale)
+
+    def value(self) -> float:
+        return self.control.value() / self.scale
+
+    def setValue(self, value) -> None:
+        self.control.setValue(int(round(float(value) * self.scale)))

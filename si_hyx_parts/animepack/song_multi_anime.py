@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import io
+import threading
+import time
 
 import animepack as _api
 
@@ -20,14 +22,7 @@ def enrich(generator, cand) -> None:
     key = _song_key(cand.song_name, cand.artist)
     rows = generator.db_cache.memo("same_song_anime_v1", key)
     if rows is None:
-        try:
-            rows = ask(cand.song_name, cand.artist)
-        except _api.AnimePackApiError as exc:
-            generator._log_rare("Одинаковые песни",
-                                f"AnisongDB: одинаковые песни не проверены: {exc}")
-            return
-        rows = [row for row in (rows or []) if _same(row, cand)]
-        generator.db_cache.remember_memo("same_song_anime_v1", key, rows)
+        rows = _ask(generator, cand, ask, key)
     primary_id = cand.mal_id
     by_id = {}
     for row in rows or []:
@@ -37,7 +32,8 @@ def enrich(generator, cand) -> None:
     if not by_id:
         return
     try:
-        cards = generator._animes_by_ids(list(by_id)[:50])
+        from .song_optional_catalog import cards as optional_cards
+        cards = optional_cards(generator, list(by_id)[:50])
     except _api.AnimePackApiError as exc:
         generator._log_rare("Одинаковые песни",
                             f"Shikimori: тайтлы одинаковой песни не загружены: {exc}")
@@ -57,6 +53,46 @@ def enrich(generator, cand) -> None:
         if len(alternates) >= MAX_TITLES - 1:
             break
     cand.song_alternates = alternates
+
+
+_ASKING = threading.Lock()
+
+
+def _ask(generator, cand, ask, key) -> list:
+    """Один запрос обогащения за раз; при сбое и паузе — локальный снимок.
+
+    Восемь потоков спрашивали AnisongDB одновременно: пауза после 503
+    ставилась, когда соседние запросы уже ушли и тоже получали 503."""
+    if not _ASKING.acquire(timeout=5):
+        return _snapshot(generator, cand)
+    try:
+        rows = generator.db_cache.memo("same_song_anime_v1", key)
+        if rows is not None:
+            return rows
+        if time.monotonic() < getattr(generator, "_same_song_retry_at", 0):
+            return _snapshot(generator, cand)
+        try:
+            rows = ask(cand.song_name, cand.artist)
+        except _api.AnimePackApiError as exc:
+            # Optional enrichment must not retry an unavailable endpoint for
+            # every distinct song. Keep failures transient and retry later.
+            generator._same_song_retry_at = time.monotonic() + 120
+            generator._log_rare("Одинаковые песни",
+                                f"AnisongDB: одинаковые песни не проверены: {exc}")
+            return _snapshot(generator, cand)
+        rows = [row for row in (rows or []) if _same(row, cand)]
+        generator.db_cache.remember_memo("same_song_anime_v1", key, rows)
+        return rows
+    finally:
+        _ASKING.release()
+
+
+def _snapshot(generator, cand) -> list:
+    """Строки той же песни из сохранённого каталога; в memo не пишутся."""
+    local = getattr(generator.anisong, "songs_by_name_artist_snapshot", None)
+    if not callable(local):
+        return []
+    return [row for row in local(cand.song_name) if _same(row, cand)]
 
 
 def join_posters(generator, cand, primary_data: bytes, primary_ext: str) -> None:

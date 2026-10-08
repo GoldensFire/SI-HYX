@@ -54,7 +54,9 @@ def test_candidate_failure_still_saves_new_metadata(tmp_path, monkeypatch):
         yield
 
     monkeypatch.setattr(gen, "iter_candidates", candidates)
-    with pytest.raises(RuntimeError, match="catalog failed"):
+    # Сбой источника доходит до вызывающего как ошибка пака: готовые вопросы
+    # при этом сохраняются (см. select_songs).
+    with pytest.raises(ap.AnimePackError, match="catalog failed"):
         gen.select_songs()
     assert saves == [1]
     assert ap.ShikimoriDbCache(gen.db_cache.path).franchise("fr1") == []

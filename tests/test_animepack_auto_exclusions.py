@@ -11,7 +11,7 @@ import animepack_tab
 def _result(path, cancelled=False):
     return SimpleNamespace(
         path=str(path), songs=[], elapsed=1.0, cancelled=cancelled,
-        requested=0, pack_number=0)
+        aborted=False, requested=0, pack_number=0)
 
 
 def test_checkbox_is_saved_and_restored(qapp):

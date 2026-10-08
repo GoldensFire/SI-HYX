@@ -151,9 +151,13 @@ def test_video_price_equals_frame_price_without_music_bonuses(song_type, difficu
     song = {"songType": song_type, "songDifficulty": difficulty}
     frame = ap.SongCandidate({}, _card(1), kind=ap.FRAME_KIND)
     video = ap.SongCandidate(song, _card(1), kind=ap.VIDEO_KIND, has_video=True)
-    ap.assign_prices([frame, video], ap.PackSettings())
+    song_video = ap.SongCandidate(song, _card(1), kind=ap.song_kind(song_type),
+                                 has_video=True, theme_video_ready=True)
+    ap.assign_prices([frame, video, song_video], ap.PackSettings())
     assert video.price == frame.price
     assert video.price_parts == frame.price_parts
+    assert song_video.price == frame.price
+    assert song_video.price_parts == frame.price_parts
 
 
 @pytest.mark.parametrize("has_video", [False, True])

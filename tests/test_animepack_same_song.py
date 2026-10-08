@@ -57,3 +57,25 @@ def test_same_franchise_placement_is_not_added_to_the_answer():
     variants = cand.answer_variants()
     assert "Другой тайтл EN" in variants
     assert "Третий тайтл Alt" in variants
+
+
+def test_unavailable_optional_endpoint_is_not_retried_for_every_song(monkeypatch):
+    from types import SimpleNamespace
+    from si_hyx_parts.animepack import song_multi_anime as module
+
+    clock, calls = [100.0], []
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+
+    def ask(*args):
+        calls.append(args)
+        raise ap.AnimePackApiError("503 Service Unavailable")
+
+    gen = SimpleNamespace(anisong=SimpleNamespace(songs_by_name_artist=ask),
+                          db_cache=_Cache(), _log_rare=lambda *a: None)
+    cand = ap.SongCandidate(_song(1), _card(1, "Оригинал", "one"))
+    enrich(gen, cand)
+    enrich(gen, cand)
+    assert len(calls) == 1 and gen.db_cache.value is None
+    clock[0] += 121
+    enrich(gen, cand)
+    assert len(calls) == 2

@@ -196,11 +196,34 @@ class SakugaApi:
                 continue
             if size > MAX_CLIP_BYTES:
                 continue
+            # Теги поста: по ним видно genga и все тайтлы, к которым
+            # вырезку отнесли (цена и ответ — см. sakuga_generation).
+            tags = str(row.get("tags") or "").split()
             out.append({"id": str(row.get("id") or ""), "url": url, "ext": ext,
-                        "size": size, "source": str(row.get("source") or "")})
+                        "size": size, "source": str(row.get("source") or ""),
+                        "tags": tags})
         with self._lock:
             self._posts[key] = list(out)
         return out
+
+    def absent(self, card: dict) -> bool:
+        """После clip(): у тайтла на сайте нет ни тега, ни одной вырезки
+        (а не просто все его вырезки уже заняты этим паком)."""
+        tag = self.tag_for(card)
+        return not tag or not self.clips(tag)
+
+    @classmethod
+    def card_tagged(cls, card: dict, tags) -> bool:
+        """Ромадзи или английское название карточки — один из тегов вырезки."""
+        try:
+            year = int((card.get("airedOn") or {}).get("year") or 0)
+        except (AttributeError, TypeError, ValueError):
+            year = 0
+        for name in (card.get("name"), card.get("english")):
+            want = slug(name)
+            if want and any(cls._same_series(tag, want, year) for tag in tags if tag):
+                return True
+        return False
 
     def clip(self, card: dict, excluded=()) -> dict:
         """Случайный отрывок тайтла ({} — подходящего нет)."""

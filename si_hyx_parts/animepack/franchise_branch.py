@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from functools import lru_cache
 import re
 
 import animepack as _api
@@ -35,10 +36,17 @@ def _science_adventure_branch(card: dict) -> str:
                  if any(form in names for form in forms)), "")
 
 
-def _roots(card: dict) -> set[str]:
+def _roots(card: dict) -> frozenset[str]:
+    # Корни частей одной франшизы считаются для каждой её карточки заново:
+    # кэш по самим названиям снимает это с построения плана книг.
+    return _roots_of(tuple(str((card or {}).get(field) or "").strip()
+                           for field in ("russian", "name", "english")))
+
+
+@lru_cache(maxsize=1 << 17)
+def _roots_of(values: tuple) -> frozenset[str]:
     roots = set()
-    for field in ("russian", "name", "english"):
-        value = str((card or {}).get(field) or "").strip()
+    for value in values:
         root = _api.title_root(value)
         if not root:
             # Общий title_root намеренно отбрасывает короткие слова, чтобы не
@@ -50,7 +58,7 @@ def _roots(card: dict) -> set[str]:
                 root = ""
         if root:
             roots.add(root)
-    return roots
+    return frozenset(roots)
 
 
 def franchise_branch_parts(card: dict, parts) -> list[dict]:

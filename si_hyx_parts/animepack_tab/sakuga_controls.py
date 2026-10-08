@@ -26,11 +26,6 @@ def build_controls(tab):
         "секунд отрывок в вопрос не идёт — всё лишнее обрезается.")
     layout.addWidget(tab._lab("Длина отрывка"), 0, 0)
     layout.addWidget(tab.sp_sakuga_cut, 0, 1)
-    tab.chk_sakuga_safe = _api.QCheckBox("Только метка «safe»")
-    tab.chk_sakuga_safe.setChecked(True)
-    tab.chk_sakuga_safe.setToolTip(
-        "Снятая галочка пускает и вырезки с меткой «questionable» — это драки "
-        "и кровь, но не порно: его на Sakugabooru нет вовсе.")
     # Скорость кодирования у сакуги своя, отдельно от вопросов-роликов
     # (просьба пользователя): вырезок в паке бывает два десятка, и время на
     # них уходит заметное — а качество короткого отрывка простительно хуже.
@@ -46,7 +41,6 @@ def build_controls(tab):
         "CRF у вырезки общий с роликами.")
     layout.addWidget(tab._lab("Пресет кодирования"), 1, 0)
     layout.addWidget(tab.sp_sakuga_preset, 1, 1)
-    layout.addWidget(tab.chk_sakuga_safe, 2, 0, 1, 2)
     layout.setColumnStretch(1, 1)
     tab.box_sakuga.setVisible(False)
     tab.chk_sakuga.toggled.connect(lambda value: toggle(tab, value))
@@ -62,7 +56,7 @@ def collect(tab, settings):
     settings.pack_sakuga = tab.chk_sakuga.isChecked()
     settings.pct_sakuga = tab.mix.shares()["sakuga"]
     settings.sakuga_cut = tab.sp_sakuga_cut.value()
-    settings.sakuga_safe_only = tab.chk_sakuga_safe.isChecked()
+    settings.sakuga_safe_only = False
     settings.sakuga_preset = tab.sp_sakuga_preset.value()
 
 
@@ -70,6 +64,6 @@ def apply_controls(tab, settings):
     tab.sp_sakuga_cut.setValue(max(2, min(_api.SAKUGA_MAX_CUT,
                                           int(settings.sakuga_cut
                                               or _api.SAKUGA_CUT))))
-    tab.chk_sakuga_safe.setChecked(bool(settings.sakuga_safe_only))
+    settings.sakuga_safe_only = False
     tab.sp_sakuga_preset.setValue(max(0, min(13, int(
         getattr(settings, "sakuga_preset", _api.VIDEO_PRESET)))))

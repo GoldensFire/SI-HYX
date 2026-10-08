@@ -112,7 +112,7 @@ def test_signed_watch_cache_is_bounded_and_expires(monkeypatch):
     assert len(_race._watch_cache) == 2
 
 
-def test_native_failure_uses_legacy_english_subtitles_when_ru_is_missing(generator, monkeypatch):
+def test_native_failure_never_uses_disabled_miruro(generator, monkeypatch):
     gen = generator
     gen.s.episode_ru_subtitles = True
     gen.kuhi.close()
@@ -129,9 +129,6 @@ def test_native_failure_uses_legacy_english_subtitles_when_ru_is_missing(generat
 
     monkeypatch.setattr(subtitles, "find", failed_subtitles)
     candidate = api.SongCandidate({}, make_anime(), kind=api.EPISODE_KIND)
-    assert gen.download_episode(candidate)
-    assert calls == ["legacy"]
-    assert candidate.has_video
-    assert not candidate.episode_clip["ru_subtitles"]
-    assert candidate.episode_clip["subtitle_language"] == "en"
-    assert candidate.episode_clip["subtitle_source"] == "en_hardsub"
+    assert not gen.download_episode(candidate)
+    assert calls == []
+    assert not candidate.has_video

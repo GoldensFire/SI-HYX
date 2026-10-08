@@ -71,7 +71,9 @@ def build_controls(tab):
     tab.chk_pixiv_gemini = _api.QCheckBox("Проверять арт через Gemini")
     tab.chk_pixiv_gemini.setChecked(True)
     tab.chk_pixiv_gemini.setToolTip(
-        "Gemini проверяет персонажей из других тайтлов. Если способ проверки "
+        "Gemini отсеивает крайне плохо нарисованные арты и персонажей "
+        "из других тайтлов. Аккуратная простая рисовка и стилизация допустимы. "
+        "Если способ проверки "
         "названия — Gemini, он проверяет и видимые названия. "
         "До четырёх картинок с одинаковой моделью проверяются одним запросом.")
     layout.addWidget(tab.chk_pixiv_gemini, 5, 0, 1, 2)
@@ -80,7 +82,8 @@ def build_controls(tab):
     tab.cb_pixiv_title_mode.addItem("Название: локальный OCR", "local")
     tab.cb_pixiv_title_mode.setToolTip(
         "В локальном режиме OCR проверяет видимое название. Gemini "
-        "по-прежнему проверяет персонажей других тайтлов, если галочка включена.")
+        "по-прежнему проверяет качество рисунка и персонажей других тайтлов, "
+        "если галочка включена.")
     layout.addWidget(tab.cb_pixiv_title_mode, 6, 0, 1, 2)
     tab.cb_pixiv_gemini_model = _api.QComboBox()
     for model in _api.GEMINI_MODELS:
@@ -88,8 +91,6 @@ def build_controls(tab):
     tab.cb_pixiv_gemini_model.setCurrentText(_api.GEMINI_DEFAULT_MODEL)
     tab.cb_pixiv_gemini_model.setToolTip(
         "Модель Gemini, которая визуально проверяет арты Pixiv.")
-    layout.addWidget(tab._lab("Модель проверки"), 7, 0)
-    layout.addWidget(tab.cb_pixiv_gemini_model, 7, 1)
     # Галочки «Пускать комиксы Pixiv» больше нет (просьба пользователя):
     # записи типа «манга» — это кадры с репликами, а не рисунок, и вопросом
     # такая работа не бывает. Поле pixiv_allow_manga осталось только ради

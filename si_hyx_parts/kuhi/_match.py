@@ -33,11 +33,13 @@ def attr(tag: str, name: str) -> str:
 
 
 def norm(s: str = "") -> str:
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+    return re.sub(r"[\W_]", "", (s or "").casefold())
 
 
 def dice_coeff(a: str, b: str) -> float:
     na, nb = norm(a), norm(b)
+    if not na or not nb:
+        return 0.0
     if na == nb:
         return 1.0
     if len(na) < 2 or len(nb) < 2:
@@ -58,7 +60,8 @@ def dice_coeff(a: str, b: str) -> float:
 def title_score(query: str, candidate: str, slug: str) -> float:
     base = max(dice_coeff(query, candidate), dice_coeff(query, slug.replace("-", " ")))
     qnum = re.search(r"\d+", norm(query))
-    snum = re.search(r"\d+", slug)
+    # Opaque provider hashes in a URL are not season numbers.
+    snum = re.search(r"\d+", norm(candidate))
     qnum, snum = (qnum.group(0) if qnum else ""), (snum.group(0) if snum else "")
     if qnum and snum and qnum != snum:
         return base * 0.65
@@ -97,10 +100,11 @@ def _build_search_queries(title: str) -> list:
 
 async def find_top_slugs(titles: list, search_fn, n: int = 6) -> list:
     candidates: dict = {}
-    queries: set = set()
+    queries = []
     for title in (titles or [])[:4]:
         for q in _build_search_queries(title):
-            queries.add(q)
+            if q not in queries:
+                queries.append(q)
 
     async def _one(q):
         try:
@@ -200,6 +204,9 @@ def episode_meta(n: int, ctx: dict) -> dict:
 
 async def select_series(candidates: list, scrape_fn, expected, status, offset, min_score: float = 0.65):
     async def _score(cand):
+        # Episode counts may reject a match, never rescue a weak title match.
+        if cand["score"] < min_score:
+            return None
         try:
             episodes = await scrape_fn(cand["slug"])
         except Exception:
@@ -215,7 +222,7 @@ async def select_series(candidates: list, scrape_fn, expected, status, offset, m
             needed = -(-expected * 9 // 10) if status == "FINISHED" else max(1, expected - 3)
             count_score = 1.0 if hits >= needed else (hits / needed if needed else 0)
         return {**cand, "episodes": episodes, "mode": mode,
-                "score": cand["score"] * 0.7 + count_score * 0.3}
+                "score": cand["score"] * (0.7 + count_score * 0.3)}
     scored = [r for r in await asyncio.gather(*[_score(c) for c in candidates]) if r]
     viable = [r for r in scored if r["episodes"] and r["score"] >= min_score]
     viable.sort(key=lambda x: x["score"], reverse=True)

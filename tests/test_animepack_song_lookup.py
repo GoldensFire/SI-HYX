@@ -73,3 +73,22 @@ def test_completed_song_rows_are_available_to_silent_questions(
     gen._song_lookup_needed = False
     candidates = list(feed.pictures(ap.FRAME_KIND, gen._used_franchise))
     assert {cand.mal_id for cand in candidates} == {1, 2}
+
+
+def test_picture_stream_reads_the_whole_catalog_in_order_while_songs_are_needed(
+        tmp_path, monkeypatch):
+    """Аудит 2026-10-05: кадры брали только тайтлы БЕЗ подходящей песни —
+    фильмы и спин-оффы, а основные сезоны с песнями им не доставались."""
+    cards = [make_anime(i) for i in range(1, 5)]
+    gen = _generator(tmp_path, monkeypatch, cards, [make_song(1), make_song(3)])
+    feed = _feed(gen)
+    pictures = feed.pictures(ap.FRAME_KIND, gen._used_franchise)
+    got = [next(pictures) for _ in range(3)]
+    assert [cand.mal_id for cand in got] == [1, 2, 3]
+    # Пока песенные места не набраны, тайтл с подходящей песней несёт её с
+    # собой (см. song_supply.ordered_songs): _pick_kind отдаст его песне, а
+    # не кадру. Тайтл без песни — обычный кадр.
+    assert [bool(cand.song) for cand in got] == [True, False, True]
+    assert got[1].kind == ap.FRAME_KIND
+    # Тайтл, ставший кадром, песенному потоку уже не достаётся.
+    assert [cand.mal_id for cand in feed.songs(gen._used_franchise)] == []

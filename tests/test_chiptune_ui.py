@@ -10,6 +10,7 @@ def test_controls_roundtrip(qapp):
                         "chiptune_lead_volume": 75, "chiptune_bass_volume": 0,
                         "chiptune_python": "C:/worker/python.exe"})
     saved = tab.get_settings()
+    assert tab.chk_chiptune.text() == "Chiptune (не работает)"
     assert saved["chiptune_enabled"]
     assert saved["chiptune_percent"] == 65
     assert saved["chiptune_seed"] == 781

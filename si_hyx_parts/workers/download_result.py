@@ -62,8 +62,11 @@ def verified_download(worker, cmd, iid, audio_only, result):
                 message = failure + "\n" + message
             retryable = is_network_error(message)
         else:
-            if not path:
-                path = worker._find_recent_output(worker.c.get("outdir", ".") or ".")
+            if not path or not _api.os.path.isfile(path):
+                # Путь из вывода yt-dlp может не совпасть с реальным (кодировка,
+                # «уже скачано» без @@PATH@@) — ищем свежий файл в папке.
+                path = worker._find_recent_output(
+                    worker.c.get("outdir", ".") or ".") or path
             if failure:
                 message = "Загрузка оборвалась: " + failure
                 retryable = is_network_error(detail + failure)

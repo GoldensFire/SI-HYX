@@ -8,7 +8,7 @@ from urllib.parse import urljoin, urlsplit
 from si_hyx_parts.kuhi._http import UA
 from si_hyx_parts.kuhi._transport import AsyncClient
 
-PLAYER_ORDER = ("cvh", "aniboom", "animelib", "alloha")
+PLAYER_ORDER = ("animelib", "cvh", "aniboom", "alloha")
 
 
 class Catalogue(dict):

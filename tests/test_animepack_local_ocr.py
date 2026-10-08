@@ -121,8 +121,11 @@ def test_pixiv_local_title_skips_gemini_but_safe_art_checks_mixed(monkeypatch):
 
         def generate_json(self, parts, schema, temperature=0):
             self.calls.append(parts)
-            return {"accept": True, "has_title_text": True,
-                    "mixed_anime": False, "reason": "название"}
+            return {"accept": True, "has_title_text": False,
+                    "mixed_anime": False, "very_poor_drawing": False,
+                    "matches_expected_anime": True,
+                    "identified_source": "Demon Slayer", "visible_text": "",
+                    "reason": "чужих франшиз нет"}
 
     client = Gemini()
     gen = SimpleNamespace(s=SimpleNamespace(pixiv_title_check_mode="local",
@@ -136,7 +139,7 @@ def test_pixiv_local_title_skips_gemini_but_safe_art_checks_mixed(monkeypatch):
     monkeypatch.setattr(ocr, "read", lambda gen, data: ([row("Artist")], .1, False))
     assert pixiv_check(gen, cand, b"safe", ".png")[0] is True
     assert len(client.calls) == 1
-    assert "только чужие франшизы" in client.calls[0][0]["text"]
+    assert "уже проверено локальным OCR" in client.calls[0][0]["text"]
 
 
 def test_tab_roundtrips_both_local_modes(qapp):

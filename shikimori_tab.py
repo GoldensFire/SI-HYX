@@ -63,21 +63,13 @@ try:
 except Exception:  # pragma: no cover
     _InfoTipPopup = None
 
-# Постоянный кеш «индекса популярности»: просмотры/взвешенная база/разбивка по
-# статусам тайтлов сохраняются в файл (CONFIG_DIR), чтобы не дозапрашивать
-# карточки Shikimori заново при каждом запуске (по просьбе пользователя). Файл
-# отдельный от settings.json — большой и обновляется часто.
+# Просмотры и «индекс популярности» берутся из базы Shikimori генератора
+# аниме-паков (si_hyx_parts/shikimori_tab/pack_index.py) — своего кеша нет.
 try:
     from config import CONFIG_DIR
-    _INDEX_CACHE_FILE = os.path.join(CONFIG_DIR, "shikimori_index_cache.json")
     _COVERS_CACHE_DIR = os.path.join(CONFIG_DIR, "shikimori_covers")
 except Exception:  # pragma: no cover
-    _INDEX_CACHE_FILE = ""
     _COVERS_CACHE_DIR = ""
-# Просмотры/база медленно растут со временем — запись живёт 30 дней, потом
-# перезапрашивается. Ограничение числа записей бережёт размер файла.
-_INDEX_CACHE_TTL = 30 * 24 * 3600
-_INDEX_CACHE_MAX = 20000
 # Обложки на диске (по просьбе пользователя — не тянуть их заново по сети при
 # каждом запуске: за день афиши не меняются). Без TTL (постеры почти не
 # меняются), но число файлов ограничено — при переполнении трём самые старые
@@ -116,9 +108,8 @@ C = {
 # Локальная (не серверная) сортировка по «просмотрам» — completed+watching+dropped
 # из карточки каждого тайтла. По умолчанию выбрана именно она (просьба пользователя).
 ORDER_VIEWS = "views"
-# «Индекс популярности» — те же просмотры, но взвешенные на свежесть выхода:
-# свежий тайтл с меньшими просмотрами часто узнаваемее старого «миллионника»
-# (см. _popularity_index). Тоже локальная сортировка, тянет те же карточки.
+# «Индекс популярности» — тот же, что у генератора аниме-паков (SongCandidate.index:
+# серия, «в избранном», свежесть, оценка). Тоже локальная сортировка.
 ORDER_INDEX = "popindex"
 
 ORDER_LABELS = {
@@ -138,14 +129,10 @@ ORDER_LABELS = {
 _THUMB_W, _THUMB_H = 96, 136
 
 
-# Сортировка по просмотрам тянет по карточке на тайтл — при широком поиске их
-# могут быть тысячи. Поэтому: (1) поиск идёт по ПОПУЛЯРНОСТИ (вверху — известные
-# тайтлы, а не мусор), (2) просмотры дозагружаем только для верхушки выдачи,
-# (3) между запросами держим паузу — Shikimori лимитирует ~90 запросов/мин и без
-# троттлинга на длинной дозагрузке сыпал 429. Остальное остаётся в найденном
-# (популярном) порядке.
+# Просмотры и индекс берутся из базы генератора аниме-паков; тайтлы, которых
+# там нет, дозапрашиваются пачками GraphQL по 50 (pack_index). Поиск идёт по
+# ПОПУЛЯРНОСТИ, а по сети дозапрашивается только верхушка выдачи.
 _VIEWS_SORT_MAX = 100
-_VIEWS_THROTTLE = 0.7   # сек между карточками (≈85 запросов/мин < лимита 90)
 
 # Автостоп поиска по достижению числа тайтлов ПОСЛЕ фильтрации (паки/франшизы/
 # оценка и т.д.) — по просьбе пользователя, чтобы не гонять поиск по всей базе,
@@ -196,22 +183,26 @@ from si_hyx_parts.shikimori_tab.base_title import _base_title
 # чтобы голый хвостовой «!» (его _norm_title уже срезал) ничего не отрезал.
 _SUBTITLE_RX = re.compile(r"\s*[:：!?…]+\s+\S.*$")
 
-from si_hyx_parts.shikimori_tab.franchise_key import (
+from si_hyx_parts.shikimori_tab.franchise import (
     _franchise_key,
     _title_words,
     _same_franchise_prefix,
+)
+from si_hyx_parts.shikimori_tab.background_tasks import (
     _SearchSignals,
     _SearchTask,
     _GenresSignals,
     _GenresTask,
-    _cover_cache_path,
-    _load_cover_from_disk,
-    _save_cover_to_disk,
-    _prune_covers_cache,
     _ThumbSignals,
     _ThumbTask,
     _ViewsSignals,
     _ViewsTask,
+)
+from si_hyx_parts.shikimori_tab.cover_cache import (
+    _cover_cache_path,
+    _load_cover_from_disk,
+    _save_cover_to_disk,
+    _prune_covers_cache,
 )
 
 
@@ -223,4 +214,5 @@ _RANK_W = 30             # ширина левого отступа строки
 
 from si_hyx_parts.shikimori_tab.views_badge_delegate import _ViewsBadgeDelegate, _TriStateGenre
 
-from si_hyx_parts.shikimori_tab.genre_picker_dialog import _GenrePickerDialog, ShikimoriTab
+from si_hyx_parts.shikimori_tab.genre_picker_dialog import _GenrePickerDialog
+from si_hyx_parts.shikimori_tab.shikimori_tab import ShikimoriTab

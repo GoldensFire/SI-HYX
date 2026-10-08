@@ -55,7 +55,7 @@ def test_subdl_empty_falls_back_to_exact_jimaku_episode():
 
 def test_missing_keys_do_not_require_gemini_or_fail_validation():
     settings = api.PackSettings(pack_episode=True, pct_episode=100, pct_songs=0,
-                                episode_ru_subtitles=True)
+                                episode_ru_subtitles=True, episode_scene_check=False)
     assert not settings.validate()
 
 
