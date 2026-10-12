@@ -12,6 +12,18 @@ def requested(settings, candidate):
         and candidate.music_effect == "original")
 
 
+def video_only(settings, candidate) -> bool:
+    """Песня вне рамки сложности AMQ попала в пак только ради видеоряда.
+
+    Без видео такой вопрос не задаётся: ни слот звука, ни запасной звук
+    вместо несостоявшегося ролика ей не положены (см. filter_song)."""
+    song = getattr(candidate, "song", None) or {}
+    if not song or getattr(candidate, "kind", "") not in ("opening", "ending"):
+        return False
+    import animepack as api
+    return not api.song_difficulty_allowed(song, settings)
+
+
 def log_summary(generator, candidates):
     songs = [candidate for candidate in candidates
              if requested(generator.s, candidate) or candidate.music_effect == "video"]

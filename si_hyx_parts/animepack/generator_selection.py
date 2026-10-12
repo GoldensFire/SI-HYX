@@ -277,8 +277,9 @@ class GeneratorSelectionMixin:
                 if not self.download_pixiv_art(cand):
                     return False
         if cand.kind == _api.MANGA_KIND:
+            from .manga_attempt_trace import run as manga_attempt
             with self._timed("страницы манги"):
-                if not self.download_manga_panel(cand):
+                if not manga_attempt(self, cand):
                     return False
         if cand.kind == _api.SAKUGA_KIND:
             # Вопрос-сакуга — это сам ролик, и без него вопроса нет.
@@ -299,12 +300,20 @@ class GeneratorSelectionMixin:
         if not cand.is_silent:
             # Видео-вопрос: если ролика для этой песни нет, вопрос всё равно
             # состоится — просто обычным отрезком звука.
-            from .song_video import requested as wants_video
+            from .song_video import requested as wants_video, video_only
             if wants_video(self.s, cand):
+                from .theme_video_title import download_clean_video
                 with self._timed("ролики"):
-                    got = self.download_video(cand)
+                    got = download_clean_video(self, cand)
             else:
                 got = False
+            if not got and video_only(self.s, cand):
+                # Песня вне рамки сложности AMQ взята ради картинки: звуком
+                # она в пак не идёт.
+                if not self.stopped():
+                    self.log(f"«{cand.title_ru}» {cand.tag}: без видеоряда не беру — "
+                             "песня вне рамки сложности AMQ.")
+                return False
             if not got:
                 with self._timed("аудио"):
                     if not self.download_audio(cand):
@@ -750,11 +759,20 @@ class GeneratorSelectionMixin:
         (лог пользователя: 21 вопрос из 48 при живых 2891 тайтлах)."""
         with self._warn_lock:
             dead = sorted(self._dead_kinds | self._spent_kinds)
+            failed = set(self._dead_kinds)
+        moved = dead
         if getattr(self.s, 'preserve_composition', True):
             # Доли не перекладываем, но и пак не рвём: остальные роды вопросов
             # набираются до конца, а недобор называется в итоге. Раньше здесь
             # летела ошибка, и недоступный Pixiv обрывал пак на третьем вопросе.
+            # Исключение — род, отключённый отказом сервиса (_drop_kind: квота
+            # Gemini, Pixiv не пускает): тайтлы для него есть, и его места
+            # отдаются живым родам — полный пак важнее точного состава
+            # (пак № 130: 46 пустых мест из 144).
+            moved = [kind for kind in dead if kind in failed]
             for kind in dead:
+                if kind in failed:
+                    continue
                 left = quotas.get(kind, 0) - counts[kind] - inflight[kind]
                 if left <= 0:
                     continue
@@ -765,8 +783,7 @@ class GeneratorSelectionMixin:
                          "не занимаю (доли не перекладываются: «сохранять "
                          "состав»), остальной пак набираю дальше."
                          + _close_reason(self, kind))
-            return
-        for kind in dead:
+        for kind in moved:
             alive = [k for k in quotas
                      if quotas.get(k, 0) > 0 and k not in dead]
             if not alive:
@@ -806,6 +823,9 @@ class GeneratorSelectionMixin:
         from music_effects import EffectSlots
         effect_slots = EffectSlots(self.s, sum(quotas.get(k, 0) for k in _api.SONG_KINDS))
         self._effect_slots = effect_slots
+        if effect_slots.counts.get("karaoke"):
+            from .karaoke_catalog import start as start_mugen_index
+            start_mugen_index(self)
         self._manga_mix.sync(quotas.get(_api.MANGA_KIND, 0))
         accepted: list[_api.SongCandidate] = []
         # Keep the live list: selection itself can fail after preparing media.
@@ -849,7 +869,7 @@ class GeneratorSelectionMixin:
         source = CandidateSource(self, candidates)
         # Чей исход ещё неизвестен — по этому поток карточек ждёт серии отложенных.
         self._selection_waits = lambda: bool(pending or deferred or source.pending)
-        pool = _api.ThreadPoolExecutor(max_workers=runtime.worker_capacity,
+        pool = _api.ThreadPoolExecutor(max_workers=runtime.pool_threads,
                                       thread_name_prefix="animepack")
         self._defer_cache_writes = True
         try:
@@ -892,11 +912,17 @@ class GeneratorSelectionMixin:
                         if kind not in self._dead_kinds)
                     # Досыпаем задач, пока есть куда: набранное + в работе < нужного.
                     scanned = 0
-                    while ((not exhausted or deferred or reserve)
-                           and len(accepted) + sum(inflight.values()) < total
-                           and len(pending) < workers * 2
-                           and any(quotas[k] > counts[k] + inflight[k]
-                                   for k in quotas if k not in self._dead_kinds)):
+                    from .manga_tail_hedge import discount
+                    while True:
+                        # seen — «в работе» глазами планировщика: на последние
+                        # места манги допускается запасная попытка.
+                        seen = discount(self, inflight, counts, quotas, pending, workers)
+                        if not ((not exhausted or deferred or reserve)
+                                and len(accepted) + sum(seen.values()) < total
+                                and len(pending) < workers * 2
+                                and any(quotas[k] > counts[k] + seen[k]
+                                        for k in quotas if k not in self._dead_kinds)):
+                            break
                         # Проверяем на КАЖДОМ кандидате, а не раз за круг: этот
                         # цикл не выходит наружу, пока есть кого просить, и
                         # каталог книг успел бы вычерпаться целиком.
@@ -911,7 +937,7 @@ class GeneratorSelectionMixin:
                         if cand is None and len(deferred) >= workers:
                             break   # отложенные ждут потоков — каталог не трогаем
                         if cand is None:
-                            cand = reserve.take(counts, inflight, quotas)
+                            cand = reserve.take(counts, seen, quotas)
                             if cand is None and not exhausted and any(
                                     quotas[k] > counts[k] + inflight[k] for k in quotas
                                     if k != _api.MANGA_KIND and k not in self._dead_kinds):
@@ -941,7 +967,7 @@ class GeneratorSelectionMixin:
                             # _pick_kind и будут выброшены до единой.
                             free = (quotas.get(_api.MANGA_KIND, 0)
                                     - counts[_api.MANGA_KIND]
-                                    - inflight[_api.MANGA_KIND])
+                                    - seen[_api.MANGA_KIND])
                             bench = (self._manga_mix.take_bench() if free > 0
                                      else [])
                             if not bench:
@@ -969,7 +995,7 @@ class GeneratorSelectionMixin:
                             self._drops["франшизу заняли, пока кандидат ждал"] += 1
                             continue
                         remember(cand)
-                        kind = self._pick_kind(cand, counts, inflight, quotas)
+                        kind = self._pick_kind(cand, counts, seen, quotas)
                         if kind is None:
                             # Мест под этот тайтл нет — но почему? Если они заняты
                             # не набранными вопросами, а теми, что качаются прямо
@@ -1002,11 +1028,28 @@ class GeneratorSelectionMixin:
                         if inflight[kind] >= capacity(kind, workers):
                             deferred.append(cand)
                             continue
+                        from .song_video import video_only
+                        if (kind in _api.SONG_KINDS and video_only(self.s, cand)
+                                and not effect_slots.video_free()):
+                            # Вне рамки AMQ песня годится только под видеоряд,
+                            # а его места заняты: тайтл пойдёт другой песней
+                            # или другим вопросом.
+                            self._drops["вне рамки AMQ, а мест с видеорядом нет"] += 1
+                            self._release_candidate(cand)
+                            reserve.park(cand, failed=True)
+                            continue
                         if kind in _api.SONG_KINDS and effect_slots.refuses(cand):
                             self._drops["нет готовых таймингов, а свободно только караоке"] += 1
                             self._release_candidate(cand)
                             reserve.park(cand, failed=True)
                             continue
+                        if kind in _api.SONG_KINDS:
+                            from .karaoke_probe import defer as defer_probe
+                            if defer_probe(self, effect_slots, cand, reserve):
+                                # Тайминги проверяются фоном, слот ждёт ту
+                                # песню, у которой они нашлись.
+                                self._release_candidate(cand)
+                                continue
                         if not reserve_exact(self, cand):
                             if getattr(cand, "_exact_waiting", False):
                                 deferred.append(cand)
@@ -1054,6 +1097,8 @@ class GeneratorSelectionMixin:
             # под ног — отсюда шли обе ошибки живого прогона.
             runtime.end_selection()
             self._selection_waits = None
+            from .karaoke_probe import close as close_karaoke_probes
+            close_karaoke_probes(self)
             self.stop_processes()
             try:
                 source.close()
@@ -1089,7 +1134,9 @@ class GeneratorSelectionMixin:
         log_video_summary(self, accepted)
         if self.s.karaoke_enabled:
             made = sum(c.music_effect == "karaoke" and c.has_video for c in accepted)
-            self.log(f"Караоке: готово {made} из {effect_slots.slots.count('karaoke')} запланированных")
+            self.log(f"Караоке: готово {made} из {effect_slots.slots.count('karaoke')} запланированных"
+                     + (f"; песен с готовыми таймингами не хватило — обычным песням отдано "
+                        f"слотов: {effect_slots.yielded}" if effect_slots.yielded else ""))
         if self.s.chiptune_enabled:
             made = sum(c.music_effect == "chiptune" for c in accepted)
             target = effect_slots.slots.count("chiptune")

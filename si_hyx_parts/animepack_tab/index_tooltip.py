@@ -92,8 +92,14 @@ def build_text(cand) -> str:
         else:
             lines.append(f"Индекс: {_fmt(index)}")
     elif franchise > 0:
-        lines.append(f"Индекс: max(свой {_fmt(own)}; серия "
-                     f"{_fmt(franchise)}) × {_dec(fav)} = {_fmt(index)}")
+        # Надбавка поверх серии меряется по соседям серии, а не части, — она
+        # своя, и в подсказке видно, откуда взялось итоговое число.
+        series = float(getattr(cand, "inherited_franchise_index", franchise)
+                       or 0.0)
+        series_fav = float(getattr(cand, "franchise_favorites_factor", fav)
+                           or 1.0)
+        lines.append(f"Индекс: max(свой {_fmt(own)}×{_dec(fav)}; серия "
+                     f"{_fmt(series)}×{_dec(series_fav)}) = {_fmt(index)}")
     elif fav != 1.0:
         lines.append(f"Индекс: {_fmt(own)} × {_dec(fav)} = {_fmt(index)}")
     else:

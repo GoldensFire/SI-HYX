@@ -16,11 +16,13 @@ QSortFilterProxyModel сравнивал бы строки через data(), т
 """
 from __future__ import annotations
 
-from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer
+from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QTableView,
-    QMenu, QTreeView, QVBoxLayout, QWidget,
+    QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QPushButton, QTableView, QMenu, QTreeView, QVBoxLayout, QWidget,
 )
+
+from config import get_icon
 
 from .db_row_tip import RowTipWatcher, _InfoTipPopup
 from .db_title_delegate import TitleActionsDelegate, character_url
@@ -33,8 +35,10 @@ TEXT_COL_WIDTH = 320
 # Уже этого первую колонку не жмём даже в узком окне: название всё-таки должно
 # читаться. Ниже — горизонтальная прокрутка, и это честнее каши из двух букв.
 MIN_TEXT_COL_WIDTH = 160
-# Поиск ждёт паузы в наборе: иначе каждая буква пересобирает выдачу.
-SEARCH_DELAY_MS = 150
+# Сколько строк выдачи создаётся сразу и добавляется при прокрутке к концу:
+# открытие панели не ждёт, пока Qt разложит десятки тысяч строк (просьба
+# пользователя — «по 200 и подгружать по мере скролла»).
+PAGE_ROWS = 200
 
 
 
@@ -78,6 +82,7 @@ class DbTableModel(QAbstractTableModel):
         self._sorts: list = []
         self._hay: list = []
         self._order: list = []
+        self._loaded = 0                  # сколько строк _order отдано Qt
         self._needle = ""
         self._sort_col = -1
         self._descending = True
@@ -93,6 +98,7 @@ class DbTableModel(QAbstractTableModel):
         self._numeric = tuple(value is not None for value in self._sorts[0]) \
             if self._sorts else ()
         self._order = self._make_order()
+        self._loaded = min(PAGE_ROWS, len(self._order))
         self.endResetModel()
 
     def clear(self) -> None:
@@ -114,7 +120,24 @@ class DbTableModel(QAbstractTableModel):
     def _reorder(self) -> None:
         self.beginResetModel()
         self._order = self._make_order()
+        self._loaded = min(PAGE_ROWS, len(self._order))
         self.endResetModel()
+
+    # ── подгрузка порциями ────────────────────────────────────────────────
+    def canFetchMore(self, parent=QModelIndex()):    # noqa: N802 — имя из Qt
+        return not parent.isValid() and self._loaded < len(self._order)
+
+    def fetchMore(self, parent=QModelIndex()):       # noqa: N802 — имя из Qt
+        self.ensure_loaded(self._loaded + PAGE_ROWS)
+
+    def ensure_loaded(self, count: int) -> None:
+        """Отдать Qt хотя бы `count` строк выдачи (если столько есть)."""
+        count = min(int(count), len(self._order))
+        if count <= self._loaded:
+            return
+        self.beginInsertRows(QModelIndex(), self._loaded, count - 1)
+        self._loaded = count
+        self.endInsertRows()
 
     def _make_order(self) -> list:
         needle = self._needle
@@ -139,7 +162,7 @@ class DbTableModel(QAbstractTableModel):
 
     # ── чтение ────────────────────────────────────────────────────────────
     def rowCount(self, parent=QModelIndex()):        # noqa: N802 — имя из Qt
-        return 0 if parent.isValid() else len(self._order)
+        return 0 if parent.isValid() else self._loaded
 
     def columnCount(self, parent=QModelIndex()):     # noqa: N802 — имя из Qt
         return 0 if parent.isValid() else len(self._headers)
@@ -191,9 +214,17 @@ class DbTableModel(QAbstractTableModel):
         """Сколько строк в базе вообще — до поиска."""
         return len(self._texts)
 
+    def visible_total(self) -> int:
+        """Сколько строк нашлось — включая ещё не подгруженные."""
+        return len(self._order)
+
 
 class Page(QWidget):
     """Одна вкладка панели: поиск сверху, таблица снизу."""
+
+    def add_tool(self, widget) -> None:
+        """Кнопка справа от поиска (фильтры отображения панели)."""
+        self._top.addWidget(widget)
 
     def __init__(self, headers, explain=None, parent=None, *,
                  hierarchical=False, refresh_title=None,
@@ -214,17 +245,20 @@ class Page(QWidget):
         self.search = QLineEdit()
         self.search.setPlaceholderText("Поиск…")
         self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(lambda *_: self._search_timer.start())
+        # Поиск — только по Enter или кнопке: на каталоге книг каждая буква
+        # пересобирала бы выдачу. Очистка крестиком сразу возвращает всё.
+        self.search.returnPressed.connect(self._apply_search)
+        self.search.textChanged.connect(self._search_cleared)
+        self.search_button = QPushButton()
+        self.search_button.setToolTip("Найти (Enter)")
+        self.search_button.setIcon(get_icon("fa5s.search", color="#cdd6f4"))
+        self.search_button.clicked.connect(self._apply_search)
         self.count = QLabel()
         top.addWidget(self.search, 1)
+        top.addWidget(self.search_button)
         top.addWidget(self.count)
+        self._top = top
         layout.addLayout(top)
-        # Набор букв сам по себе выдачу не пересобирает: ждём паузу, иначе на
-        # каталоге книг каждая буква стоила бы отдельного прохода.
-        self._search_timer = QTimer(self)
-        self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(SEARCH_DELAY_MS)
-        self._search_timer.timeout.connect(self._apply_search)
         self.model = (DbTitleTreeModel(headers, self) if self._hierarchical
                       else DbTableModel(headers, self))
         self.table = QTreeView() if self._hierarchical else QTableView()
@@ -282,6 +316,7 @@ class Page(QWidget):
         """Таблица пока собирается: показываем это вместо пустого счётчика."""
         self.model.clear()
         self.search.setEnabled(False)
+        self.search_button.setEnabled(False)
         self.count.setText(text)
 
     def set_data(self, rows, texts, sorts, hay, sort_by=0, parents=None, *,
@@ -297,6 +332,7 @@ class Page(QWidget):
         else:
             self.model.set_data(rows, texts, sorts, hay)
         self.search.setEnabled(True)
+        self.search_button.setEnabled(True)
         if self._hierarchical:
             for column in range(self.model.columnCount()):
                 self.table.resizeColumnToContents(column)
@@ -332,6 +368,7 @@ class Page(QWidget):
                 expanded.add(self._row_identity(self.model.source(index)))
         current = self.table.currentIndex()
         return {
+            "loaded": self.model.rowCount(),
             "expanded": expanded,
             "current": self._row_identity(self.model.source(current)),
             "scroll": self.table.verticalScrollBar().value(),
@@ -351,6 +388,7 @@ class Page(QWidget):
         return None
 
     def _restore_tree_state(self, state) -> None:
+        self.model.ensure_loaded(state.get("loaded", 0))
         if self.search.text().strip():
             self.table.expandAll()
         else:
@@ -418,6 +456,10 @@ class Page(QWidget):
         self._fit_columns()
 
     # ── поиск и подсказки ─────────────────────────────────────────────────
+    def _search_cleared(self, text: str) -> None:
+        if not str(text or "").strip():
+            self._apply_search()
+
     def _apply_search(self) -> None:
         self.model.set_needle(self.search.text())
         if self._hierarchical:
@@ -431,13 +473,13 @@ class Page(QWidget):
         total = self.model.total()
         if self._hierarchical:
             shown = self.model.visible_total()
-            roots = self.model.rowCount()
+            roots = self.model.root_total()
             suffix = f" · верхних: {roots}"
             self.count.setText(
                 (f"Тайтлов: {shown} из {total}" if shown != total
                  else f"Тайтлов: {total}") + suffix)
         else:
-            shown = self.model.rowCount()
+            shown = self.model.visible_total()
             self.count.setText(f"Строк: {shown} из {total}" if shown != total
                                else f"Строк: {total}")
 
@@ -497,7 +539,6 @@ class Page(QWidget):
         actions = self.row_actions(self.model.source(index))
         if not actions:
             return
-        from config import get_icon
         icon = get_icon("fa5s.sync-alt", color="#89b4fa")
         menu = QMenu(self.table)
         picked_map = {}

@@ -30,6 +30,11 @@ def init_mangadex_service(self, client=None):
             language=str(getattr(self.s, "manga_lang", "") or ""),
             allow_erotica=bool(getattr(self.s, "manga_allow_erotica", False)),
             rng=self.rng)
+        from pathlib import Path
+        from si_hyx_parts.animepack_api.manga_source_stats import attach
+        # Порядок источников — по их успешности на этом компьютере;
+        # сводку пишет manga_preflight в журнал прогона.
+        attach(self.mangadex, Path(_api.SHIKI_CACHE_FILE).parent / "manga_source_stats.json")
     self._mangadex_misses = 0
     self._manga_catalog_matches = 0
     if hasattr(getattr(self, "gemini_manga", None), "image_generate_content"):
@@ -57,6 +62,11 @@ class MangaPanelMixin:
             return False
         from .manga_page_context import is_webtoon
         if getattr(self.s, "manga_character_crop", True) and is_webtoon(cand):
+            if self._manga_mix.webtoons_off or self.gemini_manga is None:
+                # Сцену вебтуна выбирает Gemini: без него страницы не качаем.
+                from .manga_page_batch import close_webtoons
+                close_webtoons(self, cand, "Gemini для выбора сцены с персонажами недоступна")
+                return False
             from .manga_page_batch import prepare
             chosen = prepare(self, cand)
             if chosen is None:
@@ -152,9 +162,12 @@ def _pick_page(self, cand) -> tuple[str, str, list[str]]:
     Выбор страницы и её резервирование — под одним замком: иначе два рабочих
     потока взяли бы один и тот же разворот. Отклонённая проверкой страница тоже
     остаётся занятой — следующая попытка возьмёт другую."""
+    from .manga_attempt_trace import page as trace_page
     if callable(getattr(self.mangadex, "select_page", None)):
         from .manga_parallel_page import pick
-        return pick(self, cand)
+        picked = pick(self, cand)
+        trace_page(cand, picked[0])
+        return picked
     with locked(self, self._manga_lock):
         with self._frames_lock:
             excluded = set(self._frames_used)
@@ -172,6 +185,7 @@ def _pick_page(self, cand) -> tuple[str, str, list[str]]:
         if url:
             with self._frames_lock:
                 self._frames_used.add(_api.frame_url_key(url))
+    trace_page(cand, url, cand.source_link or (chapter and _api.mangadex_chapter_link(chapter)))
     return url, chapter, manga_titles
 
 
@@ -202,7 +216,9 @@ def _fetch_page(self, cand, url: str, *, manga_titles=(), raw=None):
                 and getattr(self.s, "manga_character_crop", True)):
             return data, ext, scene_checked
         # Readers also split webtoons into short chunks, often through a face.
-        if getattr(self.s, "manga_character_crop", True):
+        # Без Gemini длинную страницу обычной манги режем без выбора сцены.
+        if getattr(self.s, "manga_character_crop", True) and (
+                self.gemini_manga is not None or is_webtoon(cand)):
             select_scene = True
             from .manga_character_crop import crop
             cut = crop(self, cand, data, ext, manga_titles=manga_titles)
@@ -215,8 +231,12 @@ def _fetch_page(self, cand, url: str, *, manga_titles=(), raw=None):
         if (select_scene
                 and (self.gemini_manga is None or type(e).__name__ in
                      ("GeminiAuthError", "GeminiQuotaError", "GeminiDownError"))):
-            self._drop_kind(_api.MANGA_KIND, f"Gemini не выбрал сцену страницы: {e}")
-            cand.rejected = True
+            from .manga_page_context import is_webtoon
+            if is_webtoon(cand):
+                from .manga_page_batch import close_webtoons
+                close_webtoons(self, cand, e)
+            else:
+                cand.rejected = True    # обычной манге Gemini дальше не нужен
             self._log_rare("Выбор сцены Gemini",
                            f"Не удалось выбрать сцену с персонажами: {e}")
             return None

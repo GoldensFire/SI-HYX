@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """GUI-обёртка над build.bat: правит версию и флаг «необязательного обновления»
-(SILENT_UPDATE) в config.py, синхронизирует version_info.txt и README.md, затем
+(SILENT_UPDATE) в config.py, синхронизирует version_info.txt, затем
 запускает build.bat и показывает лог сборки в реальном времени.
 
 Инструмент для разработчика (используется вручную перед релизом) — часть
@@ -23,7 +23,6 @@ from config import STYLESHEET, get_icon
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PY = os.path.join(ROOT, "config.py")
 VERSION_INFO_TXT = os.path.join(ROOT, "version_info.txt")
-README_MD = os.path.join(ROOT, "README.md")
 BUILD_BAT = os.path.join(ROOT, "build.bat")
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
@@ -84,11 +83,7 @@ def apply_settings(version: str, silent: bool) -> None:
     text = re.sub(r"(StringStruct\('FileVersion', ')[\d.]+(')", rf"\g<1>{x}.{y}.{z}.0\g<2>", text)
     text = re.sub(r"(StringStruct\('ProductVersion', ')[\d.]+(')", rf"\g<1>{x}.{y}.{z}.0\g<2>", text)
     _write(VERSION_INFO_TXT, text)
-
-    text = _read(README_MD)
-    text = re.sub(r"Текущая версия — \*\*[\d.]+\*\*", f"Текущая версия — **{version}**", text)
-    text = re.sub(r"SI-HYX-v[\d.]+-full\.zip", f"SI-HYX-v{version}-full.zip", text)
-    _write(README_MD, text)
+    # README версию не упоминает: актуальная всегда видна во вкладке Releases.
 
 
 class BuildWindow(QMainWindow):

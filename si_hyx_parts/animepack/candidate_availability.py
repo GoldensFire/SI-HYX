@@ -24,7 +24,7 @@ def probe(generator, candidate):
     if (candidate.kind in open_kinds and candidate.kind in ('opening', 'ending', 'insert')
             and settings.karaoke_enabled and settings.karaoke_percent
             and settings.karaoke_effect != 'reverse'):
-        from karaoke.identity import context
+        from karaoke.search import context
         from karaoke.budget import attempt
         from .karaoke_processing import known_rejection, instrumental, catalog_duration
         if known_rejection(generator, candidate) or instrumental(candidate):

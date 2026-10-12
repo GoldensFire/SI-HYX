@@ -38,7 +38,8 @@ from utils import (
 )
 from msgbox import msgbox_warning
 from PyQt6.QtWidgets import (QAbstractScrollArea, QSizePolicy, QAbstractButton,
-                             QLineEdit, QScrollBar, QStyleOptionSlider)
+                             QLineEdit, QScrollBar, QStyleOptionComboBox,
+                             QStyleOptionSlider)
 from PyQt6.QtCore import QUrl
 
 from si_hyx_parts.widgets.delegates import StatusColorDelegate, PreviewNameDelegate

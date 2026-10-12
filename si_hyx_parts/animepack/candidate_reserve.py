@@ -60,6 +60,10 @@ def clean_copy(candidate, failed=False):
     fresh._song_alternatives = remaining
     fresh._retry_after = getattr(candidate, "_retry_after", 0)
     fresh._technical_retries = getattr(candidate, "_technical_retries", 0)
+    # Готовые тайминги той же песни уже проверены (karaoke_probe): не заново.
+    fresh._probe_count = getattr(candidate, "_probe_count", 0)
+    if alternative is None:
+        fresh._authored_available = getattr(candidate, "_authored_available", None)
     from si_hyx_parts.animepack.generator_catalog import _franchise_marks
     fresh._bench_keys = (getattr(candidate, "_bench_keys", None)
                          or getattr(candidate, "_reserved", None)
@@ -121,8 +125,16 @@ class CandidateReserve:
             self.candidates[token] = fresh
             for kind in options:
                 self.by_kind[kind][token] = fresh
+            return fresh
+        return None
+
+    def touch(self):
+        """Состояние кандидата сменилось вне отбора (фоновая проверка)."""
+        self._version += 1
 
     def _ready(self, candidate):
+        if getattr(candidate, "_probe_pending", False):
+            return False
         if time.monotonic() < getattr(candidate, "_retry_after", 0):
             return False
         gen = self.generator
@@ -141,7 +153,10 @@ class CandidateReserve:
         now = time.monotonic()
         times = [c._retry_after - now for c in self.candidates.values()
                  if getattr(c, "_retry_after", 0) > now]
-        return min(times, default=0)
+        # Идёт фоновая проверка таймингов — отбор её дожидается.
+        pending = any(getattr(c, "_probe_pending", False)
+                      for c in self.candidates.values())
+        return min(times, default=1.0 if pending else 0)
 
     def take(self, counts, inflight, quotas):
         # Не обходим тысячи сохранённых кадров, пока свободны только

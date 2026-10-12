@@ -50,8 +50,14 @@ class RecentFilesStrip(_api.QWidget):
         self._scroll.setWidget(self._inner)
         outer.addWidget(self._scroll)
 
-        # Правая колонка (сверху справа): выбор папки-источника ленты.
-        ctl = _api.QVBoxLayout(); ctl.setContentsMargins(2, 2, 4, 2); ctl.setSpacing(2)
+        # Выбор папки-источника — значки прямо поверх правого верхнего угла
+        # ленты, а не отдельной колонкой: вся ширина остаётся под карточки.
+        self._folder_box = _api.QWidget(self)
+        ctl = _api.QHBoxLayout(self._folder_box)
+        ctl.setContentsMargins(0, 0, 0, 0); ctl.setSpacing(2)
+        style = ("QToolButton{border:none; border-radius:4px; padding:2px; margin:0;"
+                 " min-height:0; background:rgba(17,17,27,170)}"
+                 "QToolButton:hover{background:rgba(69,71,90,220)}")
         self._btn_folder = _api.QToolButton(); self._btn_folder.setAutoRaise(True)
         self._btn_folder.setIcon(_api.get_icon('fa5s.folder-open'))
         self._btn_folder.clicked.connect(self._choose_folder)
@@ -59,10 +65,9 @@ class RecentFilesStrip(_api.QWidget):
         self._btn_folder_reset.setIcon(_api.get_icon('fa5s.undo'))
         self._btn_folder_reset.setToolTip("Сбросить — брать из папки загрузки")
         self._btn_folder_reset.clicked.connect(self._reset_folder)
-        ctl.addWidget(self._btn_folder, 0, _api.Qt.AlignmentFlag.AlignTop)
-        ctl.addWidget(self._btn_folder_reset, 0, _api.Qt.AlignmentFlag.AlignTop)
-        ctl.addStretch()
-        outer.addLayout(ctl)
+        for button in (self._btn_folder_reset, self._btn_folder):
+            button.setStyleSheet(style)
+            ctl.addWidget(button)
 
         self._lbl_empty = _api.QLabel("Нет медиафайлов в папке")
         self._lbl_empty.setAlignment(_api.Qt.AlignmentFlag.AlignCenter)
@@ -190,7 +195,18 @@ class RecentFilesStrip(_api.QWidget):
 
     def showEvent(self, event):  # noqa: N802 — Qt override
         super(_api.RecentFilesStrip, self).showEvent(event)
+        self._place_folder_box()
         self._request_scan()
+
+    def resizeEvent(self, event):  # noqa: N802 — Qt override
+        super(_api.RecentFilesStrip, self).resizeEvent(event)
+        self._place_folder_box()
+
+    def _place_folder_box(self):
+        box = self._folder_box
+        box.adjustSize()
+        box.move(max(0, self.width() - box.width() - 6), 4)
+        box.raise_()
 
     def _poll(self):
         """Вызывается таймером — обновляет стрип если список файлов изменился."""
@@ -267,6 +283,7 @@ class RecentFilesStrip(_api.QWidget):
     def _update_folder_btn(self):
         custom = bool(self._custom_folder)
         self._btn_folder_reset.setVisible(custom)
+        self._place_folder_box()
         if custom:
             self._btn_folder.setToolTip(
                 f"Папка-источник ленты:\n{self._custom_folder}\n(нажмите, чтобы сменить)")

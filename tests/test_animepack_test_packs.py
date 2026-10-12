@@ -23,7 +23,7 @@ def test_actual_question_count_controls_test_title_and_boundary(tmp_path):
                       test_number=3, ignore_test_packs=True) == "Тестовый № 3"
     assert pack_title("Сгенерировано в SI-HYX", 12, full,
                       test_number=3, ignore_test_packs=True) == (
-                          "Сгенерировано в SI-HYX № 12 (Ур. 4.0)")
+                          "Сгенерировано в SI-HYX № 12 (Ур. 4.0 - 🟡Нормально)")
     assert is_test_pack(_siq(tmp_path / "small.siq", 95))
     assert not is_test_pack(_siq(tmp_path / "full.siq", 96))
 

@@ -127,6 +127,7 @@ class RuEpisodeClient(KuhiClient):
             streams = []
             for row, result in zip(rows, results):
                 if isinstance(result, BaseException):
+                    row["_resolve_error"] = result
                     HEALTH.result(f"{row['source']}/{row['player']}", "media", error=result)
                     self.log(f"{row['source']}/{row['player']}: поток недоступен: "
                              f"{error_detail(result)} ({type(result).__name__}).")

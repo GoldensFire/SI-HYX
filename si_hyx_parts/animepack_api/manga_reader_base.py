@@ -173,6 +173,7 @@ class MangaReaderBase:
                 self.last_page_info = dict(page)
                 self.last_page_info["_reader_title"] = str(row["id"])
                 index = pages.index(page)
+                self.last_page_info["number"] = index + 1   # для журнала попыток
                 self.last_page_info["neighbors"] = [
                     dict(pages[index + step], offset=step) for step in (-1, 1)
                     if 0 <= index + step < len(pages)]
@@ -189,6 +190,7 @@ class MangaReaderBase:
             data = download(self.session, url, self.base_url + "/")
             if health is not None:
                 health.record(url)
+                health.page(getattr(self, "_source_health_key", ""), True)
             self._image_failures.pop(key, None)
             ext = urlsplit(url).path.rsplit(".", 1)[-1].lower()
             return data, "." + ext if ext in (
@@ -199,8 +201,9 @@ class MangaReaderBase:
                 wall = health.wall(url)
                 if wall:
                     raise MangaSourceWalled(
-                        f"{self.label}: картинки закрыты защитой от ботов ({wall}) — "
-                        "источник выключен до конца генерации") from exc
+                        f"{self.label}: сервер картинок {urlsplit(url).hostname} закрыт "
+                        f"для вашего IP ({wall}; включён VPN или прокси?) — страницы "
+                        "с него пропускаю, остальные серверы источника работают") from exc
             if key[1] and getattr(getattr(exc, "response", None), "status_code", 0) == 403:
                 self._image_failures[key] = self._image_failures.get(key, 0) + 1
                 if self._image_failures[key] >= 2:

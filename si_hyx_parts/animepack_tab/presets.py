@@ -10,6 +10,8 @@ from PyQt6.QtWidgets import QInputDialog, QLabel, QMessageBox
 
 import animepack_tab as _api
 
+from .default_presets import DEFAULT_TEMPLATES
+
 
 META_TEMPLATES = "_templates"
 META_ACTIVE = "_active_template"
@@ -21,6 +23,10 @@ _PRESERVE = {
     "gemini_key", "elevenlabs_key", "jimaku_key", "subdl_key", "tmdb_key", "cloudflare_token",
     "cloudflare_account_id", "pixiv_refresh_token",
     "animelib_token",
+    # Привязано к конкретному компьютеру или аккаунту: шаблон, пришедший с
+    # программой или от другого человека, не должен это затирать.
+    "frame_dvd_folder", "chiptune_python", "karaoke_python",
+    "google_tts_credentials", "gemini_daily_limits",
 }
 
 
@@ -36,6 +42,14 @@ def _level_settings(low: int, high: int, average: int) -> dict:
 
 
 def default_templates() -> dict[str, dict]:
+    return deepcopy(DEFAULT_TEMPLATES)
+
+
+def _legacy_templates() -> dict[str, dict]:
+    """Шаблоны по умолчанию до 0.6.1 — одни уровни и сложность песен.
+
+    Они сохранялись в настройки вместе со своими, поэтому у обновившихся
+    пользователей перекрыли бы новые шаблоны; нетронутые узнаём по равенству."""
     easy = _level_settings(1, 6, 3)
     easy.update(difficulty_min=65, difficulty_max=100,
                 ost_difficulty_min=55, ost_difficulty_max=100)
@@ -54,10 +68,12 @@ class TemplatesMixin:
     def _load_templates(self, settings: dict) -> None:
         saved = (settings or {}).get(META_TEMPLATES)
         templates = default_templates()
+        legacy = _legacy_templates()
         if isinstance(saved, dict):
             templates.update({str(name): deepcopy(value)
                               for name, value in saved.items()
-                              if str(name).strip() and isinstance(value, dict)})
+                              if str(name).strip() and isinstance(value, dict)
+                              and value != legacy.get(str(name))})
         self._deleted_templates = {
             str(name) for name in ((settings or {}).get(META_DELETED) or [])
             if str(name).strip()}
@@ -126,7 +142,8 @@ class TemplatesMixin:
         if not isinstance(values, dict):
             return
         current = self.collect().to_dict()
-        current.update(deepcopy(values))
+        current.update(deepcopy({key: value for key, value in values.items()
+                                 if key not in _PRESERVE}))
         self.apply_settings(current)
         self._active_template = name
         _save_soon(self)

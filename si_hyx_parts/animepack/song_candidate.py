@@ -4,7 +4,9 @@
 """SongCandidate. Public namespace: animepack."""
 from __future__ import annotations
 import animepack as _api
+import shikimori_api as _shiki
 from si_hyx_parts.animepack.plot_explanation import candidate_titles, without_titles
+from si_hyx_parts.animepack.catalog_levels import ready_level
 
 
 def _expanded_plot_answer(keyword: str, explanation: str) -> str:
@@ -490,11 +492,54 @@ class SongCandidate:
         только читали». У аниме это узнаваемость его серии; короткому
         ответвлению (фильм, спешл, OVA) она засчитывается не целиком —
         см. franchise_part_weight."""
+        franchise = self.inherited_franchise_index
+        return franchise * self.franchise_favorites_factor
+
+    @property
+    def inherited_franchise_index(self) -> float:
+        """Индекс серии, засчитанный этой части (у книги — как есть)."""
         franchise = float(self.franchise_index or 0.0)
-        if not self.is_manga:
-            from .franchise_part_weight import inherited_index
-            franchise = inherited_index(self.anime, self.own_index, franchise)
-        return franchise * self.favorites_factor
+        if self.is_manga:
+            return franchise
+        from .franchise_part_weight import inherited_index
+        return inherited_index(self.anime, self.own_index, franchise)
+
+    @property
+    def franchise_favorites_factor(self) -> float:
+        """Надбавка «в избранном» поверх индекса франшизы (см. index)."""
+        return self._franchise_favorites_factor(
+            self.inherited_franchise_index, self.own_index, self.own_base,
+            self.favorites_factor)
+
+    def _franchise_favorites_factor(self, franchise: float, own_index: float,
+                                    base: float, factor: float) -> float:
+        """Надбавка «в избранном» поверх индекса ФРАНШИЗЫ.
+
+        Своя надбавка части (по соседям её собственного индекса) переносится
+        на франшизу, только если часть в ней заметна — индекс не меньше доли
+        FRANCHISE_PART_SHARE от индекса серии, как «заметная часть» в
+        franchise_parts_index. «Наруто» 2002-го, «Код Гиас», «Блич» — сами
+        флагманы, их своё число лишь приглушено возрастом, и любовь к ним —
+        любовь к серии.
+
+        Малозаметной части надбавка меряется по соседям уровня франшизы:
+        29 избранных у «Дороро и Хяккимару» (1969, индекс 3,8 тыс.) — перевес
+        против своих соседей, и ×1.35 умножал индекс всей серии (761 тыс.):
+        старый сериал обгонял ремейк 2019-го с 3,7 тыс. избранных и вставал во
+        главе франшизы в панели базы. То же у «Ранмы» 1989-го рядом с ремейком.
+
+        Анонсу надбавки нет вовсе: его избранное — ожидание, а не узнаваемость
+        («Магическая битва: Смертельная миграция. Часть 2» с 19 избранными
+        обгоняла сам сериал).
+
+        У книги рядом стоит анимешный индекс, а соседи по избранному у неё
+        книжные — шкалы не сравнить, поэтому там прежний множитель."""
+        if _api.is_announced(self.anime):
+            return 1.0
+        if (self.is_manga or franchise <= 0
+                or own_index >= franchise * _shiki.FRANCHISE_PART_SHARE):
+            return factor
+        return _api.title_favorites_factor(franchise, base, self.favorites)
 
     @property
     def effective_book_index(self) -> float:
@@ -546,7 +591,8 @@ class SongCandidate:
             from .franchise_part_weight import inherited_index
             franchise = inherited_index(self.anime, own_index, franchise)
             own = own_index * factor
-        return max(own, franchise * factor)
+        return max(own, franchise * self._franchise_favorites_factor(
+            franchise, own_index, base, factor))
 
     def _index_key(self) -> tuple:
         """Все входы формулы index — значения, а не ссылки.
@@ -581,7 +627,13 @@ class SongCandidate:
         Считается по index, то есть по одной лесенке на весь пак. Книге это
         даёт ровно то, что нужно: без аниме она упирается в MANGA_MIN_LEVEL
         (её знают только читавшие), а с аниме получает уровень своего
-        сериала — «Восхождение героя щита» узнают по нему, а не по томику."""
+        сериала — «Восхождение героя щита» узнают по нему, а не по томику.
+
+        Во время генерации уровень берётся из заготовки «Обновить базу»
+        (catalog_levels) и заново не считается."""
+        ready = ready_level(self)
+        if ready is not None:
+            return ready
         return _api.index_level(self.index)
 
     @property

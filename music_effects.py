@@ -56,6 +56,11 @@ TECHNICAL_PAUSE_SECONDS = 120
 # лежащими до конца прогона, а оставшиеся слоты играют оригиналом: полный
 # пак с предупреждением лучше обрубка.
 TECHNICAL_PAUSES = 3
+# Сколько песен без готовых таймингов подряд получают отказ, пока свободны
+# одни слоты караоке. Дальше каждая такая песня забирает слот караоке себе:
+# в прогоне 2026-10-08 21:07 одиннадцать слотов караоке ждали песен, которых
+# в рамке сложности не было, и опенингов вышло 4 из 16.
+KARAOKE_YIELD_AFTER = 3
 
 
 def runtime_python():
@@ -162,6 +167,7 @@ class EffectSlots:
     """Reserve presentation slots before parallel downloads; retry failed slots."""
 
     def __init__(self, settings, song_count):
+        self.settings = settings
         self.counts = plan(settings, song_count)
         self.slots = [name for name, count in self.counts.items()
                       for _ in range(count)]
@@ -192,6 +198,10 @@ class EffectSlots:
         self.timed_only = (getattr(settings, "karaoke_enabled", False)
                            and not getattr(settings, "karaoke_ai_fallback", False)
                            and getattr(settings, "karaoke_effect", "") != "reverse")
+        # Отказы подряд песням без таймингов (см. refuses) и слоты караоке,
+        # отданные обычным песням.
+        self.refused = 0
+        self.yielded = 0
 
     def paused(self, name):
         """Сколько секунд эффекту ещё стоять на паузе (0 — не стоит)."""
@@ -213,9 +223,19 @@ class EffectSlots:
                             None if self.timed_only else "any")
         if not self.timed_only and available is not True:
             available = "any"  # С AI песня без готовых таймингов тоже годится.
+        if video_kind and video and available in (True, "any")                 and not self.paused("karaoke") and not self._video_only(candidate):
+            # Опенинг из рамки AMQ годится куда угодно, а песне вне рамки
+            # положен только видеоряд. Раньше первые же опенинги из рамки
+            # занимали все видеослоты: песни вне рамки отсеивались («мест с
+            # видеорядом нет»), а слоты караоке пустовали — «караоке 1 из 11»
+            # при недоборе опенингов. Теперь такой опенинг сперва идёт в
+            # свободный слот караоке, видеослоты остаются тем, кому нужны.
+            pool = [slot for slot in self.free
+                    if self.slots[slot] == "karaoke"] or pool
         karaoke = [slot for slot in pool if self.slots[slot] == "karaoke"]
         if available is True and karaoke and not self.paused("karaoke"):
             pool = karaoke
+            self.refused = 0     # песни с таймингами ещё приходят
         elif available is not True and available != "any":
             pool = [slot for slot in pool if self.slots[slot] != "karaoke"] or pool
         ready = [slot for slot in pool if not self.paused(self.slots[slot])]
@@ -224,15 +244,35 @@ class EffectSlots:
         candidate.music_effect = self.slots[slot]
         candidate.music_slot = slot
 
+    def _video_only(self, candidate):
+        """Песне вне рамки AMQ положен только видеоряд (см. song_video)."""
+        if self.settings is None:
+            return False
+        from si_hyx_parts.animepack.song_video import video_only
+        return video_only(self.settings, candidate)
+
+    def video_free(self):
+        """Есть свободный слот видеоряда (его и получит опенинг/эндинг)."""
+        return any(self.slots[slot] == "video" for slot in self.free)
+
     def refuses(self, candidate):
         """Свободны одни слоты караоке, а готовых таймингов у песни нет.
 
         Такую песню в слот не пускаем: она провалилась бы наверняка, и дюжина
-        таких провалов обрывала пак строгим отказом караоке."""
-        return (self.timed_only
+        таких провалов обрывала пак строгим отказом караоке. Но после
+        KARAOKE_YIELD_AFTER отказов подряд песен с таймингами явно не хватает:
+        слот караоке переписывается на оригинал, и песня занимает его."""
+        if not (self.timed_only
                 and getattr(candidate, "_authored_available", None) is False
                 and bool(self.free)
-                and all(self.slots[slot] == "karaoke" for slot in self.free))
+                and all(self.slots[slot] == "karaoke" for slot in self.free)):
+            return False
+        self.refused += 1
+        if self.refused <= KARAOKE_YIELD_AFTER:
+            return True
+        self.slots[self.free[0]] = ORIGINAL
+        self.yielded += 1
+        return False
 
     def expand(self, settings, song_count):
         if song_count <= len(self.slots):

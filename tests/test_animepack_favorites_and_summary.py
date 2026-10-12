@@ -246,10 +246,10 @@ def test_the_pack_name_gets_its_number():
 def test_the_pack_name_ends_with_its_average_level():
     rows = [SimpleNamespace(level=3), SimpleNamespace(level=5),
             SimpleNamespace(level=5)]
-    assert pack_summary.pack_title("Пак", 56, rows) == "Пак № 56 (Ур. 4.3)"
+    assert pack_summary.pack_title("Пак", 56, rows) == "Пак № 56 (Ур. 4.3 - 🟡Нормально)"
     # Пересборка не копит приписки — ни прежние целые, ни с десятыми.
-    assert pack_summary.pack_title("Пак № 56 (Ур. 7)", 56, rows) ==         "Пак № 56 (Ур. 4.3)"
-    assert pack_summary.pack_title("Пак № 56 (Ур. 6.9)", 56, rows) ==         "Пак № 56 (Ур. 4.3)"
+    assert pack_summary.pack_title("Пак № 56 (Ур. 7)", 56, rows) ==         "Пак № 56 (Ур. 4.3 - 🟡Нормально)"
+    assert pack_summary.pack_title("Пак № 56 (Ур. 6.9 - 🔴Сложно)", 56, rows) ==         "Пак № 56 (Ур. 4.3 - 🟡Нормально)"
     assert pack_summary.pack_title("Пак", 2, []) == "Пак № 2"
 
 
@@ -267,7 +267,7 @@ def test_content_xml_numbers_the_pack_and_describes_its_parts():
     settings.pack_number = 7
     xml = ap.build_content_xml(songs, settings).decode("utf-8")
     level = pack_summary.average_level(songs)
-    assert f'name="Сгенерировано в SI-HYX № 7 (Ур. {level:.1f})"' in xml
+    assert f'name="Сгенерировано в SI-HYX № 7 (Ур. {level:.1f} - {pack_summary.grade(level)})"' in xml
     comments = re.search(r"<comments>(.*?)</comments>", xml, re.S).group(1)
     assert "Из чего состоит" not in comments
     assert "Опенинг: 1" in comments

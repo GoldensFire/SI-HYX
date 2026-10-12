@@ -44,6 +44,9 @@ class MangaMix:
         self._bench: list = []
         self._benched: set[int] = set()
         self.off = False
+        # Вебтуны без Gemini не собрать (сцену с персонажами выбирает модель):
+        # тогда закрываются только они, а не вся книжная доля.
+        self.webtoons_off = ""
         self.sync(quota)
 
     # ── цели ──────────────────────────────────────────────────────────────
@@ -66,6 +69,19 @@ class MangaMix:
             targets[key] += 1
         self.kind_target = {"manhwa": targets["manhwa"],
                             "manhua": targets["manhua"], "": targets["manga"]}
+        if self.webtoons_off and not getattr(self.s, "manga_strict_targets", False):
+            self.kind_target[""] += self.kind_target["manhwa"] + self.kind_target["manhua"]
+            self.kind_target["manhwa"] = self.kind_target["manhua"] = 0
+
+    def close_webtoons(self, reason: str) -> bool:
+        """Манхва и маньхуа больше не берутся; их места — японской манге.
+        Возвращает True при первом закрытии (чтобы сообщить один раз)."""
+        if self.webtoons_off:
+            return False
+        self.webtoons_off = reason or "вебтуны недоступны"
+        self._bench = [cand for cand in self._bench if not self._edition(cand)]
+        self.sync(self.quota)
+        return True
 
     # ── учёт ──────────────────────────────────────────────────────────────
     @staticmethod
@@ -83,6 +99,8 @@ class MangaMix:
             key = self._edition(cand) or "manga"
             if not shares(self.s).get(key):
                 return False
+            if self.webtoons_off and self._edition(cand):
+                return False
         if self.off or not self.quota or not cand.is_manga:
             return True
         adapted_key, kind_key = self._keys(cand)
@@ -96,6 +114,35 @@ class MangaMix:
             self._benched.add(id(cand))
             self._bench.append(cand)
         return False
+
+    def wants(self, cand, extra=None) -> bool:
+        """Нужна ли ещё такая книга — счёт allows, но без скамейки.
+
+        Его спрашивает план каталога (CatalogPlan): книга издания, которого
+        в паке уже хватает, подаётся после нужных. Раньше план смотрел только
+        на уровень, и отбор отправлял лишние на скамейку одну за другой: в
+        прогоне 2026-10-08 скамейка упёрлась в потолок 320, а каталог
+        просматривался 18 минут. extra — книги, уже набранные в текущую пачку
+        плана, но ещё не дошедшие до отбора."""
+        if cand.is_manga:
+            key = self._edition(cand) or "manga"
+            if not shares(self.s).get(key):
+                return False
+            if self.webtoons_off and self._edition(cand):
+                return False
+        if self.off or not self.quota or not cand.is_manga:
+            return True
+        extra = extra or {}
+        adapted_key, kind_key = self._keys(cand)
+        return (self._used[adapted_key] + extra.get(adapted_key, 0)
+                < self.adapted_target.get(adapted_key[1], 0)
+                and self._used[kind_key] + extra.get(kind_key, 0)
+                < self.kind_target.get(kind_key[1], 0))
+
+    def count(self, cand, into) -> None:
+        """Добавляет книгу в счётчик into (пачка плана, см. wants)."""
+        if cand.is_manga:
+            into.update(self._keys(cand))
 
     @property
     def bench_size(self) -> int:

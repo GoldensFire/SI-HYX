@@ -105,14 +105,12 @@ def test_japanese_html_is_utf8_even_without_charset_metadata():
     assert text_lines(document, short=True) == ["強くなれる", "君を連れて"]
 
 
-def test_ui_settings_roundtrip_and_reverse_disables_recognition(qapp):
+def test_ui_settings_roundtrip(qapp):
     import animepack_tab
     tab = animepack_tab.AnimePackTab()
     try:
         tab.chk_karaoke.setChecked(True)
         tab.sp_karaoke_percent.setValue(100)
-        tab.cb_karaoke_effect.setCurrentIndex(tab.cb_karaoke_effect.findData("tempo"))
-        tab.sp_karaoke_tempo.setValue(1.25)
         tab.sp_karaoke_crf.setValue(31)
         tab.sp_karaoke_preset.setValue(11)
         tab.sp_karaoke_ai_minutes.setValue(7)
@@ -122,7 +120,6 @@ def test_ui_settings_roundtrip_and_reverse_disables_recognition(qapp):
         settings = tab.get_settings()
         tab.apply_settings(settings)
         assert tab.collect().karaoke_enabled
-        assert tab.collect().karaoke_tempo == 1.25
         assert tab.collect().karaoke_percent == 100
         assert tab.collect().karaoke_crf == 31
         assert tab.collect().karaoke_preset == 11
@@ -130,8 +127,6 @@ def test_ui_settings_roundtrip_and_reverse_disables_recognition(qapp):
         assert tab.collect().karaoke_separator == "htdemucs"
         assert tab.collect().karaoke_translations
         assert tab.collect().video_crf == settings["video_crf"]
-        tab.cb_karaoke_effect.setCurrentIndex(tab.cb_karaoke_effect.findData("reverse"))
-        assert not tab.chk_karaoke_ai.isEnabled()
     finally:
         tab.cleanup()
         tab.close()

@@ -106,6 +106,15 @@ _api.song_difficulty_band = song_difficulty_band
 _api.song_difficulty_allowed = song_difficulty_allowed
 
 
+def video_ignores_difficulty(s: _api.PackSettings) -> bool:
+    """В паке есть места опенингов/эндингов с видеорядом."""
+    return bool(getattr(s, "song_video", False)
+                and (getattr(s, "song_video_percent", None) or 0) > 0)
+
+video_ignores_difficulty.__module__ = _api.__name__
+_api.video_ignores_difficulty = video_ignores_difficulty
+
+
 def filter_song(song: dict, s: _api.PackSettings) -> bool:
     """Проходит ли песня по настройкам (без обращения к сети)."""
     if not isinstance(song, dict):
@@ -131,7 +140,11 @@ def filter_song(song: dict, s: _api.PackSettings) -> bool:
     category = str(song.get("songCategory") or "").lower()
     if not s.categories.get(category, False):
         return False
-    return song_difficulty_allowed(song, s)
+    # Опенинг/эндинг с видеорядом угадывают по картинке, а не по музыке:
+    # рамка сложности AMQ для него не действует (просьба пользователя). Такая
+    # песня идёт только в слот видеоряда — см. song_video.video_only.
+    return (song_difficulty_allowed(song, s)
+            or (kind in ("opening", "ending") and video_ignores_difficulty(s)))
 
 filter_song.__module__ = _api.__name__
 _api.filter_song = filter_song

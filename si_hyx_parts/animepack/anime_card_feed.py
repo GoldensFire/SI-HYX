@@ -35,6 +35,8 @@ _EMPTY = object()
 # песенных мест, чтобы тайтл с песней можно было отдать под кадр: часть
 # кандидатов отсеет сложность, часть — неудачная загрузка.
 SONG_SUPPLY_MARGIN = 3
+# До скольких id запрос к AnisongDB добирается тайтлами следующих пачек.
+ANISONG_FILL = 40
 
 
 def _mal_of_song(song: dict) -> int:
@@ -116,6 +118,22 @@ class AnimeCardFeed:
             _api.filter_anime(cards[aid], gen.s)
             and not gen._root_excluded(cards[aid]))]
 
+    def _prefetch_ids(self, asked):
+        """Непрошенные id следующих пачек — в тот же запрос к AnisongDB.
+
+        К концу прогона пачка в 20 тайтлов почти целиком лежит в кэше, и
+        запрос уходил ради одного-трёх тайтлов: в прогоне 9 октября 14:53 —
+        46 таких запросов по ~1 с подряд, пока каталог дорабатывался."""
+        uncached = getattr(self.gen.anisong, "uncached", None)
+        if not callable(uncached):
+            return []
+        missing = uncached(asked)
+        if not missing or len(missing) >= ANISONG_FILL:
+            return []
+        skip = set(asked) | self.used_anime
+        pool = [aid for aid in self.plan.upcoming(ANISONG_FILL * 4) if aid not in skip]
+        return uncached(self._eligible_song_ids(pool))[:ANISONG_FILL - len(missing)]
+
     def _ask_songs(self, batch):
         """Песни пачки. Возвращает (подходящие по id, все названия по id,
         MAL id пачки) либо None, если пачку пришлось пропустить."""
@@ -130,15 +148,22 @@ class AnimeCardFeed:
                 gen.log(f"AnisongDB: спрашиваю песни для {len(asked)} аниме…")
                 songs = gen.anisong.songs_by_ann_ids(asked)
             else:
-                songs = gen.anisong.songs_by_mal_ids(asked)
+                ahead = self._prefetch_ids(asked)
+                songs = gen.anisong.songs_by_mal_ids(asked + ahead)
+                if ahead:
+                    keep = set(asked)
+                    songs = [song for song in songs if _mal_of_song(song) in keep]
                 # Пачки, целиком взятые из кэша, в журнал не пишутся: в живом
                 # логе 639 строк «спрашиваю» были чтением кэша без единого
                 # запроса к серверу.
                 fetched = getattr(gen.anisong, "last_fetched", None)
                 fetched = fetched() if callable(fetched) else len(asked)
                 if fetched:
+                    own = fetched - len(ahead)
                     gen.log(f"AnisongDB: спросил песни для {fetched} аниме "
-                            f"(из кэша {len(asked) - fetched}).")
+                            f"(из кэша {len(asked) - own}"
+                            + (f"; {len(ahead)} — наперёд, для следующих пачек)."
+                               if ahead else ")."))
         except _api.AnimePackApiError as e:
             if gen._ids_are_ann:
                 # Мастер-лист AMQ хранит ANN id: без ответа AnisongDB карточку
@@ -220,9 +245,16 @@ class AnimeCardFeed:
         first, second = self.with_song, self.no_song
         if needed and not song_stream and not self._song_supply_ok():
             first = None
+        if first and needed and not song_stream and self._karaoke_reserved(first[0][1]):
+            # Тайтл с готовыми таймингами Karaoke Mugen ждёт слот караоке, а не кадр.
+            first = None
         if first and second:
             return first if first[0][0] < second[0][0] else second
         return first or second or None
+
+    def _karaoke_reserved(self, row) -> bool:
+        from .karaoke_catalog import has_timed, karaoke_free
+        return has_timed(self.gen, row[1]) and karaoke_free(self.gen)
 
     def _song_supply_ok(self) -> bool:
         """Хватит ли песенных тайтлов, если один из них отдать под кадр."""

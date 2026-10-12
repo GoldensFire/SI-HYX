@@ -33,6 +33,22 @@ def gemini_transient(exc) -> bool:
             or any(c.__name__ == "GeminiUnavailableError" for c in type(exc).__mro__))
 
 
+def close_webtoons(generator, cand, exc):
+    """Вебтун без Gemini не собрать: закрываются манхва и маньхуа, а не вся
+    книжная доля. Раньше один такой отказ снимал и японскую мангу, которой
+    Gemini не нужен (пак № 130: манга 6 из 16)."""
+    import animepack as api
+    from .manga_editions import shares
+    cand.rejected = True
+    reason = f"Gemini не выбрал сцену вебтуна: {exc}"
+    if not shares(generator.s).get("manga"):
+        generator._drop_kind(api.MANGA_KIND, reason)
+        return
+    if generator._manga_mix.close_webtoons(reason):
+        generator.log(f"Внимание: манхва и маньхуа больше не берутся ({reason}); "
+                      "их места отдаю японской манге.")
+
+
 @operation("подготовка страницы")
 def prepare(generator, cand, *, source_round=0):
     # Import at call time: manga_panel delegates to this module.
@@ -103,15 +119,13 @@ def prepare(generator, cand, *, source_round=0):
 
 def _choose(generator, cand, pages):
     """Сцена из скачанного пула страниц: один запрос Gemini на весь пул."""
-    import animepack as api
     from .manga_page_reuse import keep
     try:
         result = crop_pages(generator, cand, pages)
     except Exception as exc:  # noqa: BLE001 — preserve terminal service handling
         if (generator.gemini_manga is None or type(exc).__name__ in
                 ("GeminiAuthError", "GeminiQuotaError", "GeminiDownError")):
-            generator._drop_kind(api.MANGA_KIND, f"Gemini не выбрал сцену вебтуна: {exc}")
-            cand.rejected = True
+            close_webtoons(generator, cand, exc)
         elif gemini_transient(exc):
             # Редкую манхву/маньхуа не сжигаем из-за перегрузки: тайтл уйдёт
             # на повтор через минуту, как при сбое сети (selection_results),

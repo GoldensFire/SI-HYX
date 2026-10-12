@@ -10,7 +10,9 @@ def capacity(kind, workers):
     if kind == ap.MANGA_KIND:
         return workers
     if kind == ap.EPISODE_KIND:
-        return max(1, min(4, workers // 2))
+        # Отрывки — самый долгий этап каждого прогона (50–60 % времени), а ждут
+        # они в основном сеть: AV1 ограничен отдельно, HTTP — по хостам.
+        return max(1, min(6, workers * 3 // 4))
     return workers * 2
 
 
@@ -29,11 +31,17 @@ def guarded_fetch(generator):
             raise generator._storage_error
         require_space(generator.folder)
         from .media_transfer import trouble_reset, trouble_seen
+        from .visual_batch import hold, wait_reset, wait_seen
         trouble_reset()
+        wait_reset()
         try:
-            result = generator._fetch_media(candidate)
-            # Сорвалось на сбое сети — тайтл откладывается на повтор.
-            candidate._network_temporary = not result and trouble_seen()
+            # Проверки картинок Gemini на паузе: вопрос, которому они нужны,
+            # ждёт её конца, не скачивая медиа впустую.
+            result = False if hold(generator, candidate) else generator._fetch_media(candidate)
+            # Сорвалось на сбое сети или паузе Gemini — тайтл откладывается на повтор.
+            candidate._gemini_wait_until = 0.0 if result else wait_seen()
+            candidate._network_temporary = not result and (
+                trouble_seen() or candidate._gemini_wait_until > 0)
             return result
         finally:
             if getattr(generator, "_storage_error", None):

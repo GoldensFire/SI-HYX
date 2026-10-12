@@ -105,6 +105,12 @@ class CachedAnisong:
         out = [song for mal in ids if mal in known for song in known[mal]]
         return out + list(fetched)
 
+    def uncached(self, ids) -> list[int]:
+        """Id без свежего ответа в кэше — их songs_by_mal_ids спросит по сети."""
+        ids = [int(i) for i in ids]
+        known = self._cached(ids) if ids else {}
+        return [mal for mal in ids if mal not in known]
+
     def last_fetched(self) -> int:
         """Сколько id прошлый songs_by_mal_ids этого потока спросил по сети."""
         return int(getattr(self._calls, "fetched", 0))

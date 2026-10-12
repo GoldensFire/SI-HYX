@@ -13,7 +13,9 @@ import animepack_tab as _api
 
 
 def build(tab) -> None:
-    tab.btn_rebuild_saved = _api.QPushButton("Собрать сохранённое")
+    # Родитель сразу: refresh() зовёт setVisible(True) до вставки в макет,
+    # и кнопка без родителя мелькала отдельным окном при запуске.
+    tab.btn_rebuild_saved = _api.QPushButton("Собрать сохранённое", tab)
     tab.btn_rebuild_saved.setIcon(_api.get_icon('fa5s.box-open'))
     tab.btn_rebuild_saved.clicked.connect(lambda: rebuild(tab))
     tab.btn_rebuild_saved.setVisible(False)

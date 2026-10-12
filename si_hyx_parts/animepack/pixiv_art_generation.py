@@ -248,9 +248,9 @@ def _visual_ok(self, cand, data, ext, illust):
         approved, reason = check(self, cand, data, ext, illust)
     except Exception as exc:  # noqa: BLE001 — типы gemini_api
         name = type(exc).__name__
-        if name == "GeminiCoolingError":
+        if any(c.__name__ == "GeminiUnavailableError" for c in type(exc).__mro__):
             from .media_transfer import trouble_mark
-            trouble_mark()      # модель на паузе — тайтл повторится позже
+            trouble_mark()      # пауза или таймаут модели — тайтл повторится позже
         # GeminiDownError — сервер подряд не отвечает (visual_batch): ждать
         # его на каждом арте значит держать рабочие потоки минутами.
         if name in ("GeminiAuthError", "GeminiQuotaError", "GeminiDownError"):

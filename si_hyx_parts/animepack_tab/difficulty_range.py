@@ -136,6 +136,9 @@ class DifficultyRange(_api._ShareBar):
         self._clamp_avg()
 
     def mousePressEvent(self, event):
+        if not self._on_bar(event.position()):
+            event.ignore()
+            return
         avg = self.avg_control.value()
         low, high = self.range_values()
         if avg and abs(event.position().x() - self._x_of(self._pct(avg))) <= 9:

@@ -33,7 +33,7 @@ def describe(generator):
     if karaoke and not settings.karaoke_ai_fallback and settings.karaoke_effect != "reverse":
         generator.log(f"Предварительная проверка караоке: нужно {karaoke} подтверждённых песен. "
                       "AI fallback выключен; наличие готовых таймингов проверяется до загрузки аудио. "
-                      "Если доступного пула не хватит, готовые вопросы будут сохранены.")
+                      "Если песен с готовыми таймингами не хватит, их места займут обычные песни.")
     kinds = [kind for kind, selected in settings.kinds.items() if selected]
     if settings.only_kind != ap.MANGA_KIND and len(kinds) == 1 and kinds[0] == "movie":
         generator.log("Выбраны только фильмы: сериалы и OVA не входят в пул; "

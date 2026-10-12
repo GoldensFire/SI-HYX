@@ -66,7 +66,13 @@ def probe(generator, url, stream=None, timeout=PROBE_TIMEOUT):
             stream["_probe_error"] = re.sub(r"https?://\S+", "[URL]", error or "таймаут")[-180:]
         if stream and hasattr(generator, "_log_rare"):
             status = re.search(r"(?:HTTP error|Server returned)\s+\d{3}[^\r\n]*", error or "")
-            reason = status.group(0)[:100] if status else "источник не читается или истёк таймаут"
+            # Без HTTP-кода — последняя строка ffprobe («Connection timed out»,
+            # «Invalid data found…»): одна общая фраза прятала, что именно было.
+            lines = [re.sub(r"^(?:\[[^\]]*\]\s*)+", "", line.strip())
+                     for line in str(error or "").splitlines() if line.strip()]
+            last = re.sub(r"https?://\S+", "[URL]", lines[-1])[:100] if lines else ""
+            reason = (status.group(0)[:100] if status
+                      else last or "истёк таймаут, ffprobe ничего не сообщил")
             generator._log_rare("ffprobe отрывка", f"{stream.get('provider', 'Kuhi')}: {reason}")
         return {}
     try:
@@ -128,12 +134,21 @@ def inspect_stream(generator, stream, final, deadline):
         stream["_reject"] = "pause"
         return {}
     video = video_track(info)
-    if video is None or number(video.get("height")) < minimum or audio_track(
-            info, source_language=stream.get("audio_language")) is None:
+    height = int(number((video or {}).get("height")))
+    audio = audio_track(info, source_language=stream.get("audio_language"))
+    if video is None or height < minimum or audio is None:
         if hasattr(generator, "_log_rare"):
-            height = int(number((video or {}).get("height")))
+            # Раньше обе причины шли одной строкой «1080p или нет японского
+            # аудио; требуется ≥1080p» — при 1080p было непонятно, что не так.
+            reasons = []
+            if video is None:
+                reasons.append("нет видеодорожки")
+            elif height < minimum:
+                reasons.append(f"{height}p, требуется ≥{minimum}p")
+            if audio is None:
+                reasons.append("нет японской аудиодорожки")
             generator._log_rare("Качество отрывка", f"{stream.get('provider', 'Kuhi')}: "
-                                f"{height}p или нет японского аудио; требуется ≥{minimum}p")
+                                + "; ".join(reasons))
         stream["_reject"] = "low"
         return {}
     stream["source_height"] = int(number(video["height"]))

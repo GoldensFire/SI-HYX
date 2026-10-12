@@ -7,7 +7,8 @@ import tempfile
 import time
 
 import animepack as ap
-from karaoke.crop import aligned_start
+from karaoke.crop import aligned_start, word_starts
+from karaoke.namedrop import mentioned, variants
 from karaoke.render import render, reverse_audio, tempo
 from karaoke.resolver import Resolver
 from karaoke.timeline import transform
@@ -84,10 +85,16 @@ def download_karaoke(generator, candidate):
                 raise ValueError("Отрезок песни выходит за её длительность.")
             cropped = transform(lines, crop_start=start, crop_end=start + duration,
                                 tempo=tempo(generator.s), offset=metadata["offset"])
-            if not cropped or not any(unit.end > unit.start and unit.text.strip()
-                                      and unit.start < line.visible_end and unit.end > line.start
-                                      for line in cropped for unit in line.units):
+            if not _sung(cropped):
                 raise Rejected("В выбранном отрезке нет вокала с таймингами.")
+            titles = namedrop_titles(candidate)
+            dropped = mentioned(cropped, titles)
+            if dropped:
+                start, duration, cropped = _without_namedrop(
+                    generator, lines, titles, requested=start, end=end,
+                    offset=metadata["offset"], minimum=span[0])
+                generator.log(f"Караоке «{candidate.song_name}»: в отрезке поют "
+                              f"название («{dropped}») — беру отрезок с {start:.1f} с.")
             highlight = choose_colour(generator.rng)
             with generator._timed("караоке: кодирование"):
                 subtitle, seconds = render(generator, source, final, cropped, start=start,
@@ -124,6 +131,43 @@ def download_karaoke(generator, candidate):
         action = "откладываю повторную попытку" if candidate._music_temporary else "беру следующую песню"
         generator.log(f"Караоке «{candidate.song_name}»: {error} — {action}.")
         return False
+
+
+def _sung(cropped) -> bool:
+    """В отрезке есть слог с таймингом, который виден на экране."""
+    return bool(cropped) and any(unit.end > unit.start and unit.text.strip()
+                                 and unit.start < line.visible_end and unit.end > line.start
+                                 for line in cropped for unit in line.units)
+
+
+def namedrop_titles(candidate) -> list[str]:
+    """Названия тайтла и их корни, которых не должно быть в словах отрезка."""
+    from .local_title_match import titles
+    names = titles(candidate.anime or {})
+    song = candidate.song or {}
+    names = [name for name in names + [song.get("animeENName"), song.get("animeJPName")]
+             if name]
+    names += [ap.title_root(name) for name in list(names)]
+    return variants(name for name in names if name)
+
+
+def _without_namedrop(generator, lines, titles, *, requested, end, offset, minimum):
+    """(начало, длина, строки) ближайшего к прежнему отрезка без названия.
+
+    Целые отрезки идут первыми, как в aligned_start; если названия нет только
+    в обрезанном у конца песни — берётся он."""
+    cut = float(generator.s.audio_cut)
+    starts = [x for x in word_starts(lines, offset) if max(0.0, minimum) <= x < end - 1]
+    starts.sort(key=lambda x: (x + cut > end, abs(x - requested), x))
+    for start in starts:
+        duration = min(cut, end - start)
+        if duration < 1:
+            continue
+        cropped = transform(lines, crop_start=start, crop_end=start + duration,
+                            tempo=tempo(generator.s), offset=offset)
+        if _sung(cropped) and not mentioned(cropped, titles):
+            return start, duration, cropped
+    raise Rejected("Название аниме звучит во всех отрезках песни.")
 
 
 def catalog_duration(candidate):

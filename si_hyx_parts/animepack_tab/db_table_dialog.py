@@ -24,7 +24,8 @@ from PyQt6.QtCore import (
     QCoreApplication, QObject, QRunnable, QThreadPool, pyqtSignal,
 )
 from PyQt6.QtWidgets import (
-    QDialog, QHBoxLayout, QPushButton, QTabWidget, QVBoxLayout, QWidget,
+    QDialog, QHBoxLayout, QPushButton, QTabWidget, QToolButton, QVBoxLayout,
+    QWidget,
 )
 
 import animepack_tab as api
@@ -104,13 +105,6 @@ class DbTableDialog(QDialog):
         for block in self.blocks.values():
             blocks_row.addWidget(block, 1)
         layout.addLayout(blocks_row)
-        filter_row = QHBoxLayout()
-        filter_row.addStretch()
-        self.btn_filters = QPushButton("Фильтры отображения…")
-        self.btn_filters.setToolTip("Только отображение таблиц. Обновление всегда собирает всю базу.")
-        self.btn_filters.clicked.connect(self._open_filters)
-        filter_row.addWidget(self.btn_filters)
-        layout.addLayout(filter_row)
         self.tabs = QTabWidget()
         from . import db_rows
         self.anime = Page(TITLE_HEADERS, db_rows.explain_title,
@@ -121,6 +115,19 @@ class DbTableDialog(QDialog):
                           refresh_franchise=self._refresh_franchise)
         self.chars = Page(CHAR_HEADERS, db_rows.explain_character,
                           refresh_title=self._refresh_character)
+        # Фильтры — значком справа от поиска на каждой вкладке, а не
+        # отдельной строкой кнопки над таблицами (просьба пользователя).
+        self._filter_buttons = []
+        for page in (self.anime, self.manga, self.chars):
+            button = QToolButton()
+            button.setIcon(api.get_icon("fa5s.filter"))
+            button.setAutoRaise(True)
+            button.setCheckable(True)
+            button.clicked.connect(self._open_filters)
+            page.add_tool(button)
+            self._filter_buttons.append(button)
+        self.btn_filters = self._filter_buttons[0]
+        self._show_filter_state(False)
         self.tabs.addTab(self.anime, "Аниме")
         self.tabs.addTab(self.manga, "Манга")
         self.tabs.addTab(self.chars, "Персонажи")
@@ -442,13 +449,24 @@ class DbTableDialog(QDialog):
         dialog = DbFiltersDialog(self._filter_kinds, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._set_filters(dialog.values())
+        else:
+            self._show_filter_state(
+                any(value is not None for value in self._filter_kinds.values()))
 
     def _set_filters(self, filters):
         self._filter_kinds = dict(filters)
-        active = any(value is not None for value in filters.values())
-        self.btn_filters.setText("Фильтры отображения (включены)…" if active
-                                 else "Фильтры отображения…")
+        self._show_filter_state(
+            any(value is not None for value in filters.values()))
         self.refresh()
+
+    def _show_filter_state(self, active: bool) -> None:
+        tip = ("Фильтры отображения (включены)" if active
+               else "Фильтры отображения")
+        tip += (".\nТолько отображение таблиц. Обновление всегда собирает "
+                "всю базу.")
+        for button in self._filter_buttons:
+            button.setChecked(active)
+            button.setToolTip(tip)
 
 
 def _kind_label(kind: str) -> str:
@@ -468,8 +486,10 @@ def _title_cells(row):
         (str(row["place"]), row["place"]),
         (row["title"], None),
         (kind, None),
-        (str(row["year"] or ""), row["year"]),
-        (f"{row['score']:.2f}" if row["score"] else "", row["score"]),
+        # Нет числа у самого Shikimori (оценка 0.0 без голосов, дата выхода
+        # не указана) — прочерк, а не пустая ячейка, похожая на сбой.
+        (str(row["year"] or "—"), row["year"]),
+        (f"{row['score']:.2f}" if row["score"] else "—", row["score"]),
         (_fmt(row["base"]), row["base"]),
         # −1 значит «не спрашивали»: ноль был бы неправдой.
         ({"AGE_RESTRICTED": "Требуется вход", "NOT_FOUND": "404",

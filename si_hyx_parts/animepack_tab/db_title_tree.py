@@ -16,13 +16,24 @@ from PyQt6.QtCore import QAbstractItemModel, QModelIndex, Qt
 
 import animepack as ap
 
+# Корней дерева отдаётся Qt сразу и добавляется при прокрутке к концу.
+PAGE_ROWS = 200
+
 
 def group_title_rows(rows, franchise_parts=None) -> tuple[list, list[int]]:
     """(строки, родители) с самым популярным тайтлом во главе франшизы.
 
     Родитель ``-1`` означает корневую строку; остальные значения — индекс
-    корня в возвращённом списке. Популярность здесь — тот же итоговый индекс,
-    по которому сортируется панель и от которого считается сложность пака.
+    корня в возвращённом списке.
+
+    Во главе — самый популярный тайтл: у кого больше всего зрителей (база
+    индекса — списки Shikimori без поправок). Не итоговый индекс: у основных
+    частей он один и тот же — унаследованный индекс серии, и решали бы его
+    надбавки и ошибки наследования («Дороро» 1969-го вставал над ремейком
+    2019-го, «Тиби-Ева» — над фильмами «Евангелиона»). И не собственный
+    индекс: в нём скидка за возраст, и над «Атакой титанов» вставал её
+    третий сезон. Сами франшизы между собой стоят по итоговому индексу
+    главы, как и вся панель.
     """
     families: dict[tuple[str, str], list] = {}
     singles = []
@@ -35,11 +46,17 @@ def group_title_rows(rows, franchise_parts=None) -> tuple[list, list[int]]:
             singles.append([row])
 
     def popular(row):
-        return (float(row.get("index") or 0.0),
+        # Анонс во главе франшизы не встаёт: у него ещё нет ни года, ни
+        # оценки, и строка франшизы выглядела бы пустой.
+        return (not ap.is_announced(row.get("card")),
                 float(row.get("base") or 0.0),
+                float(row.get("index") or 0.0),
                 int(row.get("favorites") or -1),
                 float(row.get("score") or 0.0),
                 -int(row.get("id") or 0))
+
+    def ranked(row):
+        return (float(row.get("index") or 0.0), popular(row))
 
     groups = []
     for (key, branch), members in families.items():
@@ -52,7 +69,7 @@ def group_title_rows(rows, franchise_parts=None) -> tuple[list, list[int]]:
         groups.append((header, ordered))
     for members in singles:
         groups.append((None, members))
-    groups.sort(key=lambda group: popular(group[1][0]), reverse=True)
+    groups.sort(key=lambda group: ranked(group[1][0]), reverse=True)
 
     flat, parents = [], []
     for header, members in groups:
@@ -88,6 +105,15 @@ def _missing_family_header(key: str, members, parts):
         "title": f"{name} — франшиза ({len(members)} из {total} в каталоге)",
         "_franchise_header": True,
     })
+    # «В избранном» у франшизы — самое большое число среди её частей, а не
+    # число ведущей части: у «Дороро» во главе стоит сериал 1969 года с 29
+    # избранными, хотя у ремейка 2019-го их тысячи. Подсказка индекса при
+    # этом считается по ведущей части, поэтому её собственное число храним.
+    best = max(members, key=lambda row: int(row.get("favorites", -1)))
+    if int(best.get("favorites", -1)) > int(header.get("favorites", -1)):
+        header["lead_favorites"] = header.get("favorites", -1)
+        header["favorites"] = best["favorites"]
+        header["favorites_status"] = best.get("favorites_status", "NORMAL")
     return header
 
 
@@ -111,6 +137,7 @@ class DbTitleTreeModel(QAbstractItemModel):
         self._roots: list[_Node] = []
         self._shown_roots: list[_Node] = []
         self._shown_children: dict[int, list[_Node]] = {}
+        self._loaded = 0                  # сколько корней отдано Qt
         self._needle = ""
         self._sort_col = -1
         self._descending = True
@@ -183,18 +210,36 @@ class DbTitleTreeModel(QAbstractItemModel):
                 children[root.source] = self._ordered(shown)
         self._shown_roots = self._ordered(roots)
         self._shown_children = children
+        self._loaded = min(PAGE_ROWS, len(self._shown_roots))
+
+    # ── подгрузка порциями ───────────────────────────────────────────────
+    def canFetchMore(self, parent=QModelIndex()):    # noqa: N802
+        return not parent.isValid() and self._loaded < len(self._shown_roots)
+
+    def fetchMore(self, parent=QModelIndex()):       # noqa: N802
+        self.ensure_loaded(self._loaded + PAGE_ROWS)
+
+    def ensure_loaded(self, count: int) -> None:
+        """Отдать Qt хотя бы `count` корней (если столько есть)."""
+        count = min(int(count), len(self._shown_roots))
+        if count <= self._loaded:
+            return
+        self.beginInsertRows(QModelIndex(), self._loaded, count - 1)
+        self._loaded = count
+        self.endInsertRows()
 
     # ── Qt model ─────────────────────────────────────────────────────────
     def index(self, row, column, parent=QModelIndex()):
         if row < 0 or column < 0 or column >= len(self._headers):
             return QModelIndex()
-        nodes = self._shown_roots
+        nodes, limit = self._shown_roots, self._loaded
         if parent.isValid():
             if parent.column() != 0:
                 return QModelIndex()
             node = parent.internalPointer()
             nodes = self._shown_children.get(node.source, [])
-        if row >= len(nodes):
+            limit = len(nodes)
+        if row >= limit:
             return QModelIndex()
         return self.createIndex(row, column, nodes[row])
 
@@ -213,7 +258,7 @@ class DbTitleTreeModel(QAbstractItemModel):
 
     def rowCount(self, parent=QModelIndex()):        # noqa: N802
         if not parent.isValid():
-            return len(self._shown_roots)
+            return self._loaded
         if parent.column() != 0:
             return 0
         node = parent.internalPointer()
@@ -257,6 +302,10 @@ class DbTitleTreeModel(QAbstractItemModel):
 
     def total(self) -> int:
         return sum(not row.get("_franchise_header") for row in self._rows)
+
+    def root_total(self) -> int:
+        """Сколько франшиз и тайтлов в корне — включая ещё не подгруженные."""
+        return len(self._shown_roots)
 
     def visible_total(self) -> int:
         nodes = list(self._shown_roots)

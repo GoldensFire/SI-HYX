@@ -65,8 +65,8 @@ def build(tab):
         getattr(tab, name).hide()
         setattr(tab, name, tab.cb_gemini_image_model)
     tab.box_gemini_titles.hide()
-    for widget in (tab.btn_gemini_key, tab.lbl_gemini_quota):
-        widget.show()
+    tab.lbl_gemini_quota.show()
+    tab._refresh_api_key_buttons()
     for combo in group.findChildren(QComboBox):
         combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         combo.setMinimumContentsLength(12)

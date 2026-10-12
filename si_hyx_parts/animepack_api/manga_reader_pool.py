@@ -16,6 +16,11 @@ class PageSelection:
     errors: tuple
 
 
+# Не проверка «вы не бот», а запрет по стране: CDN картинок ReManga
+# (img.reimg2.org) пускает только IP из СНГ, а API зеркала работает отовсюду.
+GEOBLOCK = "геоблок DDoS-Guard: IP вне СНГ"
+
+
 def bot_wall(response) -> str:
     """Имя защиты от ботов, ответившей вместо картинки ("" — обычный 403).
 
@@ -24,6 +29,8 @@ def bot_wall(response) -> str:
     headers = getattr(response, "headers", None) or {}
     server = str(headers.get("Server") or "").casefold()
     if "ddos-guard" in server:
+        if getattr(response, "si_hyx_geoblocked", False):
+            return GEOBLOCK
         return "DDoS-Guard"
     if str(headers.get("cf-mitigated") or "").casefold() == "challenge":
         return "Cloudflare"
@@ -35,15 +42,36 @@ class ReaderHealth:
         self.lock = threading.Lock()
         self.failures, self.until = {}, {}
         self.provider_until = {}
-        self.walls = {}   # хост → имя защиты; выключен до конца прогона
+        self.walls = {}   # хост → геоблок; этот сервер выключен до конца прогона
+        self.stats = None  # manga_source_stats.SourceStats генератора
 
     def wall(self, url):
+        host = urlsplit(url).hostname
         with self.lock:
-            return self.walls.get(urlsplit(url).hostname, "")
+            wall = self.walls.get(host, "")
+        if not wall and self.stats is not None and self.stats.host_reason(host):
+            return GEOBLOCK
+        return wall
 
     def provider_available(self, name):
+        if self.stats is not None and self.stats.block_reason(name):
+            return False
         with self.lock:
             return self.provider_until.get(name, 0) <= time.monotonic()
+
+    def blocked(self, name, reason):
+        """403 API источника: выключен и в следующих прогонах (на сутки)."""
+        self.disable_provider(name)
+        if self.stats is not None:
+            self.stats.block(name, reason)
+
+    def tried(self, name, found, page=False):
+        if self.stats is not None:
+            self.stats.tried(name, found, page)
+
+    def page(self, name, ok):
+        if self.stats is not None and name:
+            self.stats.page(name, ok)
 
     def disable_provider(self, name):
         with self.lock:
@@ -54,8 +82,11 @@ class ReaderHealth:
             self.provider_until[name] = time.monotonic() + 90
 
     def available(self, url):
+        host = urlsplit(url).hostname
+        if self.stats is not None and self.stats.host_reason(host):
+            return False
         with self.lock:
-            return self.until.get(urlsplit(url).hostname, 0) <= time.monotonic()
+            return self.until.get(host, 0) <= time.monotonic()
 
     def record(self, url, error=None, provider=""):
         host = urlsplit(url).hostname
@@ -68,11 +99,22 @@ class ReaderHealth:
             if code not in (403, 429):
                 return
             wall = bot_wall(response) if code == 403 else ""
-            if wall:
+            if wall == GEOBLOCK:
+                # Геоблок — у одного сервера картинок: ReManga отдаёт часть
+                # глав с img3.reimg2.org, и он открыт. Источник целиком не
+                # выключаем, а сервер запоминаем на сутки.
                 self.walls[host] = wall
                 self.until[host] = float("inf")
+                if self.stats is not None:
+                    self.stats.block_host(host, wall)
+                return
+            if wall:
+                # Проверка «вы не бот» (MangaLib в пике нагрузки): основной
+                # CDN MangaLib с этого IP отдаёт картинки, поэтому пауза, а не
+                # выключение до конца прогона.
+                self.until[host] = time.monotonic() + 90
                 if provider:
-                    self.provider_until[provider] = float("inf")
+                    self.provider_until[provider] = time.monotonic() + 90
                 return
             count = self.failures.get(host, 0) + 1
             self.failures[host] = count
@@ -125,6 +167,9 @@ def select_page(source, card, excluded=(), deadline=None, stopped=lambda: False)
 
 
 def close(source):
+    stats = getattr(source._health, "stats", None)
+    if stats is not None:
+        stats.save()
     with source._workers_lock:
         readers, source._workers = source._workers, []
     for reader in readers:

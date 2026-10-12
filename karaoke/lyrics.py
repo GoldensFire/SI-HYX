@@ -108,11 +108,17 @@ class LyricSites:
                         partial = partial or result
                 self._record(provider, "no_match", title, artist)
             except Exception as error:
+                import json
                 import requests
-                if (getattr(getattr(error, "response", None), "status_code", 0) == 403
-                        or isinstance(error, (requests.ConnectionError, requests.Timeout))):
+                # Не JSON вместо ответа API (uta_net: «Expecting value», дважды
+                # за прогон 9 октября) — сайт поменялся, а не песня не нашлась.
+                dead = (getattr(getattr(error, "response", None), "status_code", 0) == 403
+                        or isinstance(error, (requests.ConnectionError, requests.Timeout,
+                                              json.JSONDecodeError)))
+                if dead:
                     self._blocked.add(provider.__name__)
-                self.log(f"Караоке: {provider.__name__}: {str(error)[:140]}")
+                self.log(f"Караоке: {provider.__name__}: {str(error)[:140]}"
+                         + (" — источник отключён до конца прогона." if dead else ""))
                 self._record(provider, "error", title, artist, reason=str(error)[:300])
                 uncertain = True
         return partial, uncertain

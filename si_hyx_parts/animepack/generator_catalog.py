@@ -602,11 +602,20 @@ class GeneratorCatalogMixin:
             start_manga_plan(self)
             streams.append((_api.MANGA_KIND, self._iter_manga_candidates(),
                             manga_need))
+        def songs_first():
+            # Песни — самый редкий род и самая длинная очередь (AnimeThemes в
+            # одно соединение, караоке): пока песенные места не заняты, поток
+            # аниме спрашивается первым. По весу 21 из 144 первый опенинг
+            # доходил до загрузки на 4-й минуте, караоке — к 13-й.
+            left = getattr(self, "_song_slots_left", None)
+            return ("anime",) if song_need and (left is None or left > 0) else ()
         yield from self._merge_streams(streams, self._closed_streams,
-                                       getattr(self, "_idle_streams", None))
+                                       getattr(self, "_idle_streams", None),
+                                       first=songs_first)
 
     @staticmethod
-    def _merge_streams(streams, closed=None, idle=None) -> _api.Iterator[_api.SongCandidate]:
+    def _merge_streams(streams, closed=None, idle=None,
+                       first=None) -> _api.Iterator[_api.SongCandidate]:
         """Тянет из нескольких потоков по очереди, взвешенной по их весам
         (тот же дележ Д'Ондта, что и у долей списков).
 
@@ -620,7 +629,10 @@ class GeneratorCatalogMixin:
         «поиск кандидатов», и ни одного вопроса они не дали).
 
         idle — ключи потоков, которые спрашиваются, только когда остальные
-        кончились: в отличие от closed, такой поток не теряется насовсем."""
+        кончились: в отличие от closed, такой поток не теряется насовсем.
+
+        first — функция, возвращающая ключи потоков, которые сейчас
+        спрашиваются раньше всех, мимо весов (см. songs_first)."""
         from .manga_plan_prefetch import PENDING
         live = [[key, it, float(weight), 0] for key, it, weight in streams
                 if weight > 0]
@@ -638,7 +650,9 @@ class GeneratorCatalogMixin:
                 _api.time.sleep(0.2)
                 waiting.clear()
                 continue
-            row = max(asked, key=lambda r: r[2] / (r[3] + 1))
+            urgent = first() if first is not None else ()
+            row = next((r for r in asked if r[0] in urgent), None) or max(
+                asked, key=lambda r: r[2] / (r[3] + 1))
             cand = next(row[1], None)
             if cand is None:
                 live.remove(row)

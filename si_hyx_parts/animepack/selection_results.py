@@ -26,8 +26,15 @@ def collect_finished(self, done, pending, accepted, counts, inflight, levels,
                          or getattr(cand, "_network_temporary", False))
             # Отвергнутый по средней сложности — не «не
             # скачалось»: медиа мы даже не трогали.
+            import time
+            # Сорвался на паузе проверок картинок Gemini — ждёт её конца, и
+            # это не считается попыткой: иначе пауза сжигала бы тайтлы.
+            paused = (getattr(cand, "_gemini_wait_until", 0.0) - time.monotonic()
+                      if temporary else 0.0)
             if getattr(cand, "_music_temporary", False):
                 self._late["временный отказ музыкального источника"] += 1
+            elif paused > 0:
+                self._late["пауза проверок Gemini — тайтл ждёт её конца"] += 1
             elif temporary:
                 self._late["временный сбой сети — тайтл отложен на повтор"] += 1
             elif getattr(cand, "_exact_waiting", False):
@@ -40,10 +47,12 @@ def collect_finished(self, done, pending, accepted, counts, inflight, levels,
             else:
                 self._failed_media += 1
             if reserve is not None and not getattr(cand, "_exact_waiting", False):
-                retries = getattr(cand, "_technical_retries", 0) + 1
+                retries = getattr(cand, "_technical_retries", 0) + (paused <= 0)
                 cand._technical_retries = retries
-                if temporary and retries <= 2:
-                    import time
+                if paused > 0:
+                    # Вразброс: после паузы первым идёт один пробный запрос.
+                    cand._retry_after = time.monotonic() + paused + self.rng.uniform(1, 30)
+                elif temporary and retries <= 2:
                     cand._retry_after = time.monotonic() + 60
                 reserve.park(cand, failed=not temporary or retries > 2)
             continue

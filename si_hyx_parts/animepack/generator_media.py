@@ -850,7 +850,12 @@ class GeneratorMediaMixin:
         args = ["-seekable", "0", "-rw_timeout", "10000000"] if network else []
         cmd = [_api.FFPROBE, "-v", "error"] + args + ["-show_entries", "format=duration",
                "-of", "default=noprint_wrappers=1:nokey=1", url]
-        with GATE.slot(self.stopped) if network else nullcontext():
+        from .generation_diagnostics import measuring
+        from .theme_http import WAITING
+        from .theme_stream import yielding
+        queue = yielding(self) if network else nullcontext()
+        gate = GATE.slot(self.stopped, measuring(self, WAITING)) if network else nullcontext()
+        with queue, gate:
             with self._video_lock:
                 code, out, _err = self._run_capture(cmd, timeout=60)
         try:

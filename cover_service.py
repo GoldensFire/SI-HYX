@@ -218,7 +218,7 @@ class CoverService:
                 while time.monotonic() < deadline:
                     if self.stopped():
                         return result
-                    time.sleep(min(0.25, deadline - time.monotonic()))
+                    time.sleep(max(0.0, min(0.25, deadline - time.monotonic())))
             return result
 
     def close(self):

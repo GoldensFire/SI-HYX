@@ -12,6 +12,9 @@ from .generation_priority import (
     set_thread_level, thread_level)
 
 
+YIELD_THREADS = 6
+
+
 class GenerationRuntime:
     def __init__(self, settings, stopped=lambda: False):
         self.settings = settings
@@ -29,6 +32,12 @@ class GenerationRuntime:
     @property
     def worker_capacity(self):
         return max(1, min(16, int(self.settings.parallel)))
+
+    @property
+    def pool_threads(self):
+        # Сверх лимита задач: песни, ждущие общую очередь AnimeThemes, отдают
+        # своё место (yielding), а их потоки стоят в очереди без дела.
+        return self.worker_capacity + YIELD_THREADS
 
     @property
     def active_encoders(self):
@@ -110,6 +119,32 @@ class GenerationRuntime:
         with self.condition:
             setattr(self, counter, getattr(self, counter) - 1)
             self.condition.notify_all()
+
+    @contextmanager
+    def yielding(self):
+        """Сетевое ожидание без места рабочей задачи.
+
+        Ролики AnimeThemes качаются строго по одному, и песни часами (сумма по
+        задачам) ждали очередь, занимая шесть из восьми мест: манга и отрывки
+        серий тем временем стояли в «ожидании свободного потока»."""
+        if (not getattr(self.local, "selection_task", False)
+                or getattr(self.local, "yielded", False)):
+            yield
+            return
+        self._release("active_tasks")
+        self.local.yielded = True
+        try:
+            yield
+        finally:
+            self.local.yielded = False
+            try:
+                self._acquire("active_tasks", lambda: parallel_limit(self.settings),
+                              selection=True)
+            except BaseException:
+                # wrap_task всё равно вернёт место: возвращаем ему, что вернуть.
+                with self.condition:
+                    self.active_tasks += 1
+                raise
 
     def wrap_task(self, function):
         @wraps(function)

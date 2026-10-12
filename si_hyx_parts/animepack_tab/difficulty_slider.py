@@ -6,6 +6,33 @@ from __future__ import annotations
 import animepack_tab as _api
 
 
+class _JumpSlider(_api.QSlider):
+    """QSlider, у которого клик по дорожке ставит ручку прямо в точку клика.
+
+    Обычный QSlider сдвигается на pageStep к курсору: на трёх положениях
+    приоритета клик по «Низкому» с «Высокого» доводил только до «Обычного»."""
+
+    def mousePressEvent(self, event):
+        if event.button() != _api.Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(event)
+        from PyQt6.QtWidgets import QStyle, QStyleOptionSlider
+        opt = QStyleOptionSlider()
+        self.initStyleOption(opt)
+        style = self.style()
+        handle = style.subControlRect(QStyle.ComplexControl.CC_Slider, opt,
+                                      QStyle.SubControl.SC_SliderHandle, self)
+        pos = event.position().toPoint()
+        if not handle.contains(pos):
+            groove = style.subControlRect(QStyle.ComplexControl.CC_Slider, opt,
+                                          QStyle.SubControl.SC_SliderGroove, self)
+            span = max(1, groove.width() - handle.width())
+            x = pos.x() - groove.x() - handle.width() // 2
+            self.setValue(QStyle.sliderValueFromPosition(
+                self.minimum(), self.maximum(), x, span, opt.upsideDown))
+        # Дальше штатная обработка: ручка уже под курсором, её можно тянуть.
+        super().mousePressEvent(event)
+
+
 class DifficultySlider(_api.QWidget):
     """QSlider с интерфейсом значения, совместимым с прежним QSpinBox."""
 
@@ -15,7 +42,7 @@ class DifficultySlider(_api.QWidget):
         super().__init__(parent)
         self._special = ""
         self._suffix = ""
-        self.slider = _api.QSlider(_api.Qt.Orientation.Horizontal)
+        self.slider = _JumpSlider(_api.Qt.Orientation.Horizontal)
         self.slider.setRange(int(minimum), int(maximum))
         self.slider.setSingleStep(1)
         self.slider.setPageStep(max(1, (int(maximum) - int(minimum)) // 10))

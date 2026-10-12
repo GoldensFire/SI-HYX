@@ -8,7 +8,7 @@ import hashlib
 
 import animepack as api
 from gemini_api import (GeminiAuthError, GeminiCoolingError, GeminiDownError, GeminiError,
-                        GeminiQuotaError)
+                        GeminiQuotaError, GeminiUnavailableError)
 from .manga_visual_check import _prepare, titles
 from .visual_batch import request
 
@@ -134,6 +134,9 @@ def select(generator, candidate):
                     generator._drop_kind(api.STUDIO_KIND)
                 return None
             except Exception as error:  # noqa: BLE001 — без дорогих повторов
+                if isinstance(error, GeminiUnavailableError):
+                    from .media_transfer import trouble_mark
+                    trouble_mark()  # таймаут или 503 — тайтл повторится позже
                 generator._log_rare("Проверка кадра Gemini", str(error))
                 return None
             if not verdict["accept"] or (studio and not verdict["has_characters"]):

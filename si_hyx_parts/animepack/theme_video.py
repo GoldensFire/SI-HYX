@@ -9,7 +9,12 @@ import tempfile
 import animepack as api
 from .generation_diagnostics import operation
 from .theme_http import download, SourceError, Stopped
-from .theme_stream import remote_encode
+from .theme_stream import UNSUPPORTED, brief, remote_encode, yielding
+
+# Обрыв копии отрезка — сбой передачи, а не свойство файла: повтор копии
+# (те же ~15 с, один GET) дешевле целого ролика на 1,5 минуты. Исходник
+# целиком качается, только если оборвались все попытки.
+COPY_ATTEMPTS = 3
 
 
 @operation("скачивание")
@@ -31,7 +36,7 @@ def complete_output(generator, path, expected):
     except (TypeError, ValueError, AttributeError):
         return False, "не удалось проверить готовый ролик"
     if code or not {"video", "audio"} <= kinds:
-        return False, error.strip()[:160] or "в ролике отсутствует видео или звук"
+        return False, brief(error, "в ролике отсутствует видео или звук")
     if not math.isfinite(seconds) or seconds <= 0 or seconds < max(0.0, expected - .3):
         return False, f"ролик оборвался: {seconds:.2f} с вместо {expected:.2f} с"
     if seconds > expected + .6:
@@ -43,7 +48,7 @@ def complete_output(generator, path, expected):
         [api.FFMPEG, "-v", "error", "-xerror", "-i", str(path), "-f", "null", "-"],
         timeout=90)
     if code or error.strip():
-        return False, error.strip()[:160] or "готовый ролик не декодируется"
+        return False, brief(error, "готовый ролик не декодируется")
     return True, ""
 
 
@@ -74,7 +79,7 @@ def encode(generator, candidate, source, final):
         if broken:
             error = "поток AnimeThemes оборвался до конца ролика"
         final.unlink(missing_ok=True)
-    return False, error.strip()[:160] or "пустой файл"
+    return False, brief(error, "пустой файл")
 
 
 def download_video(generator, candidate):
@@ -88,18 +93,24 @@ def download_video(generator, candidate):
     candidate.video_url = url
     final = Path(generator.folder) / "Video" / candidate.video_out
     try:
-        good, error = remote_encode(generator, candidate, url, final, complete_output)
-        if good:
-            candidate.has_video = candidate.theme_video_ready = True
-            return True
-        if generator.stopped():
-            return False
+        for attempt in range(1, COPY_ATTEMPTS + 1):
+            good, error = remote_encode(generator, candidate, url, final, complete_output)
+            if good:
+                candidate.has_video = candidate.theme_video_ready = True
+                return True
+            if generator.stopped():
+                return False
+            if error == UNSUPPORTED or attempt == COPY_ATTEMPTS:
+                break
+            generator.log(f"AnimeThemes: {error}. Повторяю копию отрезка для "
+                          f"«{candidate.title_ru}» ({attempt + 1}/{COPY_ATTEMPTS}).")
         generator.log(f"AnimeThemes: {error}. Скачиваю исходник целиком "
                       f"для «{candidate.title_ru}».")
         # This directory is created under the generator's own temporary workspace.
         with tempfile.TemporaryDirectory(prefix="theme_", dir=generator.folder) as folder:
             source = Path(folder) / "source.webm"
-            source_file(generator, url, source)
+            with yielding(generator):
+                source_file(generator, url, source)
             good, error = encode(generator, candidate, source, final)
             if good:
                 candidate.has_video = candidate.theme_video_ready = True

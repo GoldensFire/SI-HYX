@@ -2,6 +2,7 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """Подсказки при наведении: всплывающее окно и менеджер наведения. Public namespace: widgets."""
+import time
 import widgets as _api
 from PyQt6.QtGui import QCursor
 from .info_tip_frame import source_is_current
@@ -134,6 +135,12 @@ class _InfoTipPopup(_api.QLabel):
         self._place(global_point.x() + 16, global_point.y() + 18,
                     global_point.y() - 2, sg)
 
+    def hideEvent(self, event):
+        # Когда спрятана последняя подсказка: следующая в ближайшие секунды
+        # показывается без задержки (HoverTipManager.TIP_ASLEEP_MS).
+        self._hidden_at = time.monotonic()
+        super().hideEvent(event)
+
     def hide_for(self, widget):
         """Уход старого виджета не должен закрывать подсказку нового."""
         if self._anchor == id(widget):
@@ -197,6 +204,47 @@ def _enable_clear_button(ed) -> None:
 _enable_clear_button.__module__ = _api.__name__
 _api._enable_clear_button = _enable_clear_button
 
+def _widen_truncated_combo(combo) -> None:
+    """Обрезанному выпадающему списку — свободную ширину рядом с ним.
+
+    Компактные списки (политика Ignored или Preferred при подгонке под
+    короткую длину) не растут дальше своей подсказки, а в сетке колонку
+    вдобавок держит максимум соседнего счётчика: длинный пункт («Русские
+    обязательны») резался, хотя рядом с подписью оставалось пустое место
+    (просьба пользователя). Такой список переводим в Expanding — минимум
+    остаётся прежним, поэтому в тесном месте ничего не распирает, а там, где
+    места достаточно, текст виден целиком. Трогаем только реально
+    обрезанные списки."""
+    try:
+        policy = combo.sizePolicy()
+        horizontal = policy.horizontalPolicy()
+        if horizontal.value & _api.QSizePolicy.PolicyFlag.ExpandFlag.value:
+            return
+        parent = combo.parentWidget()
+        if parent is None or parent.layout() is None                 or parent.layout().indexOf(combo) < 0:
+            return
+        fm = combo.fontMetrics()
+        text = max((fm.horizontalAdvance(combo.itemText(i))
+                    for i in range(min(combo.count(), 64))), default=0)
+        opt = _api.QStyleOptionComboBox()
+        combo.initStyleOption(opt)
+        need = combo.style().sizeFromContents(
+            _api.QStyle.ContentsType.CT_ComboBox, opt,
+            _api.QSize(text, fm.height()), combo).width()
+        if combo.width() >= need:
+            return
+        if horizontal == _api.QSizePolicy.Policy.Ignored:
+            # Ignored не смотрел на минимум вовсе: явная единица сохраняет
+            # прежнюю способность сжиматься в узкой колонке.
+            combo.setMinimumWidth(max(1, combo.minimumWidth()))
+        policy.setHorizontalPolicy(_api.QSizePolicy.Policy.Expanding)
+        combo.setSizePolicy(policy)
+    except Exception:
+        pass
+
+_widen_truncated_combo.__module__ = _api.__name__
+_api._widen_truncated_combo = _widen_truncated_combo
+
 class HoverTipManager(_api.QObject):
     """Глобальный фильтр событий: заменяет системные QToolTip на тот же
     стабильный фирменный попап, что и у значков ⓘ (_InfoTipPopup). QToolTip
@@ -205,11 +253,24 @@ class HoverTipManager(_api.QObject):
     курсора — без мерцания. Достаточно установить на QApplication, и ВСЕ
     виджеты с setToolTip(...) автоматически получают стабильную подсказку."""
 
+    # Задержка как у обычных программ (и у самого QToolTip): подсказка
+    # появляется, когда курсор постоял на месте ~0.7 с. Если только что была
+    # видна другая подсказка, следующая показывается сразу — так водят мышью
+    # по ряду кнопок, читая подсказки подряд.
+    TIP_WAKE_MS = 700
+    TIP_ASLEEP_MS = 2000
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._hover_pos = None
         self._hover_version = 0
         self._last_pointer_timestamp = 0
+        self._wake_at = 0.0
+        self._wake_timer = _api.QTimer(self)
+        self._wake_timer.setSingleShot(True)
+        self._wake_version = 0
+        self._wake_timer.timeout.connect(
+            lambda: self._refresh_hover_tip(self._wake_version))
 
     @classmethod
     def _tip_at(cls, point):
@@ -251,6 +312,13 @@ class HoverTipManager(_api.QObject):
             if popup._hover_managed:
                 popup.hide()
             return
+        wait = self._wake_at - time.monotonic()
+        if wait > 0 and not popup.isVisible():
+            # Версия наведения — как у отложенного вызова: устаревший таймер
+            # (курсор ушёл, открылся список) подсказку уже не покажет.
+            self._wake_version = version
+            self._wake_timer.start(max(1, int(wait * 1000) + 1))
+            return
         if is_item:
             if not (popup.isVisible() and popup._anchor == id(owner)
                     and popup.text() == text):
@@ -284,6 +352,12 @@ class HoverTipManager(_api.QObject):
         owner, text, _ = self._tip_at(point)
         self._hover_pos = point
         self._hover_version += 1
+        now = time.monotonic()
+        # Как в Qt: каждое движение заново заводит ожидание, пока подсказка
+        # не видна; сразу после другой подсказки ждать не нужно.
+        warm = (popup.isVisible() or now - getattr(popup, "_hidden_at", -1e9)
+                < self.TIP_ASLEEP_MS / 1000.0)
+        self._wake_at = now if warm else now + self.TIP_WAKE_MS / 1000.0
         if popup.isVisible() and (popup._anchor is not None or owner is not None):
             custom_here = (not popup._hover_managed and owner is None
                            and popup._source_ref is not None
@@ -322,6 +396,9 @@ class HoverTipManager(_api.QObject):
             if et == _api.QEvent.Type.Polish and isinstance(obj, _api.QLineEdit):
                 _api._enable_clear_button(obj)
                 return False
+            if et == _api.QEvent.Type.Resize and isinstance(obj, _api.QComboBox):
+                _api._widen_truncated_combo(obj)
+                return False
             # Шаг значения у спинбокса выделяет весь его текст (Qt делает
             # selectAll в stepBy) — и это выделение остаётся висеть синим, будто
             # в поле что-то редактируют, хотя фокус там даже не побывал: колесо
@@ -358,13 +435,17 @@ class HoverTipManager(_api.QObject):
                 # QHelpEvent can be delivered after the pointer has moved.
                 # It may only request a refresh; it must never choose or show
                 # the text itself. That happens after the event has finished.
+                # Сам ToolTip Qt шлёт уже после своей задержки — ждать дальше
+                # незачем.
                 current = obj
                 while current is not None:
                     if current.property("infoTipText") or current.toolTip():
+                        self._wake_at = 0.0
                         self._queue_hover_tip()
                         return True
                     current = current.parentWidget()
                 if self._item_tip(obj, ev.pos()):
+                    self._wake_at = 0.0
                     self._queue_hover_tip()
                     return True
                 return False

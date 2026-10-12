@@ -268,7 +268,8 @@ def explain_title(row, column: str = "") -> str:
                             media=str(row.get("media") or "anime"),
                             franchise_index=float(row.get("franchise_index")
                                                   or 0.0),
-                            favorites=int(row.get("favorites", -1)))
+                            favorites=int(row.get("lead_favorites",
+                                                  row.get("favorites", -1))))
     return index_tooltip.build_text(cand)
 
 

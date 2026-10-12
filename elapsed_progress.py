@@ -4,22 +4,23 @@ from __future__ import annotations
 import re
 import time
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QRectF, Qt, QTimer
 from PyQt6.QtGui import QColor, QFontMetricsF, QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import QProgressBar, QStyle, QStyleOptionProgressBar
 
 
-# Цвета подписи: время — акцентом, имя файла в конце (после «·») — приглушённо.
-_TEXT_COLOR = QColor("#f5f5ff")
-_TIME_COLOR = QColor("#f9e2af")
-_FILE_COLOR = QColor(186, 194, 222, 205)
-_OUTLINE = QColor(17, 17, 27, 150)
-_SHADOW = QColor(0, 0, 0, 90)
+# Подпись всегда белая с тонкой тёмной обводкой: читается и на пустой полосе,
+# и поверх заливки любого цвета (просьба пользователя).
+_TEXT_COLOR = QColor("#ffffff")
+_OUTLINE = QColor(10, 10, 18, 210)
+_TIME_PREFIX = re.compile(r"^\(\d[\d:]*\)\s*")
 _FILE_TAIL = re.compile(r"\.\w{2,5}$")
 # Справа в полосе лежит кнопка папки: поля текста одинаковые с обеих сторон,
 # чтобы подпись оставалась ровно по центру полосы.
 _SIDE_ROOM = 28
 
+# В простое полоса пустая: «Ожидание» в ней ничего не сообщает.
+_IDLE_TEXT = ("", "ожидание")
 _FINISHED_TEXT = ("ожидание", "готово", "ошибка", "отменено", "остановлено",
                   "не получилось", "файл удалён", "частичный пак")
 
@@ -38,7 +39,7 @@ class ElapsedProgressBar(QProgressBar):
         super().__init__(parent)
         self._started_at = None
         self._elapsed = 0.0
-        self._status = "Ожидание"
+        self._status = ""
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._refresh_text)
@@ -80,21 +81,18 @@ class ElapsedProgressBar(QProgressBar):
         return (self.format().replace("%p", str(percent))
                 .replace("%v", str(self.value())).replace("%m", str(total)))
 
+    def _idle(self):
+        text = _TIME_PREFIX.sub("", self._display_text())
+        return text.strip().rstrip(".…").casefold() in _IDLE_TEXT
+
     def _segments(self):
-        """[(текст, цвет)] подписи: «(06:31)», статус и приглушённое имя файла."""
+        """[(текст, цвет)] подписи; имя файла в конце (после «·») — отдельным
+        куском: если строка не влезает, ужимается сначала оно."""
         text = self._display_text()
-        out = []
-        match = re.match(r"^(\(\d[\d:]*\))\s", text)
-        if match:
-            out.append((match.group(1), _TIME_COLOR))
-            text = " " + text[match.end():]
         head, sep, tail = text.rpartition(" · ")
         if sep and _FILE_TAIL.search(tail.strip()):
-            out.append((head + sep, _TEXT_COLOR))
-            out.append((tail, _FILE_COLOR))
-        else:
-            out.append((text, _TEXT_COLOR))
-        return out
+            return [(head + sep, _TEXT_COLOR), (tail, _TEXT_COLOR)]
+        return [(text, _TEXT_COLOR)]
 
     def paintEvent(self, event):
         option = QStyleOptionProgressBar()
@@ -103,7 +101,7 @@ class ElapsedProgressBar(QProgressBar):
         painter = QPainter(self)
         self.style().drawControl(QStyle.ControlElement.CE_ProgressBar,
                                  option, painter, self)
-        if not self.isTextVisible():
+        if not self.isTextVisible() or self._idle():
             return
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
@@ -132,18 +130,19 @@ class ElapsedProgressBar(QProgressBar):
             path.addText(x, 0, font, text)
             paths.append((path, color))
             x += metrics.horizontalAdvance(text)
-        whole = QPainterPath()
-        for path, _ in paths:
-            whole.addPath(path)
-        bounds = whole.boundingRect()
-        dx = rect.center().x() - (x / 2.0)
-        dy = rect.center().y() - bounds.center().y()
+        # Центр — по дробной середине полосы и по высоте ЗАГЛАВНЫХ букв, а не
+        # по рамке набранного текста: у QRect.center() целочисленное деление
+        # поднимало подпись на пиксель, а рамка текста зависит от букв
+        # («д», «у» с хвостами тянули её вверх).
+        center = QRectF(self.rect()).center()
+        dx = center.x() - (x / 2.0)
+        dy = center.y() + metrics.capHeight() / 2.0
         painter.setClipRect(rect)
-        pen = QPen(_OUTLINE, 1.0)
+        # Перо шириной 2 видно снаружи буквы на 1 пиксель: заливка ложится
+        # поверх его внутренней половины.
+        pen = QPen(_OUTLINE, 2.0)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
         for path, color in paths:
             path.translate(dx, dy)
-            # Мягкая тень вниз и тонкий тёмный контур вместо толстой обводки.
-            painter.fillPath(path.translated(0, 1.2), _SHADOW)
             painter.strokePath(path, pen)
             painter.fillPath(path, color)

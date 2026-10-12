@@ -138,11 +138,10 @@ def test_a_dead_only_kind_is_closed_once_despite_inflight_workers():
     assert len(notices) == 1 and "96 шт." in notices[0]
 
 
-def test_preserved_composition_closes_a_dead_kind_without_stopping():
-    """«Сохранять состав»: места умершего рода пустеют, но пак не рвётся.
-
-    Раньше здесь летела ошибка, и недоступный Pixiv обрывал пак на третьем
-    вопросе из 144."""
+def test_preserved_composition_gives_a_failed_service_kind_to_the_rest():
+    """«Сохранять состав»: род, отключённый отказом сервиса (_drop_kind), не
+    рвёт пак и не оставляет дыру — его места отдаются живым родам (пак № 130:
+    46 пустых мест из 144 после минутного сбоя Gemini)."""
     lines = []
     gen = _gen(pct_songs=0, pack_anagram=True, pct_anagram=50,
                pack_plot=True, pct_plot=50, gemini_key="k",
@@ -151,6 +150,23 @@ def test_preserved_composition_closes_a_dead_kind_without_stopping():
     quotas = gen.s.question_quotas
     counts, inflight = Counter({PLOT_KIND: 2}), Counter({PLOT_KIND: 1})
     gen._drop_kind(PLOT_KIND)
+    gen._share_out_dead(quotas, counts, inflight)
+    assert quotas[PLOT_KIND] == 3 and quotas[ANAGRAM_KIND] == 45
+    assert not gen._closed_kinds
+    assert any("отдаю остальным" in line for line in lines)
+
+
+def test_preserved_composition_closes_a_spent_kind_without_stopping():
+    """«Сохранять состав»: места рода с вычерпанным каталогом пустеют, но пак
+    не рвётся. Раньше здесь летела ошибка, и пак обрывался на третьем вопросе."""
+    lines = []
+    gen = _gen(pct_songs=0, pack_anagram=True, pct_anagram=50,
+               pack_plot=True, pct_plot=50, gemini_key="k",
+               rounds=1, themes=1, questions=48, preserve_composition=True)
+    gen._log = lines.append
+    quotas = gen.s.question_quotas
+    counts, inflight = Counter({PLOT_KIND: 2}), Counter({PLOT_KIND: 1})
+    gen._spend_kind(PLOT_KIND)
     gen._share_out_dead(quotas, counts, inflight)
     assert quotas[PLOT_KIND] == 3 and quotas[ANAGRAM_KIND] == 24
     assert gen._closed_kinds == {PLOT_KIND: 21}

@@ -23,15 +23,18 @@ def _compact_numeric_fields(tab):
             field.setMaximumWidth(112)
 
 def _remember_if_complete(self, result, wanted):
-    """В «не повторять» сам попадает только полный пак.
+    """В «не повторять» попадает каждый собранный пак, даже недобранный.
 
-    Обрубок после ошибки или остановки тоже добавлялся — и его франшизы
-    выпадали из следующих паков, хотя его обычно пересобирают, а не играют."""
+    Пак, где не хватило части вопросов (или упакованный после ошибок), всё
+    равно сохранён и будет сыгран: в очереди из нескольких паков следующие
+    не должны повторять ни его франшизы, ни его вопросы (просьба
+    пользователя). Не добавляется только пак, остановленный вручную, — его
+    обычно пересобирают, а не играют."""
     if not wanted or not result.path:
         return
-    if result.cancelled or result.aborted or len(result.songs) < result.requested:
-        self.log("В исключения не добавлен: пак неполный. Если будете его "
-                 "играть, добавьте его в список вручную.")
+    if result.cancelled:
+        self.log("В исключения не добавлен: генерацию остановили. Если будете "
+                 "его играть, добавьте его в список вручную.")
         return
     self._remember_generated(result.path)
 
@@ -592,15 +595,29 @@ class AnimePackTab(
             self._progress(0, "Останавливаюсь…")
             self.btn_stop.setEnabled(False)
 
-    def _progress(self, pct: int, text: str) -> None:
+    def _progress(self, pct: int, text: str, done: int = 0, total: int = 0) -> None:
         """Своей полосы у вкладки нет — пишем в общую, внизу окна. Она же и
         строка состояния вкладки: отдельной подписи над таблицей больше нет."""
         if self.main is None or not hasattr(self.main, "update_global_progress"):
             return
+        running = self._task is not None or text == "Подготовка…"
         try:
             self.main.update_global_progress(
                 max(0, min(100, int(pct))), text, started_at=self._started_at,
-                running=self._task is not None or text == "Подготовка…")
+                running=running)
+        except Exception:
+            pass
+        if not running or text == "Останавливаюсь…":
+            return
+        # Общая полоса на 0 % убирает значок с панели задач, а генерация
+        # стоит на нуле минутами (каталог, первый вопрос) и на больших паках
+        # даёт 0 % ещё и после первого вопроса. Пока идёт работа, значок
+        # держим: точной долей по счётчику или «бегущим», пока счёта нет.
+        try:
+            if done > 0 and total > 0:
+                self.main.set_taskbar_progress(min(done, total), total)
+            else:
+                self.main.set_taskbar_progress(0, 0)
         except Exception:
             pass
 
@@ -621,7 +638,7 @@ class AnimePackTab(
         eta = self._eta(done, total)
         if eta:
             text += f" — осталось {eta}"
-        self._progress(int(done * 100 / total), text)
+        self._progress(int(done * 100 / total), text, done, total)
 
     def _eta(self, done: int, total: int) -> str:
         """Оценка остатка по средней скорости с начала генерации. Первые

@@ -13,7 +13,7 @@ from si_hyx_parts.animepack import theme_stream as stream, theme_video as video
 from si_hyx_parts.animepack.theme_http import Stopped
 
 
-HTTP_HELP = """+-initial_request_size -request_size -short_seek_size -multiple_requests
+HTTP_HELP = """+-seekable -initial_request_size -request_size -short_seek_size -multiple_requests
 -reconnect -reconnect_on_network_error -reconnect_on_http_error
 -reconnect_streamed -reconnect_delay_max -reconnect_max_retries
 -reconnect_delay_total_max -respect_retry_after
@@ -57,7 +57,7 @@ def test_http_capability_help_does_not_list_generic_rw_timeout():
                                 calls.append(a) or (0, HTTP_HELP, ""))
     args = stream.input_args(generator, "ffmpeg")
     assert args and "-rw_timeout" in args
-    assert args[args.index("-request_size") + 1] == str(4 * 1024 * 1024)
+    assert args[args.index("-seekable") + 1] == "0"
     assert stream.input_args(generator, "ffmpeg") == args
     assert len(calls) == 1
 
@@ -74,7 +74,7 @@ class Gate:
         self.active = False
 
     @contextmanager
-    def slot(self, stopped):
+    def slot(self, stopped, waiting=None):
         assert not self.active
         self.active = True
         try:
@@ -121,7 +121,11 @@ def test_validated_remote_success_needs_no_complete_transfer(remote_generator, t
     # Под шлюзом только копия отрезка из сети; AV1 кодируется уже с диска.
     def run(command, **kw):
         assert gate.active is ("-request_size" in command)
-        assert command[command.index("-ss") + 1] == "20"
+        # Копия из сети — с начала файла до start + отрезок + запас; режется уже с диска.
+        if gate.active:
+            assert "-ss" not in command and command[command.index("-t") + 1] == "37"
+        else:
+            assert command[command.index("-ss") + 1] == "20"
         Path(command[-1]).write_bytes(b"x" * (ap.MIN_VIDEO_BYTES + 1))
         return 0, ""
     generator._run_killable = run

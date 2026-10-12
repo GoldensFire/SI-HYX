@@ -19,7 +19,7 @@ from .episode_ru_client import RuEpisodeClient
 from .generation_diagnostics import measuring, operation
 from .episode_captions import allowed, prepare as prepare_captions, write as write_captions
 from . import episode_suitability
-from .episode_quality_policy import ReleaseQuality, minimum, output_height
+from .episode_quality_policy import ProviderQuality, ReleaseQuality, minimum, output_height
 from .episode_caption_policy import mode
 from .episode_scene_check import check as check_scene, initialize as initialize_scene
 from si_hyx_parts.kuhi.provider_policy import enabled
@@ -36,7 +36,10 @@ def error_text(error):
     # httpx дописывает к ошибке строку «For more information check: …» —
     # в журнале это вторая строка без смысла.
     text = re.split(r"\s*For more information check:", str(error))[0]
-    return " ".join(re.sub(r"https?://\S+", "[URL]", text).split())[:180]
+    text = " ".join(re.sub(r"https?://\S+", "[URL]", text).split())[:180]
+    # Исключение без текста (TimeoutError(), CancelledError) давало в журнале
+    # пустую причину: «animelib/animelib: ».
+    return text or type(error).__name__
 
 
 def missing_file(text):
@@ -152,17 +155,22 @@ def _download(self, candidate):
             catalog = episode_catalog(self.kuhi.episodes(aid, ctx, scope))
         episodes = list(catalog)
         self.rng.shuffle(episodes)
+        providers_quality = ProviderQuality()
         for episode in episodes[:EPISODE_ATTEMPTS]:
             if self.stopped() or time.monotonic() >= scope.deadline:
                 break
-            sources = _verified(self, playable(self.kuhi.streams(aid, episode, ctx, catalog[episode], scope), episode),
-                                final, scope, title, tally, min_height)
+            providers = providers_quality.providers(catalog[episode])
+            if not providers:
+                continue
+            sources = _verified(self, playable(self.kuhi.streams(aid, episode, ctx, providers, scope), episode),
+                                final, scope, title, tally, min_height, providers_quality)
             for stream in sources:
                 if time.monotonic() >= scope.deadline or self.stopped():
                     break
                 start = _try_cut(self, candidate, stream, final, scope)
                 if start is not None and _finish(self, candidate, aid, episode, stream, start, final, scope):
                     return True
+            providers_quality.finish_episode()
         skipped = quality.skipped
         self._log_rare("Отрывки серий", f"«{candidate.title_ru}»: пригодного 15-секундного отрывка ≥{min_height}p нет"
                        + (f" (релизов ниже {min_height}p пропущено в других сериях: {skipped})"
@@ -182,6 +190,13 @@ def _download(self, candidate):
         memory.save()
     final.unlink(missing_ok=True)
     return False
+
+
+def _variant(row):
+    """Источник, плеер и озвучка — без серии: ответ «нет дорожки» у неё общий."""
+    query = parse_qs(urlsplit(row.get("embed") or "").query)
+    voice = "/".join((query.get(name) or [""])[0] for name in ("token_movie", "translation"))
+    return f"{row.get('source')}/{row.get('player')}/{voice}"
 
 
 def _alloha_groups(rows):
@@ -226,7 +241,8 @@ def _russian(self, candidate, aid, ctx, final, scope, tally, min_height, quality
             for player in players:
                 if self.stopped() or time.monotonic() >= scope.deadline:
                     return False
-                found = [row for row in releases if row["player"] == player and not quality.low(row)]
+                found = [row for row in releases if row["player"] == player and not quality.low(row)
+                         and not memory.player_low(title, _variant(row))]
                 groups = _alloha_groups(found) if player == "alloha" else [[found]] if found else []
                 for group in groups:
                     for batch in (([row] for row in group) if player == "alloha" else group):
@@ -235,6 +251,10 @@ def _russian(self, candidate, aid, ctx, final, scope, tally, min_height, quality
                         try:
                             with measuring(self, "поиск источников"):
                                 sources = self.episode_ru.streams(batch, scope)
+                            for row in batch:
+                                # Точный тип: KeyError (тоже LookupError) — сбой разбора, а не ответ плеера.
+                                if not sources and type(row.get("_resolve_error")) is LookupError:
+                                    memory.mark_player_low(title, _variant(row))
                             sources = [dict(stream, episode=episode) for stream in sources]
                             for stream in _verified(self, sources, final, scope, title, tally, min_height,
                                                     quality):

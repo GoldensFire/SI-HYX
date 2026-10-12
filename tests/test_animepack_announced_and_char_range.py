@@ -41,4 +41,4 @@ def test_pack_title_level_has_one_decimal():
     rows = [SimpleNamespace(level=7), SimpleNamespace(level=7),
             SimpleNamespace(level=8), SimpleNamespace(level=7),
             SimpleNamespace(level=7)]
-    assert pack_summary.pack_title("Пак", 3, rows) == "Пак № 3 (Ур. 7.2)"
+    assert pack_summary.pack_title("Пак", 3, rows) == "Пак № 3 (Ур. 7.2 - 🔴Сложно)"

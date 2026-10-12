@@ -66,7 +66,8 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
 - **AnimePackTab** — [anime_pack_tab.py](si_hyx_parts/animepack_tab/anime_pack_tab.py):
   создание, применение настроек, запуск и итог; [tab_layout](si_hyx_parts/animepack_tab/tab_layout.py),
   [tab_options](si_hyx_parts/animepack_tab/tab_options.py), шаблоны —
-  [presets](si_hyx_parts/animepack_tab/presets.py), очередь —
+  [presets](si_hyx_parts/animepack_tab/presets.py) (встроенные «Лёгкий/Средний/Сложный» —
+  [default_presets](si_hyx_parts/animepack_tab/default_presets.py)), очередь —
   [generation_queue](si_hyx_parts/animepack_tab/generation_queue.py).
 - **UnifiedWindow** — [unified_window.py](si_hyx_parts/main/unified_window.py):
   создание окна, отложенные вкладки, IPC, закрытие;
@@ -121,6 +122,8 @@ Uta-Net Romaji и перенос времени — `karaoke/uta_net.py`, `karao
 `karaoke/lyric_versions.py`; непрерывный подтверждённый фрагмент —
 `karaoke/acoustic_excerpt.py`. Тестовый стенд — `tools/karaoke_generate.py`
 (`--untimed-lyrics-only --confirmed-excerpts 20`).
+Неймдроп (название тайтла в словах отрезка) — `karaoke/namedrop.py`; другой
+отрезок без названия ищет `karaoke_processing._without_namedrop`.
 Контрольные сохранения и перенос собственных подтверждённых роликов —
 `tools/karaoke_checkpoints.py`, `tools/karaoke_checkpoint_reuse.py`;
 проверка полной длительности внутри подтверждённых границ — `tools/karaoke_confirmed_verify.py`.
@@ -148,13 +151,18 @@ AnimeGO.online — `si_hyx_parts/animepack/episode_ru_animego.py`,
 
 Видео песен — `si_hyx_parts/animepack/song_video.py` (выбор и фактическая
 сводка роликов); галочка внутри «Песен» и перенос прежней доли видео —
-`si_hyx_parts/animepack_tab/song_video_controls.py`.
+`si_hyx_parts/animepack_tab/song_video_controls.py`. Рамка сложности AMQ
+опенингам/эндингам с видеорядом не мешает (`filter_song`,
+`video_ignores_difficulty`): такая песня идёт только в слот видеоряда
+(`song_video.video_only`, `EffectSlots.video_free`), без ролика вопроса нет.
+Название тайтла в кадре отрезка (OCR + Gemini для сомнительных кадров) и
+повтор другим отрезком — `animepack/theme_video_title.py`.
 Общие доли обычных песен, видеоряда, караоке и эффектов —
 `si_hyx_parts/animepack_tab/song_presentation_controls.py`: одна полоса с границами
 долей; слоты — `music_effects.py`.
-Общий прогрессбар — `elapsed_progress.py`: прошедшее время в скобках (акцентом),
-подпись по центру с тонким контуром и мягкой тенью, имя файла после «·»
-приглушено; обновление раз в секунду и остановка таймера при завершении.
+Общий прогрессбар — `elapsed_progress.py`: прошедшее время в скобках, подпись
+белая с тёмной обводкой, по центру высоты заглавных; в простое («Ожидание» или
+пусто) полоса без текста; обновление раз в секунду и остановка таймера при завершении.
 Средняя и её достижимость — `animepack/average_selection.py`, итог — `level_avg.py`.
 Разброс уровней вокруг средней (не одни пятёрки при цели 5): выбор тянется к
 нужному уровню ± случайный шаг (`SPREAD_WEIGHTS`, `aim_level`), а текущая
@@ -163,11 +171,19 @@ AnimeGO.online — `si_hyx_parts/animepack/episode_ru_animego.py`,
 Предупреждения вместо запрета SIQ — `animepack/pack_completion.py`; автоматическая
 упаковка после ошибок и резервные папки записи — `animepack/emergency_package.py`.
 Очередь 20 кандидатов — `candidate_source.py`; ранние проверки — `candidate_availability.py`.
+Песни с неизвестными таймингами, когда свободны одни слоты караоке, проверяются
+параллельно в запасе — `karaoke_probe.py`. Индекс Karaoke Mugen «MAL id → песни с
+таймингами» (раз в неделю, фоном) ставит такие тайтлы первыми в их уровне и
+придерживает их под караоке — `karaoke_catalog.py`. Пока песенные места не заняты,
+поток аниме спрашивается раньше остальных (`iter_candidates`, `songs_first`).
 План книг фоном — `manga_plan_prefetch.py`; тайтлы, отложенные до освобождения
 серии, — `AnimeCardFeed.held`; уступка средней ради полного пака — `average_selection.yields`.
 Выбор нужных уровней из всего сохранённого каталога до HTTP —
 `catalog_selection.py`; профили из карточек, франшиз и избранного —
-`catalog_profiles.py`. Для общей рамки `level_inventory.py` проверяет точную
+`catalog_profiles.py`; уровни всего каталога и совпадения книг с каталогами
+ReManga/MangaLib заготавливаются при «Обновить базу» — `catalog_levels.py`
+(`catalog_levels.json` рядом с базой), план книг учитывает доли изданий через
+`MangaMix.wants`. Для общей рамки `level_inventory.py` проверяет точную
 сумму уровней с учётом оставшегося запаса, чтобы ближайший кандидат не
 закрыл путь к целевой средней. Учитываются готовые вопросы и загрузки в работе.
 Добор сохранённой средней — `recovery_average.py`; короткий журнал — `run_log.py`.
@@ -248,6 +264,9 @@ RU-sub каталоги AnimeGO/YummyAnime/AnimeLIB — `animepack/episode_ru_*.
 Проверки картинок Gemini: [visual_batch](si_hyx_parts/animepack/visual_batch.py)
 собирает до четырёх параллельных проверок кадров, Pixiv и манги с одинаковой моделью
 в один запрос; каждый вердикт сопоставляется со своей картинкой по id.
+Молчание Gemini ставит проверки на паузу (`VisualPause`: 2, 5, 10 мин и пробный
+запрос; до конца прогона — только после 20 мин молчания); вопросы, которым
+нужна проверка, ждут конца паузы в запасе (`hold`, `_gemini_wait_until`).
 Выбор моделей — `animepack_tab/gemini_groups.py`: «Изображения»,
 «Сюжет/Диалоги», «Названия». Для визуальных проверок используется общий
 клиент; итог показывает назначение запросов и число изображений в пачках.
@@ -361,9 +380,17 @@ memo/история — [ru_popularity_store](si_hyx_parts/animepack/ru_populari
 по сохранённым метаданным —
 [manga_candidate_plan](si_hyx_parts/animepack/manga_candidate_plan.py).
 Курсоры читателей и общие сетевые ограничения —
-[manga_reader_pool](si_hyx_parts/animepack_api/manga_reader_pool.py);
+[manga_reader_pool](si_hyx_parts/animepack_api/manga_reader_pool.py)
+(геоблок закрывает один сервер картинок, а не весь источник);
+порядок источников внутри языка по их успешности на этом компьютере, 403 API и
+геоблок серверов на сутки — [manga_source_stats](si_hyx_parts/animepack_api/manga_source_stats.py)
+(файл `manga_source_stats.json` рядом с базой);
 резервирование адреса после параллельного поиска —
 [manga_parallel_page](si_hyx_parts/animepack/manga_parallel_page.py).
+Строка журнала на каждую попытку манги —
+[manga_attempt_trace](si_hyx_parts/animepack/manga_attempt_trace.py);
+запасная попытка на последние места манги —
+[manga_tail_hedge](si_hyx_parts/animepack/manga_tail_hedge.py).
 Поиск цельных полос рисунка —
 [manga_scene_prefilter](si_hyx_parts/animepack/manga_scene_prefilter.py);
 пачки вложенных ответов с отдельными id —
@@ -459,7 +486,9 @@ ID и имена героя сохраняются в манифесте; ста
 блоки частей с подсказками «как это собиралось» —
 [db_part_blocks.py](si_hyx_parts/animepack_tab/db_part_blocks.py), разбор
 кэша в строки — [db_rows.py](si_hyx_parts/animepack_tab/db_rows.py), сама
-таблица — [db_table_view.py](si_hyx_parts/animepack_tab/db_table_view.py),
+таблица — [db_table_view.py](si_hyx_parts/animepack_tab/db_table_view.py)
+(строки отдаются Qt по 200 и догружаются прокруткой — `fetchMore`; поиск только
+по Enter или кнопке),
 подсказка строки при наведении —
 [db_row_tip.py](si_hyx_parts/animepack_tab/db_row_tip.py) (пока попап показан,
 смена строки под курсором сразу меняет текст; разборы запоминаются), ПКМ
@@ -540,7 +569,8 @@ GraphQL-пачки — [shikimori_catalog](si_hyx_parts/animepack_api/shikimori_
 [generation_runtime.py](si_hyx_parts/animepack/generation_runtime.py), Windows API —
 [generation_priority.py](si_hyx_parts/animepack/generation_priority.py).
 Общие подсказки скрываются на время выбора в выпадающих списках —
-[hover_tips.py](si_hyx_parts/widgets/hover_tips.py). Каждая новая
+[hover_tips.py](si_hyx_parts/widgets/hover_tips.py); там же задержка показа
+0,7 с (`TIP_WAKE_MS`), сразу после другой подсказки — без неё. Каждая новая
 подсказка получает новое нативное окно: снова показанное окно Windows сначала
 выводит свой прошлый кадр, то есть чужую подсказку —
 [info_tip_frame.py](si_hyx_parts/widgets/info_tip_frame.py).

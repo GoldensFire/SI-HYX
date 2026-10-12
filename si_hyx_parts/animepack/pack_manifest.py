@@ -119,6 +119,27 @@ def read(path: str) -> dict:
     return {"roots": roots, "franchises": franchises}
 
 
+def created_label(path: str) -> str:
+    """Дата и время сборки пака строкой «10.10.2026 14:35» («» — не узнать).
+
+    Берётся время записи `content.xml` внутри архива: генератор пишет его
+    последним шагом сборки, и копирование файла его не меняет (в отличие от
+    даты изменения файла). У архива без такой записи — дата изменения файла."""
+    import datetime
+    import os
+    try:
+        with zipfile.ZipFile(path) as archive:
+            stamp = archive.getinfo("content.xml").date_time
+        return datetime.datetime(*stamp).strftime("%d.%m.%Y %H:%M")
+    except Exception:  # noqa: BLE001 — чужой или битый пак
+        pass
+    try:
+        return datetime.datetime.fromtimestamp(
+            os.path.getmtime(path)).strftime("%d.%m.%Y %H:%M")
+    except OSError:
+        return ""
+
+
 def read_studios(path: str) -> set[str]:
     """Студии вопросов из нашего манифеста; у старого/чужого пака пусто."""
     try:

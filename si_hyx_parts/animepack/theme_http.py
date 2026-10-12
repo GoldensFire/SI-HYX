@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 """Complete AnimeThemes transfers, shared pacing and interruptible cooldown."""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -12,6 +12,7 @@ import time
 import requests
 
 INTERVAL = 3.0
+WAITING = "ожидание очереди AnimeThemes"
 ATTEMPTS = 5
 MAX_BYTES = 256 * 1024 * 1024
 MAGIC = b"\x1a\x45\xdf\xa3"
@@ -40,17 +41,27 @@ class RequestGate:
         while self.clock() < self.next_request:
             if stopped():
                 raise Stopped("Загрузка AnimeThemes остановлена")
-            self.sleep(min(.1, self.next_request - self.clock()))
+            # Часы идут и между проверкой и вычитанием: без max(0, …) в
+            # sleep попадало отрицательное число, и песня терялась.
+            self.sleep(max(0.0, min(.1, self.next_request - self.clock())))
         if stopped():
             raise Stopped("Загрузка AnimeThemes остановлена")
 
     @contextmanager
-    def slot(self, stopped):
-        while not self.lock.acquire(timeout=.1):
-            if stopped():
-                raise Stopped("Загрузка AnimeThemes остановлена")
+    def slot(self, stopped, waiting=None):
+        # waiting — замер очереди: без него минуты ожидания шлюза в отчёте
+        # не видны (эндинг 7 мин, из них учтено полторы).
+        with waiting if waiting is not None else nullcontext():
+            while not self.lock.acquire(timeout=.1):
+                if stopped():
+                    raise Stopped("Загрузка AnimeThemes остановлена")
+            try:
+                self.wait(stopped)
+            except BaseException:
+                self.defer(self.interval)
+                self.lock.release()
+                raise
         try:
-            self.wait(stopped)
             yield
         finally:
             self.defer(self.interval)
@@ -131,7 +142,8 @@ def _download(session, url, target, stopped, log, tracker, gate):
     last = ""
     try:
         for attempt in range(ATTEMPTS):
-            with gate.slot(stopped):
+            measure = getattr(tracker, "measure", None)
+            with gate.slot(stopped, measure(WAITING) if measure else None):
                 delay = 0.0
                 try:
                     if tracker:

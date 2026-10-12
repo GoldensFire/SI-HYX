@@ -39,8 +39,17 @@ def numbered_title(title: str, number) -> str:
     return name if name.endswith(tail) else f"{name} {tail}"
 
 
-# Приписка бывает и целой («Ур. 7» у паков, собранных раньше), и с десятыми.
-_LEVEL_TAIL = re.compile(r"\s*\(Ур\.\s*\d+(?:[.,]\d+)?\)\s*$")
+# Приписка бывает и целой («Ур. 7» у паков, собранных раньше), и с десятыми,
+# и с меткой сложности («Ур. 4.3 - 🟡Нормально»).
+_LEVEL_TAIL = re.compile(r"\s*\(Ур\.\s*\d+(?:[.,]\d+)?(?:\s*-\s*[^()]*)?\)\s*$")
+
+# Метка сложности по средней пака (просьба пользователя): до 3.5 включительно —
+# лёгкий, до 5 включительно — обычный, выше — сложный.
+GRADES = ((3.5, "🟢Легко"), (5.0, "🟡Нормально"), (float("inf"), "🔴Сложно"))
+
+
+def grade(level: float) -> str:
+    return next(label for limit, label in GRADES if level <= limit)
 
 
 def average_level(songs) -> float:
@@ -59,16 +68,17 @@ def average_level(songs) -> float:
 
 def pack_title(title: str, number, songs, *, test_number=0,
                ignore_test_packs=False) -> str:
-    """«Сгенерировано в SI-HYX № 56 (Ур. 4.3)» — и внутри пака, и в имени файла.
+    """«Сгенерировано в SI-HYX № 56 (Ур. 4.3 - 🟡Нормально)» — и внутри пака,
+    и в имени файла.
 
-    Средняя сложность приписывается в конце (просьба пользователя): по списку
-    паков сразу видно, какой из них лёгкий, а какой трудный. Прежняя приписка
-    при пересборке заменяется, а не копится."""
+    Средняя сложность и её метка приписываются в конце (просьба пользователя):
+    по списку паков сразу видно, какой из них лёгкий, а какой трудный. Прежняя
+    приписка при пересборке заменяется, а не копится."""
     if ignore_test_packs and len(songs or ()) < TEST_LIMIT:
         return numbered_title("Тестовый", test_number)
     name = numbered_title(_LEVEL_TAIL.sub("", str(title or "")), number)
     level = average_level(songs)
-    return f"{name} (Ур. {level:.1f})" if name and level else name
+    return f"{name} (Ур. {level:.1f} - {grade(level)})" if name and level else name
 
 
 def composition_text(songs, settings, kind_titles: dict,

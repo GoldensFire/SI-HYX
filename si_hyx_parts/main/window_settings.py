@@ -295,6 +295,17 @@ class UnifiedWindowSettingsMixin:
         if save:
             try: self._save_settings_soon()
             except Exception: pass
+        # Вкладки прячут строки уже заданных ключей — пусть узнают о смене.
+        if not getattr(self, "_api_keys_notify_pending", False):
+            self._api_keys_notify_pending = True
+            _api.QTimer.singleShot(0, self._notify_api_keys_changed)
+
+    def _notify_api_keys_changed(self):
+        self._api_keys_notify_pending = False
+        refresh = getattr(getattr(self, "tab_animepack", None), "_refresh_api_key_buttons", None)
+        if refresh is not None:
+            try: refresh()
+            except Exception: pass
 
     def _open_settings_dialog(self, section=None):
         """section — имя раздела, к которому сразу перейти (например, «Ключи API»).
@@ -640,8 +651,8 @@ class UnifiedWindowSettingsMixin:
         chk_animepack.toggled.connect(self._set_animepack_tab_enabled)
         vexp.addWidget(chk_animepack)
         vexp.addWidget(hint(_api.icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
-                            + " Создание .siq «угадай аниме по песне». "
-                            "На основе ASPG (Leleath), с разрешения автора."))
+                            + " Собирает .siq по аниме и манге: песни, кадры, персонажи, "
+                            "отрывки, манга и арты. На основе ASPG (Leleath), с разрешения автора."))
         chk_ap_upgrade = _api.QCheckBox("Включить вкладку «Апгрейд пака»")
         chk_ap_upgrade.setChecked(
             bool(getattr(self, "_animepack_upgrade_tab_enabled", False)))
@@ -657,6 +668,7 @@ class UnifiedWindowSettingsMixin:
                 "лидерборд leaderboard рекорды никнеймы firebase счёт ник "
                 "collab coop совместная работа пак напарник соавтор реалтайм темы вопросы ответы дубли синхронизация "
                 "генерация аниме пак опенинг эндинг песни amq anisongdb myanimelist shikimori aspg угадайка siq "
+                "манга кадры персонажи отрывки серии караоке сакуга арты pixiv "
                 "апгрейд доводка спецвопросы с секретом ставка для себя варианты названий ромадзи синонимы "
                 "постер в ответе регистр написание названия заглавные буквы "
                 "сжать картинки avif вес пака мегабайт")

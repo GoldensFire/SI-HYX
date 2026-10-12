@@ -87,6 +87,11 @@ class IncludedPacksDialog(QDialog):
         text = os.path.basename(path) or path
         if not exists:
             text += "  (файл не найден)"
+        else:
+            from si_hyx_parts.animepack.pack_manifest import created_label
+            created = created_label(path)
+            if created:
+                text += f"  — собран {created}"
         item = QListWidgetItem(text)
         item.setData(Qt.ItemDataRole.UserRole, path)
         item.setToolTip(path)

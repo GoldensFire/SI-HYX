@@ -39,9 +39,10 @@ def test_poster_settings_survive_a_round_trip(qapp):
         # Ключ из старых настроек вкладки переезжает в общие настройки программы.
         assert other.main.get_api_key("tmdb") == "tmdb-key"
         assert other.chk_poster_cache.isChecked() is False
-        # Подпись и кнопка прячутся вместе с галочкой, кнопка ключа TMDB — нет.
+        # Подпись и кнопка прячутся вместе с галочкой; кнопка ключа TMDB
+        # прячется сама — ключ уже задан.
         assert other.lbl_poster_cache.isVisibleTo(other) is False
-        assert other.btn_tmdb_key.isVisibleTo(other) is True
+        assert other.btn_tmdb_key.isVisibleTo(other) is False
     finally:
         tab.cleanup()
         other.cleanup()

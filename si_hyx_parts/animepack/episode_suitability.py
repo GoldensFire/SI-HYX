@@ -80,7 +80,9 @@ class Suitability:
                    if isinstance(v, dict) and now - v.get("time", 0) < TTL.get(v.get("verdict"), 0)}
         titles = {k: v for k, v in (data.get("titles") or {}).items()
                   if isinstance(v, (int, float)) and now - v < TITLE_TTL}
-        return {"rules": RULES, "streams": streams, "titles": titles}
+        players = {k: v for k, v in (data.get("players") or {}).items()
+                   if isinstance(v, (int, float)) and now - v < TTL["low"]}
+        return {"rules": RULES, "streams": streams, "titles": titles, "players": players}
 
     def verdict(self, title, stream) -> str:
         key = f"{title}|{identity(stream)}"
@@ -113,6 +115,24 @@ class Suitability:
                 if player:
                     out.add(player)
         return out
+
+    def player_low(self, title, variant: str) -> bool:
+        """Озвучка плеера у тайтла уже отвечала «нет нужной дорожки»."""
+        with self._lock:
+            when = self.data.setdefault("players", {}).get(f"{title}|{variant}")
+        return bool(when) and time.time() - when < TTL["low"]
+
+    def mark_player_low(self, title, variant: str) -> None:
+        """Alloha: «нет японской дорожки с RU-субтитрами» — та же озвучка в
+        других сериях ответит так же. Раньше это проверялось браузером заново
+        на каждой серии и в каждом прогоне (три раза по ~20 с на тайтл)."""
+        if not title:
+            return
+        with self._lock:
+            self.data.setdefault("players", {})[f"{title}|{variant}"] = time.time()
+            self._dirty = True
+            self._revision += 1
+        self.save(force=False)
 
     def title_blocked(self, title, min_height=MIN_HEIGHT) -> bool:
         with self._lock:

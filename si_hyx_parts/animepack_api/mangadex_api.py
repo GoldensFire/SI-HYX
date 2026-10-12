@@ -334,7 +334,7 @@ class MangaDexApi:
                     self.last_chapter = str(chapter)
                     url = self.rng.choice(free)
                     index = urls.index(url)
-                    self.last_page_info = {"neighbors": [
+                    self.last_page_info = {"number": index + 1, "neighbors": [
                         {"url": urls[index + step], "offset": step} for step in (-1, 1)
                         if 0 <= index + step < len(urls)]}
                     return url

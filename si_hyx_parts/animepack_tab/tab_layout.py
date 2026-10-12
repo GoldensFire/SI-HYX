@@ -32,6 +32,24 @@ def _db_panel(self):
         return None
 
 
+def _api_key_label(button):
+    """Подпись слева от кнопки ключа в той же строке сетки (или None)."""
+    parent = button.parentWidget()
+    layout = parent.layout() if parent is not None else None
+    if not isinstance(layout, _api.QGridLayout):
+        return None
+    index = layout.indexOf(button)
+    if index < 0:
+        return None
+    row, col, _rows, _cols = layout.getItemPosition(index)
+    for left in range(col - 1, -1, -1):
+        item = layout.itemAtPosition(row, left)
+        widget = item.widget() if item is not None else None
+        if isinstance(widget, _api.QLabel):
+            return widget
+    return None
+
+
 class AnimePackTabLayoutMixin:
     """Генерация аниме-пака: панель настроек, группы, таблица результатов и стили."""
 
@@ -100,7 +118,9 @@ class AnimePackTabLayoutMixin:
     def _api_key_button(self, name: str, title: str) -> _api.QPushButton:
         """Вместо поля ввода — кнопка «задан / не задан», открывающая Настройки:
         один и тот же ключ нужен нескольким вкладкам, и место у него одно."""
-        btn = _api.QPushButton()
+        # Родитель сразу: _refresh_api_key_buttons зовёт setVisible(True) ещё
+        # до вставки в макет, и кнопка без родителя мелькала отдельным окном.
+        btn = _api.QPushButton(self)
         btn.setToolTip(f"{title} — открыть Настройки программы, раздел «Ключи API»")
         btn.clicked.connect(self._open_api_settings)
         if not hasattr(self, "_api_key_buttons"):
@@ -113,6 +133,13 @@ class AnimePackTabLayoutMixin:
         for btn, name, title in getattr(self, "_api_key_buttons", []):
             has = bool(self._api_key(name))
             btn.setText("задан" if has else "не задан — ввести")
+            # Заданный ключ — строку про него убираем вместе с подписью
+            # (просьба пользователя): вводить нечего, а сменить ключ можно в
+            # Настройках → «Ключи API».
+            btn.setVisible(not has)
+            label = _api_key_label(btn)
+            if label is not None:
+                label.setVisible(not has)
 
     def _build_settings_panel(self, body):
         # Правая колонка прокручивается отдельно: при низком окне шаблон,
@@ -732,7 +759,9 @@ class AnimePackTabLayoutMixin:
                     "Рамки ДВЕ и они независимы: опенинги с эндингами слушаются "
                     "верхней, OST — нижней. Сузили верхнюю и увидели в паке песню "
                     "со сложностью из старого диапазона — это OST, у него рамка "
-                    "своя (просьба пользователя).")
+                    "своя (просьба пользователя).\n"
+                    "Опенинги и эндинги с видеорядом рамку не соблюдают: их "
+                    "угадывают по картинке, а не по музыке.")
         for slider in (self.sp_diff_min, self.sp_diff_max,
                        self.sp_ost_diff_min, self.sp_ost_diff_max):
             slider.setToolTip(diff_tip)

@@ -40,8 +40,11 @@ def fits(generator, candidate, levels, kind=None, flying=(), selected=None):
         return average_fits(generator, candidate, levels, flying)
     # Каталог кончился, а пак не набран: полный пак важнее точной середины
     # (см. _take_level_bench). Строгой остаётся только своя средняя песен.
+    # Средняя, недостижимая уже по запасу каталога (CatalogPlan._check_reach), —
+    # тоже: ждать конца каталога ради неё бессмысленно.
     relaxed = (getattr(generator, "_level_relaxed", False)
-               or kind != ap.MANGA_KIND and getattr(generator, "_anime_level_relaxed", False))
+               or kind != ap.MANGA_KIND and getattr(generator, "_anime_level_relaxed", False)
+               or bucket in getattr(generator, "_unreachable_buckets", ()))
     if relaxed and yields(generator, kind):
         return True
     accepted = getattr(generator, "_selected_songs", ()) if selected is None else selected

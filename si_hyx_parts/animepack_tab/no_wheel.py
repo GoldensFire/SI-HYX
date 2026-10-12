@@ -50,8 +50,9 @@ class _ShareBar(_api.QWidget):
         self._keys: list[str] = []
         self._drag = -1
         self.setMinimumHeight(self.BAR_H + 20)
+        # Стрелка «влево-вправо» только над самой полосой (см. mouseMoveEvent):
+        # над легендой и вложенными галочками курсор обычный.
         self.setMouseTracking(True)
-        self.setCursor(_api.Qt.CursorShape.SizeHorCursor)
         if parts:
             self.set_parts(parts)
 
@@ -145,9 +146,21 @@ class _ShareBar(_api.QWidget):
         return max(0, min(100, int(round(x * 100.0 / w))))
 
     # ── мышь ──────────────────────────────────────────────────────────────
+    def _on_bar(self, pos) -> bool:
+        """Попадает ли точка в полосу с ручками (с запасом под их выступ)."""
+        grab = self._bar_rect().adjusted(-self.HANDLE_W, -4, self.HANDLE_W, 4)
+        return grab.contains(int(pos.x()), int(pos.y()))
+
+    def _sync_cursor(self, pos) -> None:
+        if self._drag >= 0 or self._on_bar(pos):
+            self.setCursor(_api.Qt.CursorShape.SizeHorCursor)
+        else:
+            self.unsetCursor()
+
     def mousePressEvent(self, e):
         cuts = self._cuts()
-        if not cuts:
+        if not cuts or not self._on_bar(e.position()):
+            e.ignore()
             return
         pct = self._pct_of(e.position().x())
         # Какую ручку двигать: ближнюю. При совпавших ручках (нулевая доля)
@@ -162,9 +175,11 @@ class _ShareBar(_api.QWidget):
     def mouseMoveEvent(self, e):
         if self._drag >= 0:
             self._move_to(self._pct_of(e.position().x()))
+        self._sync_cursor(e.position())
 
-    def mouseReleaseEvent(self, _e):
+    def mouseReleaseEvent(self, e):
         self._drag = -1
+        self._sync_cursor(e.position())
 
     def _move_to(self, pct: int) -> None:
         cuts = self._cuts()

@@ -96,7 +96,7 @@ def test_bad_certificate_pauses_immediately_without_disabling_tls_checks():
 
 def test_heavy_sources_leave_room_for_other_questions():
     assert capacity(ap.MANGA_KIND, 8) == 8
-    assert capacity(ap.EPISODE_KIND, 8) == 4
+    assert capacity(ap.EPISODE_KIND, 8) == 6
     assert capacity(ap.FRAME_KIND, 8) == 16
 
 

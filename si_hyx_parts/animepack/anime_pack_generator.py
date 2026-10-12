@@ -84,6 +84,8 @@ def _prepare(self, out_path):
     with self._timed("чтение чужих паков"):
         self.load_exclusions()
     _api.install_favorites_norms(self.db_cache)
+    from .catalog_levels import activate
+    activate(self)
     self.prepare_dirs()
 
 
@@ -476,6 +478,9 @@ class AnimePackGenerator(
         # аниме-вопросов, книги ещё отбираются под неё (см. _take_anime_bench).
         self._anime_level_relaxed = False
         self._anime_bench: list = []
+        # Корзины, чья средняя недостижима уже по запасу каталога
+        # (CatalogPlan._check_reach): их середина не сторожится с начала.
+        self._unreachable_buckets: set = set()
         self._level_benched = 0
         self._level_reused = 0
         # Списки заводятся по РЕЕСТРУ корзин, а не перечислением: «сюжет» добавили
@@ -544,6 +549,8 @@ class AnimePackGenerator(
         with self._warn_lock:
             n = self._warn_counts.get(tag, 0) + 1
             self._warn_counts[tag] = n
+        from .manga_attempt_trace import note
+        note(tag, message)
         if n > self.WARN_REPEATS:
             from diagnostic_logging import archive
             import re
@@ -832,6 +839,15 @@ class AnimePackGenerator(
         self.log(f"Сбор базы: {report['status']}; {total} карточек, "
                  f"{len(self._fr_parts)} франшиз; недоступных счётчиков "
                  f"{report['restricted']}, неизвестных {report['unknown']}.")
+        # Уровни всего каталога — один раз здесь, а не на старте каждой
+        # генерации (см. catalog_levels).
+        from .catalog_levels import rebuild as rebuild_levels
+        try:
+            with self._timed("заготовка уровней каталога"):
+                rebuild_levels(self)
+        except Exception as error:  # noqa: BLE001 — база уже собрана и сохранена
+            self.log(f"Уровни каталога не заготовлены: {error} — генерация "
+                     "посчитает их на старте, как раньше.")
         return total
 
     # ── всё вместе ────────────────────────────────────────────────────────
@@ -893,7 +909,11 @@ class AnimePackGenerator(
             return result
         finally:
             from .pack_completion import finish
-            finish(self, result, started, readable_log)
+            from .catalog_levels import deactivate
+            try:
+                finish(self, result, started, readable_log)
+            finally:
+                deactivate()
 
     def assemble(self, songs: list, out_path, result) -> None:
         """Готовые вопросы → .siq: проверка средней, списки, авторы, упаковка."""
@@ -949,6 +969,8 @@ class AnimePackGenerator(
             result.log_path = str(readable_log.path)
             self.log(f"Собираю сохранённую попытку: {len(songs)} вопросов…")
             _api.install_favorites_norms(self.db_cache)
+            from .catalog_levels import activate
+            activate(self)
             import tempfile
             import shutil
             self.folder = tempfile.mkdtemp(prefix='si-hyx-rebuild-')
@@ -977,7 +999,11 @@ class AnimePackGenerator(
             after_error(self, songs, out_path, result, error)
         finally:
             from .pack_completion import finish
-            finish(self, result, started, readable_log)
+            from .catalog_levels import deactivate
+            try:
+                finish(self, result, started, readable_log)
+            finally:
+                deactivate()
         # Retain the original snapshot until the user removes it; another retry
         # must remain possible even after publishing the verified archive.
         return result

@@ -15,6 +15,10 @@ def describe(generator):
     generator.log(f"Комиксы: манга {manga}, манхва {mix.kind_target['manhwa']}, "
                   f"маньхуа {mix.kind_target['manhua']}; "
                   f"строгие цели {'включены' if settings.manga_strict_targets else 'выключены'}.")
+    stats = getattr(getattr(getattr(generator, "mangadex", None), "_health", None), "stats", None)
+    if stats is not None:
+        from si_hyx_parts.animepack_api.manga_reader_base import SOURCE_LABELS
+        generator.log(stats.summary([key for key, _ in generator.mangadex.clients], SOURCE_LABELS))
     client = generator.gemini_manga
     if client is not None:
         board = getattr(client, "board", None)

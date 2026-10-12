@@ -52,10 +52,17 @@ class MangaPageSources:
 
     def _order(self, cache_key):
         languages = [self.language] if self.language else ["ru", "en", "uk"]
+        stats = self._health.stats
         for language in languages:
             groups = ([("remanga", "mangalib"), ("mangadex", "mangafire")]
                       if language == "ru" else
                       [("mangadex", "mangafire", "comix", "weebcentral")])
+            if stats is not None:
+                # Язык по-прежнему решает первым (русская страница прежде
+                # английской), а внутри языка — успешность на этом компьютере:
+                # с IP вне СНГ ReManga отдаёт страницу одному тайтлу из десяти.
+                groups = [tuple(sorted((key for group in groups for key in group),
+                                       key=stats.score, reverse=True))]
             for tier, group in enumerate(groups):
                 clients = [(key, client) for key in group
                            for name, client in self.clients if name == key
@@ -72,7 +79,7 @@ class MangaPageSources:
         self.last_client = None
         self.last_language = ""
         cache_key = (str(card.get("malId") or ""), tuple(names(card)))
-        failed = set()
+        failed, asked = set(), set()
         for key, client, language, cursor, group in self._order(cache_key):
             if key in self._disabled or key in failed or not self._health.provider_available(key):
                 continue
@@ -87,9 +94,9 @@ class MangaPageSources:
                     self._disabled.add(key)
                     # 403 API выключает источник всем рабочим потокам: прежде
                     # каждый поток после 90 с паузы снова получал тот же 403
-                    # (Comix.to — 33 отказа за прогон).
+                    # (Comix.to — 33 отказа за прогон). Теперь и на сутки вперёд.
                     if isinstance(exc, MangaSourceBlocked):
-                        self._health.disable_provider(key)
+                        self._health.blocked(key, "HTTP 403 у API")
                     else:
                         self._health.defer_provider(key)
                 self.last_errors.append(f"{SOURCE_LABELS[key]}: {exc}")
@@ -97,8 +104,14 @@ class MangaPageSources:
             finally:
                 client.language = original
             self._failures[key] = 0
+            asked.add(key)
             if not url:
                 continue
+            # Тайтл засчитывается источнику один раз, на всех языках вместе.
+            # MangaDex качает генератор сам: найденная страница и есть успех.
+            asked.discard(key)
+            self._health.tried(key, True, page=key == "mangadex")
+            self._record_misses(asked)
             self.last_source = SOURCE_LABELS[key]
             self.last_language = language
             self.last_chapter = str(getattr(client, "last_chapter", "") or "")
@@ -114,4 +127,9 @@ class MangaPageSources:
             index = next(i for i, (name, _) in enumerate(group) if name == key)
             self._next[cursor] = (index + 1) % len(group)
             return url
+        self._record_misses(asked)
         return ""
+
+    def _record_misses(self, keys):
+        for key in keys:
+            self._health.tried(key, False)

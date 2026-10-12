@@ -155,8 +155,8 @@ def test_emergency_package_keeps_karaoke_subtitles_and_episodes(tmp_path):
     assert '"episode": 3' in extras["episodes.json"]
 
 
-# ── в исключения — только полный пак ──────────────────────────────────────────
-def test_only_a_complete_pack_goes_to_exclusions():
+# ── в исключения — любой собранный пак, кроме остановленного ──────────────────
+def test_underfilled_pack_still_goes_to_exclusions():
     import animepack_tab  # noqa: F401 — части грузит публичный модуль
     from si_hyx_parts.animepack_tab.anime_pack_tab import _remember_if_complete
     remembered, lines = [], []
@@ -165,9 +165,10 @@ def test_only_a_complete_pack_goes_to_exclusions():
     _remember_if_complete(tab, ap.PackResult(path="a.siq", songs=songs, requested=4), True)
     _remember_if_complete(tab, ap.PackResult(path="b.siq", songs=songs, requested=3,
                                              aborted=True), True)
-    _remember_if_complete(tab, ap.PackResult(path="c.siq", songs=songs, requested=3), True)
-    assert remembered == ["c.siq"]
-    assert len(lines) == 2 and "вручную" in lines[0]
+    _remember_if_complete(tab, ap.PackResult(path="c.siq", songs=songs, requested=3,
+                                             cancelled=True), True)
+    assert remembered == ["a.siq", "b.siq"]
+    assert len(lines) == 1 and "вручную" in lines[0]
 
 
 # ── средняя уступает ради полного пака — с предупреждением ───────────────────

@@ -13,6 +13,9 @@ IMPORTANT = ('Отобрано вопросов:', 'Средняя сложно�
              'Оставшиеся места', 'Добор по', 'Добор средней:', 'Средняя исправлена:',
              'Каверы отключились', 'Исправляю среднюю', 'Подбор по базе:')
 
+# Построчные следы попыток: только в файл и без повторного счёта причин.
+TRACE = ('Попытка манги',)
+
 
 class RunLog:
     def __init__(self, callback, directory=None):
@@ -25,6 +28,7 @@ class RunLog:
         self.hidden = Counter()
         self.last_done = -10
         self.last_progress = 0
+        self.file_done, self.file_written = None, 0.0
         self.callback('Генерация началась. Подробности записываются в отдельный журнал.')
 
     def emit(self, message):
@@ -37,12 +41,24 @@ class RunLog:
             self.stream.flush()
             if message.startswith(IMPORTANT) or 'Пак не сохранён:' in message:
                 self.callback(message)
+            elif message.startswith(TRACE):
+                pass    # причина уже посчитана в исходной жалобе
             elif 'не найден' in message.casefold() or 'нет ' in message.casefold():
                 self.hidden['нет подходящего материала'] += 1
             elif any(word in message.casefold() for word in ('ошиб', 'отклон', 'не удалось', 'не скач')):
                 self.hidden['отказы источников и проверки качества'] += 1
 
     def progress(self, done, total, message):
+        # В файл — каждый новый готовый вопрос и раз в минуту без них, с тем,
+        # чем заняты потоки: по этим строкам видно, где прогон буксует.
+        with self.lock:
+            stamp = time.monotonic()
+            if not self.stream.closed and (done != self.file_done
+                                           or stamp - self.file_written >= 60):
+                self.file_done, self.file_written = done, stamp
+                self.stream.write(datetime.now().strftime('%H:%M:%S ')
+                                  + f'Готово {done}/{total}: {message or "подбор материала"}\n')
+                self.stream.flush()
         now = time.monotonic()
         if done == total or done >= self.last_done + 10 or now - self.last_progress >= 30:
             self.last_done, self.last_progress = done, now

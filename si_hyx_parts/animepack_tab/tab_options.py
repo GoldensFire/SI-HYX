@@ -674,13 +674,27 @@ class AnimePackTabOptionsMixin:
             self.btn_excl_clear.setEnabled(False)
             self.btn_excl_list.setEnabled(True)
             return
-        names = ", ".join(_api.os.path.basename(p) for p in self._exclude_siq[:3])
-        if n > 3:
-            names += f" и ещё {n - 3}"
+        names = self._first_packs(self._exclude_siq)
         self.lbl_excl_siq.setText(f"Не повторяю франшизы из {n} пак(ов): {names}")
-        self.lbl_excl_siq.setToolTip("\n".join(self._exclude_siq))
+        self.lbl_excl_siq.setToolTip("\n".join(
+            self._pack_entry(p, p) for p in self._exclude_siq))
         self.btn_excl_clear.setEnabled(True)
         self.btn_excl_list.setEnabled(True)
+
+    @staticmethod
+    def _pack_entry(path: str, name: str) -> str:
+        """Имя пака с датой и временем сборки: паки одной серии зовутся почти
+        одинаково, и отличить их можно только по тому, когда их собрали."""
+        from si_hyx_parts.animepack.pack_manifest import created_label
+        created = created_label(path) if _api.os.path.isfile(path) else ""
+        return f"{name} ({created})" if created else name
+
+    def _first_packs(self, paths) -> str:
+        names = ", ".join(self._pack_entry(p, _api.os.path.basename(p))
+                          for p in paths[:3])
+        if len(paths) > 3:
+            names += f" и ещё {len(paths) - 3}"
+        return names
 
     def _choose_exact_siq(self):
         paths, _ = _api.QFileDialog.getOpenFileNames(
@@ -701,7 +715,8 @@ class AnimePackTabOptionsMixin:
     def _refresh_exact_label(self):
         count = len(self._exclude_exact_siq)
         self.lbl_exact_siq.setText(
-            f"Не повторяю сами вопросы из {count} пак(ов)." if count else
+            f"Не повторяю сами вопросы из {count} пак(ов): "
+            f"{self._first_packs(self._exclude_exact_siq)}" if count else
             "Точные повторы из паков пока не исключаются.")
         self.lbl_exact_siq.setToolTip("")
         self.btn_exact_clear.setEnabled(bool(count))

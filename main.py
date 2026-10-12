@@ -60,6 +60,8 @@ install_diagnostic_logging()
 # QFFmpeg::…» в stderr. Глушим ТОЛЬКО этот шум, остальное пропускаем дальше.
 _QT_LOG_NOISE = (
     "disconnects from destroyed signal",
+    # Информационная строка QtMultimedia при первом создании плеера.
+    "Using Qt multimedia with FFmpeg version",
     # Безобидное предупреждение opus-декодера ffmpeg-бэкенда при паузе/возобновлении
     # воспроизведения во вкладке «Монтаж» — глушим, чтобы не пугать пользователя.
     "Could not update timestamps for skipped samples",

@@ -249,7 +249,7 @@ class UnifiedWindow(
         from elapsed_progress import ElapsedProgressBar
         self.pbar = ElapsedProgressBar()
         self.pbar.setTextVisible(True)
-        self.pbar.setFormat("Ожидание")
+        self.pbar.setFormat("")
         self.pbar.setFixedHeight(22)
 
         # Значок открытия — прямо поверх правого края полосы, без отдельной строки.

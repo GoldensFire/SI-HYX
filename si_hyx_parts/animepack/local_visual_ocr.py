@@ -39,7 +39,7 @@ def _models():
     root = root / "SI-HYX" / "rapidocr-3.9.2"
     root.mkdir(parents=True, exist_ok=True)
     common = {"Global.model_root_dir": str(root), "Global.use_cls": False,
-              "Global.log_level": "warning", "Det.thresh": .25,
+              "Global.log_level": "error", "Det.thresh": .25,
               "Det.box_thresh": .35}
     latin = RapidOCR(params={**common, "Det.ocr_version": OCRVersion.PPOCRV6,
                              "Det.model_type": ModelType.SMALL,

@@ -3,7 +3,7 @@ import animepack as ap
 
 
 class CachedProfiles:
-    def __init__(self, generator, manga=False):
+    def __init__(self, generator, manga=False, prefetch=True):
         self.generator = generator
         self.manga = manga
         target = 'manga' if manga else 'anime'
@@ -26,7 +26,11 @@ class CachedProfiles:
             self.screens = {str(c.get('id')): c for c in cache.all_cards('anime')}
             from .ru_popularity_store import service
             self.ru = service(generator)
-            self.ru.prefetch(self.cards.values())
+            # С заготовкой уровней (catalog_levels) профили строятся по одному,
+            # когда карточка дошла до очереди: читать базу наблюдений целиком
+            # (~5 с) незачем.
+            if prefetch:
+                self.ru.prefetch(self.cards.values())
 
     def flush(self):
         """Записать наблюдения, накопленные при обходе каталога."""
@@ -69,10 +73,10 @@ class CachedProfiles:
         return candidate
 
 
-def profiles(generator, manga=False):
+def profiles(generator, manga=False, prefetch=True):
     indexes = getattr(generator, '_catalog_profiles', None)
     if indexes is None:
         indexes = generator._catalog_profiles = {}
     if manga not in indexes:
-        indexes[manga] = CachedProfiles(generator, manga)
+        indexes[manga] = CachedProfiles(generator, manga, prefetch)
     return indexes[manga]

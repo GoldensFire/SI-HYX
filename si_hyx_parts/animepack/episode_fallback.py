@@ -3,12 +3,13 @@ from contextlib import closing
 import time
 
 from .episode_sources import episode_catalog, playable
-from .episode_quality_policy import minimum
+from .episode_quality_policy import minimum, ProviderQuality
 
 
 def native(generator, candidate, aid, ctx, final, scope, batches, tally=None):
     from .episode_generation import EPISODE_ATTEMPTS, _verified, _try_cut, _finish
     selected = []
+    quality = ProviderQuality()
     for batch in batches:
         catalog = episode_catalog(batch)
         names = ", ".join((batch.get("providers") or {}).keys())
@@ -21,14 +22,18 @@ def native(generator, candidate, aid, ctx, final, scope, batches, tally=None):
         for episode in numbers:
             if generator.stopped() or time.monotonic() >= scope.deadline:
                 return False
-            with closing(generator.kuhi.stream_batches(aid, episode, ctx, catalog[episode], scope)) as sources:
+            providers = quality.providers(catalog[episode])
+            if not providers:
+                continue
+            with closing(generator.kuhi.stream_batches(aid, episode, ctx, providers, scope)) as sources:
                 for streams in sources:
                     generator.log(f"Kuhi / AniList {aid}, серия {episode}: готовы потоки {len(streams)}.")
                     for stream in _verified(generator, playable(streams, episode), final, scope,
-                                            candidate.mal_id, tally, minimum(candidate)):
+                                            candidate.mal_id, tally, minimum(candidate), quality):
                         if generator.stopped() or time.monotonic() >= scope.deadline:
                             return False
                         start = _try_cut(generator, candidate, stream, final, scope)
                         if start is not None and _finish(generator, candidate, aid, episode, stream, start, final, scope):
                             return True
+            quality.finish_episode()
     return False

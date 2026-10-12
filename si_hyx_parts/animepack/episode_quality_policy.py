@@ -55,3 +55,30 @@ class ReleaseQuality:
             self.skipped += 1
             return True
         return False
+
+
+class ProviderQuality:
+    """Провайдеры Kuhi, у которых в проверенной серии все потоки ниже рамки.
+
+    Релиз провайдера один на все серии тайтла, как и у RU-каталогов (см.
+    ReleaseQuality). Раньше anikoto с 480p резолвился и проверялся в трёх
+    сериях подряд: «Трогательный комплекс» терял так 3 минуты, «Ди Грэй-мен» —
+    2,5. Провайдер, ответивший хоть одним годным или молчащим потоком, не
+    отсекается."""
+
+    def __init__(self):
+        self._episode: dict = {}
+        self._low: set = set()
+
+    def record(self, stream, verdict):
+        self._episode.setdefault(stream.get("provider"), set()).add(verdict)
+
+    def finish_episode(self):
+        """Итог серии: провайдеры, у которых проверенные потоки все «low»."""
+        self._low |= {name for name, verdicts in self._episode.items()
+                      if name and verdicts == {"low"}}
+        self._episode = {}
+
+    def providers(self, available):
+        """Провайдеры серии без уже проверенных как низкие."""
+        return {name: modes for name, modes in available.items() if name not in self._low}
