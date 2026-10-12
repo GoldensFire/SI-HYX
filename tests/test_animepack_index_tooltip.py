@@ -35,7 +35,9 @@ def test_index_tooltip_shows_one_compact_calculation():
 
 
 def test_index_tooltip_puts_the_series_into_the_same_formula():
-    cand = ap.SongCandidate(song=SONG, anime=CARD, kind="opening",
+    # Сериал — основная часть: ему засчитывается весь индекс серии
+    # (ответвлению — лишь часть, см. franchise_part_weight).
+    cand = ap.SongCandidate(song=SONG, anime=dict(CARD, kind="tv"), kind="opening",
                             franchise_index=9_000_000.0)
     text = index_tooltip.build_text(cand)
     assert "max(свой" in text and "серия 9 000 000" in text

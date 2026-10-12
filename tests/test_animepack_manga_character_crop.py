@@ -109,15 +109,17 @@ def test_media_uses_gemini_scene_and_keeps_its_chapter_link(generator):
         assert 245 <= picture.width < 280 and 390 <= picture.height < 440
 
 
-def test_unavailable_scene_scanner_does_not_generate_a_random_crop(generator):
+def test_ordinary_manga_without_scene_scanner_keeps_the_book_share(generator):
+    # Японской манге Gemini не нужен: длинная страница режется без выбора
+    # сцены, а книжная доля не закрывается (пак № 130: манга 6 из 16).
     gen = generator
     gen.s.manga_character_crop = True
     gen.gemini_manga = None
     gen._get_bytes = lambda *args, **kwargs: page()
     cand = ap.SongCandidate({}, make_anime(malId=656), kind=ap.MANGA_KIND,
                             media="manga")
-    assert not gen._fetch_media(cand)
-    assert not cand.has_frame and ap.MANGA_KIND in gen._dead_kinds
+    assert gen._fetch_media(cand)
+    assert cand.has_frame and ap.MANGA_KIND not in gen._dead_kinds
 
 
 @pytest.mark.parametrize("height", [600, 720, 1000, 1200])

@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
 """Редактируемые шаблоны лёгкого, среднего и сложного пака."""
 import animepack_tab
+from si_hyx_parts.animepack_tab.default_presets import DEFAULT_TEMPLATES
+
+
+def _levels(source, prefix=""):
+    get = source.get if isinstance(source, dict) else (
+        lambda key: getattr(source, key))
+    return tuple(get(f"{prefix}level_{part}") for part in ("min", "max", "avg"))
 
 
 def test_default_templates_apply_and_keep_pack_identity(qapp):
@@ -13,9 +20,9 @@ def test_default_templates_apply_and_keep_pack_identity(qapp):
         tab._apply_template()
         settings = tab.collect()
         assert settings.title == "Мой пак"
-        assert settings.difficulty_min == 65
-        assert (settings.level_min, settings.level_max, settings.level_avg) == (
-            1, 6, 3)
+        easy = DEFAULT_TEMPLATES["Лёгкий"]
+        assert settings.difficulty_min == easy["difficulty_min"]
+        assert _levels(settings) == _levels(easy)
     finally:
         tab.cleanup()
 
@@ -26,15 +33,15 @@ def test_hard_template_keeps_levels_above_eight_after_roundtrip(qapp):
         tab.cb_template.setCurrentText("Сложный")
         tab._apply_template()
         settings = tab.collect()
-        assert (settings.level_min, settings.level_max, settings.level_avg) == (
-            9, 15, 12)
+        hard = DEFAULT_TEMPLATES["Сложный"]
+        assert max(_levels(hard)) > 8
+        assert _levels(settings) == _levels(hard)
         for prefix in ("song", "studio", "char", "art", "manga", "plot"):
-            assert (getattr(settings, f"{prefix}_level_min"),
-                    getattr(settings, f"{prefix}_level_max"),
-                    getattr(settings, f"{prefix}_level_avg")) == (9, 15, 12)
+            assert (_levels(settings, f"{prefix}_")
+                    == _levels(hard, f"{prefix}_"))
         tab.apply_settings(tab.get_settings())
         assert (tab.sp_level_from.value(), tab.sp_level_to.value(),
-                tab.sp_level_avg.value()) == (9, 15, 12)
+                tab.sp_level_avg.value()) == _levels(hard)
     finally:
         tab.cleanup()
 

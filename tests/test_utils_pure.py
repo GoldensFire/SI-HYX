@@ -564,7 +564,10 @@ def _no_executable_literals(masked: str) -> bool:
     # убираем значение data-si и onload — там всё в base64/склейке, VK не видит
     stripped = re.sub(r'data-si="[^"]*"', '', masked)
     stripped = re.sub(r'onload="[^"]*"', '', stripped)
-    return not re.search(r'<script|\beval\b|\bfunction\b|Function|=>', stripped)
+    # Тег ищем подстрокой без учёта регистра, не регуляркой (CodeQL
+    # py/bad-tag-filter): VK режет и <SCRIPT>.
+    return ('<script' not in stripped.lower()
+            and not re.search(r'\beval\b|\bfunction\b|Function|=>', stripped))
 
 
 class TestMaskHtmlJsLite:

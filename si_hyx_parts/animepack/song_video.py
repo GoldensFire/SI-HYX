@@ -21,6 +21,10 @@ def video_only(settings, candidate) -> bool:
     if not song or getattr(candidate, "kind", "") not in ("opening", "ending"):
         return False
     import animepack as api
+    # Без мест под видеоряд исключения из рамки нет — песня пришла не через
+    # него, и «только ради видео» она быть не может.
+    if not api.video_ignores_difficulty(settings):
+        return False
     return not api.song_difficulty_allowed(song, settings)
 
 
