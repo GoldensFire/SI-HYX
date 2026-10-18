@@ -273,6 +273,9 @@ class PackSettings:
     manga_character_crop: bool = True
     manga_gemini_model: str = ""
     manga_title_check_mode: str = "gemini"  # gemini | local
+    # Кто проверяет картинки всего пака: gemini | ocr. «ocr» — только локальный
+    # OCR, ни одной визуальной проверки через Gemini (см. visual_mode).
+    visual_checker: str = "gemini"
     # Сколько процентов книжных вопросов должно достаться манге С АНИМЕ-
     # ЭКРАНИЗАЦИЕЙ. Такую книгу узнают по её сериалу, и вопрос выходит куда
     # легче неэкранизованной (просьба пользователя: доли задаются отдельно).
@@ -714,6 +717,10 @@ class PackSettings:
     def validate(self) -> list[str]:
         """Список проблем, из-за которых генерацию запускать бессмысленно."""
         problems: list[str] = []
+        from .visual_mode import MODES, ocr_only
+        ocr_visual = ocr_only(self)
+        if self.visual_checker not in MODES:
+            problems.append("Неизвестный способ проверки изображений.")
         if self.episode_subtitle_mode and self.episode_subtitle_mode not in ("none", "required", "preferred"):
             problems.append("Неизвестный режим субтитров отрывков серий.")
         if (self.mix_shares.get(_api.EPISODE_KIND) and self.episode_scene_check
@@ -805,7 +812,7 @@ class PackSettings:
             problems.extend(validate_pixiv_settings(self.pixiv_refresh_token))
             if self.pixiv_title_check_mode not in ("gemini", "local"):
                 problems.append("Неизвестный способ проверки названия артов Pixiv.")
-            if (getattr(self, "pixiv_gemini_check", True)
+            if (getattr(self, "pixiv_gemini_check", True) and not ocr_visual
                     and not str(self.gemini_key or "").strip()):
                 problems.append(
                     "Для визуальной проверки артов Pixiv нужен ключ Gemini. "
@@ -837,7 +844,7 @@ class PackSettings:
                                 "Выберите английский или любой язык глав.")
         if self.mix_shares.get(_api.MANGA_KIND) and self.manga_title_check_mode not in ("gemini", "local"):
             problems.append("Неизвестный способ проверки названия страниц манги.")
-        if (self.mix_shares.get(_api.MANGA_KIND)
+        if (self.mix_shares.get(_api.MANGA_KIND) and not ocr_visual
                 and (getattr(self, "manga_character_crop", True)
                      or (getattr(self, "manga_gemini_check", True)
                          and self.manga_title_check_mode == "gemini"))
@@ -847,12 +854,12 @@ class PackSettings:
                 "Введите ключ или отключите выбор сцен через Gemini и проверку "
                 "через Gemini в настройках манги.")
         from .frame_visual_check import enabled as frame_check_enabled
-        if (self.mix_shares.get(_api.STUDIO_KIND)
+        if (self.mix_shares.get(_api.STUDIO_KIND) and not ocr_visual
                 and not str(self.gemini_key or "").strip()):
             problems.append("Для студий нужен ключ Gemini: берутся только проверенные "
                             "кадры с персонажами. Введите ключ в настройках API.")
         if (any(self.mix_shares.get(kind) and frame_check_enabled(self, kind)
-                for kind in _api.FRAME_KINDS)
+                for kind in _api.FRAME_KINDS) and not ocr_visual
                 and not str(self.gemini_key or "").strip()):
             problems.append("Для проверки кадров нужен ключ Gemini. Введите ключ "
                             "или отключите проверку кадров через Gemini.")

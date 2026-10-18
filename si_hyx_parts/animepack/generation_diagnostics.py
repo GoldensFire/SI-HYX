@@ -123,6 +123,13 @@ class GenerationDiagnostics:
         log(f"Рабочие задачи: запрошено {generator.s.parallel}, "
             f"действующий лимит {limit}, максимум одновременно {self.peak}; "
             f"запущено {self.started}.")
+        priority_seconds = getattr(getattr(generator, "_runtime", None), "priority_seconds", None)
+        spent = priority_seconds() if callable(priority_seconds) else {}
+        if set(spent) - {"normal"}:
+            labels = {"low": "низкий", "normal": "обычный", "high": "высокий"}
+            log("Приоритет за прогон: " + ", ".join(
+                f"{labels.get(value, value)} {fmt(seconds)}"
+                for value, seconds in spent.items()) + ".")
         early = getattr(generator, "_early_repeats", 0)
         late = generator._late.get("тот же вопрос в выбранных паках", 0)
         log(f"Точные повторы: отсечено до подготовки медиа {early}, "

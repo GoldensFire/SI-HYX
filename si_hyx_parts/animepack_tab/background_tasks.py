@@ -36,11 +36,19 @@ class _GenTask(_api.QRunnable):
         self._runtime = GenerationRuntime(settings, lambda: self._stop)
 
     def set_priority(self, value):
-        if self._runtime.set_priority(value):
-            labels = {"low": "низкий", "normal": "обычный", "high": "высокий"}
-            self.signals.log.emit(
-                f"Приоритет текущей генерации: {labels.get(value, 'обычный')}; "
-                f"лимит кодировщиков AV1 {self._runtime.encoder_limit}.")
+        from si_hyx_parts.animepack.generation_priority import parallel_limit
+        labels = {"low": "низкий", "normal": "обычный", "high": "высокий"}
+        runtime = self._runtime
+        before = (labels.get(self.settings.generation_priority, "обычный"),
+                  parallel_limit(self.settings), runtime.encoder_limit)
+        if runtime.set_priority(value):
+            message = (f"Приоритет генерации: {before[0]} → {labels.get(value, 'обычный')}; "
+                       f"рабочих задач {parallel_limit(self.settings)} (было {before[1]}), "
+                       f"кодировщиков AV1 {runtime.encoder_limit} (было {before[2]}).")
+            # Через журнал генератора — строка попадает и в файл прогона: по ней
+            # видно, с какого момента генерация пошла медленнее.
+            gen = self._gen
+            (gen.log if gen is not None else self.signals.log.emit)(message)
 
     def stop(self):
         self._stop = True

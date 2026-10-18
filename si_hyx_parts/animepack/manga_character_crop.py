@@ -43,6 +43,11 @@ def crop(generator, cand, data: bytes, ext: str, *, manga_titles=()):
         if not is_vertical_strip(*opened.size) and not is_webtoon(cand):
             return data, ext
         picture = opened.convert("RGB")
+    from .visual_mode import ocr_only
+    if ocr_only(generator.s):
+        del picture
+        from .local_scene import crop as local_crop
+        return local_crop(generator, cand, data, ext)
     client = getattr(generator, "gemini_manga", None)
     if client is None:
         raise RuntimeError("Gemini для выбора сцены с персонажами недоступна")
@@ -161,6 +166,11 @@ def _frame(picture, windows, verdict, failures=None, contexts=None):
     width, height = right - left, bottom - top
     bounds = (left + round(width * x0 / 1000), top + round(height * y0 / 1000),
               left + round(width * x1 / 1000), top + round(height * y1 / 1000))
+    return frame_at(picture, bounds, width * height, failures, contexts)
+
+
+def frame_at(picture, bounds, area, failures=None, contexts=None):
+    """Цельная панель с репликами вокруг bounds (area — площадь окна выбора)."""
     if bounds[2] - bounds[0] < 64 or bounds[3] - bounds[1] < 64:
         return _rejected(failures, "выбран слишком маленький фрагмент")
     bounds = expand(picture, bounds, PAGE_MAX_RATIO)
@@ -168,7 +178,7 @@ def _frame(picture, windows, verdict, failures=None, contexts=None):
         return _rejected(failures, "нет безопасных границ цельной панели с репликами")
     frame = trim(picture.crop(bounds), max_ratio=PAGE_MAX_RATIO)
     fw, fh = frame.size
-    if min(fw, fh) < 64 or fw * fh < width * height * 0.02:
+    if min(fw, fh) < 64 or fw * fh < area * 0.02:
         return _rejected(failures, "после обрезки полей рисунок слишком мал")
     if fh > fw * PAGE_MAX_RATIO:
         return _rejected(failures, "выбрана узкая полоса вместо цельной панели")

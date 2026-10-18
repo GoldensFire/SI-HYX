@@ -123,7 +123,14 @@ def _choose(generator, cand, pages):
     try:
         result = crop_pages(generator, cand, pages)
     except Exception as exc:  # noqa: BLE001 — preserve terminal service handling
-        if (generator.gemini_manga is None or type(exc).__name__ in
+        from .local_character_detect import DetectorUnavailable
+        from .visual_mode import ocr_only
+        if ocr_only(generator.s):
+            # Без Gemini вебтуны закрывает только отказ самого детектора:
+            # истёкшее время страницы — беда одного тайтла.
+            if isinstance(exc, DetectorUnavailable):
+                close_webtoons(generator, cand, exc)
+        elif (generator.gemini_manga is None or type(exc).__name__ in
                 ("GeminiAuthError", "GeminiQuotaError", "GeminiDownError")):
             close_webtoons(generator, cand, exc)
         elif gemini_transient(exc):

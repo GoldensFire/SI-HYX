@@ -4,7 +4,8 @@
 """Подсказки при наведении: всплывающее окно и менеджер наведения. Public namespace: widgets."""
 import time
 import widgets as _api
-from PyQt6.QtGui import QCursor
+from PyQt6.QtGui import QCursor, QPalette
+from PyQt6.QtWidgets import QStylePainter
 from .info_tip_frame import source_is_current
 from weakref import ref
 from PyQt6.QtCore import Qt
@@ -245,6 +246,51 @@ def _widen_truncated_combo(combo) -> None:
 _widen_truncated_combo.__module__ = _api.__name__
 _api._widen_truncated_combo = _widen_truncated_combo
 
+# Отступ значка пункта от текста в QStyleSheetStyle (spacing по умолчанию).
+_COMBO_ICON_SPACING = 6
+
+
+def _paint_elided_combo(combo) -> bool:
+    """Рисует не влезающий текст выпадающего списка с «…» по ширине поля.
+
+    Под стилями приложения QComboBox текст не сокращает, а обрезает рамкой
+    поля: «Macross Plus OV» без многоточия и с пустой полосой перед стрелкой —
+    казалось, что место есть, а текст режется (просьба пользователя). Повторяем
+    QComboBox::paintEvent, но с сокращённым текстом. True — список нарисован.
+    Списки с полем ввода и со своей отрисовкой не трогаем."""
+    try:
+        if combo.isEditable():
+            return False
+        owner = next((k for k in type(combo).__mro__ if "paintEvent" in vars(k)), None)
+        if owner is not _api.QComboBox:
+            return False
+        opt = _api.QStyleOptionComboBox()
+        combo.initStyleOption(opt)
+        text = opt.currentText
+        if not text:
+            return False
+        style = combo.style()
+        field = style.subControlRect(_api.QStyle.ComplexControl.CC_ComboBox, opt,
+                                     _api.QStyle.SubControl.SC_ComboBoxEditField, combo)
+        avail = field.width() - 1
+        if not opt.currentIcon.isNull():
+            avail -= opt.iconSize.width() + _COMBO_ICON_SPACING
+        fm = combo.fontMetrics()
+        if fm.horizontalAdvance(text) <= avail:
+            return False
+        opt.currentText = fm.elidedText(text, _api.Qt.TextElideMode.ElideRight, max(0, avail))
+        painter = QStylePainter(combo)
+        painter.setPen(combo.palette().color(QPalette.ColorRole.Text))
+        painter.drawComplexControl(_api.QStyle.ComplexControl.CC_ComboBox, opt)
+        painter.drawControl(_api.QStyle.ControlElement.CE_ComboBoxLabel, opt)
+        painter.end()
+        return True
+    except Exception:
+        return False
+
+_paint_elided_combo.__module__ = _api.__name__
+_api._paint_elided_combo = _paint_elided_combo
+
 class HoverTipManager(_api.QObject):
     """Глобальный фильтр событий: заменяет системные QToolTip на тот же
     стабильный фирменный попап, что и у значков ⓘ (_InfoTipPopup). QToolTip
@@ -399,6 +445,8 @@ class HoverTipManager(_api.QObject):
             if et == _api.QEvent.Type.Resize and isinstance(obj, _api.QComboBox):
                 _api._widen_truncated_combo(obj)
                 return False
+            if et == _api.QEvent.Type.Paint and isinstance(obj, _api.QComboBox):
+                return _api._paint_elided_combo(obj)
             # Шаг значения у спинбокса выделяет весь его текст (Qt делает
             # selectAll в stepBy) — и это выделение остаётся висеть синим, будто
             # в поле что-то редактируют, хотя фокус там даже не побывал: колесо

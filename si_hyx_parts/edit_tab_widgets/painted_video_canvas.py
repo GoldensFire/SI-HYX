@@ -1108,8 +1108,7 @@ class _PaintedVideoCanvas(_api.QWidget):
         sub_rect = vr.intersected(self.rect())
         if sub_rect.width() < 10 or sub_rect.height() < 10:
             sub_rect = self.rect()
-        px = max(15, int(min(sub_rect.height(), self.height()) * 0.052))
-        _api._paint_subtitle(p, sub_rect, self._text, px, self._image, self._image_pos)
+        _api._paint_subtitle(p, sub_rect, self._text, self._image, self._image_pos)
         # Рамка кадрирования видео (как в «Редактировании фото»): в режиме
         # правки — затемнение/сетка/ручки, иначе (рамка «вооружена») — тонкая
         # пунктирная подсказка, что экспорт кадрируется по ней.

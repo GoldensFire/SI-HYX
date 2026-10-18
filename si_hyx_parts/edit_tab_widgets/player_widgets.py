@@ -232,7 +232,7 @@ class SubtitleOverlay(_api.QWidget):
         self.setAttribute(_api.Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(_api.Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self._text = ""
-        self._px = 28
+        self._video_h = 0
         self._image = None       # кадр субтитров от libass (QImage) — приоритетнее текста
         self._image_pos = (0, 0) # позиция левого верхнего угла картинки в оверлее
 
@@ -278,15 +278,16 @@ class SubtitleOverlay(_api.QWidget):
         return self.width(), self.height()
 
     def set_video_height(self, h):
-        px = max(15, int(h * 0.052))   # ~5% высоты кадра, как в плеерах
-        if px != self._px:
-            self._px = px
+        # Кегль, обводку и отступы _paint_subtitle считает от высоты области
+        # (как libass от высоты кадра) — тут лишь перерисовка при её смене.
+        if h != self._video_h:
+            self._video_h = h
             self.update()
 
     def paintEvent(self, ev):
         p = _api.QPainter(self)
-        _api._paint_subtitle(p, self.rect(), self._text, self._px,
-                        self._image, self._image_pos)
+        _api._paint_subtitle(p, self.rect(), self._text,
+                             self._image, self._image_pos)
         p.end()
 
 SubtitleOverlay.__module__ = _api.__name__

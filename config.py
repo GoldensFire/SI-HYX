@@ -534,7 +534,7 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.6.2"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # Необязательное обновление: перед сборкой (build.bat) поставь True, если этот
 # релиз НЕ должен всплывать плашкой у уже установленных пользователей — сам
@@ -542,7 +542,7 @@ APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # скачивания получают именно его. Узнать о таком обновлении можно только
 # вручную, кнопкой «Проверить обновления» (см. _check_updates в main.py). Не
 # забудь вернуть False перед следующим обычным (обязательным) релизом.
-SILENT_UPDATE = True
+SILENT_UPDATE = False
 # Репозиторий для автообновления (GitHub Releases)
 GITHUB_OWNER = "GoldensFire"
 GITHUB_REPO = "SI-HYX"
@@ -682,6 +682,9 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     selection-background-color: #89b4fa;
     selection-color: #1e1e2e;
     min-height: 22px;
+}
+QComboBox {
+    padding-right: 0px;
 }
 QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
     border-color: #89b4fa;

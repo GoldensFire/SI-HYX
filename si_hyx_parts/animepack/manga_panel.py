@@ -61,9 +61,12 @@ class MangaPanelMixin:
             self._drop_kind(_api.MANGA_KIND, "источники страниц манги не подключены")
             return False
         from .manga_page_context import is_webtoon
+        from .visual_mode import ocr_only
+        local = ocr_only(self.s)
         if getattr(self.s, "manga_character_crop", True) and is_webtoon(cand):
-            if self._manga_mix.webtoons_off or self.gemini_manga is None:
-                # Сцену вебтуна выбирает Gemini: без него страницы не качаем.
+            if self._manga_mix.webtoons_off or (self.gemini_manga is None and not local):
+                # Сцену вебтуна выбирает Gemini или, в режиме «только OCR»,
+                # детектор персонажей (local_scene): без них страницы не качаем.
                 from .manga_page_batch import close_webtoons
                 close_webtoons(self, cand, "Gemini для выбора сцены с персонажами недоступна")
                 return False
@@ -194,6 +197,7 @@ def _fetch_page(self, cand, url: str, *, manga_titles=(), raw=None):
     """(байты, расширение, сцена проверена) готовой страницы для вопроса.
 
     raw — уже скачанная в прошлой попытке страница (manga_page_reuse)."""
+    from .visual_mode import ocr_only
     scene_checked = False
     select_scene = False
     try:
@@ -216,9 +220,10 @@ def _fetch_page(self, cand, url: str, *, manga_titles=(), raw=None):
                 and getattr(self.s, "manga_character_crop", True)):
             return data, ext, scene_checked
         # Readers also split webtoons into short chunks, often through a face.
-        # Без Gemini длинную страницу обычной манги режем без выбора сцены.
+        # Без Gemini длинную страницу обычной манги режем без выбора сцены
+        # (в режиме «только OCR» сцену выбирает local_scene).
         if getattr(self.s, "manga_character_crop", True) and (
-                self.gemini_manga is not None or is_webtoon(cand)):
+                self.gemini_manga is not None or is_webtoon(cand) or ocr_only(self.s)):
             select_scene = True
             from .manga_character_crop import crop
             cut = crop(self, cand, data, ext, manga_titles=manga_titles)
@@ -229,8 +234,9 @@ def _fetch_page(self, cand, url: str, *, manga_titles=(), raw=None):
             cut = _api.fit_manga_page(data, ext, rng=self.rng)
     except Exception as e:  # noqa: BLE001 — сеть и разбор картинки
         if (select_scene
-                and (self.gemini_manga is None or type(e).__name__ in
-                     ("GeminiAuthError", "GeminiQuotaError", "GeminiDownError"))):
+                and (type(e).__name__ == "DetectorUnavailable" if ocr_only(self.s)
+                     else (self.gemini_manga is None or type(e).__name__ in
+                           ("GeminiAuthError", "GeminiQuotaError", "GeminiDownError")))):
             from .manga_page_context import is_webtoon
             if is_webtoon(cand):
                 from .manga_page_batch import close_webtoons

@@ -6,10 +6,12 @@ import edit_tab as _api
 from si_hyx_parts.edit_tab.layout import EditTabLayoutMixin
 from si_hyx_parts.edit_tab.tracks import EditTabTracksMixin
 from si_hyx_parts.edit_tab.playback import EditTabPlaybackMixin
+from si_hyx_parts.edit_tab.fullscreen import EditTabFullscreenMixin
 from si_hyx_parts.edit_tab.timeline import EditTabTimelineMixin
 from si_hyx_parts.edit_tab.effects import EditTabEffectsMixin
 from si_hyx_parts.edit_tab.export import EditTabExportMixin
 from si_hyx_parts.edit_tab.entrance_actions import EditTabEntranceMixin
+from si_hyx_parts.edit_tab.project import EditTabProjectMixin
 
 
 # ─── Edit Tab ─────────────────────────────────────────────────────────────────
@@ -17,10 +19,12 @@ class EditTab(
     EditTabLayoutMixin,
     EditTabTracksMixin,
     EditTabPlaybackMixin,
+    EditTabFullscreenMixin,
     EditTabTimelineMixin,
     EditTabEffectsMixin,
     EditTabExportMixin,
     EditTabEntranceMixin,
+    EditTabProjectMixin,
     _api.QWidget,
 ):
     # Боковая панель монтажа: кнопки масштабируются под ровно столько значков в высоту.
@@ -75,6 +79,7 @@ class EditTab(
         self._ext_audio_player = None
         self._ext_audio_output = None
         self._ext_audio_active = False
+        self._ext_audio_sync_pending = False
         self.selected_audio_abs_index = None   # абсолютный индекс выбранной аудиодорожки (для экспорта)
         self.selected_audio_ext_path = None    # путь к выбранной внешней озвучке (для экспорта)
         self.selected_sub_ext_path = None      # путь к выбранному внешнему файлу субтитров
@@ -205,6 +210,14 @@ class EditTab(
         self._scrub_idle_timer.setSingleShot(True)
         self._scrub_idle_timer.setInterval(150)
         self._scrub_idle_timer.timeout.connect(self._on_scrub_idle)
+        # Часы интерфейса во время игры: цель клика по шкале, пока плеер до неё
+        # не доехал, и «пол», ниже которого метка на ходу не опускается
+        # (см. _play_seek_hold_ms и _ui_time_s).
+        self._play_seek_hold = None
+        self._play_clock_floor = None
+        # Граница OUT во время игры действует, только если играть начали ДО неё
+        # (см. _play_limit_s): клик за OUT значит «смотреть оттуда».
+        self._play_past_out = False
 
         self.ffmpeg_thread = None
         self.proxy_thread = None
@@ -213,6 +226,8 @@ class EditTab(
         self._waveform_gen = 0              # отбрасывает устаревшие ответы воркеров волны
         self._waveform_cache = {}   # (path, mtime, size, audio_index) -> (samples, duration, left, right)
         self._subtitle_fonts_cache = {}   # (path, mtime, size) -> fonts_dir
+        # Проект из кусков (как в Filmora) — модель и состояние просмотра.
+        self._project_init()
 
         self.init_ui()
         self.apply_theme()
@@ -266,10 +281,16 @@ class EditTab(
 
     def _build_root_layout(self):
         """Корневой горизонтальный layout вкладки. Возвращает root."""
-        root = _api.QHBoxLayout(self)
+        # Снаружи — столбец: сверху вкладка как была (видео, шкала, правая
+        # панель), снизу во всю ширину — панель проекта, как таймлайн Filmora.
+        outer = _api.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        root = _api.QHBoxLayout()
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-
+        outer.addLayout(root, 1)
+        self._outer_layout = outer
         return root
 
     def _notify_busy_rename(self, wanted, saved):
@@ -324,6 +345,18 @@ class EditTab(
                 event.acceptProposedAction(); return True
         if event.type() == _api.QEvent.Type.Drop:
             md = event.mimeData(); loaded = False
+            # Файлы, брошенные на таймлайн проекта, ложатся в проект целиком
+            # (как перетаскивание медиа на таймлайн в Filmora).
+            tl = getattr(self, "project_timeline", None)
+            if tl is not None and isinstance(watched, _api.QWidget) and (
+                    watched is tl or tl.isAncestorOf(watched)):
+                paths = [u.toLocalFile() for u in md.urls()] if md.hasUrls() else []
+                paths = [x for x in paths if x and _api.os.path.isfile(x)]
+                if paths:
+                    self._project_drop(paths)
+                    event.acceptProposedAction()
+                    return True
+            self._project_leave()
             try:
                 urls = md.urls()
                 if urls:
@@ -408,6 +441,10 @@ class EditTab(
     # раскрутка GOP (см. _dispatch_frame_seek). Итоговую позицию серии досылает
     # _flush_frame_seek, так что «Воспроизвести» стартует там, где стоит монтаж.
     _SCRUB_SEEK_MS = 250
+    # Клик по шкале во время игры: сколько максимум держать интерфейс на цели,
+    # ожидая первый кадр новой точки (см. _play_seek_hold_ms). Обычно кадр
+    # приезжает за 0.2–0.5 с; дольше — значит, кадров не будет вовсе.
+    _PLAY_SEEK_HOLD_MAX_S = 2.0
 
     # ── Скраб-звук при покадровой перемотке ─────────────────────────────────
     # Длина «блипа»: кадр, но не короче — на 60 fps один кадр (16.7 мс) на слух
@@ -522,6 +559,7 @@ class EditTab(
     _VK_F = 0x46
     _VK_I = 0x49
     _VK_O = 0x4F
+    _VK_B = 0x42
 
     def keyPressEvent(self, event):
         if event.modifiers() & _api.Qt.KeyboardModifier.ControlModifier:
@@ -541,6 +579,11 @@ class EditTab(
             # QShortcut("Ctrl+S") на переведённом коде клавиши не срабатывает.
             if vk == self._VK_S or event.key() == _api.Qt.Key.Key_S:
                 self.start_cut()
+                event.accept()
+                return
+            # Ctrl+B — разрезать клип проекта у плейхеда (как в Filmora).
+            if vk == self._VK_B or event.key() == _api.Qt.Key.Key_B:
+                self.project_split()
                 event.accept()
                 return
         elif not (event.modifiers() & (_api.Qt.KeyboardModifier.AltModifier
@@ -570,6 +613,11 @@ class EditTab(
                 return
             if vk == self._VK_O or event.key() == _api.Qt.Key.Key_O:
                 self.set_out_point()
+                event.accept()
+                return
+            # Insert — выделенный кусок источника в конец проекта.
+            if event.key() == _api.Qt.Key.Key_Insert:
+                self.project_add_selection('main')
                 event.accept()
                 return
         super().keyPressEvent(event)
@@ -616,6 +664,7 @@ class EditTab(
                 'proxy_min': int(self.spin_proxy_min.value())
                     if hasattr(self, 'spin_proxy_min') else 0,
                 'subtitle_style': dict(getattr(self, '_last_subtitle_style', None) or {}) or None,
+                'project_collapsed': bool(getattr(self, '_proj_collapsed', False)),
             }
             # Атомарно (временный файл + подмена): прямая запись обрезала файл
             # ДО того, как в него ляжет новое содержимое, и жёсткое завершение
@@ -660,6 +709,8 @@ class EditTab(
             # Последние настройки стиля «Создать субтитры» (шрифт/размер/цвет/…) —
             # см. create_subtitles/SubtitleCreatorDialog.default_style.
             self._last_subtitle_style = settings.get('subtitle_style') or None
+            self._proj_collapsed = bool(settings.get('project_collapsed', False))
+            self._project_apply_collapsed()
         except Exception:
             pass
 
@@ -679,6 +730,7 @@ class EditTab(
             self.player.stop()
         except Exception:
             pass
+        self._project_shutdown()
         # Останавливаем звук покадровой перемотки: устройство вывода и фоновый
         # декодер окон PCM (он держит запущенный ffmpeg).
         try:

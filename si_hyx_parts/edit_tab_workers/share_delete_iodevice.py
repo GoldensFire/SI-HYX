@@ -212,22 +212,32 @@ class FfmpegWorker(_api.QThread):
             self.finished.emit(rc == 0 and not self._stopped, f"Код: {rc}")
             return
 
+        # Хвост вывода ffmpeg (без строк прогресса) — в сообщение об ошибке:
+        # голое «Код: 1» не говорит, что именно не так (сборка проекта из
+        # десятка кусков без него не разобрать).
+        tail = []
         try:
             for line in proc.stderr:
                 if self._stopped:
                     break
-                if 'time=' in line:
-                    try:
-                        idx = line.index('time=')
-                        tpart = line[idx + 5:].split()[0]
-                        tsec = _api.time_to_s(tpart)
-                        perc = min(100.0, max(0.0, (tsec / self.duration) * 100.0)) if self.duration > 0 else 0.0
-                        self.progress.emit(perc)
-                    except Exception:
-                        pass
+                if 'time=' not in line:
+                    if line.strip():
+                        tail.append(line.rstrip())
+                        del tail[:-12]
+                    continue
+                try:
+                    idx = line.index('time=')
+                    tpart = line[idx + 5:].split()[0]
+                    tsec = _api.time_to_s(tpart)
+                    perc = min(100.0, max(0.0, (tsec / self.duration) * 100.0)) if self.duration > 0 else 0.0
+                    self.progress.emit(perc)
+                except Exception:
+                    pass
             rc = proc.wait()
             if self._stopped:
                 self.finished.emit(False, "Отменено")
+            elif rc != 0 and tail:
+                self.finished.emit(False, f"Код: {rc}\n" + "\n".join(tail))
             else:
                 self.finished.emit(rc == 0, f"Код: {rc}")
         except Exception as e:

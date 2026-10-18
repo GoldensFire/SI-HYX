@@ -28,6 +28,10 @@ class GenerationRuntime:
         self._waiters = {}
         self._draining = False
         self.local = threading.local()
+        # Смены приоритета за прогон: (момент, значение). По ним итог журнала
+        # пишет, сколько генерация шла на каждом приоритете, — 16.10 прогон
+        # полтора часа шёл на «Низком» (2 задачи), и в журнале этого не было.
+        self.priority_history = [(time.monotonic(), settings.generation_priority)]
 
     @property
     def worker_capacity(self):
@@ -61,12 +65,23 @@ class GenerationRuntime:
         with self.condition:
             changed = self.settings.generation_priority != value
             self.settings.generation_priority = value
+            if changed:
+                self.priority_history.append((time.monotonic(), value))
             for thread_id in self.threads:
                 set_thread_level(thread_id, thread_level(self.settings))
             for process in tuple(self.processes):
                 apply_process_priority(process, self.settings)
             self.condition.notify_all()
         return changed
+
+    def priority_seconds(self):
+        """Сколько секунд прогон шёл на каждом приоритете (по порядку смен)."""
+        with self.condition:
+            history = list(self.priority_history)
+        spent = {}
+        for (start, value), (end, _) in zip(history, history[1:] + [(time.monotonic(), "")]):
+            spent[value] = spent.get(value, 0.0) + max(0.0, end - start)
+        return spent
 
     @contextmanager
     def worker(self):

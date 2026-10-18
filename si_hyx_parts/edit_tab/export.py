@@ -6,6 +6,13 @@ import edit_tab as _api
 from si_hyx_parts.edit_tab.tracks import drop_audio
 
 
+# Проходы ProcessWorker (label у run_ffmpeg_capture) → подпись этапа обрезки.
+_PROCESS_PHASES = {
+    "Pass 1 (Audio)": "Обработка: звук…",
+    "Pass 2 (Video)": "Обработка: видео…",
+}
+
+
 class EditTabExportMixin:
     """Монтаж: аргументы кодировщика, обрезка, Smart Cut и завершение экспорта."""
 
@@ -13,29 +20,39 @@ class EditTabExportMixin:
         self._cut_lastp = float(p)
         self._report_cut(self._cut_lastp)
 
+    def _start_cut_phase(self, phase):
+        """Начало экспорта: подпись этапа и отсчёт времени для _report_cut."""
+        self._cut_phase = phase
+        self._cut_t0 = _api.time.time()
+        self._cut_lastp = 0.0
+
     def _report_cut(self, p):
         """Строка прогресса обрезки с ETA. Пока ffmpeg не дал реального прогресса
         (p<1 — фаза подготовки/перемотки), показываем счётчик «прошло», чтобы не
         выглядело зависшим. Дублируем статус в крупную метку над кнопкой
         «Обрезать» (lbl_selection) — нижняя полоса окна легко теряется, а здесь
-        пользователь смотрит прямо на кнопку (см. _set_cut_status)."""
+        пользователь смотрит прямо на кнопку (см. _set_cut_status).
+
+        Строка ОДНА на обе метки: этап (_cut_phase — «Обрезка…», «Smart Cut:
+        склейка…», «Обработка: видео…») + процент и ETA. Раньше этапы воркера
+        писались в метку напрямую, а тикер раз в 0.5 с перебивал их своей
+        «Обрезка… N%» — две разные строки сменяли друг друга."""
         try:
+            phase = getattr(self, "_cut_phase", "") or "Обрезка…"
             elapsed = _api.time.time() - getattr(self, "_cut_t0", _api.time.time())
             if p >= 1.0:
                 eta = max(0.0, elapsed * (100.0 - p) / p)
-                txt = f"Обрезка… {int(p)}%  •  ETA {self._fmt_mmss(eta)}"
+                txt = f"{phase} {int(p)}%  •  ETA {self._fmt_mmss(eta)}"
                 self._report_progress(int(p), txt)
-                self._set_cut_status(f"Обрезка… {int(p)}%  •  ETA {self._fmt_mmss(eta)}",
-                                     icon='fa5s.cut')
+                self._set_cut_status(txt, icon='fa5s.cut')
             else:
                 # Фаза подготовки: при обрезке с перекодированием ffmpeg сначала
                 # перематывает декодер до точки реза (выходной seek) и ещё не даёт
                 # ни одного out_time — реального процента нет. Включаем пульсирующий
                 # («busy») режим полосы, чтобы она не выглядела зависшей на 0%.
-                txt = f"Обрезка… подготовка ({self._fmt_mmss(elapsed)})"
+                txt = f"{phase} подготовка {self._fmt_mmss(elapsed)}"
                 self._report_progress(-1, txt)
-                self._set_cut_status(f"Обрезка… подготовка {self._fmt_mmss(elapsed)}",
-                                     icon='fa5s.hourglass-half')
+                self._set_cut_status(txt, icon='fa5s.hourglass-half')
         except Exception:
             pass
 
@@ -505,7 +522,7 @@ class EditTabExportMixin:
         self.log_label.setText("Создание видео из картинки…")
         self._set_cut_status("Пикселизация… подготовка", icon='fa5s.hourglass-half')
         self._set_cut_btn_cancel(True)
-        self._cut_t0 = _api.time.time(); self._cut_lastp = 0.0
+        self._start_cut_phase("Пикселизация…")
         if getattr(self, "_cut_ticker", None) is None:
             self._cut_ticker = _api.QTimer(self); self._cut_ticker.setInterval(500)
             self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
@@ -794,8 +811,7 @@ class EditTabExportMixin:
         # Прогресс с ETA. Тикер раз в 0.5с обновляет «прошло/ETA», чтобы строка
         # не выглядела зависшей, даже если ffmpeg редко шлёт time= (короткие
         # отрезки или фаза перемотки декодером до точки реза).
-        self._cut_t0 = _api.time.time()
-        self._cut_lastp = 0.0
+        self._start_cut_phase("Обрезка…")
         if getattr(self, "_cut_ticker", None) is None:
             self._cut_ticker = _api.QTimer(self)
             self._cut_ticker.setInterval(500)
@@ -914,9 +930,12 @@ class EditTabExportMixin:
         self.ffmpeg_thread.start()
 
     def _smartcut_status(self, s):
+        """Этап от воркера: становится подписью общей строки (_report_cut), а не
+        отдельной строкой поверх неё."""
         try:
             self.log_label.setText(s)
-            self._set_cut_status(s, icon='fa5s.cut')
+            self._cut_phase = s
+            self._report_cut(getattr(self, "_cut_lastp", 0.0))
             if self.main is not None and hasattr(self.main, "log"):
                 self.main.log(s)
         except Exception:
@@ -952,7 +971,7 @@ class EditTabExportMixin:
         self.log_label.setText("Smart Cut…")
         self._set_cut_status("Smart Cut… подготовка", icon='fa5s.hourglass-half')
         self._set_cut_btn_cancel(True)
-        self._cut_t0 = _api.time.time(); self._cut_lastp = 0.0
+        self._start_cut_phase("Smart Cut…")
         if getattr(self, "_cut_ticker", None) is None:
             self._cut_ticker = _api.QTimer(self); self._cut_ticker.setInterval(500)
             self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
@@ -1103,7 +1122,7 @@ class EditTabExportMixin:
             ("Обработка звука… подготовка" if audio_only else "Обработка… подготовка"),
             icon='fa5s.hourglass-half')
         self._set_cut_btn_cancel(True, cancel_handler=lambda: self._cancel_cut_and_process(tm))
-        self._cut_t0 = _api.time.time(); self._cut_lastp = 0.0
+        self._start_cut_phase("Обработка звука…" if audio_only else "Обработка…")
         if getattr(self, "_cut_ticker", None) is None:
             self._cut_ticker = _api.QTimer(self); self._cut_ticker.setInterval(500)
             self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
@@ -1155,8 +1174,13 @@ class EditTabExportMixin:
                 self._on_cut_progress(pct)
 
         def _on_status(s_iid, txt, code, _iid=iid):
-            if s_iid == _iid:
-                self._smartcut_status(txt)
+            # Итоговые «Готово»/«Ошибка» покажет on_ffmpeg_finished; из рабочих
+            # этапов берём только проходы — «Обработка.» ничего не добавляет.
+            if s_iid != _iid or code != 'proc':
+                return
+            phase = _PROCESS_PHASES.get(txt)
+            if phase:
+                self._smartcut_status(phase)
 
         def _on_finished_all(_item=item):
             for sig, slot in ((proc_worker.progress, _on_progress),
@@ -1219,6 +1243,14 @@ class EditTabExportMixin:
             except Exception as e:
                 self.on_ffmpeg_finished(False, f"Ошибка при сохранении: {e}")
 
+        # Общую полосу и значок на панели задач ведёт сам Монтаж (_report_cut).
+        # Воркер «Обработки» шлёт туда же свой текст и в начале 0 % — 0 снимает
+        # значок, а тикер Монтажа тут же ставит «бегущий»: значок мигал и не
+        # показывал прогресса, а полоса скакала между двумя подписями.
+        try:
+            proc_worker.global_progress.disconnect(self.main.update_global_progress)
+        except Exception:
+            pass
         proc_worker.progress.connect(_on_progress)
         proc_worker.status.connect(_on_status)
         proc_worker.finished_all.connect(_on_finished_all)

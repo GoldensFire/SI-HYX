@@ -5,6 +5,42 @@
 import edit_tab as _api
 
 
+class _ElidedLabel(_api.QLabel):
+    """Подпись в одну строку: длинный текст сокращается «…» посередине по
+    реальной ширине подписи. Раньше имя файла резалось до последних 27
+    символов («…s OVA 1 [BDRemux 1080p].mkv»), а путь — до 210 px по шрифту
+    без стилей, хотя место в подписи оставалось. Ширину берёт у панели и сама
+    её не распирает."""
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self._full_text = None
+        self.setTextFormat(_api.Qt.TextFormat.PlainText)
+        self.setSizePolicy(_api.QSizePolicy.Policy.Ignored,
+                           _api.QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(1)
+
+    def set_full_text(self, text):
+        self._full_text = str(text)
+        self.ensurePolished()      # размер шрифта из styleSheet — до замера
+        self._elide_full_text()
+
+    def clear_full_text(self, text):
+        self._full_text = None
+        self.setText(text)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._elide_full_text()
+
+    def _elide_full_text(self):
+        if self._full_text is None:
+            return
+        width = max(0, self.contentsRect().width())
+        self.setText(self.fontMetrics().elidedText(
+            self._full_text, _api.Qt.TextElideMode.ElideMiddle, width))
+
+
 class EditTabLayoutMixin:
     """Монтаж: построение интерфейса, прогресс и подгонка видеовыхода."""
 
@@ -48,8 +84,7 @@ class EditTabLayoutMixin:
         sb_layout.setSpacing(12)
 
         # File section
-        self.lbl_file = _api.QLabel("Нет файла")
-        self.lbl_file.setWordWrap(True)
+        self.lbl_file = _ElidedLabel("Нет файла")
         self.lbl_file.setStyleSheet(f"""
             color: {_api.C['text3']};
             font-size: 11px;
@@ -219,13 +254,9 @@ class EditTabLayoutMixin:
         dst_lbl.setStyleSheet(f"color: {_api.C['text3']}; font-size: 12px;")
         self._relax_width(dst_lbl)
         export_card._body.addWidget(dst_lbl)
-        self.lbl_export_dir = _api.QLabel("Рядом с исходником")
-        # Без переноса (длинный путь не разрывается и распирал бы панель) — вместо
-        # этого укорачиваем в середине в _update_export_dir_label; min width 0,
-        # чтобы метка не диктовала ширину панели.
-        self.lbl_export_dir.setWordWrap(False)
-        self.lbl_export_dir.setMinimumWidth(0)
-        self._relax_width(self.lbl_export_dir)
+        # Длинный путь сокращается в середине по ширине метки (_ElidedLabel)
+        # и панель не распирает.
+        self.lbl_export_dir = _ElidedLabel("Рядом с исходником")
         self.lbl_export_dir.setStyleSheet(
             f"color: {_api.C['text2']}; font-size: 11px; padding: 4px 6px; "
             f"background: {_api.C['surface3']}; border: 1px solid {_api.C['border2']}; border-radius: 5px;")
@@ -461,7 +492,7 @@ class EditTabLayoutMixin:
             QComboBox {{
                 background: {_api.C['surface3']}; color: {_api.C['text']};
                 border: 1px solid {_api.C['border2']}; border-radius: 5px;
-                padding: 5px 8px; font-size: 12px;
+                padding: 5px 0px 5px 8px; font-size: 12px;
             }}
             QComboBox::drop-down {{ border: none; width: 18px; }}
             QComboBox QAbstractItemView {{
@@ -504,15 +535,18 @@ class EditTabLayoutMixin:
         side_l.addLayout(at_row)
 
         # Заголовок «Субтитры» + кнопка-карандаш (правка текста субтитров прямо тут).
+        # Карандаш — сразу за подписью и не выше её строки: прежняя кнопка 24×20
+        # стояла у правого края выше текста и раздувала отступы вокруг строки.
         st_hdr = _api.QHBoxLayout(); st_hdr.setContentsMargins(0, 0, 0, 0); st_hdr.setSpacing(4)
         lbl_st = _api.QLabel("Субтитры")
         lbl_st.setStyleSheet(f"color: {_api.C['text3']}; font-size: 11px; font-weight: 700;")
-        st_hdr.addWidget(lbl_st)
-        st_hdr.addStretch(1)
+        st_hdr.addWidget(lbl_st, 0, _api.Qt.AlignmentFlag.AlignVCenter)
         self.btn_edit_subs = _api.QPushButton()
         self.btn_edit_subs.setIcon(_api.get_icon('fa5s.edit', color=_api.C['text2']))
-        self.btn_edit_subs.setIconSize(_api.QSize(14, 14))
-        self.btn_edit_subs.setFixedSize(24, 20)
+        lbl_st.ensurePolished()   # размер шрифта из styleSheet — до замера
+        row_h = max(14, lbl_st.sizeHint().height())
+        self.btn_edit_subs.setIconSize(_api.QSize(row_h - 3, row_h - 3))
+        self.btn_edit_subs.setFixedSize(row_h + 4, row_h)
         self.btn_edit_subs.setCursor(_api.Qt.CursorShape.PointingHandCursor)
         self.btn_edit_subs.setToolTip("Редактировать текст выбранных субтитров")
         self.btn_edit_subs.setStyleSheet(f"""
@@ -521,7 +555,8 @@ class EditTabLayoutMixin:
             QPushButton:pressed {{ background: {_api.C['border2']}; }}
         """)
         self.btn_edit_subs.clicked.connect(self.edit_subtitles)
-        st_hdr.addWidget(self.btn_edit_subs)
+        st_hdr.addWidget(self.btn_edit_subs, 0, _api.Qt.AlignmentFlag.AlignVCenter)
+        st_hdr.addStretch(1)
         side_l.addLayout(st_hdr)
         st_row = _api.QHBoxLayout(); st_row.setContentsMargins(0, 0, 0, 0); st_row.setSpacing(5)
         self.cmb_subs = _api.QComboBox()
@@ -545,10 +580,12 @@ class EditTabLayoutMixin:
         # По умолчанию — «Как в оригинале» (стиль из самих субтитров, ничего не навязываем).
         self.cmb_sub_style.setCurrentIndex(2)
         self.cmb_sub_style.setToolTip(
-            "Стиль субтитров при вшивании в кадр:\n"
-            "Авто — стиль программы для SRT/VTT, у ASS/SSA остаётся собственный.\n"
-            "Как в программе — крупный белый шрифт с обводкой даже поверх ASS/SSA.\n"
-            "Как в оригинале — ничего не навязывать (стиль из самих субтитров).")
+            "Стиль субтитров при вшивании в кадр. Стиль программы — как у караоке\n"
+            "в генерации паков: шрифт Karaoke Rounded, обводка и тень.\n"
+            "Авто — стиль программы для SRT/VTT и субтитров MP4, у ASS/SSA свой.\n"
+            "Как в программе — стиль программы даже поверх ASS/SSA.\n"
+            "Как в оригинале — собственный стиль ASS/SSA и субтитров MP4;\n"
+            "у SRT/VTT своего стиля нет — им стиль программы, как в превью.")
         self.cmb_sub_style.setStyleSheet(_combo_css)
         self.cmb_sub_style.setSizeAdjustPolicy(
             _api.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -1038,6 +1075,8 @@ class EditTabLayoutMixin:
 
         root.addLayout(center, stretch=1)
         root.addWidget(sidebar)
+        # Проект из кусков (как в Filmora) — во всю ширину под всем остальным.
+        self._outer_layout.addWidget(self._build_project_panel(), 0)
 
     # ── Style helpers ──────────────────────────────────────────────────────
     def _slider_style(self, color, compact=False):
@@ -1300,12 +1339,9 @@ class EditTabLayoutMixin:
         if lbl is None:
             return
         if self.export_dir and _api.os.path.isdir(self.export_dir):
-            # Укорачиваем путь в середине, чтобы он не распирал панель; полный
-            # путь — в подсказке.
-            fm = _api.QFontMetrics(lbl.font())
-            elided = fm.elidedText(self.export_dir, _api.Qt.TextElideMode.ElideMiddle, 210)
-            lbl.setText(elided)
+            # Полный путь — в подсказке.
+            lbl.set_full_text(self.export_dir)
             lbl.setToolTip(self.export_dir)
         else:
-            lbl.setText("Рядом с исходником")
+            lbl.clear_full_text("Рядом с исходником")
             lbl.setToolTip("Файл сохраняется в папке исходника")

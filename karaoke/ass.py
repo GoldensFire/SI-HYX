@@ -4,7 +4,8 @@ from __future__ import annotations
 import re
 from .model import Line, Unit, validate
 from .layout import positions
-from .style import FONT_NAME, ass_colour, choose_colour, fitted_size, font_size
+from .style import (FONT_NAME, OUTLINE, OUTLINE_COLOUR, SHADOW, SHADOW_ALPHA, TEXT_COLOUR,
+                    ass_colour, ass_rgb, choose_colour, fitted_size, font_size)
 
 TAG = re.compile(r"\{([^}]*)\}")
 K = re.compile(r"\\(?:kf|ko|k|K)(\d+)")
@@ -112,6 +113,9 @@ def write_ass(lines, width=1280, height=720, *, translations=False, highlight=No
     validate(lines)
     size = font_size(height)
     colour = ass_colour(highlight or choose_colour())
+    plain, edge = ass_rgb(TEXT_COLOUR), ass_rgb(OUTLINE_COLOUR)
+    shadow = ass_rgb("000000", SHADOW_ALPHA)
+    border = f"{OUTLINE},{SHADOW}"
     header = f"""[Script Info]
 ScriptType: v4.00+
 PlayResX: {width}
@@ -120,8 +124,8 @@ WrapStyle: 2
 ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Romaji,{FONT_NAME},{size},{colour},&H00F8F8FF,&H00101016,&H70000000,-1,0,0,0,100,100,0,0,1,5,1.5,5,48,48,0,1
-Style: Translation,{FONT_NAME},{size},&H00F8F8FF,&H00F8F8FF,&H00101016,&H70000000,-1,0,0,0,100,100,0,0,1,5,1.5,5,48,48,0,1
+Style: Romaji,{FONT_NAME},{size},{colour},{plain},{edge},{shadow},-1,0,0,0,100,100,0,0,1,{border},5,48,48,0,1
+Style: Translation,{FONT_NAME},{size},{plain},{plain},{edge},{shadow},-1,0,0,0,100,100,0,0,1,{border},5,48,48,0,1
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """

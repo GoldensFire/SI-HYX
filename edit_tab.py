@@ -52,23 +52,24 @@ from msgbox import (
     msgbox_critical, msgbox_information, msgbox_question, msgbox_warning
 )
 from edit_tab_base import (
-    C, EDITOR_SETTINGS_PATH, LIBASS_AVAILABLE, QAudioFormat,
+    C, EDITOR_SETTINGS_PATH, LIBASS_AVAILABLE, MONTAGE_PROJECT_PATH, QAudioFormat,
     QAudioOutput, QAudioSink, QMediaDevices, QMediaPlayer,
     QVideoWidget, install_audio_device_recovery,
     _HAS_MULTIMEDIA, _cues_to_ass, _fmt_channels, _fullscreen_icon,
-    _libass, _parse_srt, _pixelize_block_sequence, _pixelize_filter,
-    _unique_output,
-    format_fps, make_divider, make_icon_btn, run_ffprobe, s_to_time,
-    time_to_s
+    _karaoke_style, _libass, _parse_srt, _pixelize_block_sequence,
+    _pixelize_filter, _unique_output,
+    format_fps, make_divider, make_icon_btn, prog_sub_force_style,
+    run_ffprobe, s_to_time, time_to_s
 )
 from edit_tab_workers import (
     AssExtractor, AudioSegmentWaveformLoader, AudioWaveformLoader,
-    FfmpegWorker, ProxyWorker, ShareDeleteIODevice, SmartCutWorker,
-    SubtitleExtractor, TrackOverlayWorker, TrackPathWorker, VideoInpaintWorker
+    FfmpegWorker, ProjectThumbWorker, ProxyWorker, ShareDeleteIODevice,
+    SmartCutWorker, SubtitleExtractor, TrackOverlayWorker, TrackPathWorker,
+    VideoInpaintWorker
 )
 from edit_tab_widgets import (
-    AudioMeter, FullscreenVideo, InfoCard, SeekPreview, SeekSlider,
-    SubtitleOverlay, VideoCanvas, VolumeLabel, VolumeSlider,
+    AudioMeter, FullscreenVideo, InfoCard, ProjectTimeline, SeekPreview,
+    SeekSlider, SubtitleOverlay, VideoCanvas, VolumeLabel, VolumeSlider,
     WaveformWidget
 )
 from edit_tab_dialogs import (
@@ -83,8 +84,9 @@ from edit_tab_overlay import (
     qimage_to_bgra, render_overlays
 )
 from PyQt6.QtCore import (QUrl)
-from PyQt6.QtGui import (QImage, QPainter, QShortcut)
-from PyQt6.QtWidgets import (QScrollBar, QSizePolicy, QStyle, QToolTip)
+from PyQt6.QtGui import (QImage, QPainter, QPixmap, QShortcut)
+from PyQt6.QtWidgets import (QInputDialog, QScrollBar, QSizePolicy, QStyle,
+                             QToolTip)
 
 from si_hyx_parts.edit_tab.is_attached_pic import _is_attached_pic
 
