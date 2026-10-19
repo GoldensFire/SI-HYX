@@ -1070,6 +1070,12 @@ class EditTabPlaybackMixin:
                      or getattr(self, "_prerolling", False))):
             self.project_play()
             return
+        # Просмотр проекта стоит на картинке, пустоте под звуком или ждёт файл
+        # следующего куска — плеер не играет, но Пробел всё равно «пауза».
+        if (getattr(self, "_proj_play", None) is not None
+                and self.player.playbackState() != _api.QMediaPlayer.PlaybackState.PlayingState):
+            self.project_stop()
+            return
         self._scrubbing = False   # явное play/pause не должно гаситься скрабом
         # Возврат звука после разбега отложен на четверть секунды (хвост очереди
         # аудиоустройства, см. _restore_preroll_mute) — но ждать его нельзя:
@@ -1319,6 +1325,9 @@ class EditTabPlaybackMixin:
                 self._scrub_sink_obj.setVolume(max(0.0, min(1.0, v / 100.0)))
             except Exception:
                 pass
+        # Просмотр проекта: громкость клипов поверх ползунка (project_audio).
+        if getattr(self, "_pmix_voices", None) is not None:
+            self._pmix_apply_volume()
         try:
             self.vol_lbl.update_glyph(v)
         except Exception:

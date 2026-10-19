@@ -12,6 +12,7 @@ from si_hyx_parts.edit_tab.effects import EditTabEffectsMixin
 from si_hyx_parts.edit_tab.export import EditTabExportMixin
 from si_hyx_parts.edit_tab.entrance_actions import EditTabEntranceMixin
 from si_hyx_parts.edit_tab.project import EditTabProjectMixin
+from si_hyx_parts.edit_tab.project_audio import EditTabProjectAudioMixin
 
 
 # ─── Edit Tab ─────────────────────────────────────────────────────────────────
@@ -25,6 +26,7 @@ class EditTab(
     EditTabExportMixin,
     EditTabEntranceMixin,
     EditTabProjectMixin,
+    EditTabProjectAudioMixin,
     _api.QWidget,
 ):
     # Боковая панель монтажа: кнопки масштабируются под ровно столько значков в высоту.
