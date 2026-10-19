@@ -32,6 +32,10 @@
 #   qml                — QQuickWidget + QML VideoOutput: столь же дёшево, и
 #                        оверлеи (субтитры, рамка кропа, накладки) живут в той
 #                        же сцене, поэтому рисуются поверх кадра корректно.
+#                        Сам холст «Монтажа» с тех пор переехал из QQuickWidget
+#                        в своё окно Qt Quick с потоком рендера (см. VideoCanvas):
+#                        QQuickWidget рендерит в GUI-потоке и под нагрузкой на
+#                        GPU держит его ожиданием. Здесь этот режим — эталон.
 #   montage            — НАСТОЯЩИЙ холст вкладки (edit_tab_widgets.VideoCanvas)
 #                        со всей его обвязкой: свой QVideoSink между плеером и
 #                        сценой (пин кадра, граница OUT, часы кадра) и слой
@@ -210,8 +214,7 @@ def _run_one(mode, src, seconds, out_path):
         player.setVideoSink(canvas.videoSink())
         canvas.videoSink().videoFrameChanged.connect(
             lambda _f: stats.__setitem__("delivered", stats["delivered"] + 1))
-        quick = getattr(canvas, "_quick", None)
-        qwin = quick.quickWindow() if quick is not None else None
+        qwin = getattr(canvas, "_qwin", None)
         if qwin is not None:
             # Кадр сцены = кадр на экране. У ЦП-холста ту же роль играет
             # paintEvent, поэтому колонки таблицы сравнимы.

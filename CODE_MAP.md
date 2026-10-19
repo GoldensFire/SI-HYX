@@ -652,6 +652,15 @@ URL держало замок минутами и при медленном пр
 (`AudioScrubber`). Прежний импорт `from edit_tab_frames import AudioScrubber`
 работает: класс реэкспортируется.
 
+Холст видео «Монтажа» — [video_canvas.py](si_hyx_parts/edit_tab_widgets/video_canvas.py)
+(вывод кадра; пин, граница OUT, часы кадра и мышь — в предке
+[painted_video_canvas.py](si_hyx_parts/edit_tab_widgets/painted_video_canvas.py))
+и [canvas_scene.py](si_hyx_parts/edit_tab_widgets/canvas_scene.py) (окно Qt Quick
+из QML, провайдер слоя оверлеев, нативные кнопки поверх сцены). Сцена рисуется
+потоком рендера Qt Quick, и Python туда попадать не должен — GUI-поток ждёт
+синхронизацию, держа GIL: никаких QQuickPaintedItem, Python-подклассов окна и
+прямых соединений с его сигналами.
+
 Время «Монтажа» для ЛЮБОГО показа на экране берётся только у
 `EditTab._ui_time_s` ([timeline.py](si_hyx_parts/edit_tab/timeline.py)):
 `player.position()` во время прогрева уезжает на полсекунды назад, а на паузе

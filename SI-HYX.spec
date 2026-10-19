@@ -39,12 +39,12 @@ datas += _pw_data
 binaries += _pw_bin
 hiddenimports += _pw_imports
 datas += [('si_hyx_parts/kuhi/LICENSE', 'si_hyx_parts/kuhi')]
-# Холст видео «Монтажа» выводит кадр через QML VideoOutput (см. VideoCanvas в
-# edit_tab_widgets.py), поэтому в сборку обязаны попасть Qt Quick/Qml вместе с
-# их qml-плагинами (их подтягивают хуки PyInstaller для этих модулей) и
-# QML-модуль QtMultimedia. Импорт в коде стоит внутри try/except — перечисляем
-# явно, чтобы анализатор не решил, что модули необязательные.
-hiddenimports += ['PyQt6.QtQml', 'PyQt6.QtQuick', 'PyQt6.QtQuickWidgets']
+# Холст видео «Монтажа» выводит кадр через QML VideoOutput в окне Qt Quick (см.
+# VideoCanvas в edit_tab_widgets.py), поэтому в сборку обязаны попасть Qt
+# Quick/Qml вместе с их qml-плагинами (их подтягивают хуки PyInstaller для этих
+# модулей) и QML-модуль QtMultimedia. Импорт в коде стоит внутри try/except —
+# перечисляем явно, чтобы анализатор не решил, что модули необязательные.
+hiddenimports += ['PyQt6.QtQml', 'PyQt6.QtQuick']
 # Каверы опенингов (docs/anime-covers.md) подключаются ЛЕНИВО — импортом внутри
 # функции загрузчика звука и внутри кнопки «Проверить каверы…». Перечисляем
 # явно, чтобы анализатор не решил, что модули необязательные.
@@ -104,9 +104,9 @@ excludes = [
 
 # Что из притащенного хуком Qt Quick выбрасываем. Проверялось замером: без
 # фильтра сборка росла на 257 МБ, с ним — на 36 МБ. Список намеренно узкий:
-# сцена холста (см. _QML_CANVAS_SOURCE в edit_tab_widgets.py) состоит из Item,
-# Rectangle и VideoOutput, то есть базового QtQuick и QtMultimedia — всё
-# остальное в Quick-стеке лишнее. Если сцена перестанет подниматься, вкладка
+# сцена холста (см. _QML_CANVAS_SOURCE в edit_tab_widgets.py) состоит из
+# Window, Item, Image и VideoOutput, то есть базового QtQuick и QtMultimedia —
+# всё остальное в Quick-стеке лишнее. Если сцена перестанет подниматься, вкладка
 # скажет об этом в лог («сцена Qt Quick не поднялась»), а кадр будет рисоваться
 # на ЦП — тогда что-то из списка вернуть.
 _QT_QUICK_DROP = (

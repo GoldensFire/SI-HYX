@@ -12,7 +12,7 @@ class _PaintedVideoCanvas(_api.QWidget):
     SubtitleOverlay.
 
     ВНИМАНИЕ: во вкладке «Монтаж» этот класс больше НЕ используется — там кадр
-    выводит GPU-путь (VideoCanvas ниже: QQuickWidget + QML VideoOutput), потому
+    выводит GPU-путь (VideoCanvas ниже: окно Qt Quick + QML VideoOutput), потому
     что toImage() каждого кадра занимал главный поток на 8-9 мс при бюджете
     кадра 16.7 мс (1080p60), и вкладка «лагала». Здесь остался ЦП-путь для
     мини-плеера диалога субтитров (_SubtitlePreview): у него поверх холста живёт
