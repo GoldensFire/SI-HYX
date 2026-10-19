@@ -43,6 +43,7 @@ from si_hyx_parts.edit_tab_widgets.subtitle_timeline import _SubtitleTimeline, s
 from si_hyx_parts.edit_tab_widgets.player_widgets import (
     VolumeSlider,
     VolumeLabel,
+    TimecodeLabel,
     InfoCard,
     AudioMeter,
     SubtitleOverlay,

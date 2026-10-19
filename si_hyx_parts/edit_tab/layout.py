@@ -769,7 +769,9 @@ class EditTabLayoutMixin:
         time_fl.setSpacing(3)
         _mono = _api.QFont("Courier New" if _api.os.name == 'nt' else "Courier")
         _mono.setBold(True); _mono.setPointSize(11)
-        self.lbl_current_time = _api.QLabel("00:00:00.000")
+        # Таймкоды, что меняются каждый кадр, — фиксированной ширины: иначе
+        # каждый setText перекладывал бы всё окно (см. TimecodeLabel).
+        self.lbl_current_time = _api.TimecodeLabel("00:00:00.000")
         self.lbl_current_time.setFont(_mono)
         self.lbl_current_time.setStyleSheet(f"color: {_api.C['green2']}; background: transparent;")
         sep_time = _api.QLabel("/")
@@ -777,7 +779,7 @@ class EditTabLayoutMixin:
         self.lbl_total_time = _api.QLabel("00:00:00.000")
         self.lbl_total_time.setFont(_mono)
         self.lbl_total_time.setStyleSheet(f"color: {_api.C['text3']}; background: transparent;")
-        time_fl.addWidget(self.lbl_current_time)
+        time_fl.addWidget(self.lbl_current_time, 0, _api.Qt.AlignmentFlag.AlignVCenter)
         time_fl.addWidget(sep_time)
         time_fl.addWidget(self.lbl_total_time)
         seek_row.addWidget(time_frame)
@@ -884,11 +886,12 @@ class EditTabLayoutMixin:
         seg_l.setContentsMargins(8, 4, 8, 4); seg_l.setSpacing(6)
         seg_cap = _api.QLabel("⏱ старт→плейхед")
         seg_cap.setStyleSheet(f"color: {_api.C['text3']}; font-size: 11px; font-weight: 700;")
-        self.lbl_seg_dur = _api.QLabel("00:00:00.000")
+        self.lbl_seg_dur = _api.TimecodeLabel("00:00:00.000")
         self.lbl_seg_dur.setStyleSheet(f"color: {_api.C['text']}; font-size: 12px; font-weight: 700;")
         self.lbl_seg_dur.setToolTip(
             "Длительность от начала (старта) до жёлтой полосы воспроизведения")
-        seg_l.addWidget(seg_cap); seg_l.addWidget(self.lbl_seg_dur)
+        seg_l.addWidget(seg_cap)
+        seg_l.addWidget(self.lbl_seg_dur, 0, _api.Qt.AlignmentFlag.AlignVCenter)
         pctrl_row.addWidget(seg_frame)
 
         pctrl_row.addStretch()

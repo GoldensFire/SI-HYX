@@ -1152,11 +1152,46 @@ class EditTabTimelineMixin:
             # reset() на каждый шаг: они убивают QIODevice, и следующий шаг
             # платил бы за start() те же 45 мс задержки перед звуком.
             self._scrub_sink_io = sink.start()
+            self._scrub_sink_asleep = False
+            self._schedule_scrub_sink_sleep()
             return sink
         except Exception:
             self._scrub_sink_obj = None
             self._scrub_sink_io = None
             return None
+
+    def _schedule_scrub_sink_sleep(self):
+        """(Пере)заводит таймер, который усыпит устройство скраб-звука после
+        _SCRUB_SINK_SLEEP_MS тишины — см. _sleep_scrub_sink."""
+        timer = getattr(self, "_scrub_sink_sleep_timer", None)
+        if timer is None:
+            timer = _api.QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(self._SCRUB_SINK_SLEEP_MS)
+            timer.timeout.connect(self._sleep_scrub_sink)
+            self._scrub_sink_sleep_timer = timer
+        timer.start()
+
+    def _sleep_scrub_sink(self):
+        """suspend() открытого QAudioSink, в который давно не писали. Пока поток
+        WASAPI крутится, Qt на каждый его период (~5 мс) шлёт в главный поток
+        событие «в буфере есть место» — 200 пробуждений в секунду впустую, в том
+        числе всё время обычного воспроизведения. Сеанс при этом не закрывается:
+        следующий шаг будит устройство resume() (см. _wake_scrub_sink)."""
+        sink = getattr(self, "_scrub_sink_obj", None)
+        if sink is None or getattr(self, "_scrub_sink_asleep", False):
+            return
+        try:
+            sink.suspend()
+            self._scrub_sink_asleep = True
+        except Exception:
+            pass
+
+    def _wake_scrub_sink(self, sink):
+        if getattr(self, "_scrub_sink_asleep", False):
+            sink.resume()
+            self._scrub_sink_asleep = False
+        self._schedule_scrub_sink_sleep()
 
     def _scrub_volume(self):
         try:
@@ -1247,6 +1282,7 @@ class EditTabTimelineMixin:
         if sink is None or io is None:
             return
         try:
+            self._wake_scrub_sink(sink)
             sink.setVolume(self._scrub_volume())
             free = int(sink.bytesFree())
             pending = max(0, int(sink.bufferSize()) - free)
@@ -1260,11 +1296,22 @@ class EditTabTimelineMixin:
 
     def _release_scrub_sink(self):
         sink = getattr(self, "_scrub_sink_obj", None)
+        asleep = getattr(self, "_scrub_sink_asleep", False)
         self._scrub_sink_obj = None
         self._scrub_sink_io = None
         self._scrub_fmt = None
+        self._scrub_sink_asleep = False
+        timer = getattr(self, "_scrub_sink_sleep_timer", None)
+        if timer is not None:
+            timer.stop()
         if sink is not None:
             try:
+                # stop() доигрывает буфер в потоке WASAPI, а у усыплённого
+                # клиента этот поток стоит и не завершился бы никогда — будим,
+                # как было до усыпления. (В Qt 6.10.0–6.10.1 поток после stop()
+                # не завершается и так — баг Qt, исправлен в 6.10.2.)
+                if asleep:
+                    sink.resume()
                 sink.stop()
             except Exception:
                 pass

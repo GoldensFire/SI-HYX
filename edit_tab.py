@@ -68,7 +68,7 @@ from edit_tab_workers import (
 )
 from edit_tab_widgets import (
     AudioMeter, FullscreenVideo, InfoCard, SeekPreview, SeekSlider,
-    SubtitleOverlay, VideoCanvas, VolumeLabel, VolumeSlider,
+    SubtitleOverlay, TimecodeLabel, VideoCanvas, VolumeLabel, VolumeSlider,
     WaveformWidget
 )
 from edit_tab_dialogs import (

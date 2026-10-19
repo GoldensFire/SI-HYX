@@ -140,8 +140,13 @@ class AudioWaveformLoader(_api.QThread):
         """Возвращает (combined, duration, left, right): combined — поканальный
         максимум (для рисовки волны), left/right — раздельные огибающие каналов
         (для честного стерео-индикатора). Кадры деинтерливим (буфер L,R,L,R…)
-        и считаем пики L и R в одних и тех же бакетах, чтобы шкалы были выровнены."""
-        import array as _array
+        и считаем пики L и R в одних и тех же бакетах, чтобы шкалы были выровнены.
+
+        Пики считает numpy. Прежний счёт на Python (max/min по срезам array)
+        для 40-минутного фильма держал GIL ~1.5 с, и главный поток всё это время
+        ждал GIL на каждом своём обработчике: игра «Монтажа» дёргалась задержками
+        по 100–150 мс через 6–9 с после загрузки файла."""
+        import numpy as np
         try:
             wf = _api.wave.open(wav_path, 'rb')
         except Exception:
@@ -160,26 +165,29 @@ class AudioWaveformLoader(_api.QThread):
         samples_per_pixel = max(1, n_frames // target_samples)
         chunk_size_frames = 256 * 1024
 
+        # WAV — little-endian; 8 бит беззнаковые с нулём в 128. Модуль пика
+        # считаем в типе шире исходного: abs(-32768) в int16 переполнился бы.
         if sampwidth == 1:
-            typecode = 'B'; scale = 128.0; bias = 128
+            dtype = np.dtype(np.uint8); wide = np.int32; scale = 128.0; bias = 128
         elif sampwidth == 2:
-            typecode = 'h'; scale = 32768.0; bias = 0
+            dtype = np.dtype('<i2'); wide = np.int32; scale = 32768.0; bias = 0
         elif sampwidth == 4:
-            typecode = 'i'; scale = 2147483648.0; bias = 0
+            dtype = np.dtype('<i4'); wide = np.int64; scale = 2147483648.0; bias = 0
         else:
             wf.close()
             return [], duration, [], []
 
-        def _peak(seg):
-            if not len(seg):
-                return 0.0
-            hi = max(seg); lo = min(seg)
-            if bias:
-                return max(abs(hi - bias), abs(lo - bias)) / scale
-            return max(abs(hi), abs(lo)) / scale
+        def _peaks(seg, n):
+            """Пики n целых бакетов непрерывного канала seg."""
+            seg = seg[:n * samples_per_pixel].reshape(n, samples_per_pixel)
+            hi = seg.max(axis=1).astype(wide) - bias
+            lo = seg.min(axis=1).astype(wide) - bias
+            return (np.maximum(np.abs(hi), np.abs(lo)) / scale).tolist()
 
         comb: list[float] = []; left: list[float] = []; right: list[float] = []
-        cur_l = 0.0; cur_r = 0.0; acc = 0
+        # Хвост кадров, не добравший до целого бакета, переносится в следующий
+        # кусок файла; неполный последний бакет отбрасывается (как и раньше).
+        tail_l = tail_r = np.empty(0, dtype=dtype)
 
         processed = 0
         while processed < n_frames:
@@ -188,29 +196,23 @@ class AudioWaveformLoader(_api.QThread):
             raw = wf.readframes(chunk_size_frames)
             if not raw:
                 break
-            buf = _array.array(typecode, raw)
-            if typecode != 'B' and _api.sys.byteorder == 'big':
-                buf.byteswap()
-            if nchan >= 2:
-                lbuf = buf[0::nchan]; rbuf = buf[1::nchan]
-            else:
-                lbuf = buf; rbuf = buf
-            frames_in_chunk = len(lbuf)
-            i = 0
-            while i < frames_in_chunk:
-                take = min(samples_per_pixel - acc, frames_in_chunk - i)
-                if take <= 0:
-                    break
-                pl = _peak(lbuf[i: i + take])
-                pr = _peak(rbuf[i: i + take])
-                if pl > cur_l: cur_l = pl
-                if pr > cur_r: cur_r = pr
-                acc += take
-                i += take
-                if acc >= samples_per_pixel:
-                    left.append(cur_l); right.append(cur_r)
-                    comb.append(cur_l if cur_l > cur_r else cur_r)
-                    cur_l = 0.0; cur_r = 0.0; acc = 0
+            buf = np.frombuffer(raw, dtype=dtype)
+            frames_in_chunk = len(buf) // nchan
+            if frames_in_chunk <= 0:
+                break
+            frames = buf[:frames_in_chunk * nchan].reshape(frames_in_chunk, nchan)
+            # Каналы — в непрерывные массивы: редукция по строкам с шагом в
+            # nchan отсчётов у numpy в разы медленнее.
+            lbuf = np.concatenate((tail_l, frames[:, 0]))
+            rbuf = (np.concatenate((tail_r, frames[:, 1])) if nchan >= 2 else lbuf)
+            n_full = len(lbuf) // samples_per_pixel
+            if n_full:
+                pl = _peaks(lbuf, n_full)
+                pr = _peaks(rbuf, n_full) if nchan >= 2 else pl
+                left.extend(pl); right.extend(pr)
+                comb.extend(map(max, pl, pr))
+            tail_l = lbuf[n_full * samples_per_pixel:]
+            tail_r = rbuf[n_full * samples_per_pixel:]
             processed += frames_in_chunk
 
         wf.close()
