@@ -7,6 +7,9 @@ import animepack as _api
 from dataclasses import replace
 from si_hyx_parts.animepack.catalog_pages import iter_catalog_pages
 
+# Сколько кандидатов подряд срочный поток (песни) берёт мимо весов.
+URGENT_RUN = 3
+
 
 def _franchise_marks(anime: dict, adapted: _api.Optional[dict] = None) -> tuple:
     """Ключи, по которым тайтл считается «той же серией», что уже в паке.
@@ -640,6 +643,11 @@ class GeneratorCatalogMixin:
         # Потоки, ответившие PENDING (план ещё строится): их пропускаем, пока
         # остальные отдают кандидатов, и переспрашиваем после каждого кандидата.
         waiting: set[int] = set()
+        # Срочный поток подряд не больше URGENT_RUN раз: дальше один ход по
+        # весам. Без этого застрявшие на караоке песни держали поток аниме
+        # «первым» 22 минуты, и книги не спрашивались вовсе — манга начиналась
+        # только после последнего опенинга (пак 15.10 14:33: 54 мин вместо ~20).
+        urgent_run = 0
         while live:
             ready = [row for row in live if row[0] not in off]
             if not ready:
@@ -651,8 +659,17 @@ class GeneratorCatalogMixin:
                 waiting.clear()
                 continue
             urgent = first() if first is not None else ()
-            row = next((r for r in asked if r[0] in urgent), None) or max(
-                asked, key=lambda r: r[2] / (r[3] + 1))
+            row = next((r for r in asked if r[0] in urgent), None)
+            def share(r):
+                return r[2] / (r[3] + 1)
+            others = [r for r in asked if r is not row]
+            behind = max(others, key=share) if others else None
+            if (row is not None and behind is not None and urgent_run >= URGENT_RUN
+                    and share(behind) > share(row)):
+                row = behind    # отстал от своей доли — один ход вне очереди
+            elif row is None:
+                row = max(asked, key=share)
+            urgent_run = urgent_run + 1 if row[0] in urgent else 0
             cand = next(row[1], None)
             if cand is None:
                 live.remove(row)

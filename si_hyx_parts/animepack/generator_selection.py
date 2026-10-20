@@ -912,7 +912,9 @@ class GeneratorSelectionMixin:
                         if kind not in self._dead_kinds)
                     # Досыпаем задач, пока есть куда: набранное + в работе < нужного.
                     scanned = 0
+                    paused_wait = False
                     from .manga_tail_hedge import discount
+                    from .visual_batch import note_wait, pause_blocks
                     while True:
                         # seen — «в работе» глазами планировщика: на последние
                         # места манги допускается запасная попытка.
@@ -929,6 +931,18 @@ class GeneratorSelectionMixin:
                         if any(future.done() for future in pending):
                             break
                         workers = parallel_limit(self.s)
+                        # Пауза проверок Gemini, а всем незанятым родам она
+                        # нужна: ждём её конца. Иначе каждый кандидат тут же
+                        # возвращался в запас — 16.10 за паузу так прошли 2267
+                        # попыток и весь каталог книг, и отбор полез в отложенных
+                        # ради средней.
+                        open_kinds = [k for k in quotas if k not in self._dead_kinds
+                                      and quotas[k] > counts[k] + seen[k]]
+                        if open_kinds and all(pause_blocks(self, k, inflight)
+                                              for k in open_kinds):
+                            paused_wait = True
+                            note_wait(self)
+                            break
                         scanned += 1
                         if scanned > 32:
                             break
@@ -1025,6 +1039,15 @@ class GeneratorSelectionMixin:
                             self._bench_candidate(cand)
                             continue        # средняя сложность уехала бы дальше
                         cand.kind = kind    # в смешанном режиме тип мог смениться
+                        if pause_blocks(self, kind, inflight):
+                            # Задача сорвалась бы на паузе сразу: тайтл ждёт
+                            # её конца в запасе, не тратя попытку.
+                            self._drops["пауза проверок Gemini — ждёт её конца"] += 1
+                            self._release_candidate(cand)
+                            cand._retry_after = (self._visual_pause.until
+                                                 + self.rng.uniform(1, 30))
+                            reserve.park(cand)
+                            continue
                         if inflight[kind] >= capacity(kind, workers):
                             deferred.append(cand)
                             continue
@@ -1074,6 +1097,11 @@ class GeneratorSelectionMixin:
                     if not waiting:
                         if not any(quotas[k] > counts[k] for k in quotas if k not in self._dead_kinds):
                             break
+                        if paused_wait:
+                            from .progress_heartbeat import beat
+                            beat(self, len(accepted), total, inflight)
+                            _api.time.sleep(0.5)
+                            continue
                         if deferred or reserve.retry_wait() or scanned > 32 and not exhausted:
                             _api.time.sleep(0.1)
                             continue

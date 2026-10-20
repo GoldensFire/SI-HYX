@@ -124,6 +124,11 @@ class AnimePackGenerator(
                  frames_history_path: str = _api.FRAMES_HISTORY_FILE,
                  db_cache: _api.Optional[_api.ShikimoriDbCache] = None,
                  generation_runtime=None):
+        from .visual_mode import effective, ocr_only
+        # Режим «только OCR» сводится к флагам секций один раз — дальше весь
+        # генератор видит согласованные настройки (см. visual_mode).
+        settings = effective(settings)
+        ocr_visual = ocr_only(settings)
         self.s = settings
         # Эти обратные вызовы нужны клиентам, создаваемым ниже. В частности Pixiv
         # сразу получает rng; поэтому они должны существовать до init_*_service.
@@ -159,12 +164,13 @@ class AnimePackGenerator(
         # рассуждения у них отдельные от сюжета и диалогов (просьба
         # пользователя). Подменённый в тестах клиент один на всё.
         self.gemini_titles = gemini
-        self.gemini_pixiv = gemini
-        self.gemini_frames = gemini
+        self.gemini_pixiv = None if ocr_visual else gemini
+        self.gemini_frames = None if ocr_visual else gemini
         self._visual_spare = None
         from .frame_visual_check import enabled as frame_check_enabled
-        needs_frames = any(settings.mix_shares.get(kind) and frame_check_enabled(settings, kind)
-                           for kind in (*_api.FRAME_KINDS, _api.STUDIO_KIND))
+        needs_frames = not ocr_visual and any(
+            settings.mix_shares.get(kind) and frame_check_enabled(settings, kind)
+            for kind in (*_api.FRAME_KINDS, _api.STUDIO_KIND))
         needs_general = any(settings.mix_shares.get(k)
                             for k in (_api.PLOT_KIND, _api.DIALOGUE_KIND,
                                       _api.DESCRIPTION_AUDIO_KIND))
@@ -179,7 +185,7 @@ class AnimePackGenerator(
                            and getattr(settings, "pixiv_gemini_check", True))
         # Gemini chooses the character scene on the original page and can also
         # check the final crop for title lettering.
-        needs_manga = bool(settings.mix_shares.get(_api.MANGA_KIND)
+        needs_manga = bool(not ocr_visual and settings.mix_shares.get(_api.MANGA_KIND)
                            and (getattr(settings, "manga_character_crop", True)
                                 or (getattr(settings, "manga_gemini_check", True)
                                     and (settings.manga_title_check_mode == "gemini"
@@ -269,6 +275,10 @@ class AnimePackGenerator(
         initialize_visual_batches(self)
         from .local_visual_ocr import initialize as initialize_local_ocr
         initialize_local_ocr(self)
+        if ocr_visual:
+            self.log("Проверка изображений: локально, без Gemini — названия "
+                     "ищет OCR, персонажей в кадрах и сценах вебтунов — детектор "
+                     "голов; рисовка артов Pixiv не оценивается.")
         from .plot_batch import initialize as initialize_plot_batches
         initialize_plot_batches(self)
         self.jimaku = jimaku

@@ -914,6 +914,15 @@ class _PaintedVideoCanvas(_api.QWidget):
         if self.isVisible():
             self.update()
 
+    def _adopt_pin_frame(self, pts_us):
+        """Плеер сам привёз кадр, заявленный пином (перемотка на паузе), — он и
+        есть точный кадр. Дальше чужие кадры на экран не пускаем: без этого
+        разбег прогрева (кадры за полсекунды ДО цели) пролезал на холст, пока
+        предекодер не привёз свою копию того же кадра."""
+        span = self._pin_span
+        if span is not None and not self._pin_has_img and span[0] <= pts_us < span[1]:
+            self._pin_has_img = True
+
     def clear_frame_pin(self):
         """Снять пин — кадры плеера снова главные (воспроизведение)."""
         self._pin_span = None
@@ -989,6 +998,7 @@ class _PaintedVideoCanvas(_api.QWidget):
             if pts_us is not None and pts_us >= 0:
                 self._last_pts_us = pts_us
                 self._last_frame_at = _api.time.monotonic()
+                self._adopt_pin_frame(pts_us)
             # Время для предпросмотра накладки берём из PTS самого кадра: так
             # накладка стоит ровно на своём кадре и при воспроизведении, и при
             # покадровой перемотке (positionChanged плеера приходит реже).
@@ -1108,8 +1118,7 @@ class _PaintedVideoCanvas(_api.QWidget):
         sub_rect = vr.intersected(self.rect())
         if sub_rect.width() < 10 or sub_rect.height() < 10:
             sub_rect = self.rect()
-        px = max(15, int(min(sub_rect.height(), self.height()) * 0.052))
-        _api._paint_subtitle(p, sub_rect, self._text, px, self._image, self._image_pos)
+        _api._paint_subtitle(p, sub_rect, self._text, self._image, self._image_pos)
         # Рамка кадрирования видео (как в «Редактировании фото»): в режиме
         # правки — затемнение/сетка/ручки, иначе (рамка «вооружена») — тонкая
         # пунктирная подсказка, что экспорт кадрируется по ней.

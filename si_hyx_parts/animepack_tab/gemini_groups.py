@@ -44,7 +44,21 @@ def build(tab):
         ("Названия", "Синонимы, антонимы, украинский и определения; анаграммы создаются локально",
          tab.cb_gemini_title_model, tab.cb_gemini_title_think),
     )
-    row = 1
+    tab.cb_visual_checker = api.QComboBox()
+    tab.cb_visual_checker.addItem("Gemini", "gemini")
+    tab.cb_visual_checker.addItem("Локальный OCR (без Gemini)", "ocr")
+    tab.cb_visual_checker.setToolTip(
+        "Кто проверяет картинки: кадры, студии, кадры с эффектами, страницы "
+        "манги, арты Pixiv и видеоряд опенингов.\n"
+        "Локальный режим работает на этом компьютере, без запросов и квоты "
+        "Gemini: OCR сверяет надписи с названиями тайтла, детектор персонажей "
+        "проверяет кадры студий и выбирает сцену вебтуна (модель ~45 МБ "
+        "скачивается один раз). Рисовку и чужие франшизы на артах Pixiv он не "
+        "оценивает — их отсекают только метки.\n"
+        "Отрывки серий по-прежнему проверяет Gemini.")
+    grid.addWidget(tab._lab("Проверка изображений"), 1, 0, 1, 2)
+    grid.addWidget(tab.cb_visual_checker, 2, 0, 1, 2)
+    row = 3
     for label, tip, model, think in groups:
         heading = tab._lab(label)
         heading.setToolTip(tip)
@@ -87,3 +101,6 @@ def apply(tab, settings):
     refresh_image_levels(tab)
     think = tab.cb_gemini_image_think
     think.setCurrentIndex(max(0, think.findData(settings.gemini_image_thinking)))
+    checker = tab.cb_visual_checker
+    checker.setCurrentIndex(max(0, checker.findData(
+        getattr(settings, "visual_checker", "gemini"))))

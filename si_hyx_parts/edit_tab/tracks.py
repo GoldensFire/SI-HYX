@@ -2,14 +2,58 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """Монтаж: аудиодорожки, внешняя озвучка и субтитры (поиск, оверлей, правка)."""
+import re
+
 import edit_tab as _api
+from si_hyx_parts.edit_tab import subtitle_style
 
 
 AUDIO_OFF_LABEL = "Нет"
+MORE_FILES_LABEL = "Показать другие файлы в папке… ({})"
+
+# Теги в скобках у имён релизов: «[Group] Title - 01 [1080p] (BD)».
+_NAME_TAGS = re.compile(r"\[[^\]]*\]|\([^)]*\)|\{[^}]*\}")
+_NAME_SEPS = re.compile(r"[._]+")
+_NAME_SPACES = re.compile(r"\s+")
+_NAME_NUMBERS = re.compile(r"\d+")
+
+
+def media_name_key(path) -> str:
+    """Имя файла без расширения и тегов в скобках, в нижнем регистре:
+    «[Group] Title - 01 [1080p].mkv» и «[Dub] Title - 01.mka» → «title - 01»."""
+    name = _api.os.path.splitext(_api.os.path.basename(str(path)))[0].lower()
+    name = _NAME_SEPS.sub(" ", _NAME_TAGS.sub(" ", name))
+    return _NAME_SPACES.sub(" ", name).strip(" -")
+
+
+def names_relate(a: str, b: str) -> bool:
+    """Ключи имён (media_name_key) про один и тот же фильм/серию: один
+    содержит другой, а последние числа (номер серии) совпадают, если есть у
+    обоих — «title - 01» не родня «title - 011»."""
+    if not a or not b or not (a == b or a in b or b in a):
+        return False
+    na, nb = _NAME_NUMBERS.findall(a), _NAME_NUMBERS.findall(b)
+    return not na or not nb or int(na[-1]) == int(nb[-1])
 
 
 def _audio_is_off(self) -> bool:
     return bool(getattr(self, "audio_disabled", False))
+
+
+def _track_title(tags: dict) -> str:
+    """Имя дорожки из тегов ffprobe. MKV кладёт его в title, MP4/M4V — в name
+    (атом udta), иногда только в handler_name. Служебные handler_name
+    («SoundHandler», «Core Media Audio», «ISO Media file produced by…»)
+    именем не считаются."""
+    for key in ('title', 'TITLE', 'name', 'NAME'):
+        value = str(tags.get(key) or '').strip()
+        if value:
+            return value
+    handler = str(tags.get('handler_name') or tags.get('HANDLER_NAME') or '').strip()
+    low = handler.casefold()
+    if not handler or 'handler' in low or low.startswith(('core media', 'iso media')):
+        return ''
+    return handler
 
 
 def drop_audio(cmd: list, out: str) -> list:
@@ -44,17 +88,20 @@ class EditTabTracksMixin:
 
     @staticmethod
     def _track_label(s, i, kind, total=1):
+        """Подпись дорожки — её имя из файла целиком («English DUB from
+        StudioCanal Stereo»). Безымянная — язык и кодек («2. eng AAC»)."""
         tags = s.get('tags', {}) or {}
         lang = tags.get('language') or tags.get('LANGUAGE') or ''
-        title = tags.get('title') or tags.get('TITLE') or ''
+        title = _track_title(tags)
+        if title:
+            return f"{i + 1}. {title}"
         codec = (s.get('codec_name') or '').upper()
         parts = [f"{i + 1}."]
         # Тег языка показываем ТОЛЬКО когда дорожек несколько — иначе выбирать
         # нечего, а тег часто врёт (YouTube помечает единственную/оригинальную
         # дорожку как "eng" независимо от реального языка озвучки).
         if lang and total > 1: parts.append(lang)
-        if title: parts.append(title[:18])
-        if codec and not title: parts.append(codec)
+        if codec: parts.append(codec)
         return " ".join(parts) or f"Дорожка {i + 1}"
 
     def _populate_track_combos(self):
@@ -67,20 +114,10 @@ class EditTabTracksMixin:
         self._sub_use_overlay = False
         self._hide_sub_display()
         try:
-            # ── Аудио: встроенные дорожки + внешние файлы (озвучка) ──
-            self.cmb_audio.clear()
-            self._audio_entries = []
-            for i, s in enumerate(self._audio_streams):
-                self.cmb_audio.addItem(self._track_label(s, i, "Аудио", total=len(self._audio_streams)))
-                self._audio_entries.append(('emb', i))
-            for p in self._audio_ext:
-                self.cmb_audio.addItem(_api.get_icon('fa5s.file'), _api.os.path.basename(p))
-                self._audio_entries.append(('ext', p))
-            if not self._audio_entries:
-                self.cmb_audio.addItem("— нет —")
-            # «Нет» — выключить звук: превью молчит, экспорт идёт без звука.
-            self._add_audio_off_entry()
-            self.cmb_audio.setEnabled(len(self._audio_entries) > 1)
+            # ── Аудио: встроенные дорожки + внешние файлы (озвучка), «Нет» —
+            # выключить звук (превью молчит, экспорт без звука) ──
+            self._fill_audio_combo()
+            self._audio_sel_entry = self._audio_entries[0] if self._audio_entries else None
 
             # ── Субтитры: «Выкл» + встроенные + внешние файлы ──
             self.cmb_subs.clear()
@@ -91,7 +128,7 @@ class EditTabTracksMixin:
                 self.cmb_subs.addItem(self._track_label(s, i, "Субтитры", total=len(self._sub_streams)))
                 self._sub_entries.append(('emb', i))
             for p in self._sub_ext:
-                self.cmb_subs.addItem(_api.get_icon('fa5s.file'), _api.os.path.basename(p))
+                self.cmb_subs.addItem(_api.os.path.basename(p))
                 self._sub_entries.append(('ext', p))
             if getattr(self, "_sub_ext_hidden", None):
                 self.cmb_subs.addItem(_api.get_icon('fa5s.folder-open'),
@@ -111,6 +148,13 @@ class EditTabTracksMixin:
         if self._loading_tracks or idx < 0 or idx >= len(self._audio_entries):
             return
         kind, ref = self._audio_entries[idx]
+        if kind == 'more':
+            # Как у субтитров: досыпать отложенные файлы, остаться на прежнем
+            # выборе и снова раскрыть список — его открывали, чтобы выбрать.
+            self._expand_external_audio()
+            _api.QTimer.singleShot(0, self._reopen_audio_popup)
+            return
+        self._audio_sel_entry = (kind, ref)
         if kind == 'none':
             # Звук выключен: гасим и внешнюю озвучку, волну оставляем как есть.
             self.selected_audio_ext_path = None
@@ -196,9 +240,131 @@ class EditTabTracksMixin:
     def _external_audio_insert_at(self) -> int:
         """Куда вставить новый файл озвучки: перед пунктом «Нет»."""
         for i, (kind, _ref) in enumerate(self._audio_entries):
-            if kind == 'none':
+            if kind in ('none', 'more'):
                 return i
         return len(self._audio_entries)
+
+    def _add_audio_more_entry(self) -> None:
+        """«Показать другие файлы в папке…» — последним пунктом, если поиск
+        озвучки что-то отложил (см. _scan_external_audio)."""
+        hidden = getattr(self, "_audio_ext_hidden", None)
+        if not hidden:
+            return
+        if not self._audio_entries:
+            # У файла нет своего звука: плейсхолдер «— нет —» и значит «Нет».
+            self._audio_entries.append(('none', None))
+        self.cmb_audio.addItem(_api.get_icon('fa5s.folder-open'),
+                               MORE_FILES_LABEL.format(len(hidden)))
+        self._audio_entries.append(('more', None))
+
+    def _external_audio_label(self, path):
+        """Подпись внешней озвучки. Файл из подпапки — вместе с её путём
+        («Eng Sound / файл.mka»): по папке обычно и видно, чья это озвучка."""
+        base = _api.os.path.basename(str(path))
+        src = getattr(self, "actual_source_file", None)
+        if not src:
+            return base
+        try:
+            rel = _api.os.path.relpath(_api.os.path.dirname(str(path)),
+                                       _api.os.path.dirname(str(src)))
+        except (ValueError, TypeError):
+            return base
+        if rel in (".", "") or rel.startswith(".."):
+            return base
+        return f"{rel.replace(_api.os.sep, ' / ')} / {base}"
+
+    def _fill_audio_combo(self):
+        """Список аудиодорожек: встроенные, внешние файлы, «Нет» и «ещё»."""
+        self.cmb_audio.clear()
+        self._audio_entries = []
+        for i, s in enumerate(self._audio_streams):
+            self.cmb_audio.addItem(self._track_label(s, i, "Аудио", total=len(self._audio_streams)))
+            self._audio_entries.append(('emb', i))
+        for p in self._audio_ext:
+            self.cmb_audio.addItem(self._external_audio_label(p))
+            self._audio_entries.append(('ext', p))
+        if not self._audio_entries:
+            self.cmb_audio.addItem("— нет —")
+        self._add_audio_off_entry()
+        self._add_audio_more_entry()
+        self.cmb_audio.setEnabled(len(self._audio_entries) > 1)
+
+    def _expand_external_audio(self):
+        """«Показать другие файлы» у звука: отложенные файлы — в список, выбор
+        остаётся на той дорожке, что играет сейчас."""
+        hidden = getattr(self, "_audio_ext_hidden", None) or []
+        self._audio_ext_hidden = []
+        for p in hidden:
+            if p not in self._audio_ext:
+                self._audio_ext.append(p)
+        sel = getattr(self, "_audio_sel_entry", None)
+        self._loading_tracks = True
+        try:
+            self._fill_audio_combo()
+            if sel is not None and sel in self._audio_entries:
+                self.cmb_audio.setCurrentIndex(self._audio_entries.index(sel))
+        finally:
+            self._loading_tracks = False
+
+    def _reopen_audio_popup(self):
+        cmb = getattr(self, "cmb_audio", None)
+        if cmb is None or not cmb.isEnabled() or not cmb.isVisible():
+            return
+        try:
+            cmb.showPopup()
+        except Exception:
+            pass
+
+    # Слова в названии папки с озвучкой: Rus Sound, Eng Sound [Studio], Audio,
+    # Dub, Озвучка, Звук…
+    _AUDIO_FOLDER_WORDS = ('sound', 'audio', 'dub', 'voice', 'звук', 'озвуч', 'аудио')
+
+    def _scan_external_audio(self, src):
+        """Внешняя озвучка рядом с видео и в подпапках (до 3 уровней) — как у
+        субтитров. Сразу в список: файлы, чьё имя совпадает с видео без тегов в
+        скобках (media_name_key), и единственный звуковой файл папки озвучки
+        (Rus Sound, Audio, Озвучка…) — у фильма с переводом имя бывает своё.
+        Остальное (папка озвучки на весь сезон, чужие mp3 рядом) откладывается
+        в self._audio_ext_hidden — его открывает «Показать другие файлы…»."""
+        found, hidden, folders = [], [], {}
+        try:
+            base = _api.os.path.dirname(str(src))
+            if not base or not _api.os.path.isdir(base):
+                self._audio_ext_hidden = []
+                return []
+            own = _api.os.path.normcase(_api.os.path.abspath(str(src)))
+            key = media_name_key(src)
+            seen = 0
+            for root, dirs, files in _api.os.walk(base):
+                rel_dir = root[len(base):].lstrip(_api.os.sep)
+                depth = rel_dir.count(_api.os.sep) + (1 if rel_dir else 0)
+                if depth >= 3:
+                    dirs[:] = []
+                # Папка озвучки — подпапка самого видео (Rus Sound/Студия/…), а
+                # не «Rus Sound» соседнего фильма в его собственной папке.
+                segs = [s.lower() for s in rel_dir.split(_api.os.sep) if s]
+                audio_dir = bool(segs) and any(w in segs[0] for w in self._AUDIO_FOLDER_WORDS)
+                for fn in files:
+                    if _api.os.path.splitext(fn)[1].lower() not in self._AUDIO_EXTS:
+                        continue
+                    p = _api.os.path.join(root, fn)
+                    if _api.os.path.normcase(_api.os.path.abspath(p)) == own:
+                        continue
+                    seen += 1
+                    if names_relate(media_name_key(fn), key):
+                        found.append(p)
+                    elif audio_dir:
+                        folders.setdefault(root, []).append(p)
+                    else:
+                        hidden.append(p)
+                if seen >= 500:
+                    break
+            for paths in folders.values():
+                (found if len(paths) == 1 else hidden).extend(paths)
+        except Exception:
+            pass
+        self._audio_ext_hidden = self._sort_external_subs(hidden, src)
+        return self._sort_external_subs(found, src)
 
     def _ensure_ext_audio_player(self):
         if self._ext_audio_player is None:
@@ -218,19 +384,29 @@ class EditTabTracksMixin:
         except Exception:
             pass
         try:
-            self._ext_audio_output.setVolume(self.vol_slider.value() / 100.0)
+            self._ext_audio_output.setVolume(self._output_volume())
         except Exception:
             pass
         self._ext_audio_active = True
+        self._ext_audio_sync_pending = True
         p.setSource(_api.QUrl.fromLocalFile(str(path)))
 
         # Точную синхронизацию делаем по событию загрузки (_on_ext_audio_status).
 
     def _on_ext_audio_status(self, status):
+        """Первая синхронизация озвучки с видео — ОДИН раз после загрузки.
+
+        Раньше она срабатывала на каждый BufferedMedia, а её же setPosition
+        снова запускает буферизацию: плеер озвучки перематывался по кругу
+        (70 раз за 3 с), позиция шла, а звук так и не начинался —
+        после перемотки аудио-конвейеру нужно ~0.4 с на раскрутку."""
         if not self._ext_audio_active or self._ext_audio_player is None:
+            return
+        if not getattr(self, "_ext_audio_sync_pending", False):
             return
         if status in (_api.QMediaPlayer.MediaStatus.LoadedMedia,
                       _api.QMediaPlayer.MediaStatus.BufferedMedia):
+            self._ext_audio_sync_pending = False
             try:
                 self._ext_audio_player.setPosition(self.player.position())
                 if (self.player.playbackState()
@@ -264,6 +440,7 @@ class EditTabTracksMixin:
         if not getattr(self, "_ext_audio_active", False):
             return
         self._ext_audio_active = False
+        self._ext_audio_sync_pending = False
         p = self._ext_audio_player
         if p is not None:
             try: p.pause()
@@ -307,6 +484,7 @@ class EditTabTracksMixin:
                 self._sub_ext_hidden = []
                 return []
             stem = _api.os.path.splitext(_api.os.path.basename(str(src)))[0].lower()
+            key = media_name_key(src)
             for root, dirs, files in _api.os.walk(base):
                 rel_dir = root[len(base):].lstrip(_api.os.sep)
                 depth = rel_dir.count(_api.os.sep) + (1 if rel_dir else 0)
@@ -316,7 +494,11 @@ class EditTabTracksMixin:
                 for fn in files:
                     if _api.os.path.splitext(fn)[1].lower() in self._SUB_EXTS:
                         p = _api.os.path.join(root, fn)
-                        (found if related else hidden).append(p)
+                        # Имя совпадает с видео без тегов в скобках («Rus Sub/
+                        # Фильм.srt», «[Group] Title - 01.ass») — свой файл в
+                        # любой подпапке.
+                        own = related or names_relate(media_name_key(fn), key)
+                        (found if own else hidden).append(p)
                         if len(found) + len(hidden) >= 500:
                             self._sub_ext_hidden = self._sort_external_subs(hidden, src)
                             return self._sort_external_subs(found, src)
@@ -358,7 +540,7 @@ class EditTabTracksMixin:
                 self.cmb_subs.addItem(self._track_label(s, i, "Субтитры", total=len(self._sub_streams)))
                 self._sub_entries.append(('emb', i))
             for p in self._sub_ext:
-                self.cmb_subs.addItem(_api.get_icon('fa5s.file'), _api.os.path.basename(p))
+                self.cmb_subs.addItem(_api.os.path.basename(p))
                 self._sub_entries.append(('ext', p))
             if getattr(self, "_sub_ext_hidden", None):
                 self.cmb_subs.addItem(_api.get_icon('fa5s.folder-open'),
@@ -415,11 +597,10 @@ class EditTabTracksMixin:
                             if e[0] == 'more'), None)
             if more_at is None:
                 self._sub_entries.append(target)
-                self.cmb_subs.addItem(_api.get_icon('fa5s.file'), _api.os.path.basename(path))
+                self.cmb_subs.addItem(_api.os.path.basename(path))
             else:
                 self._sub_entries.insert(more_at, target)
-                self.cmb_subs.insertItem(more_at + 1, _api.get_icon('fa5s.file'),
-                                          _api.os.path.basename(path))
+                self.cmb_subs.insertItem(more_at + 1, _api.os.path.basename(path))
             self.cmb_subs.setEnabled(True)
             self._loading_tracks = False
         try:
@@ -535,19 +716,25 @@ class EditTabTracksMixin:
         if dlg.exec() != _api.QDialog.DialogCode.Accepted:
             return
         new_text = dlg.text()
-        if not _api._parse_srt(new_text):
+        new_cues = _api._parse_srt(new_text)
+        if not new_cues:
             _api.msgbox_warning(self, "Субтитры",
                                 "После правки не осталось ни одной реплики.")
             return
+        # Стилизованная дорожка (ASS/SSA/mov_text) сохраняется в .ass со
+        # стилями оригинала: правился только текст, а голый SRT вшивался бы
+        # стилем libass по умолчанию вместо исходного.
+        styled = self._styled_edit_result(new_cues)
+        ext, payload = (".ass", styled) if styled else (".srt", new_text)
         try:
             _api.os.makedirs(_api.CONFIG_DIR, exist_ok=True)
             base = self.actual_source_file.stem if self.actual_source_file else "subs"
-            path = _api.os.path.join(_api.CONFIG_DIR, f"{base}_edited.srt")
+            path = _api.os.path.join(_api.CONFIG_DIR, f"{base}_edited{ext}")
             n = 1
             while _api.os.path.exists(path) and _api.os.path.normpath(path) not in self._sub_ext:
-                path = _api.os.path.join(_api.CONFIG_DIR, f"{base}_edited_{n}.srt"); n += 1
+                path = _api.os.path.join(_api.CONFIG_DIR, f"{base}_edited_{n}{ext}"); n += 1
             with open(path, 'w', encoding='utf-8') as f:
-                f.write(new_text if new_text.endswith("\n") else new_text + "\n")
+                f.write(payload if payload.endswith("\n") else payload + "\n")
         except Exception as e:
             _api.msgbox_warning(self, "Субтитры", f"Не удалось сохранить: {e}")
             return
@@ -565,6 +752,39 @@ class EditTabTracksMixin:
                 self.cmb_subs.setCurrentIndex(idx)
         else:
             self._add_external_sub(path)
+
+    def _styled_edit_result(self, cues):
+        """Текст .ass для правленых реплик активной дорожки со стилями её
+        оригинала, или None (дорожка без своих стилей — srt/vtt)."""
+        entry = getattr(self, "_sub_sel_entry", None)
+        if not entry:
+            return None
+        kind, ref = entry
+        try:
+            if kind == 'emb':
+                src, idx = self.actual_source_file, ref
+                codec = (self._sub_streams[ref].get('codec_name') or '').lower()
+            elif kind == 'ext':
+                src, idx = ref, 0
+                codec = _api.os.path.splitext(str(ref))[1].lower().lstrip('.')
+            else:
+                return None
+        except Exception:
+            return None
+        if codec not in ('ass', 'ssa', 'mov_text') or not src:
+            return None
+        original = None
+        if kind == 'ext' and codec == 'ass':
+            try:
+                with open(ref, 'r', encoding='utf-8-sig', errors='replace') as f:
+                    original = f.read()
+            except Exception:
+                original = None
+        if not original:
+            original = subtitle_style.extract_ass(src, idx, codec)
+        if not original:
+            return None
+        return subtitle_style.rebuild_ass(original, cues)
 
     def create_subtitles(self):
         """«Создать субтитры»: диалог с репликами (текст+тайминг) и позицией на
@@ -692,18 +912,19 @@ class EditTabTracksMixin:
         target = ('ext', path)
         if path not in self._audio_ext:
             self._audio_ext.append(path)
+            hidden = getattr(self, "_audio_ext_hidden", None)
+            if hidden and path in hidden:
+                hidden.remove(path)
+            # Список собирается заново (файл встаёт перед «Нет», плейсхолдер
+            # «— нет —» уходит, счётчик «ещё» верный); выбор пока прежний.
+            sel = getattr(self, "_audio_sel_entry", None)
             self._loading_tracks = True
-            # Убираем плейсхолдер «— нет —», если до этого дорожек не было.
-            if not self._audio_entries:
-                self.cmb_audio.clear()
-            # Новый файл встаёт перед пунктом «Нет».
-            at = self._external_audio_insert_at()
-            self._audio_entries.insert(at, target)
-            self.cmb_audio.insertItem(at, _api.get_icon('fa5s.file'), _api.os.path.basename(path))
-            if all(kind != 'none' for kind, _ref in self._audio_entries):
-                self._add_audio_off_entry()
-            self.cmb_audio.setEnabled(len(self._audio_entries) > 1)
-            self._loading_tracks = False
+            try:
+                self._fill_audio_combo()
+                if sel is not None and sel in self._audio_entries:
+                    self.cmb_audio.setCurrentIndex(self._audio_entries.index(sel))
+            finally:
+                self._loading_tracks = False
         try:
             idx = self._audio_entries.index(target)
         except ValueError:
@@ -1001,7 +1222,10 @@ class EditTabTracksMixin:
                 ex.start()
             return
         try:
-            self._ass = _api._libass.AssRenderer()
+            # Шрифт караоке — у реплик, созданных в «Создать субтитры» стилем
+            # по умолчанию (системным провайдером libass он не виден).
+            self._ass = _api._libass.AssRenderer(
+                fonts=[str(_api._karaoke_style.FONT_FILE)])
             if not self._ass.load_ass_file(path):
                 raise RuntimeError("load_ass_file failed")
             self._ass_path = path
@@ -1111,8 +1335,11 @@ class EditTabTracksMixin:
         # Стиль вшиваемых субтитров — по выбору пользователя (cmb_sub_style):
         #   0 Авто      — стиль программы для SRT/VTT/mov_text, у ASS/SSA свой;
         #   1 Программа — насильно стиль программы даже поверх ASS/SSA;
-        #   2 Оригинал  — ничего не навязываем (ASS/SSA — свой стиль, SRT/VTT —
-        #                 стиль libass по умолчанию).
+        #   2 Оригинал  — свой стиль у ASS/SSA/mov_text. У SRT/VTT своего стиля
+        #                 нет вовсе — им стиль программы, тот же, что в превью
+        #                 (раньше вшивался голый Arial libass, а в плеере был
+        #                 другой вид).
+        # Стиль программы — как у караоке в генерации паков (prog_sub_force_style).
         try:
             style_choice = int(self.cmb_sub_style.currentIndex())
         except Exception:
@@ -1121,25 +1348,61 @@ class EditTabTracksMixin:
         if style_choice == 1:
             apply_prog_style = True
         elif style_choice == 2:
-            apply_prog_style = False
+            apply_prog_style = not (native_styled or sub_codec == 'mov_text')
         else:
             apply_prog_style = not native_styled
+        if not apply_prog_style and not ext_sub and sub_codec == 'mov_text':
+            # Оригинальный mov_text: его шрифт задан в пикселях кадра, а ffmpeg
+            # сам ставит холст 384×288 — выходили субтитры в полэкрана. Вшиваем
+            # ASS-копию с холстом по размеру видео (subtitle_style).
+            fixed = subtitle_style.mov_text_burn_file(src, burn_idx)
+            if fixed:
+                vf = f"subtitles='{self._escape_filter_path(fixed)}'"
         if apply_prog_style:
-            # Белый жирный шрифт с чёрной обводкой — РОВНО как в превью монтажа.
-            # Превью рисует текст высотой 5.2% кадра (см. VideoCanvas.paintEvent
-            # px=...*0.052). Текстовые субтитры libass рендерит в скрипте 384×288
-            # (дефолт libav) и масштабирует до кадра, поэтому Fontsize=15 даёт
-            # 15/288 ≈ 5.2% высоты кадра НА ЛЮБОМ разрешении. Прежний Fontsize=28
-            # давал ~2× (на FullHD субтитры «огромные» — это и был баг).
-            style = ("FontName=Arial,Fontsize=15,Bold=1,"
-                     "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-                     "BorderStyle=1,Outline=1,Shadow=0,MarginV=14")
-            vf += f":force_style='{style}'"
-        fonts_dir = self._extract_subtitle_fonts(src)
+            # Караоке-вид — РОВНО как в превью Монтажа (_paint_subtitle считает
+            # пиксели по тем же правилам libass). Текстовые субтитры ffmpeg
+            # рендерит на холсте 384×288 и масштабирует до кадра, поэтому кегль
+            # в долях кадра один на любом разрешении. У ASS холст свой — кегль
+            # пересчитывается на его PlayResY, иначе на холсте 1080 текст вышел
+            # бы вчетверо мельче.
+            play_res_y = (self._ass_play_res_y(src, ext_sub, burn_idx)
+                          if native_styled else None)
+            vf += f":force_style='{_api.prog_sub_force_style(play_res_y)}'"
+        fonts_dir = self._subtitle_fonts_dir(src)
         if fonts_dir:
             fesc = self._escape_filter_path(fonts_dir)
             vf += f":fontsdir='{fesc}'"
         return vf
+
+    def _ass_play_res_y(self, src, ext_sub=None, burn_idx=-1):
+        """PlayResY дорожки ASS/SSA для вшивания (None — не прочитать)."""
+        text = None
+        if ext_sub:
+            try:
+                with open(ext_sub, 'r', encoding='utf-8-sig', errors='replace') as f:
+                    text = f.read()
+            except Exception:
+                text = None
+        elif burn_idx is not None and burn_idx >= 0:
+            text = subtitle_style.extract_ass(src, burn_idx)
+        return subtitle_style.play_res_y(text) if text else None
+
+    def _subtitle_fonts_dir(self, src):
+        """Папка шрифтов для вшивания: вложенные шрифты контейнера (родные
+        стили ASS) плюс шрифт караоке — им рисуется стиль программы и он же
+        стиль «Создать субтитры» по умолчанию. ffmpeg принимает одну папку,
+        поэтому шрифт караоке кладётся к извлечённым."""
+        karaoke_font = _api._karaoke_style.FONT_FILE
+        fonts_dir = self._extract_subtitle_fonts(src)
+        if not fonts_dir:
+            return str(karaoke_font.parent)
+        target = _api.os.path.join(fonts_dir, karaoke_font.name)
+        if not _api.os.path.exists(target):
+            try:
+                _api.shutil.copyfile(str(karaoke_font), target)
+            except Exception:
+                pass
+        return fonts_dir
 
     def _burn_subs_spec(self, src, in_s):
         """Описание вшивания субтитров для вкладки «Обработка», или None.

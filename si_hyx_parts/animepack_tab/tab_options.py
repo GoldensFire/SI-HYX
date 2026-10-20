@@ -954,6 +954,7 @@ class AnimePackTabOptionsMixin:
         s.gemini_model = self.cb_gemini_model.currentText().strip()
         s.gemini_image_model = self.cb_gemini_image_model.currentText().strip()
         s.gemini_image_thinking = self.cb_gemini_image_think.currentData() or "minimal"
+        s.visual_checker = self.cb_visual_checker.currentData() or "gemini"
         s.gemini_thinking = (self.cb_gemini_think.currentData()
                              or _api.GEMINI_THINKING_LEVEL)
         # Загадки по названию ходят к своей модели (просьба пользователя).

@@ -25,6 +25,11 @@ def keep(generator, cand, value) -> None:
             pool.pop(next(iter(pool)))
 
 
+def count(generator) -> int:
+    """Сколько тайтлов ждут повтора с уже скачанными страницами."""
+    return len(generator.__dict__.get("_manga_kept_pages") or ())
+
+
 def take(generator, cand):
     """Сохранённое для тайтла (и забыть его) либо None."""
     pool = generator.__dict__.get("_manga_kept_pages")

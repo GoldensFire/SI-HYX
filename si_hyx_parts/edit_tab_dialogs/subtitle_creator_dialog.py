@@ -53,6 +53,10 @@ class SubtitleCreatorDialog(_api.QDialog):
         # по умолчанию наследует то, что пользователь выбирал в прошлый раз, а
         # не жёстко зашитый DEFAULT_SUBTITLE_STYLE.
         self._default_style = dict(default_style) if default_style else dict(_api.DEFAULT_SUBTITLE_STYLE)
+        # Шрифт караоке (стиль по умолчанию) не системный: регистрируем его ДО
+        # списка шрифтов — иначе QFontComboBox его не знает и подставил бы
+        # первый попавшийся вместо «Karaoke Rounded».
+        _api._karaoke_font_family()
         self._cues = []          # [{'start','end','text','style'(override|None)}]
         self._selected = -1
         self._presets = _api._load_subtitle_presets()

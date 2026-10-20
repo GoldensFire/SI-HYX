@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
-"""Монтаж: загрузка файла, прокси для просмотра, плеер и полный экран."""
+"""Монтаж: загрузка файла, прокси для просмотра и плеер."""
 import edit_tab as _api
 
 
 class EditTabPlaybackMixin:
-    """Монтаж: загрузка файла, прокси для просмотра, плеер и полный экран."""
+    """Монтаж: загрузка файла, прокси для просмотра и плеер."""
 
     # ── File loading ──────────────────────────────────────────────────────
     def open_file(self):
@@ -15,12 +15,16 @@ class EditTabPlaybackMixin:
             "Медиа файлы (*.mp4 *.mkv *.mov *.avi *.mp3 *.aac *.wav *.flac "
             "*.png *.jpg *.jpeg *.bmp *.webp *.gif);;Все файлы (*)")
         if fname:
+            self._project_leave()
             self.load_file(fname)
 
     def clear_file(self):
         """Убирает текущий файл и возвращает редактор в исходное «пустое»
         состояние (как при запуске без файла): останавливает плеер и фоновые
         воркеры, чистит временный proxy, сбрасывает инфо/волну/тайминги."""
+        # Таймлайн — тоже пустой (Ctrl+Z вернёт клипы, а с ними и файл).
+        if getattr(self, "project_timeline", None) is not None:
+            self.project_clear()
         # Снимок для отмены «Очистить» через Ctrl+Z: файл + текущая обрезка.
         if self.filepath:
             self._cleared_snapshot = {
@@ -64,11 +68,17 @@ class EditTabPlaybackMixin:
                 pass
         self.tmp_proxy_file = None
         self.is_proxy_active = False
-        # Выгружаем источник из плеера.
+        # Выгружаем источник из плеера и закрываем его девайс: хэндл исходника
+        # (см. _set_player_file) иначе жил до следующего файла — сам файл
+        # удалялся «в ожидании», а папку с ним Windows не давала удалить.
         try:
             self.player.setSource(_api.QUrl())
         except Exception:
             pass
+        dev = getattr(self, '_play_device', None)
+        self._play_device = None
+        if dev is not None:
+            _api.QTimer.singleShot(0, lambda d=dev: self._close_play_device(d))
         # Очищаем последний кадр на холсте (frame-режим).
         if isinstance(self.video_widget, _api.VideoCanvas):
             self.video_widget.clear_frame()
@@ -121,6 +131,7 @@ class EditTabPlaybackMixin:
         self._audio_streams = []
         self._sub_streams = []
         self._audio_ext = []
+        self._audio_ext_hidden = []
         self._sub_ext = []
         self.selected_audio_ext_path = None
         self.selected_sub_ext_path = None
@@ -132,7 +143,7 @@ class EditTabPlaybackMixin:
             lbl.setText("—")
 
         # Подпись файла → исходный «пустой» вид (пунктирная рамка).
-        self.lbl_file.setText("Нет файла")
+        self.lbl_file.clear_full_text("Нет файла")
         self.lbl_file.setToolTip("")
         self.lbl_file.setStyleSheet(f"""
             color: {_api.C['text3']};
@@ -177,10 +188,17 @@ class EditTabPlaybackMixin:
         грузим первый существующий файл в редактор, как обычный drop в окно."""
         for p in (paths or []):
             if p and _api.os.path.exists(p):
+                self._project_leave()
                 self.load_file(p)
                 break
 
     def load_file(self, path):
+        # Файл открывает пользователь (а не проект ради своего куска) — он
+        # ложится на таймлайн: новым проектом или, по выбору, в конец.
+        if (not getattr(self, "_proj_internal_load", False)
+                and getattr(self, "project_timeline", None) is not None
+                and not self._project_on_user_load(path)):
+            return
         # Останавливаем воркер волны и подчищаем его временный wav (баг #7).
         if self.audio_worker and self.audio_worker.isRunning():
             self.audio_worker.stop(); self.audio_worker.wait()
@@ -262,13 +280,9 @@ class EditTabPlaybackMixin:
         # с новым файлом (в т.ч. в подпапках). Списки используются при построении
         # комбобоксов в finish_loading_file → _populate_track_combos.
         self._clear_external_audio()
-        self._audio_ext = []
+        self._audio_ext = self._scan_external_audio(self.actual_source_file)
         self._sub_ext = self._scan_external_subs(self.actual_source_file)
 
-        name = self.actual_source_file.name
-        if len(name) > 30:
-            name = "…" + name[-27:]
-        self.lbl_file.setText(f"{_api.icon_html('fa5s.file', 14, _api.C['text'])}  {name}")
         self.lbl_file.setToolTip(str(self.actual_source_file))
         self.lbl_file.setStyleSheet(f"""
             color: {_api.C['text']};
@@ -278,6 +292,7 @@ class EditTabPlaybackMixin:
             border: 1px solid {_api.C['border2']};
             border-radius: 6px;
         """)
+        self.lbl_file.set_full_text(self.actual_source_file.name)
 
         self.undo_stack = _api.deque(maxlen=50); self.redo_stack = _api.deque(maxlen=50)
 
@@ -324,6 +339,8 @@ class EditTabPlaybackMixin:
             # _proxy_scale_for) — сохраняем, чтобы ими же пользовалась смена качества.
             try: self._src_video_h = int(vinfo.get('height') or 0)
             except Exception: self._src_video_h = 0
+            try: self._src_video_w = int(vinfo.get('width') or 0)
+            except Exception: self._src_video_w = 0
             self._src_video_fps = self._parse_fps(vinfo)
             scale = self._proxy_scale_for(is_av1)
             # Прокси нужен если: исходник AV1 (QtMultimedia его не тянет плавно), ИЛИ
@@ -396,6 +413,10 @@ class EditTabPlaybackMixin:
             + " Картинка загружена — включите «Пикселизацию»")
         self.log_label.setStyleSheet(f"color: {_api.C['text2']}; font-size: 12px;")
         self._update_media_buttons()
+        # У картинки LoadedMedia не будет — то, ради чего её открыли (лечь на
+        # таймлайн, показ куска), делаем сразу.
+        if getattr(self, "_proj_pending", None) is not None:
+            _api.QTimer.singleShot(0, self._proj_resume_pending)
 
     def _pb_quality_scale(self):
         """Коэффициент масштаба прокси для текущего «качества воспроизведения».
@@ -646,15 +667,19 @@ class EditTabPlaybackMixin:
     def _set_player_file(self, path):
         """Грузит файл в плеер через девайс с FILE_SHARE_DELETE — тогда исходник
         можно удалить из Проводника прямо во время монтажа (плеер его не держит
-        намертво). Если девайс открыть не удалось — обычная загрузка по URL."""
+        намертво). Девайс — QFile поверх такого хэндла (читает сам Qt, без GIL,
+        см. open_share_delete_file); не открылся — прежний Python-девайс, а
+        если и он нет — обычная загрузка по URL."""
         path = str(path)
         old = getattr(self, '_play_device', None)
-        dev = _api.ShareDeleteIODevice(path)
-        opened = False
-        try:
-            opened = dev.open()
-        except Exception:
-            opened = False
+        dev = _api.open_share_delete_file(path)
+        opened = dev is not None
+        if not opened:
+            dev = _api.ShareDeleteIODevice(path)
+            try:
+                opened = dev.open()
+            except Exception:
+                opened = False
         try:
             if opened:
                 self._play_device = dev
@@ -849,6 +874,29 @@ class EditTabPlaybackMixin:
         at_end = self.current_out >= (self.duration - 0.02)
         return (self.duration - guard) if at_end else self.current_out
 
+    def _play_limit_s(self):
+        """Где воспроизведение встаёт само: на OUT — или у конца файла, если
+        играть начали уже за OUT (см. _arm_play_limit). Во время просмотра
+        проекта — конец текущего куска (EditTabProjectMixin)."""
+        if getattr(self, "_proj_play", None) is not None:
+            lim = self._proj_play_limit()
+            if lim is not None:
+                frame_s = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.04
+                return max(0.0, min(lim, self.duration - max(frame_s, 0.05)))
+        if getattr(self, "_play_past_out", False):
+            frame_s = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.04
+            return max(0.0, self.duration - max(frame_s, 0.05))
+        return self._effective_out_s()
+
+    def _arm_play_limit(self, pos_s):
+        """Решает, действует ли граница OUT для воспроизведения с pos_s.
+
+        Плейхед, поставленный за OUT (кликом по шкале на ходу или перед
+        «Воспроизвести»), значит «смотреть отсюда». Раньше граница срабатывала
+        тут же: игра вставала, а жёлтая полоса уезжала обратно на OUT."""
+        frame_s = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.04
+        self._play_past_out = bool(pos_s >= self._effective_out_s() - frame_s * 0.5)
+
     def _set_play_bound(self, active):
         """Вкл/выкл блокировку кадров за OUT в painted-режиме (анти-overshoot)."""
         vw = self.video_widget
@@ -858,17 +906,26 @@ class EditTabPlaybackMixin:
             frame_s = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.04
             # граница = effective_out + полкадра: кадр НА границе ещё показываем,
             # а следующий (за ней) — блокируем и встаём на паузу.
-            vw.set_play_bound(self._effective_out_s() + frame_s * 0.5)
+            vw.set_play_bound(self._play_limit_s() + frame_s * 0.5)
         else:
             vw.set_play_bound(None)
 
     def _on_play_boundary(self):
         """Пришёл кадр за OUT (по PTS) — мгновенная пауза и снап на границу ДО
-        показа кадра. Убирает проскок-и-отскок правой границы."""
+        показа кадра. Убирает проскок-и-отскок правой границы. В просмотре
+        проекта это конец куска — следом играет следующий."""
+        # Только что кликнули на ходу (часы держат цель, _play_seek_hold_ms) —
+        # «кадр за границей» может быть кадром СТАРОГО места, а не новым: после
+        # клика назад он лежит дальше новой границы и останавливал бы игру
+        # сразу. Настоящую границу в это окно поймает sync_ui по позиции плеера.
+        hold = getattr(self, "_play_seek_hold", None)
+        if hold is not None and _api.time.monotonic() - hold[1] < self._PLAY_SEEK_HOLD_MAX_S:
+            return
+        proj = getattr(self, "_proj_play", None) is not None and self._proj_boundary_begin()
         try:
             if self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState:
                 self.player.pause()
-            out_s = self._effective_out_s()
+            out_s = self._play_limit_s()
             # Кадр остановки задаём явно: иначе пауза «пришпилила» бы последний
             # ПОКАЗАННЫЙ кадр, и метка отскочила бы от границы на кадр назад.
             if self._grid.valid:
@@ -879,6 +936,8 @@ class EditTabPlaybackMixin:
             self._ext_audio_seek(int(out_s * 1000))
         except Exception:
             pass
+        if proj:
+            self._proj_boundary_end()
 
     def sync_ui(self):
         if self.duration <= 0.1:
@@ -888,14 +947,16 @@ class EditTabPlaybackMixin:
         pos_s = self.player.position() / 1000.0
         # А интерфейс (метка времени, полоса, плейхед на волне, субтитры) ведём
         # по МАСТЕР-ЧАСАМ — времени кадра, который сейчас на экране. Пока плеер
-        # занят служебным делом (разбег, транзиентный play скраба), часы стоят
-        # на отметке пользователя — см. _ui_pinned_ms.
+        # занят служебным делом (разбег, транзиентный play скраба) или ещё едет
+        # к точке клика, часы стоят на отметке пользователя — см. _ui_pinned_ms.
         pinned_ms = self._ui_pinned_ms()
         disp_s = (pinned_ms / 1000.0) if pinned_ms is not None else self._clock_pos_s()
         # Авто-пауза в конце воспроизводимого участка (резерв к покадровому
         # блоку VideoCanvas: ловит границу в overlay-режиме и как страховка).
-        effective_out = self._effective_out_s()
-        if effective_out > self.current_in and pos_s >= effective_out:
+        effective_out = self._play_limit_s()
+        proj = getattr(self, "_proj_play", None) is not None
+        if (effective_out > self.current_in or proj) and pos_s >= effective_out:
+            proj = proj and self._proj_boundary_begin()
             self.player.pause()
             if self._grid.valid:
                 self._frame_idx = self._grid.index_at(effective_out)
@@ -903,8 +964,10 @@ class EditTabPlaybackMixin:
             self.lbl_current_time.setText(_api.s_to_time(effective_out))
             self.waveform.set_playhead(effective_out)
             self._update_seg_duration(effective_out)
+            if proj:
+                self._proj_boundary_end()
             return
-        self._paint_playhead(disp_s)
+        self._paint_playhead(disp_s)   # плейхед проекта едет за ним там же
         self._update_meter(disp_s)
         self._update_subtitle(disp_s)
         # Рассинхрон внешней озвучки. Порог опущен с 220 до 130 мс: 220 мс — это
@@ -924,6 +987,7 @@ class EditTabPlaybackMixin:
                 pass
 
     def on_slider_moved(self, value):
+        self._project_leave()
         if self.duration > 0:
             self.seek_to((value / 1000.0) * self.duration)
 
@@ -934,18 +998,48 @@ class EditTabPlaybackMixin:
             # продолжил бы играть уже от новой отметки и уехал бы с неё.
             if getattr(self, "_prerolling", False):
                 self._preroll_cancel()
+            # Немой доигрыш разбега после «Воспроизвести» ждал СВОЮ цель — клик
+            # её отменил: отдаём звук и картинку воспроизведению сразу.
+            if getattr(self, "_preroll_handoff", False):
+                self._preroll_handoff_finish()
+            # Прогрев ждал кадр прежнего места — он больше не нужен (таймер
+            # ожидания, увидев пустую заявку, остановится сам).
+            self._preroll_wait = None
             # Отложенная цель покадровой серии устарела — позицию ставим здесь.
             self._frame_seek_deferred_ms = None
+            try:
+                playing = (self.player.playbackState()
+                           == _api.QMediaPlayer.PlaybackState.PlayingState)
+            except Exception:
+                playing = False
             if isinstance(self.video_widget, _api.VideoCanvas):
                 self.video_widget.set_scrub_active(True)
                 self._scrub_idle_timer.start()   # перезапуск — «перемотка ещё идёт»
+            # Метка, полоса и волна — на НАЧАЛО кадра цели, как и везде.
+            shown_s = ms / 1000.0
+            if self._grid.valid:
+                idx = self._grid.index_at(ms / 1000.0)
+                shown_s = self._grid.start_of(idx)
+            if playing:
+                # На ходу пин кадра НЕ ставим: холст отбросил бы кадры плеера как
+                # чужие, и картинка встала бы (а с кадром из буфера — навсегда).
+                # Вместо пина часы интерфейса держат цель, пока плеер не привезёт
+                # кадр новой точки (_play_seek_hold_ms): иначе жёлтая полоса
+                # уезжала обратно на старое место и потом снова прыгала сюда.
+                self._play_seek_hold = (int(round(shown_s * 1000.0)),
+                                        _api.time.monotonic())
+                self._arm_play_limit(shown_s)
+                self._set_play_bound(True)
+            else:
+                self._play_seek_hold = None
+            self._play_clock_floor = None
             # Целевой кадр запоминаем сразу: от него пойдёт покадровый шаг.
             # Пин ПЕРЕВОДИМ на новый кадр тут же — без этого холст продолжал бы
             # считать «своим» кадр, где перемотка началась, и отбрасывал бы все
             # кадры плеера: картинка стояла бы всю протяжку. Точные кадры при
             # этом не заказываем (ffmpeg на каждый пиксель протяжки не нужен) —
             # но если нужный кадр уже лежит в буфере, показываем его мгновенно.
-            if self._grid.valid:
+            if self._grid.valid and not playing:
                 self._frame_idx = self._grid.index_at(ms / 1000.0)
                 vw = getattr(self, "video_widget", None)
                 if isinstance(vw, _api.VideoCanvas):
@@ -957,9 +1051,17 @@ class EditTabPlaybackMixin:
                         vw.set_exact_frame(
                             img, span,
                             int(self._grid.start_of(self._frame_idx) * 1_000_000))
-            self.player.setPosition(ms)
-            self.waveform.set_playhead(t_s)
-            self._ext_audio_seek(ms)
+            if playing:
+                # Перемотка на ходу рвёт звук треском — новое место зазвучит
+                # плавно, когда отыграет его рваное начало (timeline_seek).
+                self._seek_fade_begin(ms)
+            if not playing and getattr(self, "_tl_dragging", False):
+                # Плейхед тянут мышью: в полёте одна перемотка (timeline_seek).
+                self._drag_seek(ms)
+            else:
+                self.player.setPosition(ms)
+                self._ext_audio_seek(ms)
+            self._paint_playhead(shown_s)
         except Exception as e:
             self.main.log(f"seek_to error: {e}")
 
@@ -981,12 +1083,40 @@ class EditTabPlaybackMixin:
             # Окно PCM для скраб-звука — в новой точке (первый шаг после клика
             # по шкале обязан звучать сразу, см. AudioScrubber).
             self._prime_scrub_audio()
+            if getattr(self, "_tl_dragging", False):
+                return          # плейхед ещё тянут мышью — прогреем после отпускания
             # Греем аудио-конвейер в новой точке, пока стоим на паузе: иначе
             # первое «Воспроизвести» после перемотки начиналось с ~0.35 с тишины
-            # и докрутить обрезку по слуху было нельзя (см. _preroll_at).
-            self._preroll_at(self._playhead_target_s())
+            # и докрутить обрезку по слуху было нельзя (см. _preroll_at). Но
+            # только когда на экране кадр этой точки (timeline_seek).
+            self._preroll_when_shown()
 
     def toggle_play(self):
+        # Плеер на проекте — Пробел играет проект с его плейхеда: кусок за
+        # куском, с границами клипов (EditTabProjectMixin.project_play).
+        try:
+            playing = (self.player.playbackState()
+                       == _api.QMediaPlayer.PlaybackState.PlayingState
+                       and not getattr(self, "_prerolling", False))
+        except Exception:
+            playing = False
+        if getattr(self, "_proj_play", None) is not None and not playing:
+            self.project_stop()         # Пробел на стыке кусков — стоп просмотра
+            return
+        if getattr(self, "_proj_active", False) and not playing:
+            self.project_play()
+            return
+        if playing:
+            self._scrubbing = False
+            self._flush_preroll_mute()
+            self._flush_frame_seek()
+            self.player.pause()
+            return
+        self._play_from_here(jump_to_in=True)
+
+    def _play_from_here(self, jump_to_in=False):
+        """Запуск воспроизведения с кадра, на котором стоит монтаж (подхват
+        прогретого звука). jump_to_in — плейхед на OUT начинает с IN."""
         self._scrubbing = False   # явное play/pause не должно гаситься скрабом
         # Возврат звука после разбега отложен на четверть секунды (хвост очереди
         # аудиоустройства, см. _restore_preroll_mute) — но ждать его нельзя:
@@ -1030,28 +1160,33 @@ class EditTabPlaybackMixin:
             try:
                 self.audio_output.setMuted(self._preroll_prev_muted)
                 # Остаток разбега длиннее порога — ждать дольше, чем стоит
-                # перемотка; доводим позицию.
+                # перемотка; доводим позицию (на ходу — со звуком без треска).
                 if tgt is not None and behind > self._PREROLL_HANDOFF_MS:
+                    self._seek_fade_begin(int(tgt))
                     self.player.setPosition(int(tgt))
             except Exception:
                 pass
             self._release_frame_lock()
             self.on_playback_changed(self.player.playbackState())
             return
-        if self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-        else:
-            pos_s = self.player.position() / 1000.0
-            if abs(pos_s - self.current_out) < 0.15 and self.current_out > (self.current_in + 0.5):
-                self.seek_to(self.current_in)
-            # Пин снимаем ДО play(): иначе первые кадры воспроизведения (у них
-            # уже другой pts) холст отбросил бы как «чужие», и картинка стояла бы
-            # лишние доли секунды. Предекодер тоже глушим — во время игры
-            # процессор нужен декодеру плеера, а не буферу стоп-кадров.
-            self._release_frame_lock()
-            self.player.play()
+        pos_s = self.player.position() / 1000.0
+        if (jump_to_in and abs(pos_s - self.current_out) < 0.15
+                and self.current_out > (self.current_in + 0.5)):
+            self.seek_to(self.current_in)
+        # Пин снимаем ДО play(): иначе первые кадры воспроизведения (у них
+        # уже другой pts) холст отбросил бы как «чужие», и картинка стояла бы
+        # лишние доли секунды. Предекодер тоже глушим — во время игры
+        # процессор нужен декодеру плеера, а не буферу стоп-кадров.
+        hold_ms = self._play_start_hold_ms()
+        self._release_frame_lock()
+        self.player.play()
+        self._hold_play_start(hold_ms)
 
     def stop_playback(self):
+        if getattr(self, "_proj_active", False):
+            self.project_stop()
+            self._project_seek(0.0)
+            return
         self.player.pause(); self.seek_to(self.current_in)
         # «Камера» идёт за плейхедом: если зум стоит не на начале зоны, докручиваем
         # окно обзора так, чтобы точка, куда прыгнула жёлтая полоска, была видна.
@@ -1086,6 +1221,17 @@ class EditTabPlaybackMixin:
                 return
         except Exception:
             pass
+        # Часы интерфейса начинают с чистого листа: «пол» прошлой игры и цель
+        # клика, до которой плеер так и не доехал, к новому состоянию не относятся.
+        self._play_clock_floor = None
+        if not playing:
+            self._play_seek_hold = None
+            self._seek_fade_cancel()
+        # Просмотр проекта: пауза между кусками — переход, пауза пользователем —
+        # конец просмотра (EditTabProjectMixin._proj_on_state).
+        if (getattr(self, "_proj_play", None) is not None
+                or getattr(self, "_proj_transition", False)):
+            self._proj_on_state(playing)
         # Painted-режим: во время игры ресайзим кадр быстрым методом (экономим ЦП).
         vw = getattr(self, "video_widget", None)
         if isinstance(vw, _api.VideoCanvas):
@@ -1104,9 +1250,12 @@ class EditTabPlaybackMixin:
         elif self._grid.valid and self.video_stream_index is not None:
             # Сбрасываем ПЕРЕД вычислением: иначе _current_frame_index вернул бы
             # прежний номер (он на паузе доверяет _frame_idx), а нам нужен кадр,
-            # на котором воспроизведение реально остановилось.
+            # на котором воспроизведение реально остановилось. Заказанный кадр
+            # держим про запас: показанный кадр мог остаться от места ДО
+            # перемотки (см. _stop_frame_index).
+            keep = self._frame_idx
             self._frame_idx = None
-            self._frame_idx = self._current_frame_index()
+            self._frame_idx = self._stop_frame_index(keep)
             self._show_exact_frame(self._frame_idx)
             # Плейхед — сразу на кадр остановки. Без этого интерфейс до первого
             # следующего события жил по позиции плеера (аудио-часы), и жёлтая
@@ -1118,6 +1267,12 @@ class EditTabPlaybackMixin:
         if playing:
             self.btn_play.setIcon(self.style().standardIcon(_api.QStyle.StandardPixmap.SP_MediaPause))
             self.sync_timer.start()
+            # Плейхед за OUT — играем оттуда до конца файла (см. _arm_play_limit).
+            # Время — интерфейса: у передачи разбега это отметка пользователя.
+            try:
+                self._arm_play_limit(self._ui_time_s())
+            except Exception:
+                pass
         else:
             self.btn_play.setIcon(self.style().standardIcon(_api.QStyle.StandardPixmap.SP_MediaPlay))
             self.sync_timer.stop()
@@ -1139,6 +1294,13 @@ class EditTabPlaybackMixin:
                       _api.QMediaPlayer.MediaStatus.BufferedMedia):
             if getattr(self, "_audio_only_mode", False):
                 self._apply_audio_only_to_player()
+            # Проект открыл другой файл ради куска — продолжаем (показ, игра,
+            # открытие клипа): до LoadedMedia плеер перемотку пропускает.
+            if getattr(self, "_proj_pending", None) is not None:
+                _api.QTimer.singleShot(0, self._proj_resume_pending)
+            if getattr(self, "project_timeline", None) is not None:
+                self._project_sync_source()
+                self._project_update_ui()
         # После смены качества воспроизведения (swap источника) восстанавливаем
         # позицию и состояние, как только медиа загрузилось.
         if (status in (_api.QMediaPlayer.MediaStatus.LoadedMedia,
@@ -1192,16 +1354,9 @@ class EditTabPlaybackMixin:
             sl.setValue(prev if prev > 0 else 100)
 
     def _on_volume_changed(self, v):
-        try:
-            self.audio_output.setVolume(v / 100.0)
-        except Exception:
-            pass
-        # Та же громкость — для внешней озвучки (отдельный аудиовыход).
-        if self._ext_audio_output is not None:
-            try:
-                self._ext_audio_output.setVolume(v / 100.0)
-            except Exception:
-                pass
+        # Звук видео и внешняя озвучка (отдельный аудиовыход) — с учётом
+        # плавного возврата звука после перемотки на ходу (timeline_seek).
+        self._apply_output_volume()
         # …и для скраб-звука покадровой перемотки.
         if getattr(self, "_scrub_sink_obj", None) is not None:
             try:
@@ -1371,125 +1526,3 @@ class EditTabPlaybackMixin:
                 "На обрезку и экспорт это не влияет.")
         else:
             vw.set_audio_only_message("")
-
-    # ── Полноэкранный режим ─────────────────────────────────────────────────
-    def toggle_fullscreen(self):
-        if getattr(self, "_fs_window", None) is not None:
-            self.exit_fullscreen()
-        else:
-            self.enter_fullscreen()
-
-    def enter_fullscreen(self):
-        if getattr(self, "_fs_window", None) is not None:
-            return
-        if self.duration <= 0.1:   # нет загруженного видео
-            return
-        try:
-            fs = _api.FullscreenVideo(self)
-            # fs — самостоятельное окно без родителя (иначе showFullScreen на
-            # дочернем виджете ведёт себя иначе), поэтому Qt может открыть его
-            # fullscreen'ом на ПЕРВИЧНОМ мониторе, даже если само приложение
-            # (и мышь пользователя) сейчас на другом. Явно ставим тот же экран,
-            # где сейчас окно приложения — заодно фиксирует QScreen ДО первого
-            # show(), от чего зависит и корректный клэмп tooltip'ов панели
-            # управления (см. FullscreenVideo._relayout).
-            try:
-                src_screen = self.window().windowHandle().screen()
-            except Exception:
-                src_screen = None
-            if src_screen is not None:
-                fs.winId()   # форсирует создание нативного хэндла ДО setScreen
-                wh = fs.windowHandle()
-                if wh is not None:
-                    wh.setScreen(src_screen)
-            # Снимаем фиксированные размеры с видео и переносим его в окно.
-            self.video_widget.setMinimumSize(0, 0)
-            self.video_widget.setMaximumSize(16777215, 16777215)
-            fs.attach_video(self.video_widget)
-            self._fs_window = fs
-            self.btn_fullscreen.setIcon(_api._fullscreen_icon(expand=False))
-            self.btn_fullscreen.setToolTip("Свернуть (Esc / двойной клик по видео)")
-            fs.showFullScreen()
-            # Без этого клавиши (F/Esc/Space/стрелки) не доходили до окна: после
-            # showFullScreen() фокус клавиатуры мог оставаться на виджете, у
-            # которого он был ДО входа в полноэкранный режим (например, на
-            # волне/поле ссылки в основном окне) — F там ничего не делал.
-            fs.activateWindow()
-            fs.setFocus(_api.Qt.FocusReason.OtherFocusReason)
-            fs.sync_from_player()
-            fs.sync_volume()
-            fs.update_play_icon(
-                self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState)
-            # Холст переехал в другое окно, а с ним и его сцена Qt Quick:
-            # графический контекст пересоздан, и показанный кадр в нём не
-            # переживает переезд. На паузе кадров от плеера больше не будет —
-            # ставим точный кадр заново (на воспроизведении метод сам ничего не
-            # делает: там следующий кадр приедет через ~16 мс).
-            _api.QTimer.singleShot(0, self._restore_canvas_frame)
-            try:
-                self._update_subtitle(self._ui_time_s())
-                _api.QTimer.singleShot(0, self._position_overlay)
-            except Exception:
-                pass
-        except Exception as e:
-            self.main.log(f"enter_fullscreen error: {e}")
-            self._fs_window = None
-
-    def exit_fullscreen(self):
-        fs = getattr(self, "_fs_window", None)
-        if fs is None:
-            return
-        self._fs_window = None
-        try:
-            # Возвращаем видео обратно в контейнер вкладки.
-            self.vc_layout.insertWidget(0, self.video_widget, 0, _api.Qt.AlignmentFlag.AlignCenter)
-            self.video_widget.show()
-        except Exception:
-            pass
-        # Оверлей субтитров мог стать дочерним к окну fs — вернём его главному
-        # окну ДО удаления fs, иначе Qt удалит оверлей вместе с fs.
-        try:
-            if self.sub_overlay is not None:
-                self._reparent_overlay(self.window())
-        except Exception:
-            pass
-        try:
-            fs.close(); fs.deleteLater()
-        except Exception:
-            pass
-        try:
-            self.btn_fullscreen.setIcon(_api._fullscreen_icon(expand=True))
-            self.btn_fullscreen.setToolTip("Полноэкранный режим (F / двойной клик по видео)")
-            self._adjust_video_height()
-            _api.QTimer.singleShot(0, self._position_overlay)
-            # Обратный переезд — та же история, что и при входе (см. там).
-            _api.QTimer.singleShot(0, self._restore_canvas_frame)
-        except Exception:
-            pass
-
-    def _restore_canvas_frame(self):
-        """Возвращает кадр на холст после переезда в другое окно.
-
-        Нужен только на паузе: сцена холста теряет показанный кадр вместе с
-        графическим контекстом, а новых кадров плеер на паузе не шлёт. Точный
-        кадр берётся из того же предекодера, что и при покадровом шаге, так что
-        на экране оказывается ровно тот кадр, на котором стояли."""
-        try:
-            if self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState:
-                return
-        except Exception:
-            return
-        try:
-            self._show_exact_frame(self._frame_idx)
-        except Exception:
-            pass
-
-    def _fs_sync_position(self):
-        """Обновляет полосу/тайминги в полноэкранном окне (вызывается из sync_ui
-        и on_position_changed, когда оно открыто)."""
-        fs = getattr(self, "_fs_window", None)
-        if fs is not None:
-            try:
-                fs.sync_from_player()
-            except Exception:
-                pass

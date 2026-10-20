@@ -104,6 +104,55 @@ class ShareDeleteIODevice(_api.QIODevice):
 ShareDeleteIODevice.__module__ = _api.__name__
 _api.ShareDeleteIODevice = ShareDeleteIODevice
 
+
+def open_share_delete_file(path):
+    """QFile поверх файла, открытого с FILE_SHARE_DELETE (Windows), — источник
+    для QMediaPlayer. None — не вышло (не Windows, файла нет).
+
+    Удалять исходник во время монтажа можно так же, как с ShareDeleteIODevice,
+    но читает его сам Qt: у ShareDeleteIODevice каждое чтение демультиплексора
+    плеера (его собственный поток) шло через Python и ждало GIL. Замер на
+    BDRemux 36 Мбит/с при занятом интерпретаторе: звук после перемотки на ходу
+    появлялся через 230–670 мс, через QFile — через 190–210 мс, как без
+    нагрузки. Плееру нужен произвольный доступ — у QFile на дескрипторе
+    дискового файла он есть."""
+    if _api.os.name != 'nt':
+        return None
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        GENERIC_READ = 0x80000000
+        SHARE_ALL = 0x1 | 0x2 | 0x4          # READ | WRITE | DELETE
+        OPEN_EXISTING = 3
+        NORMAL = 0x80
+        INVALID = ctypes.c_void_p(-1).value
+        h = k32.CreateFileW(str(path), GENERIC_READ, SHARE_ALL, None,
+                            OPEN_EXISTING, NORMAL, None)
+        if not h or h == INVALID:
+            return None
+        try:
+            fd = msvcrt.open_osfhandle(h, _api.os.O_RDONLY | _api.os.O_BINARY)
+        except Exception:
+            k32.CloseHandle(wintypes.HANDLE(h))
+            return None
+        f = _api.QFile()
+        if not f.open(fd, _api.QIODevice.OpenModeFlag.ReadOnly,
+                      _api.QFileDevice.FileHandleFlag.AutoCloseHandle):
+            _api.os.close(fd)
+            return None
+        return f
+    except Exception:
+        return None
+
+open_share_delete_file.__module__ = _api.__name__
+_api.open_share_delete_file = open_share_delete_file
+
 def start_share_delete_feeder(path, stdin, stop_flag=None):
     """Фоновый поток: читает файл с FILE_SHARE_DELETE и пишет его байты в stdin
     запущенного ffmpeg (вход «pipe:0»). Зачем: ffmpeg, открывая файл напрямую,
@@ -124,6 +173,17 @@ def start_share_delete_feeder(path, stdin, stop_flag=None):
             if _api.os.name == 'nt':
                 import ctypes
                 from ctypes import wintypes
+                # Фоновый режим потока (Windows): ввод-вывод и процессор —
+                # с низким приоритетом. Поток читает исходник ЦЕЛИКОМ (волна,
+                # прокси) — на BDRemux в 10 ГБ это ~25 с чтения диска на
+                # пределе, и плеер того же файла в это время запинался.
+                try:
+                    own = ctypes.WinDLL("kernel32")
+                    own.GetCurrentThread.restype = wintypes.HANDLE
+                    own.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+                    own.SetThreadPriority(own.GetCurrentThread(), 0x00010000)  # THREAD_MODE_BACKGROUND_BEGIN
+                except Exception:
+                    pass
                 k32 = ctypes.windll.kernel32
                 k32.CreateFileW.restype = wintypes.HANDLE
                 k32.CreateFileW.argtypes = [
@@ -212,22 +272,32 @@ class FfmpegWorker(_api.QThread):
             self.finished.emit(rc == 0 and not self._stopped, f"Код: {rc}")
             return
 
+        # Хвост вывода ffmpeg (без строк прогресса) — в сообщение об ошибке:
+        # голое «Код: 1» не говорит, что именно не так (сборка проекта из
+        # десятка кусков без него не разобрать).
+        tail = []
         try:
             for line in proc.stderr:
                 if self._stopped:
                     break
-                if 'time=' in line:
-                    try:
-                        idx = line.index('time=')
-                        tpart = line[idx + 5:].split()[0]
-                        tsec = _api.time_to_s(tpart)
-                        perc = min(100.0, max(0.0, (tsec / self.duration) * 100.0)) if self.duration > 0 else 0.0
-                        self.progress.emit(perc)
-                    except Exception:
-                        pass
+                if 'time=' not in line:
+                    if line.strip():
+                        tail.append(line.rstrip())
+                        del tail[:-12]
+                    continue
+                try:
+                    idx = line.index('time=')
+                    tpart = line[idx + 5:].split()[0]
+                    tsec = _api.time_to_s(tpart)
+                    perc = min(100.0, max(0.0, (tsec / self.duration) * 100.0)) if self.duration > 0 else 0.0
+                    self.progress.emit(perc)
+                except Exception:
+                    pass
             rc = proc.wait()
             if self._stopped:
                 self.finished.emit(False, "Отменено")
+            elif rc != 0 and tail:
+                self.finished.emit(False, f"Код: {rc}\n" + "\n".join(tail))
             else:
                 self.finished.emit(rc == 0, f"Код: {rc}")
         except Exception as e:

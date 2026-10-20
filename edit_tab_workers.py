@@ -22,11 +22,12 @@ import wave
 from config import (CREATE_NO_WINDOW, FFMPEG, FFPROBE, QThread, pyqtSignal)
 from edit_tab_base import (_parse_srt, time_to_s)
 from utils import csv_first
-from PyQt6.QtCore import (QIODevice)
+from PyQt6.QtCore import (QFile, QFileDevice, QIODevice)
 from PyQt6.QtGui import (QImage)
 
 from si_hyx_parts.edit_tab_workers.share_delete_iodevice import (
     ShareDeleteIODevice,
+    open_share_delete_file,
     start_share_delete_feeder,
     FfmpegWorker,
 )
@@ -53,3 +54,5 @@ from si_hyx_parts.edit_tab_workers.waveform_loaders import (
 from si_hyx_parts.edit_tab_workers.subtitle_extractor import SubtitleExtractor
 
 from si_hyx_parts.edit_tab_workers.ass_extractor import AssExtractor, _SeekThumbnailer
+
+from si_hyx_parts.edit_tab_workers.project_thumbs import ProjectThumbWorker

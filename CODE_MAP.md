@@ -49,11 +49,21 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
   клавиши, настройки, завершение; [layout](si_hyx_parts/edit_tab/layout.py) —
   интерфейс и подгонка видео; [tracks](si_hyx_parts/edit_tab/tracks.py) —
   аудиодорожки и субтитры; [playback](si_hyx_parts/edit_tab/playback.py) —
-  загрузка, прокси, плеер, полный экран; [timeline](si_hyx_parts/edit_tab/timeline.py) —
+  загрузка, прокси, плеер; [fullscreen](si_hyx_parts/edit_tab/fullscreen.py) —
+  полный экран; [timeline](si_hyx_parts/edit_tab/timeline.py) —
   волна, отметки, undo, покадровый шаг, предпрокрутка, звук скраба;
+  [timeline_seek](si_hyx_parts/edit_tab/timeline_seek.py) — перемещение по
+  таймлайну: звук после перемотки на ходу (громкость 0 и плавный возврат по
+  первому буферу нового места), протяжка плейхеда мышью (пауза на время
+  протяжки, одна перемотка в полёте), кадр остановки и прогрев после кадра;
+  [subtitle_sync](si_hyx_parts/edit_tab/subtitle_sync.py) — автосинхронизация
+  субтитров по звуку (сдвиг ±5 с, копия `…_sync.srt/.ass`);
   [effects](si_hyx_parts/edit_tab/effects.py) — кадрирование, пикселизация,
   накладки, удаление объекта, трекинг; [export](si_hyx_parts/edit_tab/export.py) —
-  кодировщик, обрезка, Smart Cut; [entrance_actions](si_hyx_parts/edit_tab/entrance_actions.py) — меню «⋯».
+  кодировщик, обрезка, Smart Cut; [entrance_actions](si_hyx_parts/edit_tab/entrance_actions.py) — меню «⋯»;
+  [project](si_hyx_parts/edit_tab/project.py) — проект из кусков (как в Filmora):
+  единственный таймлайн вкладки, правка у плейхеда, связь плейхеда с плеером,
+  просмотр цепочкой кусков, сборка.
 - **AnimePackGenerator** — [anime_pack_generator.py](si_hyx_parts/animepack/anime_pack_generator.py):
   создание, журнал, `run`/`assemble`, обновление базы;
   [generator_catalog](si_hyx_parts/animepack/generator_catalog.py) — исключения,
@@ -299,6 +309,15 @@ PP-OCRv5 Mobile; [local_title_match](si_hyx_parts/animepack/local_title_match.py
 сравнивает надписи с названиями. Первое использование загружает модели в
 пользовательский кэш SI-HYX; далее OCR работает без сети. Вердикт OCR
 кэшируется по хэшу изображения; сомнения уходят в существующий Gemini batch.
+Режим «Проверка изображений: Локальный OCR» (`visual_checker="ocr"`) —
+[visual_mode](si_hyx_parts/animepack/visual_mode.py): ни одной визуальной
+проверки через Gemini; флаги секций сводятся в `effective()` при создании
+генератора, кадры и студии проверяются `frame_verdict`. Персонажей ищет
+[local_character_detect](si_hyx_parts/animepack/local_character_detect.py)
+(детектор голов deepghs, ONNX, скачивается в кэш с проверкой SHA-256), сцену
+вебтуна выбирает [local_scene](si_hyx_parts/animepack/local_scene.py) через
+общий `frame_at` из `manga_character_crop`. Рисовка Pixiv локально не
+оценивается; отрывки серий — на Gemini.
 
 Арты Pixiv: [pixiv_art_api.py](pixiv_art_api.py) — клиент и отбор;
 [pixiv_auth.py](pixiv_auth.py) — вход с повторами, сбой сети отдельно от отказа ключа;
@@ -655,8 +674,57 @@ URL держало замок минутами и при медленном пр
 Время «Монтажа» для ЛЮБОГО показа на экране берётся только у
 `EditTab._ui_time_s` ([timeline.py](si_hyx_parts/edit_tab/timeline.py)):
 `player.position()` во время прогрева уезжает на полсекунды назад, а на паузе
-живёт по аудио-часам. Фильтр вшивания субтитров общий для обоих путей экспорта —
-[tracks.py](si_hyx_parts/edit_tab/tracks.py).
+живёт по аудио-часам. Клик по шкале на ходу и старт игры держат часы на цели,
+пока не придёт кадр новой точки (`_play_seek_hold_ms`): иначе жёлтая полоса
+уезжала на старое место и прыгала обратно; на ходу метка не идёт назад
+(«пол» в `_clock_pos_s`). Клик за OUT — игра до конца файла (`_play_limit_s`).
+
+Проект «Монтажа» (как в Filmora): модель, дорожки и сборка одной командой
+ffmpeg — [montage_project.py](montage_project.py) (основная дорожка
+«магнитная», верхние видеодорожки перекрывают кадр, звук смешивается;
+куски режутся по сетке кадров проекта, первым входом amix — тишина:
+задержанный первый вход ломал метки звука). Таймлайн —
+[project_timeline.py](si_hyx_parts/edit_tab_widgets/project_timeline.py)
+(неподвижный слой в кэше, шаг плейхеда перерисовывает две полоски: полная
+отрисовка на каждый шаг занимала главный поток во время игры), полоса кадров
+вдоль клипа (как в Filmora) —
+[project_thumbs.py](si_hyx_parts/edit_tab_workers/project_thumbs.py): ключевой
+кадр на ячейку, три ffmpeg с низким приоритетом, дисковый кэш
+`montage_thumbs/` рядом с файлом проекта; пока кадра нет — ближайший готовый.
+Вкладка — [project.py](si_hyx_parts/edit_tab/project.py); проект сохраняется
+сам в `MONTAGE_PROJECT_PATH`. Шкала у «Монтажа» одна — этот таймлайн: открытый
+пользователем файл ложится на «Видео 1» целиком (`_project_on_user_load`;
+файлы, которые грузит сам проект, — через `_proj_load`), плейхед проекта едет
+за плеером из `_paint_playhead` (`_proj_follow_source`), шаг через стык —
+`_proj_step`. Волна источника (`WaveformWidget`) скрыта: она строит волну для
+клипов и держит IN/OUT, по которым одиночный кусок режет прежняя «Обрезка»
+(`_proj_single_clip`, `_project_export_route`); несколько кусков собирает
+`project_export`.
+
+Плеер «Монтажа» читает файл через QFile поверх хэндла с FILE_SHARE_DELETE
+(`open_share_delete_file` в
+[share_delete_iodevice.py](si_hyx_parts/edit_tab_workers/share_delete_iodevice.py)):
+прежний Python-девайс заставлял демультиплексор ждать GIL, и звук после
+перемотки запаздывал до 0.7 с. Поток, прокачивающий весь исходник в ffmpeg
+(волна, прокси), работает в фоновом режиме Windows. Шкала уровня звука
+перерисовывается своим тактом и только при сдвиге пикселей
+([player_widgets.py](si_hyx_parts/edit_tab_widgets/player_widgets.py)).
+Внешняя озвучка ищется рядом с видео и в подпапках, как субтитры
+(`_scan_external_audio` в [tracks.py](si_hyx_parts/edit_tab/tracks.py): имя без
+тегов в скобках — `media_name_key`/`names_relate`; одиночный файл папки
+озвучки), остальное — за пунктом «Показать другие файлы в папке…».
+
+Программный стиль субтитров = караоке генерации паков: цвета, обводка и тень —
+[karaoke/style.py](karaoke/style.py), превью и вшивание —
+`_paint_ass_text` / `prog_sub_force_style` в [edit_tab_base.py](edit_tab_base.py)
+(кегль ASS переводится в пиксели по правилам libass, превью совпадает с файлом). Фильтр вшивания субтитров общий для обоих путей экспорта —
+[tracks.py](si_hyx_parts/edit_tab/tracks.py). Стиль «как в оригинале» —
+[subtitle_style.py](si_hyx_parts/edit_tab/subtitle_style.py): mov_text вшивается
+ASS-копией с холстом по размеру кадра (иначе шрифт вырастает в разы), а правка
+текста ASS/mov_text сохраняется в .ass со стилями исходных реплик.
+Строку прогресса обрезки (и значок на панели задач) ведёт только
+`_report_cut` в [export.py](si_hyx_parts/edit_tab/export.py); этапы воркеров
+идут в неё подписью `_cut_phase`.
 
 Книжная часть пака: [manga_scale.py](si_hyx_parts/animepack/manga_scale.py)
 (перевод книжного счёта на общую с аниме шкалу и его потолок — книга без

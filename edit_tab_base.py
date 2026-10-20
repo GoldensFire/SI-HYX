@@ -20,6 +20,7 @@
 import os
 import json
 import math
+import struct
 import subprocess
 
 # Бэкенды Qt нужно выбрать ДО создания QMediaPlayer/QVideoWidget. Модуль
@@ -40,9 +41,14 @@ os.environ.setdefault("QSG_RHI_BACKEND", "d3d11" if os.name == "nt" else "opengl
 # импортируемый выше, — он читает настройку video_hw_decode.
 os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")
 
-from PyQt6.QtCore import (Qt, QRect, QSize)
+from PyQt6.QtCore import (Qt, QSize, QPointF)
 from PyQt6.QtWidgets import (QApplication, QPushButton, QFrame)
-from PyQt6.QtGui import (QPainter, QColor, QPen, QFont, QPixmap, QIcon)
+from PyQt6.QtGui import (QPainter, QColor, QPen, QFont, QPixmap, QIcon,
+                         QFontDatabase, QFontMetricsF, QPainterPath,
+                         QPainterPathStroker, QRawFont, QTransform)
+
+# Вид программных субтитров — караоке генератора паков (см. PROG_SUB_FONTSIZE).
+from karaoke import style as _karaoke_style
 
 # Нативный рендер ASS/SSA для превью (libass). Если DLL нет/не загрузились —
 # LIBASS_AVAILABLE=False, и субтитры показываются обычным текстовым оверлеем.
@@ -70,12 +76,21 @@ except Exception:
     QMediaPlayer = QAudioOutput = QVideoSink = QVideoWidget = None
     QMediaDevices = QAudioFormat = QAudioSink = None
     _HAS_MULTIMEDIA = False
+# Копия звука, который плеер прямо сейчас отдаёт устройству (Qt 6.8+): по ней
+# «Монтаж» узнаёт, что после перемотки на ходу пошёл звук нового места.
+try:
+    from PyQt6.QtMultimedia import QAudioBufferOutput
+except Exception:
+    QAudioBufferOutput = None
 
 # Пути к ffmpeg/ffprobe и флаг скрытия консоли берём из общей конфигурации SI-HYX,
 # чтобы редактор работал и в собранном .exe с bundled-ffmpeg.
 from config import (FFPROBE, CREATE_NO_WINDOW, CONFIG_DIR, get_icon)
 
 EDITOR_SETTINGS_PATH = os.path.join(CONFIG_DIR, "editor_settings.json")
+# Проект «Монтажа» из кусков (montage_project): сохраняется сам после каждой
+# правки и переживает перезапуск.
+MONTAGE_PROJECT_PATH = os.path.join(CONFIG_DIR, "montage_project.json")
 
 
 # ─── Color Palette ───────────────────────────────────────────────────────────
@@ -349,87 +364,272 @@ def _parse_srt(text):
     cues.sort(key=lambda c: c[0])
     return cues
 
-def _paint_subtitle(painter, rect, text="", px=28, image=None, image_pos=(0, 0)):
-    """Рисует субтитры в области rect: либо готовый кадр от libass (image,
-    приоритетнее), либо стиль VLC — белый жирный текст с чёрной обводкой снизу
-    по центру. Используется и оверлеем-окном, и встроенным рендером в кадр."""
+# ── Программный стиль субтитров — как у караоке в генерации паков ────────────
+# Текстовые субтитры без собственного стиля Монтаж рисует сам: шрифт Karaoke
+# Rounded (Nunito Black из karaoke/fonts), почти белый текст, тёмная обводка и
+# полупрозрачная тень — ровно как подписи караоке-видео. Цвета, обводку и тень
+# берём из karaoke/style.py, чтобы стиль был один на оба места. Размер —
+# субтитровый: у караоке текст единственный в кадре (кегль 1/11.25 высоты), а
+# поверх видео такой занял бы пятую часть кадра.
+#
+# Всё задано в единицах ASS при PlayResY 288 — на таком холсте ffmpeg вшивает
+# SRT. Превью переводит их в пиксели ТЕМИ ЖЕ правилами, что и libass
+# (_ass_text_metrics), поэтому субтитры в плеере и в готовом файле совпадают.
+PROG_SUB_FONTSIZE = 21          # кегль ASS: em ≈ 5.3 % высоты кадра
+PROG_SUB_MARGIN_V = 14          # отступ снизу ≈ 4.9 % высоты кадра
+
+_KARAOKE_FAMILY = None
+_ASS_METRICS = {}
+_ASS_TEXT_CACHE = {}
+
+
+def _karaoke_font_family():
+    """Семейство шрифта караоке для Qt; шрифт регистрируется один раз.
+
+    Шрифт не системный, поэтому Qt (превью, список шрифтов «Создать субтитры»)
+    его без регистрации не видит. До создания QApplication регистрировать
+    нечем — тогда отвечаем Arial, но не запоминаем."""
+    global _KARAOKE_FAMILY
+    if _KARAOKE_FAMILY is not None:
+        return _KARAOKE_FAMILY
+    if QApplication.instance() is None:
+        return "Arial"
+    family = ""
+    try:
+        fid = QFontDatabase.addApplicationFont(str(_karaoke_style.FONT_FILE))
+        if fid >= 0 and _karaoke_style.FONT_NAME in QFontDatabase.applicationFontFamilies(fid):
+            family = _karaoke_style.FONT_NAME
+    except Exception:
+        family = ""
+    _KARAOKE_FAMILY = family or "Arial"
+    return _KARAOKE_FAMILY
+
+
+def _ass_text_metrics(font):
+    """(em/кегль, доля асцендера) шрифта так, как их считает libass.
+
+    Кегль ASS у libass — высота winAscent+winDescent из таблицы OS/2 (так
+    считал VSFilter), а не em, как у Qt. У Arial em = 0.895 кегля, у Nunito
+    Black — всего 0.726: прими превью кегль за em, и текст в плеере вышел бы
+    на 38 % крупнее вшитого. Межстрочный шаг libass — сам кегль, базовая линия
+    стоит на доле hhea-асцендера от него."""
+    key = (font.family(), font.bold(), font.italic())
+    hit = _ASS_METRICS.get(key)
+    if hit is not None:
+        return hit
+    ratio, asc_frac = 0.9, 0.8
+    try:
+        probe = QFont(font)
+        probe.setPixelSize(100)
+        raw = QRawFont.fromFont(probe)
+        head = bytes(raw.fontTable("head"))
+        os2 = bytes(raw.fontTable("OS/2"))
+        hhea = bytes(raw.fontTable("hhea"))
+        upem = struct.unpack(">H", head[18:20])[0]
+        win_a, win_d = struct.unpack(">HH", os2[74:78])
+        asc, desc = struct.unpack(">hh", hhea[4:8])
+        if upem > 0 and win_a + win_d > 0:
+            ratio = upem / float(win_a + win_d)
+        if asc - desc > 0:
+            asc_frac = asc / float(asc - desc)
+    except Exception:
+        pass
+    _ASS_METRICS[key] = (ratio, asc_frac)
+    return ratio, asc_frac
+
+
+def _wrap_ass_text(text, fm, width):
+    """Строки текста с переносом по словам, как WrapStyle 0 у libass: сперва
+    жадно, затем слова переезжают вниз, пока соседние строки от этого
+    становятся ровнее (верхняя остаётся чуть шире). Явные переносы — свои."""
+    out = []
+    for para in str(text).split("\n"):
+        words = [w for w in para.strip().split(" ") if w]
+        if not words:
+            out.append("")
+            continue
+        lines, cur = [], ""
+        for w in words:
+            cand = w if not cur else cur + " " + w
+            if cur and fm.horizontalAdvance(cand) > width:
+                lines.append(cur)
+                cur = w
+            else:
+                cur = cand
+        lines.append(cur)
+        moved = True
+        while moved and len(lines) > 1:
+            moved = False
+            for i in range(len(lines) - 1):
+                top, bottom = lines[i], lines[i + 1]
+                if " " not in top:
+                    continue
+                head, last = top.rsplit(" ", 1)
+                new_bottom = last + " " + bottom
+                old = abs(fm.horizontalAdvance(top) - fm.horizontalAdvance(bottom))
+                new = abs(fm.horizontalAdvance(head) - fm.horizontalAdvance(new_bottom))
+                if new < old:
+                    lines[i], lines[i + 1] = head, new_bottom
+                    moved = True
+        out.extend(lines)
+    return out
+
+
+def _ass_text_shape(text, rect_w, rect_h, family, size, bold, italic, underline,
+                    spacing, align, margin_l, margin_r, margin_v, outline,
+                    play_res):
+    """Контуры текста (path) и его «тела» с обводкой (body, для тени) в
+    координатах области rect_w×rect_h. Считается один раз на текст и размер."""
+    key = (text, rect_w, rect_h, family, round(size, 3), bold, italic, underline,
+           round(spacing, 3), align, margin_l, margin_r, margin_v,
+           round(outline, 3), play_res)
+    hit = _ASS_TEXT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    scale_y = rect_h / float(play_res[1])
+    scale_x = rect_w / float(play_res[0])
+    font = QFont(family)
+    font.setBold(bool(bold))
+    font.setItalic(bool(italic))
+    font.setUnderline(bool(underline))
+    ratio, asc_frac = _ass_text_metrics(font)
+    size_px = max(1.0, size * scale_y)
+    # Контуры строим в крупном кегле и масштабируем: setPixelSize целый, и у
+    # маленького превью округление em сдвигало бы размер на проценты.
+    ref = 200.0
+    font.setPixelSize(int(ref))
+    k = size_px * ratio / ref
+    if spacing:
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing,
+                              spacing * scale_y / k)
+    fm = QFontMetricsF(font)
+    ml, mr, mv = margin_l * scale_x, margin_r * scale_x, margin_v * scale_y
+    avail = max(1.0, rect_w - ml - mr)
+    lines = _wrap_ass_text(text, fm, avail / k)
+    block = size_px * len(lines)
+    row, col = (int(align) - 1) // 3, (int(align) - 1) % 3
+    top = (rect_h - mv - block if row == 0
+           else (rect_h - block) / 2.0 if row == 1 else mv)
+    ref_path = QPainterPath()
+    for i, line in enumerate(lines):
+        if not line:
+            continue
+        w = fm.horizontalAdvance(line) * k
+        x = ml if col == 0 else (rect_w - mr - w if col == 2 else ml + (avail - w) / 2.0)
+        base = top + i * size_px + size_px * asc_frac
+        ref_path.addText(QPointF(x / k, base / k), font, line)
+    path = QTransform.fromScale(k, k).map(ref_path)
+    body = path
+    if outline > 0:
+        stroker = QPainterPathStroker()
+        stroker.setWidth(2.0 * outline * scale_y)
+        stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
+        body = stroker.createStroke(path).united(path)
+    if len(_ASS_TEXT_CACHE) >= 24:
+        _ASS_TEXT_CACHE.pop(next(iter(_ASS_TEXT_CACHE)))
+    _ASS_TEXT_CACHE[key] = (path, body, scale_y)
+    return path, body, scale_y
+
+
+def _style_num(style, key, default):
+    """Число из стиля реплики; нет ключа (стиль сохранён до караоке-вида) или
+    он пуст — прежнее значение по умолчанию."""
+    try:
+        value = style.get(key)
+        return float(default if value is None else value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _paint_ass_text(painter, rect, text, style, margins=None,
+                    play_res=None):
+    """Текст субтитра с обводкой и тенью — так, как его рисует libass
+    (BorderStyle 1): тень — копия текста с обводкой, сдвинутая вниз-вправо,
+    затем обводка, затем сам текст. Размеры стиля (кегль, обводка, тень,
+    отступы) — в единицах ASS холста play_res, кадр — rect."""
+    if not text or rect.width() < 4 or rect.height() < 4:
+        return
+    play_res = play_res or (_ASS_PLAYRES_X, _ASS_PLAYRES_Y)
+    ml, mr, mv = margins or (_ASS_MARGIN_L, _ASS_MARGIN_R, _ASS_MARGIN_V)
+    family = style.get('font') or DEFAULT_SUBTITLE_STYLE['font']
+    if family == _karaoke_style.FONT_NAME:
+        family = _karaoke_font_family()
+    outline = _style_num(style, 'outline', 1.0)
+    shadow = _style_num(style, 'shadow', 0.0)
+    path, body, scale_y = _ass_text_shape(
+        text, rect.width(), rect.height(), family,
+        float(style.get('size') or DEFAULT_SUBTITLE_STYLE['size']),
+        bool(style.get('bold')), bool(style.get('italic')),
+        bool(style.get('underline')), float(style.get('spacing') or 0),
+        int(style.get('align') or 2), ml, mr, mv, outline, play_res)
+    painter.save()
+    painter.translate(rect.left(), rect.top())
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    shadow_px = shadow * scale_y
+    alpha = 255 - int(_style_num(style, 'shadow_alpha', 0))
+    if shadow_px > 0 and alpha > 0:
+        painter.fillPath(body.translated(shadow_px, shadow_px), QColor(0, 0, 0, alpha))
+    if outline > 0:
+        pen = QPen(QColor(style.get('outline_color') or '#000000'),
+                   2.0 * outline * scale_y)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.strokePath(path, pen)
+    painter.fillPath(path, QColor(style.get('color') or '#FFFFFF'))
+    painter.restore()
+
+
+def _prog_sub_style():
+    """Программный стиль субтитров Монтажа (см. PROG_SUB_FONTSIZE): стиль
+    «Создать субтитры» по умолчанию — он и есть караоке-стиль."""
+    return dict(DEFAULT_SUBTITLE_STYLE)
+
+
+def prog_sub_force_style(play_res_y=None):
+    """force_style ffmpeg-фильтра subtitles для программного стиля.
+
+    play_res_y — высота холста самой дорожки: у SRT/VTT это 288 (холст, на
+    котором их рендерит ffmpeg), у ASS — её PlayResY. Без пересчёта кегль 21
+    на холсте 1080 вышел бы вчетверо мельче."""
+    st = _prog_sub_style()
+    k = float(play_res_y or _ASS_PLAYRES_Y) / _ASS_PLAYRES_Y
+
+    def num(v):
+        return f"{float(v) * k:.2f}".rstrip("0").rstrip(".")
+
+    return (f"FontName={_karaoke_style.FONT_NAME},Fontsize={num(st['size'])},Bold=1,"
+            f"PrimaryColour={_hex_to_ass_color(st['color'])},"
+            f"OutlineColour={_hex_to_ass_color(st['outline_color'])},"
+            f"BackColour={_hex_to_ass_color('#000000', st['shadow_alpha'])},"
+            f"BorderStyle=1,Outline={num(st['outline'])},Shadow={num(st['shadow'])},"
+            f"MarginV={num(PROG_SUB_MARGIN_V)},ScaledBorderAndShadow=yes")
+
+
+def _paint_subtitle(painter, rect, text="", image=None, image_pos=(0, 0)):
+    """Рисует субтитры в области кадра rect: либо готовый кадр от libass (image,
+    приоритетнее), либо текст программным стилем — как у караоке (см.
+    PROG_SUB_FONTSIZE): снизу по центру, обводка и тень. Используется и
+    оверлеем-окном, и встроенным рендером в кадр."""
     if image is not None and not image.isNull():
         painter.drawImage(rect.left() + image_pos[0], rect.top() + image_pos[1], image)
         return
     if not text:
         return
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-    f = QFont("Arial"); f.setBold(True); f.setPixelSize(px)
-    painter.setFont(f)
-    margin_v = max(10, int(rect.height() * 0.05))
-    side = int(rect.width() * 0.05)
-    area = QRect(rect.left() + side, rect.top(),
-                 max(10, rect.width() - 2 * side),
-                 max(10, rect.height() - margin_v))
-    flags = (Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom
-             | Qt.TextFlag.TextWordWrap)
-    o = max(2, px // 11)   # толщина обводки
-    painter.setPen(QPen(QColor(0, 0, 0)))
-    for dx in (-o, 0, o):
-        for dy in (-o, 0, o):
-            if dx == 0 and dy == 0:
-                continue
-            painter.drawText(area.translated(dx, dy), flags, text)
-    painter.setPen(QPen(QColor(255, 255, 255)))
-    painter.drawText(area, flags, text)
+    _paint_ass_text(painter, rect, text, _prog_sub_style(),
+                    margins=(_ASS_MARGIN_L, _ASS_MARGIN_R, PROG_SUB_MARGIN_V))
 
 
 def _paint_subtitle_styled(painter, rect, text, style=None):
     """Стилизованный рендер субтитров для превью в SubtitleCreatorDialog: шрифт,
-    размер, жирный/курсив/подчёркивание, трекинг, выравнивание (numpad 1-9) и
-    цвета — как в стиле реплики (см. DEFAULT_SUBTITLE_STYLE). Размер/трекинг
-    заданы в единицах ASS PlayResY (288) и масштабируются в экранные px по
-    высоте rect — так же, как libass масштабирует их при вшивании через ffmpeg,
-    поэтому превью примерно совпадает с итоговым видео. НЕ используется вне
-    этого диалога — обычный VLC-стиль оверлея (_paint_subtitle) не трогаем."""
+    размер, жирный/курсив/подчёркивание, трекинг, выравнивание (numpad 1-9),
+    цвета, обводка и тень — как в стиле реплики (см. DEFAULT_SUBTITLE_STYLE).
+    Размеры заданы в единицах ASS PlayResY (288) и переводятся в пиксели по
+    правилам libass (_paint_ass_text), поэтому превью совпадает с итоговым
+    видео."""
     if not text:
         return
-    style = style or DEFAULT_SUBTITLE_STYLE
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-    scale = rect.height() / _ASS_PLAYRES_Y if rect.height() > 0 else 1.0
-    px = max(8, int(round(float(style.get('size') or 20) * scale)))
-    f = QFont(style.get('font') or 'Arial')
-    f.setBold(bool(style.get('bold')))
-    f.setItalic(bool(style.get('italic')))
-    f.setUnderline(bool(style.get('underline')))
-    f.setPixelSize(px)
-    spacing = float(style.get('spacing') or 0) * scale
-    if spacing:
-        f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, spacing)
-    painter.setFont(f)
-
-    align = int(style.get('align') or 2)
-    row = (align - 1) // 3; col = (align - 1) % 3
-    h_flag = (Qt.AlignmentFlag.AlignLeft if col == 0
-              else Qt.AlignmentFlag.AlignRight if col == 2
-              else Qt.AlignmentFlag.AlignHCenter)
-    v_flag = (Qt.AlignmentFlag.AlignBottom if row == 0
-              else Qt.AlignmentFlag.AlignTop if row == 2
-              else Qt.AlignmentFlag.AlignVCenter)
-    margin_v = max(6, int(rect.height() * 0.05))
-    side = max(6, int(rect.width() * 0.04))
-    area = QRect(rect.left() + side, rect.top() + margin_v,
-                 max(10, rect.width() - 2 * side),
-                 max(10, rect.height() - 2 * margin_v))
-    flags = int(h_flag | v_flag | Qt.TextFlag.TextWordWrap)
-    o = max(1, px // 11)
-    outline = QColor(style.get('outline_color') or '#000000')
-    fill = QColor(style.get('color') or '#FFFFFF')
-    painter.setPen(QPen(outline))
-    for dx in (-o, 0, o):
-        for dy in (-o, 0, o):
-            if dx == 0 and dy == 0:
-                continue
-            painter.drawText(area.translated(dx, dy), flags, text)
-    painter.setPen(QPen(fill))
-    painter.drawText(area, flags, text)
+    _paint_ass_text(painter, rect, text, style or DEFAULT_SUBTITLE_STYLE)
 
 def _ass_timestamp(t):
     """Секунды → таймкод ASS «H:MM:SS.cc» (сотые доли, без ведущего нуля у часов)."""
@@ -447,10 +647,21 @@ def _hex_to_ass_color(hex_color, alpha=0x00):
 
 
 # Стиль субтитров по умолчанию (используется, пока у реплики нет собственного
-# переопределения — см. SubtitleCreatorDialog._effective_style).
+# переопределения — см. SubtitleCreatorDialog._effective_style). Это же —
+# программный стиль Монтажа (_prog_sub_style): караоке-вид из karaoke/style.py
+# с кеглем субтитров. Обводка и тень у караоке заданы для кегля BASE_SIZE —
+# здесь пропорционально меньше. 'outline'/'shadow' — в единицах ASS; у старых
+# сохранённых стилей их нет, и там действуют прежние 1 и 0 (см. _style_line).
 DEFAULT_SUBTITLE_STYLE = {
-    'font': 'Arial', 'size': 20, 'bold': True, 'italic': False, 'underline': False,
-    'align': 2, 'spacing': 0, 'color': '#FFFFFF', 'outline_color': '#000000',
+    'font': _karaoke_style.FONT_NAME, 'size': PROG_SUB_FONTSIZE, 'bold': True,
+    'italic': False, 'underline': False, 'align': 2, 'spacing': 0,
+    'color': '#' + _karaoke_style.TEXT_COLOUR,
+    'outline_color': '#' + _karaoke_style.OUTLINE_COLOUR,
+    'outline': round(PROG_SUB_FONTSIZE * _karaoke_style.OUTLINE
+                     / _karaoke_style.BASE_SIZE, 2),
+    'shadow': round(PROG_SUB_FONTSIZE * _karaoke_style.SHADOW
+                    / _karaoke_style.BASE_SIZE, 2),
+    'shadow_alpha': _karaoke_style.SHADOW_ALPHA,
     'animation': 'none',
 }
 _ASS_PLAYRES_X, _ASS_PLAYRES_Y = 384, 288
@@ -499,8 +710,12 @@ def _style_line(name, style):
     align = int(style.get('align') or 2)
     primary = _hex_to_ass_color(style.get('color') or '#FFFFFF')
     outline = _hex_to_ass_color(style.get('outline_color') or '#000000')
-    return (f"Style: {name},{font},{size},{primary},&H000000FF,{outline},&H00000000,"
-            f"{bold},{italic},{underline},0,100,100,{spacing},0,1,1,0,{align},"
+    # Толщина обводки и тень: у стилей, сохранённых до караоке-вида, ключей
+    # нет — им остаются прежние Outline 1 и Shadow 0.
+    border = f"{_style_num(style, 'outline', 1):g},{_style_num(style, 'shadow', 0):g}"
+    back = _hex_to_ass_color('#000000', int(_style_num(style, 'shadow_alpha', 0)))
+    return (f"Style: {name},{font},{size},{primary},&H000000FF,{outline},{back},"
+            f"{bold},{italic},{underline},0,100,100,{spacing},0,1,{border},{align},"
             f"{_ASS_MARGIN_L},{_ASS_MARGIN_R},{_ASS_MARGIN_V},1")
 
 

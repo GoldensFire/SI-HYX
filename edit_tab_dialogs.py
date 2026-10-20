@@ -22,7 +22,7 @@ from config import (
 )
 from msgbox import (msgbox_information, msgbox_warning)
 from edit_tab_base import (
-    C, DEFAULT_SUBTITLE_STYLE, _load_subtitle_presets,
+    C, DEFAULT_SUBTITLE_STYLE, _karaoke_font_family, _load_subtitle_presets,
     _pixelize_block_sequence, _save_subtitle_presets, make_divider,
     make_icon_btn, s_to_time
 )

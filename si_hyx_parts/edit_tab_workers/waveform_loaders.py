@@ -26,11 +26,14 @@ class AudioWaveformLoader(_api.QThread):
         # feed_path задан → вход «pipe:0» кормим файлом через FILE_SHARE_DELETE
         # (исходник остаётся удаляемым из Проводника во время построения волны).
         full = cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:]
+        # Приоритет ниже обычного: волна строится фоном и не должна отнимать
+        # процессор у плеера и перемотки.
+        flags = _api.CREATE_NO_WINDOW | (0x00004000 if _api.os.name == 'nt' else 0)
         self.proc = _api.subprocess.Popen(
             full, stdin=(_api.subprocess.PIPE if feed_path else None),
             stdout=_api.subprocess.PIPE, stderr=_api.subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace",
-            creationflags=_api.CREATE_NO_WINDOW)
+            creationflags=flags)
         if feed_path:
             _api.start_share_delete_feeder(
                 feed_path, self.proc.stdin, stop_flag=lambda: self._stopped)

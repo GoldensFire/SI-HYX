@@ -358,7 +358,10 @@ def initialize(generator):
 def uses_gemini(generator, cand):
     """Нужна ли вопросу этого рода проверка картинки через Gemini."""
     import animepack as api
+    from .visual_mode import ocr_only
     settings = generator.s
+    if ocr_only(settings):
+        return False
     if cand.kind in api.FRAME_KINDS or cand.kind == api.STUDIO_KIND:
         from .frame_visual_check import enabled
         return enabled(settings, cand.kind)
@@ -375,10 +378,64 @@ def uses_gemini(generator, cand):
     return False
 
 
-def hold(generator, cand):
-    """Пауза проверок картинок идёт, а вопросу она нужна: не начинать загрузку."""
+def _paused(generator):
     pause = getattr(generator, "_visual_pause", None)
     if pause is None or pause.down or pause.remaining() <= 0:
+        return None
+    return pause
+
+
+def kind_uses_gemini(generator, kind):
+    """uses_gemini для рода вопросов, пока кандидата нет: манга — с запасом
+    на вебтун, которому сцену выбирает Gemini."""
+    import animepack as api
+    if kind != api.MANGA_KIND:
+        from types import SimpleNamespace
+        return uses_gemini(generator, SimpleNamespace(kind=kind))
+    from .visual_mode import ocr_only
+    settings = generator.s
+    if ocr_only(settings) or getattr(generator, "gemini_manga", None) is None:
+        return False
+    return ((getattr(settings, "manga_gemini_check", True)
+             and getattr(settings, "manga_title_check_mode", "gemini") == "gemini")
+            or getattr(settings, "manga_character_crop", True))
+
+
+def pause_blocks(generator, kind, inflight):
+    """Не запускать вопрос этого рода, пока проверки картинок на паузе.
+
+    Манга во время паузы готовит страницы впрок: поиск, скачивание и вырезка
+    идут, а на проверке Gemini тайтл уходит на повтор, и его страницы ждут в
+    manga_page_reuse. После паузы остаётся один запрос Gemini — в прогоне
+    16.10 хвост манги стоял 22 минуты, а потом готовил страницы с нуля.
+    Впрок готовим не больше, чем удержит кладовая страниц."""
+    if _paused(generator) is None or not kind_uses_gemini(generator, kind):
+        return False
+    import animepack as api
+    if kind == api.MANGA_KIND:
+        from .manga_page_reuse import KEEP_TITLES, count
+        return inflight[kind] + count(generator) >= KEEP_TITLES
+    return True
+
+
+def note_wait(generator):
+    """Одна строка журнала на паузу: отбор ждёт её конца, каталог не трогает."""
+    pause = _paused(generator)
+    if pause is None or getattr(generator, "_pause_wait_noted", None) == pause.until:
+        return
+    generator._pause_wait_noted = pause.until
+    generator.log(f"Пауза проверок Gemini ещё {pause.remaining():.0f} с: оставшимся "
+                  "вопросам нужна проверка картинок — жду её конца, не перебирая "
+                  "каталог; манга тем временем готовит страницы впрок.")
+
+
+def hold(generator, cand):
+    """Пауза проверок картинок идёт, а вопросу она нужна: не начинать загрузку.
+
+    Мангу не держим: её страницы готовятся впрок (см. pause_blocks)."""
+    import animepack as api
+    pause = _paused(generator)
+    if pause is None or cand.kind == api.MANGA_KIND:
         return False
     if not uses_gemini(generator, cand):
         return False

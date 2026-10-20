@@ -5,6 +5,42 @@
 import edit_tab as _api
 
 
+class _ElidedLabel(_api.QLabel):
+    """Подпись в одну строку: длинный текст сокращается «…» посередине по
+    реальной ширине подписи. Раньше имя файла резалось до последних 27
+    символов («…s OVA 1 [BDRemux 1080p].mkv»), а путь — до 210 px по шрифту
+    без стилей, хотя место в подписи оставалось. Ширину берёт у панели и сама
+    её не распирает."""
+
+    def __init__(self, text=""):
+        super().__init__(text)
+        self._full_text = None
+        self.setTextFormat(_api.Qt.TextFormat.PlainText)
+        self.setSizePolicy(_api.QSizePolicy.Policy.Ignored,
+                           _api.QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(1)
+
+    def set_full_text(self, text):
+        self._full_text = str(text)
+        self.ensurePolished()      # размер шрифта из styleSheet — до замера
+        self._elide_full_text()
+
+    def clear_full_text(self, text):
+        self._full_text = None
+        self.setText(text)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._elide_full_text()
+
+    def _elide_full_text(self):
+        if self._full_text is None:
+            return
+        width = max(0, self.contentsRect().width())
+        self.setText(self.fontMetrics().elidedText(
+            self._full_text, _api.Qt.TextElideMode.ElideMiddle, width))
+
+
 class EditTabLayoutMixin:
     """Монтаж: построение интерфейса, прогресс и подгонка видеовыхода."""
 
@@ -48,8 +84,7 @@ class EditTabLayoutMixin:
         sb_layout.setSpacing(12)
 
         # File section
-        self.lbl_file = _api.QLabel("Нет файла")
-        self.lbl_file.setWordWrap(True)
+        self.lbl_file = _ElidedLabel("Нет файла")
         self.lbl_file.setStyleSheet(f"""
             color: {_api.C['text3']};
             font-size: 11px;
@@ -219,13 +254,9 @@ class EditTabLayoutMixin:
         dst_lbl.setStyleSheet(f"color: {_api.C['text3']}; font-size: 12px;")
         self._relax_width(dst_lbl)
         export_card._body.addWidget(dst_lbl)
-        self.lbl_export_dir = _api.QLabel("Рядом с исходником")
-        # Без переноса (длинный путь не разрывается и распирал бы панель) — вместо
-        # этого укорачиваем в середине в _update_export_dir_label; min width 0,
-        # чтобы метка не диктовала ширину панели.
-        self.lbl_export_dir.setWordWrap(False)
-        self.lbl_export_dir.setMinimumWidth(0)
-        self._relax_width(self.lbl_export_dir)
+        # Длинный путь сокращается в середине по ширине метки (_ElidedLabel)
+        # и панель не распирает.
+        self.lbl_export_dir = _ElidedLabel("Рядом с исходником")
         self.lbl_export_dir.setStyleSheet(
             f"color: {_api.C['text2']}; font-size: 11px; padding: 4px 6px; "
             f"background: {_api.C['surface3']}; border: 1px solid {_api.C['border2']}; border-radius: 5px;")
@@ -344,8 +375,8 @@ class EditTabLayoutMixin:
         sb_bottom.setStyleSheet(
             f"#SidebarBottom {{ background: {_api.C['surface']}; border-top: 1px solid {_api.C['border']}; }}")
         bottom_l = _api.QVBoxLayout(sb_bottom)
-        bottom_l.setContentsMargins(16, 10, 16, 14)
-        bottom_l.setSpacing(10)
+        bottom_l.setContentsMargins(16, 10, 16, 0)
+        bottom_l.setSpacing(0)
         bottom_l.addStretch()
 
         self.lbl_selection = _api.QLabel("Зона: —")
@@ -381,8 +412,14 @@ class EditTabLayoutMixin:
             QPushButton:pressed {{ background: #74c7ec; }}
             QPushButton:disabled {{ background: {_api.C['surface3']}; color: {_api.C['text3']}; }}
         """)
-        bottom_l.addWidget(self.btn_cut)
-        bottom_l.addStretch()
+        # «Обрезать» — в строке высотой с панель плеера слева (её подгоняет
+        # eventFilter по размеру панели): кнопка стоит на одной линии с
+        # кнопкой полноэкранного режима.
+        self._cut_row = _api.QWidget()
+        cut_l = _api.QHBoxLayout(self._cut_row)
+        cut_l.setContentsMargins(0, 0, 0, 0)
+        cut_l.addWidget(self.btn_cut, 0, _api.Qt.AlignmentFlag.AlignVCenter)
+        bottom_l.addWidget(self._cut_row)
         sb_outer.addWidget(sb_bottom, 0)
 
         # progress/log_label больше не показываются в интерфейсе (прогресс идёт в
@@ -461,7 +498,7 @@ class EditTabLayoutMixin:
             QComboBox {{
                 background: {_api.C['surface3']}; color: {_api.C['text']};
                 border: 1px solid {_api.C['border2']}; border-radius: 5px;
-                padding: 5px 8px; font-size: 12px;
+                padding: 5px 0px 5px 8px; font-size: 12px;
             }}
             QComboBox::drop-down {{ border: none; width: 18px; }}
             QComboBox QAbstractItemView {{
@@ -504,15 +541,18 @@ class EditTabLayoutMixin:
         side_l.addLayout(at_row)
 
         # Заголовок «Субтитры» + кнопка-карандаш (правка текста субтитров прямо тут).
+        # Карандаш — сразу за подписью и не выше её строки: прежняя кнопка 24×20
+        # стояла у правого края выше текста и раздувала отступы вокруг строки.
         st_hdr = _api.QHBoxLayout(); st_hdr.setContentsMargins(0, 0, 0, 0); st_hdr.setSpacing(4)
         lbl_st = _api.QLabel("Субтитры")
         lbl_st.setStyleSheet(f"color: {_api.C['text3']}; font-size: 11px; font-weight: 700;")
-        st_hdr.addWidget(lbl_st)
-        st_hdr.addStretch(1)
+        st_hdr.addWidget(lbl_st, 0, _api.Qt.AlignmentFlag.AlignVCenter)
         self.btn_edit_subs = _api.QPushButton()
         self.btn_edit_subs.setIcon(_api.get_icon('fa5s.edit', color=_api.C['text2']))
-        self.btn_edit_subs.setIconSize(_api.QSize(14, 14))
-        self.btn_edit_subs.setFixedSize(24, 20)
+        lbl_st.ensurePolished()   # размер шрифта из styleSheet — до замера
+        row_h = max(14, lbl_st.sizeHint().height())
+        self.btn_edit_subs.setIconSize(_api.QSize(row_h - 3, row_h - 3))
+        self.btn_edit_subs.setFixedSize(row_h + 4, row_h)
         self.btn_edit_subs.setCursor(_api.Qt.CursorShape.PointingHandCursor)
         self.btn_edit_subs.setToolTip("Редактировать текст выбранных субтитров")
         self.btn_edit_subs.setStyleSheet(f"""
@@ -521,7 +561,23 @@ class EditTabLayoutMixin:
             QPushButton:pressed {{ background: {_api.C['border2']}; }}
         """)
         self.btn_edit_subs.clicked.connect(self.edit_subtitles)
-        st_hdr.addWidget(self.btn_edit_subs)
+        st_hdr.addWidget(self.btn_edit_subs, 0, _api.Qt.AlignmentFlag.AlignVCenter)
+        # Автосинхронизация: реплики отстают или спешат на пару секунд —
+        # сдвинуть их к речи выбранной аудиодорожки (subtitle_sync).
+        self.btn_sync_subs = _api.QPushButton()
+        self.btn_sync_subs.setIcon(_api.get_icon('mdi6.timer-sync-outline', color=_api.C['text2']))
+        self.btn_sync_subs.setIconSize(_api.QSize(row_h, row_h))
+        self.btn_sync_subs.setFixedSize(row_h + 4, row_h)
+        self.btn_sync_subs.setCursor(_api.Qt.CursorShape.PointingHandCursor)
+        self.btn_sync_subs.setToolTip(
+            "Синхронизировать субтитры со звуком: если реплики отстают или "
+            "спешат на пару секунд, они сдвигаются к речи выбранной "
+            "аудиодорожки. Результат — копия субтитров, она сразу выбирается; "
+            "исходная дорожка остаётся в списке")
+        self.btn_sync_subs.setStyleSheet(self.btn_edit_subs.styleSheet())
+        self.btn_sync_subs.clicked.connect(self.sync_subtitles)
+        st_hdr.addWidget(self.btn_sync_subs, 0, _api.Qt.AlignmentFlag.AlignVCenter)
+        st_hdr.addStretch(1)
         side_l.addLayout(st_hdr)
         st_row = _api.QHBoxLayout(); st_row.setContentsMargins(0, 0, 0, 0); st_row.setSpacing(5)
         self.cmb_subs = _api.QComboBox()
@@ -545,10 +601,12 @@ class EditTabLayoutMixin:
         # По умолчанию — «Как в оригинале» (стиль из самих субтитров, ничего не навязываем).
         self.cmb_sub_style.setCurrentIndex(2)
         self.cmb_sub_style.setToolTip(
-            "Стиль субтитров при вшивании в кадр:\n"
-            "Авто — стиль программы для SRT/VTT, у ASS/SSA остаётся собственный.\n"
-            "Как в программе — крупный белый шрифт с обводкой даже поверх ASS/SSA.\n"
-            "Как в оригинале — ничего не навязывать (стиль из самих субтитров).")
+            "Стиль субтитров при вшивании в кадр. Стиль программы — как у караоке\n"
+            "в генерации паков: шрифт Karaoke Rounded, обводка и тень.\n"
+            "Авто — стиль программы для SRT/VTT и субтитров MP4, у ASS/SSA свой.\n"
+            "Как в программе — стиль программы даже поверх ASS/SSA.\n"
+            "Как в оригинале — собственный стиль ASS/SSA и субтитров MP4;\n"
+            "у SRT/VTT своего стиля нет — им стиль программы, как в превью.")
         self.cmb_sub_style.setStyleSheet(_combo_css)
         self.cmb_sub_style.setSizeAdjustPolicy(
             _api.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -680,36 +738,33 @@ class EditTabLayoutMixin:
         self._build_more_actions()
 
         # Две колонки по 4 квадратные кнопки (место под 8 штук) — левая и правая,
-        # каждая прижата к низу (симметрично высоте шкалы уровня звука справа).
-        # Дополнительные действия собраны в нижней кнопке с тремя точками.
+        # сразу под «Вшить субтитры» (раньше их прижимало к низу панели, и между
+        # галочкой и значками зияла пустота). Дополнительные действия собраны в
+        # нижней кнопке с тремя точками.
         self._montage_side_btns = [self.btn_crop_frame, self.btn_pixelize,
                                    self.btn_save_frame, self.btn_remove_object,
                                    self.btn_create_subs, self.btn_track_object,
                                    self.btn_image_overlay, self.btn_more_actions]
         col_l = _api.QVBoxLayout(); col_l.setContentsMargins(0, 0, 0, 0)
         col_l.setSpacing(self._MSIDE_GAP)
-        col_l.addStretch(1)
         for _b in (self.btn_crop_frame, self.btn_pixelize,
                    self.btn_save_frame, self.btn_remove_object):
             col_l.addWidget(_b)
+        col_l.addStretch(1)
         col_r = _api.QVBoxLayout(); col_r.setContentsMargins(0, 0, 0, 0)
         col_r.setSpacing(self._MSIDE_GAP)
-        col_r.addStretch(1)
         for _b in (self.btn_create_subs, self.btn_track_object,
                    self.btn_image_overlay, self.btn_more_actions):
             col_r.addWidget(_b)
+        col_r.addStretch(1)
         btn_col = _api.QHBoxLayout(); btn_col.setContentsMargins(0, 0, 0, 0)
         btn_col.setSpacing(self._MSIDE_GAP)
         btn_col.addLayout(col_l)
         btn_col.addLayout(col_r)
         btn_col.addStretch(1)   # не растягивать колонки шире квадратных кнопок
 
-        # Правая колонка — подпись + шкала, отцентрованная под текстом.
-        vu_col = _api.QVBoxLayout(); vu_col.setContentsMargins(0, 0, 0, 0); vu_col.setSpacing(3)
-        lbl_vu = _api.QLabel("Уровень звука")
-        lbl_vu.setStyleSheet(f"color: {_api.C['text3']}; font-size: 11px; font-weight: 700;")
-        lbl_vu.setAlignment(_api.Qt.AlignmentFlag.AlignHCenter)
-        vu_col.addWidget(lbl_vu, 0)
+        # Правая колонка — шкала уровня звука во всю высоту (без подписи).
+        vu_col = _api.QVBoxLayout(); vu_col.setContentsMargins(0, 0, 0, 0); vu_col.setSpacing(0)
         self.audio_meter = _api.AudioMeter()
         self.audio_meter.setFixedWidth(54)
         meter_row = _api.QHBoxLayout(); meter_row.setContentsMargins(0, 0, 0, 0)
@@ -732,101 +787,32 @@ class EditTabLayoutMixin:
         return center
 
     def _build_player_bar(self, center):
-        """Панель плеера под видео: play/pause, время, громкость, покадровый шаг."""
-        # ── Player bar (прямо под видео) ──────────────────────────────────
-        # Компактный плеер как в обычном видеоплеере: полоса воспроизведения,
-        # тайминги (текущее/общее), кнопки и громкость — всё под самим видео.
+        """Одна строка под видео: транспорт, время проекта, правка у плейхеда,
+        громкость. Шкала у вкладки ОДНА — таймлайн проекта под всем остальным:
+        отдельные полоса воспроизведения и волна источника убраны (они
+        повторяли таймлайн и съедали высоту видео)."""
         player_bar = _api.QFrame()
         player_bar.setObjectName("PlayerBar")
         player_bar.setStyleSheet(f"#PlayerBar {{ background: {_api.C['surface']}; border-top: 1px solid {_api.C['border']}; }}")
         pb_layout = _api.QVBoxLayout(player_bar)
-        pb_layout.setContentsMargins(12, 6, 12, 7)
-        pb_layout.setSpacing(6)
+        pb_layout.setContentsMargins(10, 5, 10, 5)
+        pb_layout.setSpacing(0)
 
-        # Верхняя строка: полоса воспроизведения + тайминги (текущее / общее)
-        seek_row = _api.QHBoxLayout()
-        seek_row.setContentsMargins(0, 0, 0, 0)
-        seek_row.setSpacing(10)
-
+        # Скрытые держатели прежних элементов: на них завязан остальной код
+        # (полноэкранный режим, превью кадров, IN/OUT источника при обрезке).
+        # Родитель — скрытый виджет: setVisible(True) где-то в глубине кода не
+        # превратит их в отдельные окна.
+        hidden = _api.QWidget(player_bar)
+        hidden.hide()
+        self._hidden_holder = hidden
+        hid_l = _api.QHBoxLayout(hidden)
         self.slider = _api.SeekSlider(_api.Qt.Orientation.Horizontal)
         self.slider.setRange(0, 1000)
         self.slider.sliderMoved.connect(self.on_slider_moved)
         self.slider.setStyleSheet(self._slider_style(_api.C["playhead"]))
-        # Превью кадров при наведении на полосу (как на YouTube). Один контроллер
-        # на обе полосы — в окне и в полноэкранном режиме (см. FullscreenVideo).
+        # Превью кадров при наведении на полосу полноэкранного режима.
         self.seek_preview = _api.SeekPreview(lambda: getattr(self, "duration", 0.0) or 0.0)
         self.slider.attach_preview(self.seek_preview)
-        seek_row.addWidget(self.slider, 1)
-
-        time_frame = _api.QFrame()
-        time_frame.setStyleSheet(f"""
-            background: {_api.C['bg']};
-            border: 1px solid {_api.C['border']};
-            border-radius: 6px;
-        """)
-        time_fl = _api.QHBoxLayout(time_frame)
-        time_fl.setContentsMargins(8, 3, 8, 3)
-        time_fl.setSpacing(3)
-        _mono = _api.QFont("Courier New" if _api.os.name == 'nt' else "Courier")
-        _mono.setBold(True); _mono.setPointSize(11)
-        self.lbl_current_time = _api.QLabel("00:00:00.000")
-        self.lbl_current_time.setFont(_mono)
-        self.lbl_current_time.setStyleSheet(f"color: {_api.C['green2']}; background: transparent;")
-        sep_time = _api.QLabel("/")
-        sep_time.setStyleSheet(f"color: {_api.C['text3']}; background: transparent;")
-        self.lbl_total_time = _api.QLabel("00:00:00.000")
-        self.lbl_total_time.setFont(_mono)
-        self.lbl_total_time.setStyleSheet(f"color: {_api.C['text3']}; background: transparent;")
-        time_fl.addWidget(self.lbl_current_time)
-        time_fl.addWidget(sep_time)
-        time_fl.addWidget(self.lbl_total_time)
-        seek_row.addWidget(time_frame)
-        pb_layout.addLayout(seek_row)
-
-        # Нижняя строка: кнопки управления + громкость
-        pctrl_row = _api.QHBoxLayout()
-        pctrl_row.setContentsMargins(0, 0, 0, 0)
-        pctrl_row.setSpacing(6)
-
-        # Кнопки плеера — только иконки, без подписей (квадратные).
-        self.btn_stop = _api.make_icon_btn("", icon_std=_api.QStyle.StandardPixmap.SP_MediaStop)
-        self.btn_stop.setFixedWidth(40)
-        self.btn_stop.setToolTip("Стоп — к началу зоны")
-        self.btn_stop.clicked.connect(self.stop_playback)
-        pctrl_row.addWidget(self.btn_stop)
-
-        self.btn_step_back = _api.make_icon_btn("", icon_std=_api.QStyle.StandardPixmap.SP_MediaSeekBackward)
-        self.btn_step_back.setFixedWidth(40)
-        self.btn_step_back.setToolTip("Кадр назад (←)")
-        self.btn_step_back.clicked.connect(_api.partial(self.step_frame_scrub, -1))
-        pctrl_row.addWidget(self.btn_step_back)
-
-        self.btn_play = _api.make_icon_btn("", icon_std=_api.QStyle.StandardPixmap.SP_MediaPlay, accent=True)
-        self.btn_play.setFixedWidth(48)
-        self.btn_play.setToolTip("Воспроизвести / пауза (Пробел)")
-        self.btn_play.clicked.connect(self.toggle_play)
-        pctrl_row.addWidget(self.btn_play)
-
-        self.btn_step_fwd = _api.make_icon_btn("", icon_std=_api.QStyle.StandardPixmap.SP_MediaSeekForward)
-        self.btn_step_fwd.setFixedWidth(40)
-        self.btn_step_fwd.setToolTip("Кадр вперёд (→)")
-        self.btn_step_fwd.clicked.connect(_api.partial(self.step_frame_scrub, 1))
-        pctrl_row.addWidget(self.btn_step_fwd)
-
-        self.btn_jump_end = _api.make_icon_btn("", icon_std=_api.QStyle.StandardPixmap.SP_MediaSkipForward)
-        self.btn_jump_end.setFixedWidth(40)
-        self.btn_jump_end.setToolTip("Перейти к концу зоны (OUT)")
-        self.btn_jump_end.clicked.connect(lambda: self.seek_to(self.current_out))
-        pctrl_row.addWidget(self.btn_jump_end)
-
-        pctrl_row.addSpacing(14)
-
-        # Поля ввода таймкода IN/OUT убраны по запросу — вместо них кнопки
-        # «Обрезать старт/конец» (до плейхеда) и длительность выделения. Сами
-        # объекты in_time_edit/out_time_edit/in_frame_spin/out_frame_spin остаются
-        # СКРЫТЫМИ держателями: на них завязан остальной код (set_in_out и т.п.).
-        io_holder = _api.QWidget(player_bar)
-        io_h = _api.QHBoxLayout(io_holder); io_h.setContentsMargins(0, 0, 0, 0)
         self.in_time_edit = _api.QLineEdit("00:00:00.000")
         self.in_time_edit.returnPressed.connect(self.set_in_point)
         self.in_frame_spin = _api.QSpinBox(); self.in_frame_spin.setMaximum(100000000)
@@ -835,82 +821,122 @@ class EditTabLayoutMixin:
         self.out_time_edit.returnPressed.connect(self.set_out_point)
         self.out_frame_spin = _api.QSpinBox(); self.out_frame_spin.setMaximum(100000000)
         self.out_frame_spin.valueChanged.connect(self.on_out_frame_changed)
-        for _w in (self.in_time_edit, self.in_frame_spin,
-                   self.out_time_edit, self.out_frame_spin):
-            io_h.addWidget(_w)
-        io_holder.hide()
+        self.lbl_seg_dur = _api.QLabel("00:00:00.000")
+        for _w in (self.slider, self.in_time_edit, self.in_frame_spin,
+                   self.out_time_edit, self.out_frame_spin, self.lbl_seg_dur):
+            hid_l.addWidget(_w)
 
-        _trim_btn_css = f"""
-            QPushButton {{
-                background: {_api.C['surface3']};
-                color: {_api.C['text']};
-                border: 1px solid {_api.C['border2']};
-                border-radius: 6px;
-                padding: 7px 14px;
-                font-size: 12px;
-                font-weight: 600;
-            }}
-            QPushButton:hover {{ background: {_api.C['surface2']}; border-color: {_api.C['accent']}; }}
-            QPushButton:pressed {{ background: {_api.C['surface']}; }}
-            QPushButton:disabled {{ color: {_api.C['text3']}; }}
-        """
+        row = _api.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(5)
+
+        def _tbtn(icon, tip, slot, width=36, accent=False, std=None):
+            b = _api.make_icon_btn("", icon_std=std, icon=icon, accent=accent)
+            if icon:
+                big = icon.startswith('mdi6.')      # у mdi-значков больше поля
+                b.setIconSize(_api.QSize(21, 21) if big else _api.QSize(17, 17))
+            b.setFixedWidth(width)
+            b.setToolTip(tip)
+            # NoFocus: клик не уводит фокус с вкладки — Пробел, Ctrl+Z и стрелки
+            # остаются у монтажа, а не жмут кнопку повторно.
+            b.setFocusPolicy(_api.Qt.FocusPolicy.NoFocus)
+            b.clicked.connect(slot)
+            row.addWidget(b)
+            return b
+
+        def _sep():
+            line = _api.QFrame()
+            line.setFixedSize(1, 22)
+            line.setStyleSheet(f"background: {_api.C['border2']};")
+            row.addSpacing(3)
+            row.addWidget(line)
+            row.addSpacing(3)
+
+        SP = _api.QStyle.StandardPixmap
+        self.btn_stop = _tbtn(None, "Стоп — в начало", self.stop_playback, std=SP.SP_MediaStop)
+        self.btn_step_back = _tbtn(None, "Кадр назад (← / A)",
+                                   _api.partial(self.step_frame_scrub, -1), std=SP.SP_MediaSeekBackward)
+        self.btn_play = _tbtn(None, "Воспроизвести / пауза (Пробел)", self.toggle_play,
+                              width=44, accent=True, std=SP.SP_MediaPlay)
+        self.btn_step_fwd = _tbtn(None, "Кадр вперёд (→ / D)",
+                                  _api.partial(self.step_frame_scrub, 1), std=SP.SP_MediaSeekForward)
+        self.btn_jump_end = _tbtn(None, "В конец", self.jump_to_end, std=SP.SP_MediaSkipForward)
+
+        row.addSpacing(4)
+        time_frame = _api.QFrame()
+        time_frame.setStyleSheet(f"""
+            background: {_api.C['bg']};
+            border: 1px solid {_api.C['border']};
+            border-radius: 6px;
+        """)
+        time_fl = _api.QHBoxLayout(time_frame)
+        time_fl.setContentsMargins(7, 3, 7, 3)
+        time_fl.setSpacing(3)
+        _mono = _api.QFont("Courier New" if _api.os.name == 'nt' else "Courier")
+        _mono.setBold(True); _mono.setPointSize(10)
+        self.lbl_current_time = _api.QLabel("00:00:00.000")
+        self.lbl_current_time.setFont(_mono)
+        self.lbl_current_time.setStyleSheet(f"color: {_api.C['green2']}; background: transparent; border: none;")
+        sep_time = _api.QLabel("/")
+        sep_time.setStyleSheet(f"color: {_api.C['text3']}; background: transparent; border: none;")
+        self.lbl_total_time = _api.QLabel("00:00:00.000")
+        self.lbl_total_time.setFont(_mono)
+        self.lbl_total_time.setStyleSheet(f"color: {_api.C['text3']}; background: transparent; border: none;")
+        self.lbl_total_time.setToolTip("Длина проекта")
+        time_fl.addWidget(self.lbl_current_time)
+        time_fl.addWidget(sep_time)
+        time_fl.addWidget(self.lbl_total_time)
+        row.addWidget(time_frame)
+
+        # ── Правка у плейхеда — то же, что в Filmora над таймлайном ──────────
+        _sep()
         _ss = getattr(self, "trim_start_seq", "Shift+C")
         _es = getattr(self, "trim_end_seq", "Shift+V")
-        self.btn_trim_start = _api.QPushButton("Обрезать старт")
-        self.btn_trim_start.setToolTip(
-            f"Поставить начало (старт) на жёлтую полосу воспроизведения ({_ss})")
-        self.btn_trim_start.setStyleSheet(_trim_btn_css)
-        # NoFocus: иначе клик мыши уводил клавиатурный фокус на кнопку, и потом
-        # Space/Ctrl+Z воспринимались как нажатие кнопки/уходили мимо вкладки
-        # (баг «после кнопок Обрезать Ctrl+Z не работает»). Фокус оставляем на
-        # вкладке монтажа — там висят все хоткеи (WidgetWithChildrenShortcut).
-        self.btn_trim_start.setFocusPolicy(_api.Qt.FocusPolicy.NoFocus)
-        self.btn_trim_start.clicked.connect(self.trim_start_to_playhead)
-        pctrl_row.addWidget(self.btn_trim_start)
+        self.btn_proj_split = _tbtn('fa5s.cut', "Разрезать клип у плейхеда (Ctrl+B)",
+                                    lambda: self.project_split())
+        self.btn_trim_start = _tbtn('mdi6.format-horizontal-align-left',
+                                    f"Обрезать начало клипа до плейхеда ({_ss})",
+                                    self.trim_start_to_playhead)
+        self.btn_trim_end = _tbtn('mdi6.format-horizontal-align-right',
+                                  f"Обрезать конец клипа до плейхеда ({_es})",
+                                  self.trim_end_to_playhead)
+        self.btn_proj_delete = _tbtn('fa5s.trash-alt', "Удалить выбранный клип (Delete)",
+                                     lambda: self.project_delete())
+        _sep()
+        self.btn_proj_undo = _tbtn('fa5s.undo', "Отменить (Ctrl+Z)", self.undo)
+        self.btn_proj_redo = _tbtn('fa5s.redo', "Повторить (Ctrl+Y)", self.redo)
+        _sep()
+        self.btn_proj_add = _tbtn('fa5s.plus', "Добавить файл в конец проекта\n"
+                                  "(или перетащите файл на таймлайн)", self.project_add_file)
+        self.btn_proj_fit = _tbtn('fa5s.expand-arrows-alt', "Весь проект в окне",
+                                  lambda: self.project_timeline.zoom_to_fit())
+        self.btn_proj_more = _tbtn('fa5s.ellipsis-h', "Ещё", lambda: None)
+        more = _api.QMenu(self.btn_proj_more)
+        more.addAction("Добавить файл в проект…", self.project_add_file)
+        more.addSeparator()
+        more.addAction("Добавить видеодорожку", lambda: self._project_action('add_track:video', ''))
+        more.addAction("Добавить аудиодорожку", lambda: self._project_action('add_track:audio', ''))
+        more.addSeparator()
+        more.addAction("Очистить проект…", self.project_clear)
+        self.btn_proj_more.setMenu(more)
+        self.btn_proj_more.setStyleSheet(self.btn_proj_more.styleSheet()
+                                         + "QPushButton::menu-indicator { width: 0; }")
 
-        self.btn_trim_end = _api.QPushButton("Обрезать конец")
-        self.btn_trim_end.setToolTip(
-            f"Поставить конец на жёлтую полосу воспроизведения ({_es})")
-        self.btn_trim_end.setStyleSheet(_trim_btn_css)
-        self.btn_trim_end.setFocusPolicy(_api.Qt.FocusPolicy.NoFocus)
-        self.btn_trim_end.clicked.connect(self.trim_end_to_playhead)
-        pctrl_row.addWidget(self.btn_trim_end)
-
-        # Длительность отрезка от старта (IN) до жёлтой полосы воспроизведения.
-        seg_frame = _api.QFrame()
-        seg_frame.setObjectName("SegFrame")
-        seg_frame.setStyleSheet(f"#SegFrame {{ background: {_api.C['surface3']}; border: 1px solid {_api.C['border2']}; border-radius: 6px; }}")
-        seg_l = _api.QHBoxLayout(seg_frame)
-        seg_l.setContentsMargins(8, 4, 8, 4); seg_l.setSpacing(6)
-        seg_cap = _api.QLabel("⏱ старт→плейхед")
-        seg_cap.setStyleSheet(f"color: {_api.C['text3']}; font-size: 11px; font-weight: 700;")
-        self.lbl_seg_dur = _api.QLabel("00:00:00.000")
-        self.lbl_seg_dur.setStyleSheet(f"color: {_api.C['text']}; font-size: 12px; font-weight: 700;")
-        self.lbl_seg_dur.setToolTip(
-            "Длительность от начала (старта) до жёлтой полосы воспроизведения")
-        seg_l.addWidget(seg_cap); seg_l.addWidget(self.lbl_seg_dur)
-        pctrl_row.addWidget(seg_frame)
-
-        pctrl_row.addStretch()
+        row.addStretch(1)
 
         # «Только звук» — снимает видеодорожку с ПЛЕЕРА. На тяжёлых исходниках
         # (AV1/HEVC 1080p60, ЦП-декод) отрисовка кадров съедает главный поток и
         # монтаж начинает лагать, а картинка нужна не всегда: половину работы
-        # режут по волне и на слух. Кнопка убирает видео из превью целиком —
-        # на РЕЗУЛЬТАТ обрезки это не влияет (её гонит отдельный ffmpeg).
+        # режут по волне и на слух. На РЕЗУЛЬТАТ обрезки это не влияет.
         self.btn_audio_only = _api.make_icon_btn("")
         self.btn_audio_only.setIcon(_api.get_icon('fa5s.headphones'))
-        self.btn_audio_only.setIconSize(_api.QSize(18, 18))
-        self.btn_audio_only.setFixedWidth(40)
+        self.btn_audio_only.setIconSize(_api.QSize(17, 17))
+        self.btn_audio_only.setFixedWidth(36)
         self.btn_audio_only.setCheckable(True)
-        # NoFocus — иначе клик уводит фокус с вкладки и Пробел начинает жать
-        # кнопку вместо воспроизведения (та же беда, что у «Обрезать старт»).
         self.btn_audio_only.setFocusPolicy(_api.Qt.FocusPolicy.NoFocus)
         self.btn_audio_only.setToolTip(
             "Только звук: отключить видео в плеере, чтобы не лагало.\n"
             "На обрезку и экспорт не влияет — там видео остаётся.")
-        # make_icon_btn не стилизует :checked — подсвечиваем включённый режим
-        # акцентом, иначе не видно, что видео отключено намеренно.
         self.btn_audio_only.setStyleSheet(self.btn_audio_only.styleSheet() + f"""
             QPushButton:checked {{
                 background: {_api.C['accent']}; color: #11111b;
@@ -920,90 +946,73 @@ class EditTabLayoutMixin:
         """)
         self.btn_audio_only.toggled.connect(self._toggle_audio_only)
         self.btn_audio_only.setEnabled(False)   # активна только при видео
-        pctrl_row.addWidget(self.btn_audio_only)
+        row.addWidget(self.btn_audio_only)
 
-        pctrl_row.addSpacing(8)
-
-        # Регулятор громкости — у правого края, рядом с полноэкранным режимом.
-        # (Кнопки «Сохранить кадр»/«Удалить исходник» — внизу боковой панели.)
+        row.addSpacing(4)
         self.vol_lbl = _api.VolumeLabel(lambda: getattr(self, "vol_slider", None))
         self.vol_lbl.setStyleSheet(f"color: {_api.C['text2']}; font-size: 14px;")
         # Клик по динамику — mute/unmute с возвратом прежнего уровня.
         self.vol_lbl.clicked.connect(self.toggle_mute)
-        pctrl_row.addWidget(self.vol_lbl)
+        row.addWidget(self.vol_lbl)
         self.vol_slider = _api.VolumeSlider(_api.Qt.Orientation.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(100)
-        self.vol_slider.setFixedWidth(96)
+        self.vol_slider.setFixedWidth(84)
         self.vol_slider.setStyleSheet(self._slider_style(_api.C["text2"], compact=True))
         self.vol_slider.valueChanged.connect(self._on_volume_changed)
-        pctrl_row.addWidget(self.vol_slider)
+        row.addWidget(self.vol_slider)
 
-        pctrl_row.addSpacing(8)
+        row.addSpacing(4)
         self.btn_fullscreen = _api.make_icon_btn("", accent=True)
         # Стартует без видео → disabled и приглушённая иконка (станет белой при
         # загрузке видео в _update_media_buttons).
         self.btn_fullscreen.setIcon(_api._fullscreen_icon(expand=True, color=_api.C['text3']))
-        self.btn_fullscreen.setIconSize(_api.QSize(20, 20))
+        self.btn_fullscreen.setIconSize(_api.QSize(18, 18))
+        self.btn_fullscreen.setFixedWidth(40)
         self.btn_fullscreen.setToolTip("Полноэкранный режим (F / двойной клик по видео)")
         self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
         self.btn_fullscreen.setEnabled(False)   # активна только при загруженном видео
-        pctrl_row.addWidget(self.btn_fullscreen)
+        row.addWidget(self.btn_fullscreen)
 
-        pb_layout.addLayout(pctrl_row)
+        pb_layout.addLayout(row)
         center.addWidget(player_bar)
+        # Высота строки «Обрезать» справа следует за этой панелью (eventFilter).
+        self._player_bar = player_bar
+        player_bar.installEventFilter(self)
 
         # Состояние полноэкранного режима (окно создаётся по запросу).
         self._fs_window = None
 
     def _build_timeline_panel(self, center, root, sidebar):
-        """Нижняя панель таймлайна (волна, субтитры) и финальная сборка вкладки."""
-        # ── Timeline panel ────────────────────────────────────────────────
-        # Высота полосы таймлайна фиксирована и совпадает с нижним блоком правой
-        # панели («Итог» + «Обрезать»), чтобы они визуально были одной строкой.
-        # Панель ужата почти до высоты самой визуализации (волна + скроллбар +
-        # небольшие отступы сверху/снизу) — остальное место отдаётся видео.
-        BAND_H = 116
-        timeline_panel = _api.QFrame()
-        timeline_panel.setObjectName("TimelinePanel")
-        timeline_panel.setFixedHeight(BAND_H)
-        timeline_panel.setStyleSheet(f"#TimelinePanel {{ background: {_api.C['surface']}; border-top: 1px solid {_api.C['border']}; }}")
-        tp_layout = _api.QVBoxLayout(timeline_panel)
-        tp_layout.setContentsMargins(12, 6, 12, 6)
-        tp_layout.setSpacing(3)
+        """Финальная сборка вкладки: таймлайн проекта во всю ширину внизу.
 
-        # Горизонтальная прокрутка волны — над виджетом визуализации аудио.
-        # Видна только когда волна увеличена (zoom>1) и есть что прокручивать;
-        # двигает «окно обзора» (view_offset) по таймлайну.
+        Волна источника (WaveformWidget) больше не показывается — шкала одна,
+        а звук виден прямо на клипах. Объект волны остаётся СКРЫТЫМ: он строит
+        волну файла (её рисуют клипы) и держит IN/OUT источника, на которых
+        стоит обрезка одного куска (Smart Cut, кадрирование, субтитры)."""
+        hid_l = self._hidden_holder.layout()
         self.wave_scroll = _api.QScrollBar(_api.Qt.Orientation.Horizontal)
         self.wave_scroll.setObjectName("WaveScroll")
         self.wave_scroll.setRange(0, 0)
         self.wave_scroll.valueChanged.connect(self.on_wave_scroll)
-        self.wave_scroll.setVisible(False)
         self.wave_scroll.setStyleSheet(f"""
             QScrollBar:horizontal {{
                 background: {_api.C['surface2']};
-                height: 12px;
-                border-radius: 6px;
+                height: 10px;
+                border-radius: 5px;
                 margin: 0;
             }}
             QScrollBar::handle:horizontal {{
                 background: {_api.C['border2']};
-                border-radius: 5px;
+                border-radius: 4px;
                 min-width: 28px;
             }}
             QScrollBar::handle:horizontal:hover {{ background: {_api.C['accent']}; }}
             QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
             QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: transparent; }}
         """)
-        tp_layout.addWidget(self.wave_scroll)
-
-        # Waveform — невысокая полоса (амплитуда у обычного звука небольшая, при
-        # большой высоте сверху/снизу остаётся пустота). Ограничиваем высоту и
-        # оставляем небольшой отступ снизу (margin tp_layout).
+        hid_l.addWidget(self.wave_scroll)
         self.waveform = _api.WaveformWidget()
-        self.waveform.setMinimumHeight(54)
-        self.waveform.setMaximumHeight(104)
         self.waveform.seekRequested.connect(self.on_wave_seek)
         self.waveform.playSeekRequested.connect(self.on_wave_playseek)
         # ВНИМАНИЕ: inSetRequested/outSetRequested НЕ подключаем — selectionChanged
@@ -1011,33 +1020,17 @@ class EditTabLayoutMixin:
         self.waveform.selectionChanged.connect(self.on_wave_selection_changed)
         self.waveform.viewChanged.connect(self.on_wave_view_changed)
         self.waveform.interactionStarted.connect(self.push_undo)
-        # ПКМ по аудио-визуализации → меню обрезки старт/конец до плейхеда.
-        self.waveform.setContextMenuPolicy(_api.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.waveform.customContextMenuRequested.connect(self._trim_ctx_menu)
-        tp_layout.addWidget(self.waveform, stretch=1)
-
-        # Строка «ПРОКРУТКА» убрана по запросу. pan_slider оставлен как скрытый
-        # объект (без родителя, никогда не показывается) — чтобы существующий код
-        # update_pan_slider_values не падал; pan_row_w намеренно НЕ создаём
-        # (getattr → None → строка панорамирования не отображается).
+        hid_l.addWidget(self.waveform)
+        # pan_slider — скрытый объект без родителя (update_pan_slider_values).
         self.pan_slider = _api.QSlider(_api.Qt.Orientation.Horizontal)
         self.pan_slider.setRange(0, 1000)
         self.pan_slider.setEnabled(False)
         self.pan_slider.sliderMoved.connect(self.on_pan_moved)
 
-        # Полоса воспроизведения (self.slider) перенесена в player_bar под видео.
-
-        # Таймлайн фиксированной (небольшой) высоты — лишнее место отдаётся видео
-        # (video_row = stretch 1). Нижние панели (IN/OUT) тоже stretch=0, поэтому
-        # на маленьком окне ужимается именно видео, а не интерфейс под ним.
-        center.addWidget(timeline_panel, stretch=0)
-
-        # (IN/OUT перенесены на строку с кнопками плеера в player_bar; отдельной
-        #  панели IN/OUT больше нет. Панель управления плеером — в player_bar под
-        #  видео; «Итог» и «Обрезать» — в правой панели.)
-
         root.addLayout(center, stretch=1)
         root.addWidget(sidebar)
+        # Таймлайн проекта (как в Filmora) — во всю ширину под всем остальным.
+        self._outer_layout.addWidget(self._build_project_panel(), 0)
 
     # ── Style helpers ──────────────────────────────────────────────────────
     def _slider_style(self, color, compact=False):
@@ -1300,12 +1293,9 @@ class EditTabLayoutMixin:
         if lbl is None:
             return
         if self.export_dir and _api.os.path.isdir(self.export_dir):
-            # Укорачиваем путь в середине, чтобы он не распирал панель; полный
-            # путь — в подсказке.
-            fm = _api.QFontMetrics(lbl.font())
-            elided = fm.elidedText(self.export_dir, _api.Qt.TextElideMode.ElideMiddle, 210)
-            lbl.setText(elided)
+            # Полный путь — в подсказке.
+            lbl.set_full_text(self.export_dir)
             lbl.setToolTip(self.export_dir)
         else:
-            lbl.setText("Рядом с исходником")
+            lbl.clear_full_text("Рядом с исходником")
             lbl.setToolTip("Файл сохраняется в папке исходника")

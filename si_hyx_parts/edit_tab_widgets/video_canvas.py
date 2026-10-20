@@ -300,6 +300,7 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         if pts >= 0:
             self._last_pts_us = pts
             self._last_frame_at = _api.time.monotonic()
+            self._adopt_pin_frame(pts)
             # Время предпросмотра накладки берём из PTS самого кадра: так
             # накладка стоит на своём кадре и при воспроизведении, и при
             # покадровой перемотке (positionChanged плеера приходит реже).

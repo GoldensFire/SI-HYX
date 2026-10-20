@@ -126,6 +126,8 @@ class EditTabTimelineMixin:
             self.current_out = use_duration
         self._update_total_time()
         self.waveform.set_data(samples, use_duration, left, right)
+        # Волна на клипах таймлайна — уже нормированная для рисовки.
+        self._project_store_wave(list(self.waveform.disp_samples or []), use_duration)
         # Восстанавливаем выделение пользователя после загрузки волны
         # (waveform.set_in_out пошлёт selectionChanged → синхронизация полей/кадров).
         self.waveform.set_in_out(self.current_in, self.current_out)
@@ -148,6 +150,11 @@ class EditTabTimelineMixin:
         self.redo_stack.clear()
 
     def undo(self):
+        # Вся правка — на таймлайне проекта: отменяем её (и «Очистить» тоже).
+        if getattr(self, "project_timeline", None) is not None and (
+                self._proj_undo or not self.project.is_empty()):
+            self.project_undo()
+            return
         # Отмена «Очистить»: восстанавливаем выгруженный файл и его обрезку
         # (свой undo-стек был очищен вместе с файлом).
         snap = getattr(self, "_cleared_snapshot", None)
@@ -173,6 +180,10 @@ class EditTabTimelineMixin:
             # prev == cur — это пустой снимок, отбрасываем и ищем дальше.
 
     def redo(self):
+        if getattr(self, "project_timeline", None) is not None and (
+                self._proj_redo or not self.project.is_empty()):
+            self.project_redo()
+            return
         cur = (self.current_in, self.current_out)
         while self.redo_stack:
             nxt = self.redo_stack.pop()
@@ -249,9 +260,13 @@ class EditTabTimelineMixin:
             new_out = min(self.duration, self.current_in + (1.0 / self.fps))
         self.set_in_out(self.current_in, new_out)
 
-    def on_wave_seek(self, t):     self.seek_to(t)
+    def on_wave_seek(self, t):
+        self._project_leave()          # клик по шкале источника — плеер снова на нём
+        self.seek_to(t)
 
-    def on_wave_playseek(self, t): self.seek_to(t)
+    def on_wave_playseek(self, t):
+        self._project_leave()
+        self.seek_to(t)
 
     def on_wave_selection_changed(self, new_in, new_out):
         self.current_in = new_in; self.current_out = new_out
@@ -264,14 +279,19 @@ class EditTabTimelineMixin:
         # и стопит/телепортит плеер на прежнем месте зелёной полоски (баг).
         try:
             if self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState:
+                # OUT сдвинули за плейхед — граница снова действует; перед ним —
+                # играем до конца файла (см. _arm_play_limit).
+                self._arm_play_limit(self._ui_time_s())
                 self._set_play_bound(True)
         except Exception:
             pass
 
     def update_selection_label(self):
-        # Показываем только итоговую длительность будущего ролика (без таймкодов
-        # начала/конца — они и так есть в полях IN/OUT).
+        # Показываем только итоговую длительность будущего ролика — длину
+        # проекта (без проекта — выделения IN/OUT).
         dur = max(0.0, self.current_out - self.current_in)
+        if getattr(self, "project_timeline", None) is not None and not self.project.is_empty():
+            dur = self.project.duration()
         self.lbl_selection.setText(
             f"{_api.icon_html('fa5s.stopwatch', 13, _api.C['text'])}  Итог: {_api.s_to_time(dur)}")
 
@@ -303,7 +323,10 @@ class EditTabTimelineMixin:
         """Обновляет общее время в плеере (00:00 / ОБЩЕЕ под видео)."""
         lbl = getattr(self, "lbl_total_time", None)
         if lbl is not None:
-            lbl.setText(_api.s_to_time(self.duration if self.duration and self.duration > 0 else 0.0))
+            total = self.duration if self.duration and self.duration > 0 else 0.0
+            if getattr(self, "project_timeline", None) is not None and not self.project.is_empty():
+                total = self.project.duration()
+            lbl.setText(_api.s_to_time(total))
 
     def _playhead_target_s(self):
         """Куда ЦЕЛИТСЯ плеер для текущего плейхеда, с.
@@ -351,7 +374,11 @@ class EditTabTimelineMixin:
                            == _api.QMediaPlayer.PlaybackState.PlayingState)
             except Exception:
                 playing = False
-            if playing or not self._grid.valid or self._frame_idx is None:
+            if playing:
+                if getattr(self, "_play_seek_hold", None) is None:
+                    return None
+                return self._play_seek_hold_ms()
+            if not self._grid.valid or self._frame_idx is None:
                 return None
             return int(round(self._grid.start_of(self._frame_idx) * 1000.0))
         # Истина у интерфейса одна — НАЧАЛО кадра, на котором стоит монтаж
@@ -384,6 +411,69 @@ class EditTabTimelineMixin:
         if pinned is not None:
             return max(0.0, pinned / 1000.0)
         return self._clock_pos_s()
+
+    def _play_seek_hold_ms(self):
+        """Цель клика по шкале ВО ВРЕМЯ игры (мс), пока плеер до неё не доехал;
+        иначе None.
+
+        После setPosition на ходу картинка ещё 0.2–0.5 с показывает кадры ПРЕЖНЕГО
+        места (декодер раскручивает GOP новой точки), а часы интерфейса живут по
+        показанному кадру. Замер на живом окне: клик на 12.0 с при игре с 1.5 с —
+        жёлтая полоса 12.0 → 1.5 (0.33 с, старые кадры) → 12.27…12.35 (запасные
+        часы плеера, пока кадров нет) → 12.03 (первый новый кадр) → дальше.
+        То есть «туда, обратно и снова туда». Поэтому интерфейс стоит на цели,
+        пока не придёт кадр, снятый ПОСЛЕ перемотки и лежащий у цели."""
+        hold = getattr(self, "_play_seek_hold", None)
+        if hold is None:
+            return None
+        target_ms, at = hold
+        elapsed = _api.time.monotonic() - at
+        if elapsed > self._PLAY_SEEK_HOLD_MAX_S:
+            # Кадров так и не дождались (тяжёлый файл, нет видео) — отдаём
+            # интерфейс обычным часам, иначе метка стояла бы вечно.
+            self._play_seek_hold = None
+            return None
+        vw = getattr(self, "video_widget", None)
+        if (isinstance(vw, _api.VideoCanvas) and self.video_stream_index is not None
+                and not getattr(self, "_audio_only_mode", False)):
+            age = vw.frame_clock_age()
+            pts = vw.last_frame_pts()
+            if age is None or pts is None or age >= elapsed:
+                return target_ms          # с перемотки не пришло ни одного кадра
+            now_ms = pts * 1000.0
+        else:
+            try:
+                now_ms = float(self.player.position())
+            except Exception:
+                return target_ms
+        frame_ms = (1000.0 / self.fps) if (self.fps and self.fps > 0) else 40.0
+        tol = max(80.0, 2.0 * frame_ms)
+        # Новый кадр начинается не раньше цели (минус кадр) и не позже, чем
+        # плеер успел уехать от неё с момента клика.
+        if target_ms - tol <= now_ms <= target_ms + elapsed * 1000.0 + tol:
+            self._play_seek_hold = None
+            return None
+        return target_ms
+
+    def _play_start_hold_ms(self):
+        """Начало кадра, с которого стартует игра (мс), — пока пин не снят."""
+        grid = getattr(self, "_grid", None)
+        idx = getattr(self, "_frame_idx", None)
+        if grid is None or not grid.valid or idx is None:
+            return None
+        return int(round(grid.start_of(idx) * 1000.0))
+
+    def _hold_play_start(self, hold_ms):
+        """Сразу после play() часы интерфейса держим на кадре старта, пока не
+        придёт первый кадр плеера (_play_seek_hold_ms).
+
+        Иначе на первом такте sync_ui метка брала pts последнего кадра,
+        полученного ОТ ПЛЕЕРА, — а он мог быть с прошлого места: перемотали на
+        паузе и сразу нажали «Воспроизвести» (точный кадр ещё не доехал) или
+        проект перешёл к следующему куску. Жёлтая полоса прыгала туда и
+        обратно — тот же баг, что и с кликом по шкале на ходу."""
+        if hold_ms is not None:
+            self._play_seek_hold = (int(hold_ms), _api.time.monotonic())
 
     def _preroll_at(self, t_s):
         """Беззвучный прогрев конвейера «с разбега» перед точкой t_s.
@@ -772,9 +862,18 @@ class EditTabTimelineMixin:
             # Часы кадра «живые» — берём их. Если кадры перестали приходить
             # (декодер захлебнулся/нет видео) — возвращаемся к часам плеера,
             # иначе метка замерла бы вместе с картинкой.
-            if age is not None and age < 0.35:
-                return pts
-            return pos_s
+            t_s = pts if (age is not None and age < 0.35) else pos_s
+            # …но на ходу время интерфейса только идёт вперёд. Позиция плеера
+            # (аудио-часы) впереди картинки, и следующий приехавший кадр
+            # возвращал полосу назад на эту разницу (замерено: 12.35 → 12.03).
+            # Мелкий откат на ходу — всегда артефакт часов: держим прежнее
+            # значение, пока картинка не догонит. «Пол» сбрасывают перемотка и
+            # смена состояния плеера (seek_to, on_playback_changed).
+            floor = getattr(self, "_play_clock_floor", None)
+            if floor is not None and floor - 0.6 < t_s < floor:
+                return floor
+            self._play_clock_floor = t_s
+            return t_s
         # На паузе показанный кадр и есть текущее время — но только если он
         # действительно наш (пин с картинкой, часы в его диапазоне), а не
         # случайный кадр после смены источника: заявленный, но не приехавший пин
@@ -847,6 +946,9 @@ class EditTabTimelineMixin:
             self.slider.blockSignals(False)
         self.waveform.set_playhead(t_s)
         self._update_seg_duration(t_s)
+        # Плейхед таймлайна и время под видео — во времени ПРОЕКТА.
+        if getattr(self, "project_timeline", None) is not None:
+            self._proj_follow_source(t_s)
         self._fs_sync_position()
 
     def _on_exact_frame(self, idx, img):
@@ -991,6 +1093,11 @@ class EditTabTimelineMixin:
         if getattr(self, "_prerolling", False):
             self._preroll_cancel()
         playing = (self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState)
+        # Шаг через стык клипов (или с плейхеда в пустоте) — переход по
+        # проекту; внутри клипа — обычный шаг по файлу.
+        if (not playing and getattr(self, "project_timeline", None) is not None
+                and self._proj_step(step)):
+            return
         painted = isinstance(self.video_widget, _api.VideoCanvas)
         # Серия шагов: при удержании ←/→ считаем от _scrub_target (детерминизм),
         # а на ПЕРВОМ шаге серии — от живой позиции плеера.
@@ -1286,7 +1393,12 @@ class EditTabTimelineMixin:
 
     # ── Обрезка до точки воспроизведения (плейхеда) ─────────────────────────
     def trim_start_to_playhead(self):
-        """Ставит точку IN на текущую позицию воспроизведения (обрезает старт)."""
+        """Обрезает начало клипа под плейхедом до плейхеда (без проекта —
+        ставит IN источника)."""
+        if getattr(self, "project_timeline", None) is not None and not self.project.is_empty():
+            self.project_trim_to_playhead('left')
+            self._grab_kbd_focus()
+            return
         if self.duration <= 0:
             return
         self.push_undo()
@@ -1301,7 +1413,12 @@ class EditTabTimelineMixin:
         self._grab_kbd_focus()
 
     def trim_end_to_playhead(self):
-        """Ставит точку OUT на текущую позицию воспроизведения (обрезает конец)."""
+        """Обрезает конец клипа под плейхедом до плейхеда (без проекта —
+        ставит OUT источника)."""
+        if getattr(self, "project_timeline", None) is not None and not self.project.is_empty():
+            self.project_trim_to_playhead('right')
+            self._grab_kbd_focus()
+            return
         if self.duration <= 0:
             return
         self.push_undo()

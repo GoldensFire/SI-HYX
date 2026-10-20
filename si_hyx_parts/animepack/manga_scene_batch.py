@@ -30,6 +30,10 @@ def crop_pages(generator, cand, pages):
     """Return (selected page index, encoded crop), with at most two AI calls."""
     if not pages or generator.stopped():
         return None
+    from .visual_mode import ocr_only
+    if ocr_only(generator.s):
+        from .local_scene import crop_pages as local_crop_pages
+        return local_crop_pages(generator, cand, pages)
     from .manga_budget import check
     check(generator, cand)
     client = generator.gemini_manga

@@ -134,7 +134,13 @@ _api.InfoCard = InfoCard
 class AudioMeter(_api.QWidget):
     """Стерео-индикатор уровня звука: две вертикальные шкалы (зелёный→жёлтый→
     красный) с пик-маркерами и плавным спадом. Уровни 0..1 подаёт плеер во время
-    воспроизведения (берутся из аудиоволны на позиции плейхеда)."""
+    воспроизведения (берутся из аудиоволны на позиции плейхеда).
+
+    Перерисовывается только своим тактом (45 мс) и только когда на шкале
+    сдвинулся хоть один пиксель. Раньше перерисовку звал и каждый новый
+    уровень, и спад: ~46 раз в секунду, и в окне с QML-холстом это занимало
+    до 40% главного потока вкладки во время игры (замер) — звук после
+    перемотки и интерфейс из-за этого запаздывали."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -145,10 +151,11 @@ class AudioMeter(_api.QWidget):
         self._r = 0.0
         self._pk_l = 0.0
         self._pk_r = 0.0
+        self._fresh = False          # пришёл уровень — этот такт без спада
+        self._shown = None           # пиксели, нарисованные последними
         self._timer = _api.QTimer(self)
         self._timer.setInterval(45)
         self._timer.timeout.connect(self._decay)
-        self._timer.start()
 
     def set_levels(self, l, r=None):
         if r is None:
@@ -157,19 +164,38 @@ class AudioMeter(_api.QWidget):
         self._r = max(0.0, min(1.0, float(r)))
         if self._l > self._pk_l: self._pk_l = self._l
         if self._r > self._pk_r: self._pk_r = self._r
-        self.update()
+        self._fresh = True
+        if not self._timer.isActive():
+            self._timer.start()
+            self._repaint_if_moved()
 
     def reset(self):
         self._l = self._r = self._pk_l = self._pk_r = 0.0
-        self.update()
+        self._fresh = False
+        self._timer.stop()
+        self._repaint_if_moved()
 
     def _decay(self):
-        changed = False
-        for a, d in (('_l', 0.08), ('_r', 0.08), ('_pk_l', 0.02), ('_pk_r', 0.02)):
-            v = getattr(self, a)
-            if v > 0:
-                setattr(self, a, max(0.0, v - d)); changed = True
-        if changed:
+        if self._fresh:
+            self._fresh = False
+        else:
+            for a, d in (('_l', 0.08), ('_r', 0.08), ('_pk_l', 0.02), ('_pk_r', 0.02)):
+                v = getattr(self, a)
+                if v > 0:
+                    setattr(self, a, max(0.0, v - d))
+            if not (self._l or self._r or self._pk_l or self._pk_r):
+                self._timer.stop()          # всё погасло — такт не нужен
+        self._repaint_if_moved()
+
+    def _bar_h(self):
+        return max(1, self.height() - 26)
+
+    def _repaint_if_moved(self):
+        bar_h = self._bar_h()
+        shown = (int(bar_h * self._l), int(bar_h * self._r),
+                 int(bar_h * self._pk_l), int(bar_h * self._pk_r), bar_h)
+        if shown != self._shown:
+            self._shown = shown
             self.update()
 
     def paintEvent(self, e):
@@ -177,7 +203,7 @@ class AudioMeter(_api.QWidget):
         w = self.width(); h = self.height()
         p.fillRect(0, 0, w, h, _api.QColor(_api.C["bg"]))
         m_top, m_bot = 10, 16
-        bar_h = max(1, h - m_top - m_bot)
+        bar_h = self._bar_h()
         gap = 6
         bw = max(6, int((w - gap * 3) / 2))
         data = [(self._l, self._pk_l, "L"), (self._r, self._pk_r, "R")]
@@ -232,7 +258,7 @@ class SubtitleOverlay(_api.QWidget):
         self.setAttribute(_api.Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(_api.Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self._text = ""
-        self._px = 28
+        self._video_h = 0
         self._image = None       # кадр субтитров от libass (QImage) — приоритетнее текста
         self._image_pos = (0, 0) # позиция левого верхнего угла картинки в оверлее
 
@@ -278,15 +304,16 @@ class SubtitleOverlay(_api.QWidget):
         return self.width(), self.height()
 
     def set_video_height(self, h):
-        px = max(15, int(h * 0.052))   # ~5% высоты кадра, как в плеерах
-        if px != self._px:
-            self._px = px
+        # Кегль, обводку и отступы _paint_subtitle считает от высоты области
+        # (как libass от высоты кадра) — тут лишь перерисовка при её смене.
+        if h != self._video_h:
+            self._video_h = h
             self.update()
 
     def paintEvent(self, ev):
         p = _api.QPainter(self)
-        _api._paint_subtitle(p, self.rect(), self._text, self._px,
-                        self._image, self._image_pos)
+        _api._paint_subtitle(p, self.rect(), self._text,
+                             self._image, self._image_pos)
         p.end()
 
 SubtitleOverlay.__module__ = _api.__name__

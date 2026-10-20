@@ -110,6 +110,7 @@ def _bind(lib):
     lib.ass_library_done.argtypes = [c_void_p]
     lib.ass_set_extract_fonts.argtypes = [c_void_p, c_int]
     lib.ass_set_fonts_dir.argtypes = [c_void_p, c_char_p]
+    lib.ass_add_font.argtypes = [c_void_p, c_char_p, c_char_p, c_int]
 
     lib.ass_renderer_init.restype = c_void_p
     lib.ass_renderer_init.argtypes = [c_void_p]
@@ -136,7 +137,7 @@ class AssRenderer:
     render(now_ms) -> (QImage|None, changed: bool). QImage в формате
     RGBA8888_Premultiplied, размером с кадр; None — если нет видимых субтитров."""
 
-    def __init__(self, default_family="Arial"):
+    def __init__(self, default_family="Arial", fonts=()):
         if not AVAILABLE:
             raise RuntimeError("libass недоступна: " + LOAD_ERROR)
         self._lib = _LIB
@@ -144,6 +145,18 @@ class AssRenderer:
         if not self._library:
             raise RuntimeError("ass_library_init вернул NULL")
         self._lib.ass_set_extract_fonts(self._library, 1)
+        # Свои шрифты (например, шрифт караоке — стиль «Создать субтитры» по
+        # умолчанию): системный провайдер их не видит. Добавляем из памяти —
+        # libass копирует данные, а путь с не-ASCII символами ей не помеха.
+        # Обязательно ДО ass_set_fonts: шрифты из памяти он и подхватывает.
+        for path in fonts or ():
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+                name = os.path.basename(str(path)).encode("utf-8")
+                self._lib.ass_add_font(self._library, name, data, len(data))
+            except Exception:
+                pass
         self._renderer = self._lib.ass_renderer_init(self._library)
         if not self._renderer:
             raise RuntimeError("ass_renderer_init вернул NULL")

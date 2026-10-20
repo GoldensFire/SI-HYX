@@ -92,8 +92,10 @@ def check(generator, candidate, data, ext, *, purpose="проверка кадр
 
 def select(generator, candidate):
     """Возвращает байты и расширение проверенного кадра, либо None."""
+    from .visual_mode import frame_verdict, ocr_only
     candidate.frame_has_characters = None
     checking = enabled(generator.s, candidate.kind)
+    local = ocr_only(generator.s)
     studio = candidate.kind == api.STUDIO_KIND
     attempted = set()
     downloaded = False
@@ -114,7 +116,22 @@ def select(generator, candidate):
         except Exception as error:  # noqa: BLE001 — пробуем другой кадр
             generator.log(f"Кадр «{candidate.title_ru}» не скачался: {error}")
             continue
-        if checking:
+        if checking and local:
+            try:
+                verdict = frame_verdict(generator, candidate, data)
+            except Exception as error:  # noqa: BLE001 — нет моделей OCR
+                if generator.stopped():
+                    return None
+                generator._log_rare("OCR кадра", f"недоступен ({error}) — "
+                                    "кадр без проверки названия не беру")
+                return None
+            if not verdict["accept"] or (studio and not verdict["has_characters"]):
+                category = "Кадр студии не подходит" if verdict["accept"] else "Кадр с названием"
+                generator._log_rare(category, f"«{candidate.title_ru}»: "
+                                    f"{verdict['reason']} — беру другой кадр")
+                continue
+            candidate.frame_has_characters = verdict["has_characters"]
+        elif checking:
             try:
                 verdict = check(generator, candidate, data, ext,
                                 purpose="кадры студий" if studio else "проверка кадров")
