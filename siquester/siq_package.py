@@ -80,6 +80,67 @@ def _safe_replace(tmp: str, dst: str) -> None:
     raise last_err if last_err is not None else OSError(f"could not replace {dst}")
 
 
+# ── Формат v4: <scenario><atom> вместо <params><param type="content"><item> ────
+# Соответствие типов/размещения взято из SIQuester (SIPackages/Question.cs,
+# Question.Upgrade + GetContentType/GetPlacement) — см. исходники на Диске:
+#   say   → текст, читаемый ведущим вслух   (placement=replic)
+#   voice → аудио ФОНОМ, параллельно всему  (placement=background)
+#   audio → аудио на экране (обычный элемент), image/video/html/text — как есть
+_V4_ATOM_TYPE      = {'say': 'text',   'voice': 'audio'}
+_V4_ATOM_PLACEMENT = {'say': 'replic', 'voice': 'background'}
+
+
+def _scenario_items(q_el, tag) -> list[tuple]:
+    """Атомы v4 как кортежи в формате v5-элемента.
+
+    Возвращает список ``(pname, itype, is_ref, text, placement,
+    wait_for_finish, xml_duration)`` — ровно те поля, из которых ``_parse_q``
+    собирает обычный item, так что дальше формат v4 и v5 неразличим.
+
+    Правила ровно как в SIQuester Question.Upgrade():
+      • первый ``<atom type="marker"/>`` делит сценарий на вопрос и ответ;
+        ПОВТОРНЫЕ маркеры игнорируются (остаток всё равно идёт в ответ);
+      • ссылка на медиа — текст, начинающийся с «@» (сам «@» отбрасывается);
+      • атрибут ``time`` — целые СЕКУНДЫ (не «мм:сс», как duration в v5);
+        ``time="-1"`` таймера не задаёт, а означает «проигрывать одновременно
+        со следующим» (в v5 это waitForFinish="False").
+    """
+    scenario = q_el.find(tag('scenario'))
+    if scenario is None:
+        return []
+    out: list[tuple] = []
+    pname = 'question'
+    seen_marker = False
+    for atom in scenario.findall(tag('atom')):
+        atype = (atom.get('type') or 'text').strip().lower()
+        if atype == 'marker':
+            if not seen_marker:
+                seen_marker = True
+                pname = 'answer'
+            continue
+        raw = (atom.text or '').strip()
+        is_ref = raw.startswith('@')
+        text = raw[1:] if is_ref else raw
+        # time — целое число секунд; «-1» = «одновременно со следующим».
+        try:
+            atom_time = int((atom.get('time') or '0').strip())
+        except ValueError:
+            atom_time = 0
+        wait_for_finish = 'False' if atom_time == -1 else 'True'
+        # xml_duration хранится в том же виде, что и v5-атрибут duration
+        # («чч:мм:сс»), — его так читает редактор (util._parse_hms).
+        if atom_time > 0:
+            xml_duration = f'{atom_time // 3600:02d}:{atom_time // 60 % 60:02d}:{atom_time % 60:02d}'
+        else:
+            xml_duration = ''
+        out.append((pname,
+                    _V4_ATOM_TYPE.get(atype, atype),
+                    is_ref, text,
+                    _V4_ATOM_PLACEMENT.get(atype, ''),
+                    wait_for_finish, xml_duration))
+    return out
+
+
 class SiqPackage:
     def __init__(self, path):
         self.path = path
@@ -252,10 +313,7 @@ class SiqPackage:
                     wrong_ans = derived_wrong
 
         # ── Build items list — reuse all_params collected above ──
-        # Cache frequently-used attribute accessors to avoid repeated
-        # Python attribute lookups on every iteration.
-        _item_tag = tag('item')
-        _true_set = frozenset(('true', '1', 'yes'))
+        # (_item_tag / _true_set уже подняты выше — переиспользуем.)
         _MEDIA_ITEM_TYPES = ('image', 'audio', 'video', 'html')  # a_items normalizes voice→audio
         # q_items/a_items — тот же формат, что sigstats/siq.py::_item_info, для
         # общей логики группировки/итога длительности из siq_duration.py (см.
@@ -263,70 +321,83 @@ class SiqPackage:
         # UI-редакторе вопроса, формат которого не меняем).
         q_items: list[dict] = []
         a_items: list[dict] = []
+
+        def _add_item(pname, itype, is_ref, text, placement, wait_for_finish,
+                      xml_duration):
+            """Собрать один элемент содержимого (общее для v5-item и v4-atom)."""
+            simultaneous = (wait_for_finish.lower() == 'false') \
+                           or (pname == 'background') \
+                           or (placement == 'background')
+
+            dur_attr = siq_duration.parse_dur_attr(xml_duration) if xml_duration else None
+            item_dur = 0.0
+            if dur_attr is not None:
+                item_dur = max(0.0, dur_attr)
+            elif is_ref and itype in ('video', 'audio', 'voice'):
+                fname = _unquote(text)
+                mm = self._media_map
+                zpath = mm.get(fname) or mm.get(fname.split('/')[-1])
+                if zpath:
+                    try:
+                        with self._zip.open(zpath) as zfp:
+                            if zpath[-4:].lower() == '.mp4':
+                                item_dur = mp4_duration(zfp)
+                            else:
+                                item_dur = mp3_duration(
+                                    zfp, total_bytes=self._zip_sizes.get(zpath, 0))
+                    except Exception:
+                        pass
+            elif itype == 'image':
+                item_dur = siq_duration.IMAGE_SEC
+            elif itype == 'html':
+                # No reliable way to know how long an interactive minigame
+                # runs — treat it like a static image unless timed.
+                item_dur = siq_duration.IMAGE_SEC
+            elif itype == 'text' and placement != 'replic':
+                item_dur = (len(text) / siq_duration.CHARS_PER_SEC) if text else 0.0
+            items.append({"param": pname, "type": itype, "text": text,
+                          "is_ref": is_ref, "dur": item_dur,
+                          "placement": placement, "simultaneous": simultaneous,
+                          "wait_for_finish": wait_for_finish,
+                          "xml_duration": xml_duration})
+
+            # Классификация для siq_duration — та же, что sigstats/siq.py:
+            # только пункты из params "question"/"answer" (не "background" —
+            # у sigstats тоже нет спецобработки по имени параметра, только по
+            # атрибуту placement на самом пункте), группировка одновременного
+            # показа — по placement=="background"/waitForFinish=="false".
+            if pname in ('question', 'answer'):
+                dest = q_items if pname == 'question' else a_items
+                dest.append({
+                    "type": "audio" if itype == "voice" else itype,
+                    "raw": text,
+                    "placement": placement.lower(),
+                    "wait_false": wait_for_finish.lower() == "false",
+                    "duration": item_dur,
+                })
+
         for param in all_params:
             pname = param.get('name', '')
             if pname in ('answerType', 'answerOptions'):
                 continue
-            is_background_param = (pname == 'background')
             for item in param.findall(_item_tag):
-                iget      = item.get
-                itype     = iget('type', 'text')
-                is_ref    = iget('isRef', 'False').lower() in _true_set
-                text      = (item.text or '').strip()
-                placement = iget('placement', '')
-                xml_duration = iget('duration', '')
+                iget = item.get
+                _add_item(pname, iget('type', 'text'),
+                          iget('isRef', 'False').lower() in _true_set,
+                          (item.text or '').strip(),
+                          iget('placement', ''),
+                          iget('waitForFinish', 'True'),
+                          iget('duration', ''))
 
-                wait_for_finish = iget('waitForFinish', 'True')
-                simultaneous = (wait_for_finish.lower() == 'false') \
-                               or is_background_param \
-                               or (placement == 'background')
-
-                dur_attr = siq_duration.parse_dur_attr(xml_duration) if xml_duration else None
-                item_dur = 0.0
-                if dur_attr is not None:
-                    item_dur = max(0.0, dur_attr)
-                elif is_ref and itype in ('video', 'audio', 'voice'):
-                    fname = _unquote(text)
-                    mm = self._media_map
-                    zpath = mm.get(fname) or mm.get(fname.split('/')[-1])
-                    if zpath:
-                        try:
-                            with self._zip.open(zpath) as zfp:
-                                if zpath[-4:].lower() == '.mp4':
-                                    item_dur = mp4_duration(zfp)
-                                else:
-                                    item_dur = mp3_duration(
-                                        zfp, total_bytes=self._zip_sizes.get(zpath, 0))
-                        except Exception:
-                            pass
-                elif itype == 'image':
-                    item_dur = siq_duration.IMAGE_SEC
-                elif itype == 'html':
-                    # No reliable way to know how long an interactive minigame
-                    # runs — treat it like a static image unless timed.
-                    item_dur = siq_duration.IMAGE_SEC
-                elif itype == 'text' and placement != 'replic':
-                    item_dur = (len(text) / siq_duration.CHARS_PER_SEC) if text else 0.0
-                items.append({"param": pname, "type": itype, "text": text,
-                              "is_ref": is_ref, "dur": item_dur,
-                              "placement": placement, "simultaneous": simultaneous,
-                              "wait_for_finish": wait_for_finish,
-                              "xml_duration": xml_duration})
-
-                # Классификация для siq_duration — та же, что sigstats/siq.py:
-                # только пункты из params "question"/"answer" (не "background" —
-                # у sigstats тоже нет спецобработки по имени параметра, только по
-                # атрибуту placement на самом пункте), группировка одновременного
-                # показа — по placement=="background"/waitForFinish=="false".
-                if pname in ('question', 'answer'):
-                    dest = q_items if pname == 'question' else a_items
-                    dest.append({
-                        "type": "audio" if itype == "voice" else itype,
-                        "raw": text,
-                        "placement": placement.lower(),
-                        "wait_false": wait_for_finish.lower() == "false",
-                        "duration": item_dur,
-                    })
+        # Паки версии 4 держат содержимое вопроса в <scenario><atom> — params у
+        # них нет вовсе (то, что выглядит как параметры, — это <type><param>
+        # «кота в мешке», к содержимому отношения не имеющий). Разбираем
+        # сценарий, только если из params содержимого не набралось: когда в паке
+        # есть и то и другое (переходный формат), выигрывает params — так же,
+        # как в sigstats/siq.py.
+        if not items:
+            for _atom in _scenario_items(q_el, tag):
+                _add_item(*_atom)
 
         # «время на ответ»: таймер на вопросе целиком или на блоке ответа
         # (та же семантика, что sigstats/siq.py::_parse_question).
@@ -1093,6 +1164,36 @@ class SiqPackage:
             _logger.warning(f"[add_question] {e}")
             return False
 
+    @staticmethod
+    def _add_v4_atom(scenario_el, tag, itype: str, ref_text: str,
+                     param_name: str):
+        """Дописать медиа-<atom> в сценарий вопроса версии 4.
+
+        Половину сценария выбирает *param_name*: «question» — перед маркером
+        (или в конец, если маркера нет), «answer» — в конец, добавив маркер,
+        если его ещё не было. Тип пишем по-старому (audio → «voice»): именно
+        так помечено аудио во всех настоящих v4-паках.
+        """
+        atom_type = 'voice' if itype == 'audio' else itype
+        new_atom = ET.Element(tag('atom'))
+        new_atom.set('type', atom_type)
+        new_atom.text = '@' + ref_text        # v4-ссылка на файл в архиве
+        children = list(scenario_el)
+        marker_idx = next(
+            (i for i, a in enumerate(children)
+             if a.tag == tag('atom') and (a.get('type') or '').strip().lower() == 'marker'),
+            None)
+        if param_name == 'answer':
+            if marker_idx is None:
+                marker = ET.SubElement(scenario_el, tag('atom'))
+                marker.set('type', 'marker')
+            scenario_el.append(new_atom)
+        elif marker_idx is None:
+            scenario_el.append(new_atom)
+        else:
+            scenario_el.insert(marker_idx, new_atom)
+        return new_atom
+
     def add_media_to_question(self, rnd_idx: int, theme_idx: int, q_idx: int,
                                file_path: str, param_name: str = 'question') -> bool:
         """Copy a local media file into the SIQ zip and add a ref item to the question."""
@@ -1118,20 +1219,30 @@ class SiqPackage:
             ref_text = os.path.basename(zip_name)           # plain filename → item.text (no URL encoding)
 
             root, ns_url, tag, q_el = self._xml_nav_q(rnd_idx, theme_idx, q_idx)
+            placement = ''
+            scenario_el = q_el.find(tag('scenario'))
             params_el = q_el.find(tag('params'))
-            if params_el is None:
-                params_el = ET.SubElement(q_el, tag('params'))
-            # Find or create the target param
-            target_param = None
-            for p in params_el.findall(tag('param')):
-                if p.get('name') == param_name:
-                    target_param = p; break
-            if target_param is None:
-                target_param = ET.SubElement(params_el, tag('param'))
-                target_param.set('name', param_name); target_param.set('type', 'content')
-            new_item = ET.SubElement(target_param, tag('item'))
-            new_item.set('type', itype); new_item.set('isRef', 'True')
-            new_item.text = ref_text   # plain filename; SIGame finds the zip entry by this name
+            if scenario_el is not None and params_el is None:
+                # Вопрос версии 4 — дописываем <atom> в сценарий. Создать тут
+                # <params> нельзя: при разборе params выигрывает у scenario, и
+                # весь старый контент вопроса пропал бы из виду (проверено).
+                self._add_v4_atom(scenario_el, tag, itype, ref_text, param_name)
+                if itype == 'audio':
+                    placement = 'background'   # v4 voice = фоновое аудио
+            else:
+                if params_el is None:
+                    params_el = ET.SubElement(q_el, tag('params'))
+                # Find or create the target param
+                target_param = None
+                for p in params_el.findall(tag('param')):
+                    if p.get('name') == param_name:
+                        target_param = p; break
+                if target_param is None:
+                    target_param = ET.SubElement(params_el, tag('param'))
+                    target_param.set('name', param_name); target_param.set('type', 'content')
+                new_item = ET.SubElement(target_param, tag('item'))
+                new_item.set('type', itype); new_item.set('isRef', 'True')
+                new_item.text = ref_text   # plain filename; SIGame finds the zip entry by this name
 
             # Repack zip including new media file
             tmp = self.path + ".edit_tmp"
@@ -1176,7 +1287,8 @@ class SiqPackage:
                     q_obj["items"].append({"param": param_name, "type": itype,
                                            "text": ref_text, "is_ref": True,
                                            "dur": 5.0 if itype in ('image', 'html') else 0.0,
-                                           "placement": "", "simultaneous": False,
+                                           "placement": placement,
+                                           "simultaneous": placement == 'background',
                                            "wait_for_finish": "True", "xml_duration": ""})
                 except Exception as _e: _logger.debug(str(_e))
                 return True

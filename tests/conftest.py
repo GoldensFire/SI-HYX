@@ -137,6 +137,70 @@ CONTENT_XML_V5 = """<?xml version="1.0" encoding="utf-8"?>
 """
 
 
+# Формат v4 (SIGame 3.x): содержимое вопроса лежит в <scenario><atom>, а не в
+# <params>. Отличия, которые важны при разборе:
+#   • <atom type="marker"/> делит сценарий на вопрос и ответ;
+#   • ссылка на медиа — «@имя_файла» (в v5 «@» нет, есть isRef="True");
+#   • атрибут time — целые СЕКУНДЫ (в v5 duration — «чч:мм:сс»);
+#     time="-1" — не таймер, а «проигрывать одновременно со следующим»;
+#   • type="say" — устный текст ведущего, type="voice" — ФОНОВОЕ аудио.
+# Пространство имён намеренно объявлено (у настоящих v4-паков оно есть).
+CONTENT_XML_V4 = """<?xml version="1.0" encoding="utf-8"?>
+<package name="Пак четвёртой версии" version="4" id="pkg-v4" date="01.01.2019"
+         difficulty="5" xmlns="http://ur-quan1986.narod.ru/ygpackage3.0.xsd">
+  <info><authors><author>Старый автор</author></authors></info>
+  <rounds>
+    <round name="Раунд 1">
+      <themes>
+        <theme name="Тема v4">
+          <questions>
+            <question price="100">
+              <scenario>
+                <atom type="image">@pic.png</atom>
+                <atom>Текст вопроса v4</atom>
+              </scenario>
+              <right><answer>Ответ v4 100</answer></right>
+            </question>
+            <question price="200">
+              <scenario>
+                <atom type="voice">@sound.mp3</atom>
+                <atom type="marker"/>
+                <atom type="image">@pic.png</atom>
+              </scenario>
+              <right><answer>Ответ v4 200</answer></right>
+            </question>
+            <question price="300">
+              <scenario>
+                <atom type="image" time="7">@pic.png</atom>
+                <atom type="say">Прочитать вслух</atom>
+                <atom type="text" time="-1">Одновременно со следующим</atom>
+                <atom type="video">@clip.mp4</atom>
+              </scenario>
+              <right><answer>Ответ v4 300</answer></right>
+            </question>
+            <question price="400">
+              <type name="cat">
+                <param name="theme">Кот в мешке</param>
+                <param name="cost">400</param>
+              </type>
+              <scenario>
+                <atom type="image">@pic.png</atom>
+                <atom type="marker"/>
+                <atom>Первый ответный блок</atom>
+                <atom type="marker"/>
+                <atom>Второй маркер игнорируется</atom>
+              </scenario>
+              <right><answer>Ответ v4 400</answer></right>
+            </question>
+          </questions>
+        </theme>
+      </themes>
+    </round>
+  </rounds>
+</package>
+"""
+
+
 @pytest.fixture
 def make_siq(tmp_path):
     """Собирает валидный .siq (zip) во временной папке и возвращает путь.
