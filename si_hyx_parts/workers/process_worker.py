@@ -5,6 +5,7 @@
 import workers as _api
 from si_hyx_parts.workers.process_filters import ProcessFiltersMixin
 from si_hyx_parts.workers.process_images import ProcessImagesMixin
+from si_hyx_parts.workers.process_project import ProcessProjectMixin
 
 
 def _build_atempo_chain(speed_factor: float) -> list:
@@ -46,7 +47,8 @@ class _ImgRunnable(_api.QRunnable):
 _ImgRunnable.__module__ = _api.__name__
 _api._ImgRunnable = _ImgRunnable
 
-class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, _api.QThread):
+class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin,
+                    _api.QThread):
     progress = _api.pyqtSignal(str, int)
     status = _api.pyqtSignal(str, str, str)
     log = _api.pyqtSignal(str)
@@ -463,10 +465,10 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, _api.QThread):
                 # уводил весь кадр в RGB и цвет итога уезжал (см.
                 # overlay_chroma_format).
                 vf_arg = self._overlay_vf(vf_list, item, current_input)
-                # Пробные кодирования подбора CRF/оценки меряют ТОТ ЖЕ кадр, что
-                # уйдёт в файл, — иначе метрика считалась бы по картинке без
-                # накладок.
-                vf_list = [vf_arg] if vf_arg else []
+                # Пробные кодирования подбора CRF/оценки получают vf_list как есть:
+                # _resolve_crf сам оставит в нём геометрию кадра и добавит те же
+                # накладки (см. _metric_vf), чтобы метрика считалась по картинке
+                # с ними.
 
                 # FPS из настроек — ОДИН раз на оба профиля («Стандартный» и
                 # «Тёмные сцены»). Раньше `-r` дописывался только к cmd_step2, и
@@ -833,6 +835,9 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, _api.QThread):
             if item.get('type') == 'IMG':
                 out_path = self.process_avif(item, item_prog)
                 self._overwrite_source_if_needed(item, out_path)
+            elif item.get('project'):
+                # Проект «Монтажа»: склейка и «Обработка» одним кодированием.
+                out_path = self.process_project(item, item_prog)
             else:
                 # Путь берём У САМОЙ process_media (она его и собрала), а не
                 # угадываем по настройкам: угадывание не знало ни про аудио-режим

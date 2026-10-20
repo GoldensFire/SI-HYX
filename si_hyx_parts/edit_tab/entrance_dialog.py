@@ -38,7 +38,7 @@ class EntranceDialog(QDialog):
         self.sp_entrance_strength = self._spin(10, 100, 70, " %")
         self.sp_entrance_fps = self._spin(10, 60, 30)
         self.sp_entrance_preset = self._spin(0, 13, 13)
-        self.sp_crf = self._spin(0, 63, 25)
+        self.sp_crf = self._spin(1, 63, 25)
         form = QFormLayout()
         for text, widget in (("Длительность появления", self.sp_entrance_seconds),
                              ("Сила", self.sp_entrance_strength),

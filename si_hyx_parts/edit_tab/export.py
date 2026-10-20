@@ -29,14 +29,12 @@ class EditTabExportMixin:
     def _report_cut(self, p):
         """Строка прогресса обрезки с ETA. Пока ffmpeg не дал реального прогресса
         (p<1 — фаза подготовки/перемотки), показываем счётчик «прошло», чтобы не
-        выглядело зависшим. Дублируем статус в крупную метку над кнопкой
-        «Обрезать» (lbl_selection) — нижняя полоса окна легко теряется, а здесь
-        пользователь смотрит прямо на кнопку (см. _set_cut_status).
+        выглядело зависшим.
 
-        Строка ОДНА на обе метки: этап (_cut_phase — «Обрезка…», «Smart Cut:
-        склейка…», «Обработка: видео…») + процент и ETA. Раньше этапы воркера
-        писались в метку напрямую, а тикер раз в 0.5 с перебивал их своей
-        «Обрезка… N%» — две разные строки сменяли друг друга."""
+        Строка ОДНА: этап (_cut_phase — «Обрезка…», «Smart Cut: склейка…»,
+        «Обработка: видео…») + процент и ETA. Раньше этапы воркера писались
+        напрямую, а тикер раз в 0.5 с перебивал их своей «Обрезка… N%» — две
+        разные строки сменяли друг друга."""
         try:
             phase = getattr(self, "_cut_phase", "") or "Обрезка…"
             elapsed = _api.time.time() - getattr(self, "_cut_t0", _api.time.time())
@@ -44,7 +42,6 @@ class EditTabExportMixin:
                 eta = max(0.0, elapsed * (100.0 - p) / p)
                 txt = f"{phase} {int(p)}%  •  ETA {self._fmt_mmss(eta)}"
                 self._report_progress(int(p), txt)
-                self._set_cut_status(txt, icon='fa5s.cut')
             else:
                 # Фаза подготовки: при обрезке с перекодированием ffmpeg сначала
                 # перематывает декодер до точки реза (выходной seek) и ещё не даёт
@@ -52,27 +49,6 @@ class EditTabExportMixin:
                 # («busy») режим полосы, чтобы она не выглядела зависшей на 0%.
                 txt = f"{phase} подготовка {self._fmt_mmss(elapsed)}"
                 self._report_progress(-1, txt)
-                self._set_cut_status(txt, icon='fa5s.hourglass-half')
-        except Exception:
-            pass
-
-    def _set_cut_status(self, text, icon='fa5s.cut'):
-        """Показывает текст прогресса обрезки в крупной метке над кнопкой
-        «Обрезать» (вместо «Итог: …»). Видно прямо на месте действия, в отличие
-        от полосы внизу окна. Снимается через _clear_cut_status → восстанавливает
-        обычный «Итог: …»."""
-        lbl = getattr(self, "lbl_selection", None)
-        if lbl is None:
-            return
-        try:
-            lbl.setText(f"{_api.icon_html(icon, 13, _api.C['accent'])}  {text}")
-        except Exception:
-            pass
-
-    def _clear_cut_status(self):
-        """Возвращает метку над кнопкой к обычному виду «Итог: …» после обрезки."""
-        try:
-            self.update_selection_label()
         except Exception:
             pass
 
@@ -149,12 +125,14 @@ class EditTabExportMixin:
         return candidate
 
     def _set_cut_btn_cancel(self, cancel_mode, cancel_handler=None):
-        """Переключает btn_cut («Обрезать») между обычным видом и «Отмена» на
+        """Переключает btn_cut («Экспорт») между обычным видом и «Отмена» на
         время перекодировки/обрезки — тот же приём, что _set_remove_btn_cancel
         для «Удалить объект», но с сохранением исходных текста/иконки/стиля:
-        у btn_cut они меняются по режиму («Обрезать» / «Создать видео» для
+        у btn_cut они меняются по режиму («Экспорт» / «Создать видео» для
         картинки), и вернуть нужно РОВНО то, что было до переключения."""
         b = self.btn_cut
+        # Пока флаг стоит, подпись с длительностью не перебивает «Отмена».
+        self._cut_btn_cancel = bool(cancel_mode)
         try:
             b.clicked.disconnect()
         except Exception:
@@ -184,6 +162,8 @@ class EditTabExportMixin:
             saved = getattr(self, '_cut_btn_saved', None)
             if saved:
                 b.setText(saved[0]); b.setIcon(saved[1]); b.setStyleSheet(saved[2])
+            # Длительность могла смениться, пока шёл экспорт.
+            self._refresh_export_btn()
             b.setEnabled(True)
             b.clicked.connect(self.start_cut)
 
@@ -191,7 +171,7 @@ class EditTabExportMixin:
         """Отменяет текущую обрезку/перекодировку/Smart Cut (self.ffmpeg_thread)."""
         th = getattr(self, "ffmpeg_thread", None)
         if th is not None and th.isRunning():
-            self._set_cut_status("Отмена…", icon='fa5s.hourglass-half')
+            self._report_progress(-1, "Отмена…")
             self.btn_cut.setEnabled(False)
             th.stop()
 
@@ -199,7 +179,7 @@ class EditTabExportMixin:
         """Отменяет «Обрезать и обработать» (worker вкладки «Обработка»)."""
         w = getattr(tab_media, 'worker', None)
         if w is not None and w.isRunning():
-            self._set_cut_status("Отмена…", icon='fa5s.hourglass-half')
+            self._report_progress(-1, "Отмена…")
             self.btn_cut.setEnabled(False)
             w.stop()
 
@@ -335,7 +315,7 @@ class EditTabExportMixin:
         if th is not None and th.isRunning():
             return
 
-        # Режим картинки: «Обрезать» = собрать видео-проявление из картинки.
+        # Режим картинки: «Экспорт» = собрать видео-проявление из картинки.
         if getattr(self, "is_still_image", False):
             self._export_still_pixelize()
             return
@@ -376,7 +356,7 @@ class EditTabExportMixin:
             _api.msgbox_warning(self, "Внимание", "Конечная точка должна быть позже начальной.")
             return
 
-        # Висит предпросмотр привязки к объекту — «Обрезать» и есть его экспорт:
+        # Висит предпросмотр привязки к объекту — «Экспорт» и есть его экспорт:
         # режем выбранный отрезок и вшиваем накладку по уже посчитанному пути.
         if self.has_track_preview():
             self._render_track_overlay(in_s, out_s)
@@ -525,7 +505,6 @@ class EditTabExportMixin:
 
         self._report_progress(0, "Создание видео…")
         self.log_label.setText("Создание видео из картинки…")
-        self._set_cut_status("Пикселизация… подготовка", icon='fa5s.hourglass-half')
         self._set_cut_btn_cancel(True)
         self._start_cut_phase("Пикселизация…")
         if getattr(self, "_cut_ticker", None) is None:
@@ -810,7 +789,6 @@ class EditTabExportMixin:
 
         self._report_progress(0, "Обрезка…")
         self.log_label.setText("Обрезка...")
-        self._set_cut_status("Обрезка… подготовка", icon='fa5s.hourglass-half')
         self._set_cut_btn_cancel(True)
 
         # Прогресс с ETA. Тикер раз в 0.5с обновляет «прошло/ETA», чтобы строка
@@ -974,7 +952,6 @@ class EditTabExportMixin:
 
         self._report_progress(0, "Smart Cut…")
         self.log_label.setText("Smart Cut…")
-        self._set_cut_status("Smart Cut… подготовка", icon='fa5s.hourglass-half')
         self._set_cut_btn_cancel(True)
         self._start_cut_phase("Smart Cut…")
         if getattr(self, "_cut_ticker", None) is None:
@@ -1055,7 +1032,8 @@ class EditTabExportMixin:
             return True
 
     def _execute_cut_and_process(self, in_s, out_s, out_path=None, src=None,
-                                 audio_only=False, burn_subs=False):
+                                 audio_only=False, burn_subs=False,
+                                 project=None, name_stem=None):
         """Кнопка «Обрезать и обработать»: режет диапазон [in_s,out_s) И сразу
         применяет вкладку «Обработка» ЕЁ ТЕКУЩИМИ настройками (CRF/preset/
         скорость/loudnorm/fps/…) — одним ffmpeg-проходом внутри
@@ -1085,12 +1063,19 @@ class EditTabExportMixin:
         Два РАЗНЫХ отрезка одного исходника получают разные файлы: имя занято —
         уходим на «…_обрез_1» (см. _unique_output), а не затираем предыдущий
         клип. Перезапись остаётся только для внутреннего пере-реза (out_path)
-        и правки «на месте»."""
+        и правки «на месте».
+
+        project — проект Монтажа (Project.to_dict(), project_export): его
+        склейку и «Обработку» ProcessWorker делает ОДНИМ кодированием (см.
+        ProcessProjectMixin). src тогда — первый файл проекта (папка по
+        умолчанию), а дорожки, накладки и субтитры открытого файла к проекту
+        не относятся. Итог называется name_stem + суффиксы «Обработки»."""
         src = _api.Path(src) if src else self.actual_source_file
         if not src or not src.exists():
             _api.msgbox_warning(self, "Внимание", "Файл не загружен.")
             return
-        if audio_only and bool(getattr(self, "audio_disabled", False)):
+        if (audio_only and project is None
+                and bool(getattr(self, "audio_disabled", False))):
             _api.msgbox_warning(self, "Внимание",
                                 "Звук выключен (дорожка «Нет») — обрабатывать нечего.")
             return
@@ -1109,7 +1094,7 @@ class EditTabExportMixin:
                 "завершения и повторите обрезку.")
             return
 
-        stem = src.stem
+        stem = name_stem or src.stem
         out_dir = (_api.Path(self.export_dir)
                    if (self.export_dir and _api.os.path.isdir(self.export_dir)) else src.parent)
         # out_path приходит только от ВНУТРЕННЕГО пере-реза (предложение
@@ -1123,9 +1108,6 @@ class EditTabExportMixin:
         self._report_progress(0, "Обработка…")
         self.log_label.setText("Отправлено в «Обработку»…"
                                + (" (только звук)" if audio_only else ""))
-        self._set_cut_status(
-            ("Обработка звука… подготовка" if audio_only else "Обработка… подготовка"),
-            icon='fa5s.hourglass-half')
         self._set_cut_btn_cancel(True, cancel_handler=lambda: self._cancel_cut_and_process(tm))
         self._start_cut_phase("Обработка звука…" if audio_only else "Обработка…")
         if getattr(self, "_cut_ticker", None) is None:
@@ -1136,22 +1118,38 @@ class EditTabExportMixin:
         iid = _api.uuid.uuid4().hex
         # Выбранная аудиодорожка (если в контейнере их несколько) — иначе
         # process_media брал первую по умолчанию, игнорируя выбор в Монтаже.
+        # У сборки проекта одна дорожка, и выбор открытого файла к ней не относится.
         sel_a = (self.selected_audio_abs_index
                  if (self.selected_audio_abs_index is not None
                      and len(self._audio_streams) > 1) else None)
-        item = {'iid': iid, 'path': str(src), 'type': 'MEDIA',
-                'dur': max(0.0, out_s - in_s), 'is_done': False,
-                'trim': (in_s, out_s), 'audio_index': sel_a,
-                'audio_only': bool(audio_only),
-                # Пункт «Нет» в списке дорожек — как галочка «Удалить аудио».
-                'remove_audio': bool(getattr(self, "audio_disabled", False))}
+        if project is not None:
+            item = {'iid': iid, 'path': str(src), 'type': 'MEDIA',
+                    'dur': max(0.0, out_s - in_s), 'is_done': False,
+                    'project': project, 'name': stem,
+                    'audio_only': bool(audio_only),
+                    # Видео проекта не скопировать — при выключенном
+                    # «Перекодировать видео» его кодирует кодер Монтажа.
+                    'fallback_venc': self._video_encoder_args()}
+            if burn_subs and not audio_only:
+                # Субтитры открытого файла — в его куски проекта (как и звук,
+                # см. _project_retarget_audio); куски других файлов без них.
+                subs = self._project_burn_subs()
+                if subs:
+                    item['project_subs'] = subs
+        else:
+            item = {'iid': iid, 'path': str(src), 'type': 'MEDIA',
+                    'dur': max(0.0, out_s - in_s), 'is_done': False,
+                    'trim': (in_s, out_s), 'audio_index': sel_a,
+                    'audio_only': bool(audio_only),
+                    # Пункт «Нет» в списке дорожек — как галочка «Удалить аудио».
+                    'remove_audio': bool(getattr(self, "audio_disabled", False))}
         # Наложенные картинки едут в «Обработку» готовыми PNG (уже отрисованы
         # под размер ИСХОДНОГО кадра, координаты — в его пикселях). process_media
         # подмешивает их фильтром overlay ПЕРЕД своей цепочкой (crop чёрных
         # полос/scale/fade), поэтому кадрирование и масштаб применяются уже к
         # кадру с картинкой — ровно как это видно в плеере Монтажа. Аудио-режим
         # видеоряда не выводит, поэтому там накладки не рендерим вовсе.
-        if not audio_only:
+        if not audio_only and project is None:
             ovl = self._render_export_overlays()
             if ovl:
                 item['overlays'] = ovl
@@ -1212,7 +1210,7 @@ class EditTabExportMixin:
                 # всегда .mp4, даже если источник .mkv).
                 temp_stem, temp_ext = _api.os.path.splitext(_api.os.path.basename(temp_out))
                 tail = temp_stem[len(stem):] if temp_stem.startswith(stem) else ("_" + temp_stem)
-                final_out = str(out_dir / f"{stem}_обрез{tail}{temp_ext}")
+                final_out = str(out_dir / f"{stem if name_stem else stem + '_обрез'}{tail}{temp_ext}")
                 # Второй отрезок ИЗ ТОГО ЖЕ файла с теми же настройками даёт
                 # ровно то же имя — и раньше «Перезаписать файл» (галочка
                 # включена по умолчанию) молча стирала первый клип. Правило
@@ -1270,9 +1268,7 @@ class EditTabExportMixin:
             self.log_label.setText(_api.icon_html('fa5s.check', 12, _api.C['green2']) + " Готово")
             self.log_label.setStyleSheet(f"color: {_api.C['green2']}; font-size: 12px; font-weight: 600;")
             self._report_progress(100, "Готово")
-            # Кратко показываем «Готово» над кнопкой, затем возвращаем «Итог: …».
-            self._set_cut_status("Готово", icon='fa5s.check')
-            _api.QTimer.singleShot(1800, self._clear_cut_status)
+            self.update_selection_label()
             # Сразу обновляем верхнюю ленту файлов: если результат перезаписал файл
             # по тому же пути (напр. «…_обрез.mp4» переэкспортирован перекодировкой
             # и стал короче/легче), карточка иначе висела бы со старым превью.
@@ -1286,7 +1282,7 @@ class EditTabExportMixin:
             self.log_label.setText("Отменено")
             self.log_label.setStyleSheet(f"color: {_api.C['text2']}; font-size: 12px;")
             self._report_progress(0, "Отменено")
-            self._clear_cut_status()
+            self.update_selection_label()
         else:
             self.log_label.setText(_api.icon_html('fa5s.times', 12, _api.C['red2']) + " Ошибка")
             self.log_label.setStyleSheet(f"color: {_api.C['red2']}; font-size: 12px; font-weight: 600;")
@@ -1298,7 +1294,7 @@ class EditTabExportMixin:
             except Exception:
                 _api.msgbox_critical(self, "Ошибка", f"Обрезка завершилась с ошибкой:\n{message}")
             self._report_progress(0, "Ошибка")
-            self._clear_cut_status()
+            self.update_selection_label()
 
     @staticmethod
     def _escape_filter_path(p):

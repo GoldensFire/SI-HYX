@@ -282,13 +282,13 @@ class EditTab(
         передаются явными параметрами (а не через self), чтобы было видно,
         какая секция что использует."""
         root = self._build_root_layout()
-        sidebar, sb_outer, sb_scroll, sb_content, sb_layout = self._build_sidebar()
+        sb_content, sb_layout = self._build_sidebar()
         pbq_card = self._build_quality_card()
-        self._build_proxy_card(pbq_card, sb_content, sb_layout, sb_outer, sb_scroll)
-        self._build_cut_summary(sb_outer)
-        center = self._build_center_area()
+        self._build_proxy_card(pbq_card, sb_layout)
+        self._build_export_button()
+        center = self._build_center_area(sb_content)
         self._build_player_bar(center)
-        self._build_timeline_panel(center, root, sidebar)
+        self._build_timeline_panel(center, root)
 
     def _build_root_layout(self):
         """Корневой горизонтальный layout вкладки. Возвращает root."""
@@ -329,12 +329,6 @@ class EditTab(
         if (event.type() == _api.QEvent.Type.Resize
                 and watched is getattr(self, "audio_meter", None)):
             self._resize_montage_side_btns(watched.height())
-        # Панель плеера изменила высоту → строка «Обрезать» справа такой же
-        # высоты: кнопка на одной линии с полноэкранной.
-        if (event.type() == _api.QEvent.Type.Resize
-                and watched is getattr(self, "_player_bar", None)
-                and getattr(self, "_cut_row", None) is not None):
-            self._cut_row.setFixedHeight(watched.height())
         if event.type() == _api.QEvent.Type.Wheel and isinstance(
                 watched, (_api.QSpinBox, _api.QComboBox, _api.QSlider)):
             # Виджеты с пометкой wheelAlways (ползунок громкости) — колесо меняет
@@ -605,7 +599,7 @@ class EditTab(
                 self.redo()
                 event.accept()
                 return
-            # Ctrl+S («Обрезать») — тот же баг, что и Ctrl+Z/Y на кириллице:
+            # Ctrl+S («Экспорт») — тот же баг, что и Ctrl+Z/Y на кириллице:
             # QShortcut("Ctrl+S") на переведённом коде клавиши не срабатывает.
             if vk == self._VK_S or event.key() == _api.Qt.Key.Key_S:
                 self.start_cut()

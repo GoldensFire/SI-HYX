@@ -356,7 +356,7 @@ class TestMeasureAtCrf:
             self.killable_calls.append(cmd)
             return self._killable_ok
 
-        def _measure_metric(self, orig, enc, metric):
+        def _measure_metric(self, orig, enc, metric, ref_vf=""):
             self.measure_calls.append((orig, enc, metric))
             return self._metric_score
 

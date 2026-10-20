@@ -87,7 +87,9 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
   [window_updates](si_hyx_parts/main/window_updates.py), [window_console](si_hyx_parts/main/window_console.py).
 - **ProcessWorker** — [process_worker.py](si_hyx_parts/workers/process_worker.py):
   цикл обработки и `process_media`; [process_filters](si_hyx_parts/workers/process_filters.py) —
-  аргументы ffmpeg и подбор CRF; [process_images](si_hyx_parts/workers/process_images.py) — картинки и AVIF.
+  аргументы ffmpeg и подбор CRF; [process_images](si_hyx_parts/workers/process_images.py) — картинки и AVIF;
+  [process_project](si_hyx_parts/workers/process_project.py) — проект Монтажа настройками
+  «Обработки» одним кодированием (граф `montage_project.build_source` + цепочки «Обработки»).
 - **MediaTab** — [media_tab.py](si_hyx_parts/tabs/media_tab.py) и
   [media_tab_settings](si_hyx_parts/tabs/media_tab_settings.py).
 - **InpaintCanvas** — [inpaint_canvas.py](si_hyx_parts/photo_tab/inpaint_canvas.py),

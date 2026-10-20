@@ -122,8 +122,8 @@ def validate(settings):
             errors.append("Караоке: темп должен быть от 0.5 до 2.")
         if not -12 <= settings.karaoke_pitch <= 12:
             errors.append("Караоке: высота тона от −12 до +12 полутонов.")
-        if not 0 <= settings.karaoke_crf <= 63:
-            errors.append("Караоке: CRF должен быть от 0 до 63.")
+        if not 1 <= settings.karaoke_crf <= 63:
+            errors.append("Караоке: CRF должен быть от 1 до 63.")
         if not 0 <= settings.karaoke_preset <= 13:
             errors.append("Караоке: пресет кодирования должен быть от 0 до 13.")
         if not 60 <= settings.karaoke_ai_timeout <= 3600:

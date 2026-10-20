@@ -983,7 +983,7 @@ class PackUpgrader:
                 before=f"{plan.ext.lstrip('.') or '?'}"
                        + (f", {got.codec}" if got.codec else "")
                        + f", {_api.fmt_size(plan.size)}",
-                after=f"av1 crf {max(0, min(63, int(self.s.video_crf)))}"
+                after=f"av1 crf {max(1, min(63, int(self.s.video_crf)))}"
                       + (f", {height}p" if height else "")
                       + f", {_api.fmt_size(got.size)}",
                 title=plan.new_decoded,
@@ -1066,7 +1066,8 @@ class PackUpgrader:
         libsvtav1, keyint=-1 и scd=1 (ключевые кадры только на сменах сцены),
         crf и пресет из настроек. Звук — тот же opus и с той же нормализацией,
         что у дорожек пака, иначе ролик звучал бы громче соседних вопросов."""
-        crf = max(0, min(63, int(self.s.video_crf)))
+        # CRF от 1: «-crf 0» libsvtav1 молча заменяет своим значением 35.
+        crf = max(1, min(63, int(self.s.video_crf)))
         preset = max(0, min(13, int(self.s.video_preset)))
         kbps = _api.nearest_bitrate(self.s.audio_kbps)
         cmd = ([_api.FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", raw,

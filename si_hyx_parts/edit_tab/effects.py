@@ -52,7 +52,7 @@ class EditTabEffectsMixin:
                 if self.main is not None and hasattr(self.main, "log"):
                     self.main.log("Кадрирование видео: правьте рамку ручками "
                                   "(углы/стороны), затем «Применить» (Enter) или "
-                                  "«Отмена» (Esc). Применится при «Обрезать» "
+                                  "«Отмена» (Esc). Применится при «Экспорт» "
                                   "(перекодирование).")
             except Exception:
                 pass
@@ -60,7 +60,7 @@ class EditTabEffectsMixin:
     def _toggle_pixelize(self, on):
         """Вкл/выкл эффект «проявление из пикселей». При включении открывается
         диалог с параметрами (число шагов, стартовый блок); отмена снимает чек.
-        Эффект применяется при «Обрезать» и виден только в итоговом файле (живого
+        Эффект применяется при «Экспорт» и виден только в итоговом файле (живого
         превью нет — мозаика считается при перекодировке)."""
         if on:
             is_image = bool(getattr(self, "is_still_image", False))
@@ -88,7 +88,7 @@ class EditTabEffectsMixin:
                         self.main.log(
                             f"Пикселизация задана ({self._pixelize_steps} шаг(ов), "
                             f"старт {self._pixelize_block}px{extra}) — применится при "
-                            f"«Обрезать». Блоки: "
+                            f"«Экспорт». Блоки: "
                             + " → ".join(f"{b}px" if b > 1 else "чётко" for b in seq))
                 except Exception:
                     pass
@@ -142,14 +142,14 @@ class EditTabEffectsMixin:
 
     def _on_crop_applied(self):
         """Холст: нажата «Применить» — снимаем чек с кнопки (режим правки закрыт),
-        рамка остаётся «вооружённой» для «Обрезать»."""
+        рамка остаётся «вооружённой» для «Экспорт»."""
         b = getattr(self, "btn_crop_frame", None)
         if b is not None and b.isChecked():
             b.blockSignals(True); b.setChecked(False); b.blockSignals(False)
         armed = self._video_crop_filter() is not None
         try:
             if self.main is not None and hasattr(self.main, "log"):
-                self.main.log("Кадрирование задано — применится при «Обрезать»."
+                self.main.log("Кадрирование задано — применится при «Экспорт»."
                               if armed else "Кадрирование снято (рамка = весь кадр).")
         except Exception:
             pass
@@ -182,7 +182,7 @@ class EditTabEffectsMixin:
     # ── Наложение картинки поверх видео ──────────────────────────────────────
     #
     # Слои живут на холсте (VideoCanvas), правятся мышью, а в файл попадают
-    # фильтром overlay=… при «Обрезать». Порядок фильтров: НАКЛАДКИ → кадрирование
+    # фильтром overlay=… при «Экспорт». Порядок фильтров: НАКЛАДКИ → кадрирование
     # → субтитры → пикселизация (см. edit_tab_overlay.overlay_filter_graph) —
     # ровно как это видно в плеере.
     def _overlay_frame_size(self):
@@ -255,7 +255,7 @@ class EditTabEffectsMixin:
                     f"Наложена картинка {_api.os.path.basename(path)}: двигайте мышью, "
                     "тяните за уголки, крутите за кружок сверху (Shift — шаг 15°), "
                     "Ctrl+стрелки — точная сдвижка, Delete — убрать. "
-                    "Вшивается при «Обрезать» (перекодировка).")
+                    "Вшивается при «Экспорт» (перекодировка).")
         except Exception:
             pass
 
@@ -635,8 +635,6 @@ class EditTabEffectsMixin:
         self.btn_cut.setEnabled(False)
         self._set_remove_btn_cancel(True)
         self._report_progress(-1, "Удаление объекта…")
-        self._set_cut_status("Удаление объекта… подготовка",
-                             icon='fa5s.hourglass-half')
         self.log_label.setText("Удаление объекта с видео…")
 
         self._vinp_worker = _api.VideoInpaintWorker(
@@ -666,15 +664,13 @@ class EditTabEffectsMixin:
         """Просит фоновый воркер прерваться (временные файлы он уберёт сам)."""
         w = getattr(self, "_vinp_worker", None)
         if w is not None and w.isRunning():
-            self._set_cut_status("Отмена…", icon='fa5s.hourglass-half')
+            self._report_progress(-1, "Отмена…")
             if getattr(self, "btn_remove_object", None) is not None:
                 self.btn_remove_object.setEnabled(False)
             w.cancel()
 
     def _on_vinp_progress(self, pct, text):
         self._report_progress(pct, text)
-        self._set_cut_status(text, icon='fa5s.magic' if pct >= 0
-                             else 'fa5s.hourglass-half')
 
     def _finish_video_inpaint(self):
         """Общая уборка состояния UI после завершения/отмены/ошибки обработки."""
@@ -714,7 +710,7 @@ class EditTabEffectsMixin:
             self._cancel_track_overlay()
             return
         # Накладка уже висит в плеере — второе нажатие её снимает (отдельной
-        # кнопки «Отмена» на холсте нет, экспортом занимается «Обрезать»).
+        # кнопки «Отмена» на холсте нет, экспортом занимается «Экспорт»).
         if self.has_track_preview():
             self._clear_track_preview()
             return
@@ -779,8 +775,6 @@ class EditTabEffectsMixin:
         self._trk_running = True
         self._set_track_export_busy(True)
         self._report_progress(-1, "Привязка к объекту…")
-        self._set_cut_status("Привязка к объекту… подготовка",
-                             icon='fa5s.hourglass-half')
         self.log_label.setText("Отслеживание объекта на видео…")
 
         self._trk_worker = _api.TrackPathWorker(
@@ -794,7 +788,7 @@ class EditTabEffectsMixin:
     def _on_track_path_ready(self, boxes):
         """Путь объекта посчитан — показываем накладку прямо в плеере. Ничего
         никуда не записано: в файл накладка попадёт обычным экспортом, то есть
-        кнопкой «Обрезать» (см. start_cut)."""
+        кнопкой «Экспорт» (см. start_cut)."""
         self._finish_track_overlay()
         spec = getattr(self, "_trk_spec", None)
         if not spec or not boxes:
@@ -818,10 +812,9 @@ class EditTabEffectsMixin:
         })
         canvas.set_track_time(max(0.0, self._ui_time_s()))
         self._connect_track_preview_signals(canvas)
-        self._set_cut_status("Накладка привязана — сохранит её «Обрезать»",
-                             icon='fa5s.crosshairs')
+        self._report_progress(0, "Накладка привязана — сохранит её «Экспорт»")
         self.log_label.setText(
-            "Смотрите, как накладка едет за объектом. «Обрезать» сохранит видео "
+            "Смотрите, как накладка едет за объектом. «Экспорт» сохранит видео "
             "с накладкой, кнопка привязки — уберёт её.")
 
     def _connect_track_preview_signals(self, canvas):
@@ -833,7 +826,7 @@ class EditTabEffectsMixin:
         self._trk_signals_canvas = canvas
 
     def has_track_preview(self):
-        """Есть ли посчитанная накладка, ждущая экспорта («Обрезать»)."""
+        """Есть ли посчитанная накладка, ждущая экспорта («Экспорт»)."""
         spec = getattr(self, "_trk_spec", None)
         return bool(spec and spec.get("boxes"))
 
@@ -843,14 +836,14 @@ class EditTabEffectsMixin:
         canvas = getattr(self, "video_widget", None)
         if isinstance(canvas, _api.VideoCanvas) and canvas.has_track_preview():
             canvas.set_track_preview(None)
-            self._set_cut_status("")
+            self._report_progress(0, "")
             self.log_label.setText("Готово")
         self._trk_spec = None
 
     def _render_track_overlay(self, trim_in=None, trim_out=None):
         """Экспорт видео с накладкой по УЖЕ посчитанной траектории (отслеживать
         заново нечего, этап только кодирующий). trim_in/trim_out — выделенный в
-        Монтаже отрезок: «Обрезать» с активной накладкой и режет, и вшивает."""
+        Монтаже отрезок: «Экспорт» с активной накладкой и режет, и вшивает."""
         spec = getattr(self, "_trk_spec", None)
         if not spec or getattr(self, "_trk_running", False):
             return
@@ -889,8 +882,6 @@ class EditTabEffectsMixin:
         self._trk_running = True
         self._set_track_export_busy(True)
         self._report_progress(-1, "Привязка к объекту…")
-        self._set_cut_status("Привязка к объекту… подготовка",
-                             icon='fa5s.hourglass-half')
         self.log_label.setText("Наложение на кадры…")
 
         self._trk_worker = _api.TrackOverlayWorker(
@@ -911,18 +902,16 @@ class EditTabEffectsMixin:
         """Просит фоновый воркер прерваться (временные файлы он уберёт сам)."""
         w = getattr(self, "_trk_worker", None)
         if w is not None and w.isRunning():
-            self._set_cut_status("Отмена…", icon='fa5s.hourglass-half')
+            self._report_progress(-1, "Отмена…")
             if getattr(self, "btn_track_object", None) is not None:
                 self.btn_track_object.setEnabled(False)
             w.cancel()
 
     def _on_trk_progress(self, pct, text):
         self._report_progress(pct, text)
-        self._set_cut_status(text, icon='fa5s.crosshairs' if pct >= 0
-                             else 'fa5s.hourglass-half')
 
     def _set_track_export_busy(self, busy):
-        """На время отслеживания/рендера «Обрезать» превращается в «Отмена» (как
+        """На время отслеживания/рендера «Экспорт» превращается в «Отмена» (как
         при обычном экспорте), а кнопка привязки выключается."""
         b = getattr(self, "btn_track_object", None)
         if b is not None:

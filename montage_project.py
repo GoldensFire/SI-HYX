@@ -361,6 +361,22 @@ class Project:
     def copy(self):
         return Project.from_dict(json.loads(json.dumps(self.to_dict())))
 
+    def excerpt(self, t0, t1):
+        """Копия проекта, где осталось только время [t0, t1) — сдвинутое к
+        нулю. Клипы обрезаются по краям окна, раскладка не пересчитывается."""
+        p = Project()
+        p.tracks = [Track(t.kind, t.enabled) for t in self.tracks]
+        for c in self.clips:
+            a, b = max(c.start, t0), min(c.end, t1)
+            if b - a <= _EPS:
+                continue
+            part = Clip(**{f.name: getattr(c, f.name) for f in fields(Clip)})
+            part.in_s = c.source_time(a)
+            part.out_s = c.source_time(b)
+            part.start = a - t0
+            p.clips.append(part)
+        return p
+
 
 # ── Сборка итогового видео ───────────────────────────────────────────────────
 def _num(v):
@@ -373,22 +389,46 @@ def fps_expr(fps):
     return f"{fr.numerator}/{fr.denominator}"
 
 
+def source_key(path):
+    """Ключ файла для сравнения путей (регистр и вид разделителей)."""
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
 def _seek_s(c, s):
     """Точка входного -ss для кадра, начинающегося в s: на четверть кадра
     раньше — ffmpeg оставляет первый кадр с pts ≥ ss, а дробные fps не
-    ложатся ровно в миллисекунды (тот же приём, что у «Обрезать»)."""
+    ложатся ровно в миллисекунды (тот же приём, что у «Экспорт»)."""
     if c.fps and c.fps > 0 and not c.is_image:
         idx = math.floor(s * c.fps + 1e-3)
         return max(0.0, (idx - 0.25) / c.fps)
     return max(0.0, s)
 
 
-def build_export(project, out_path, ffmpeg, video_args, audio_args=None):
-    """Команда ffmpeg для сборки проекта.
+@dataclass
+class SourceGraph:
+    """Проект как источник для ffmpeg: входы и граф фильтров с выходами
+    [vout] (видео yuv420p в размере и fps проекта) и [aout] (стерео 48 кГц)."""
+    inputs: list                  # аргументы каждого входа: [..., "-i", путь]
+    graph: str
+    video: bool
+    audio: bool
+    duration: float               # длина итога (по сетке кадров, если есть видео)
+    width: int
+    height: int
+    fps: float
 
-    Возвращает (cmd, graph, duration): graph — граф фильтров (его кладут в
-    файл и передают через -/filter_complex, если команда длинная), duration —
-    длина итога для прогресса. None, если собирать нечего.
+    def input_args(self):
+        return [a for args in self.inputs for a in args]
+
+
+def build_source(project, video=True, audio=True, subs=None):
+    """Граф проекта без кодирования: SourceGraph или None, если собирать
+    нечего. video/audio=False выбрасывают соответствующую часть.
+
+    subs — вшивание субтитров: {source_key(файл): фильтр subtitles=…}. Куски
+    этих файлов получают фильтр на кадре исходника (до масштаба под проект)
+    и во времени исходника: входной -ss обнуляет метки, а реплики фильтр
+    ищет по времени самого файла субтитров.
 
     Как устроено: каждый видимый кусок видео — свой вход с входным -ss/-t
     (кадрово точно и без декодирования файла с начала), приводится к размеру и
@@ -397,9 +437,8 @@ def build_export(project, out_path, ffmpeg, video_args, audio_args=None):
     что ошибка не копится: звук, расставленный по точному времени (adelay),
     не уезжает дальше полукадра на любом числе кусков. Звук всех клипов —
     отдельные входы, смешивание amix без приглушения."""
-    audio_args = audio_args or ["-c:a", "aac", "-b:a", "192k"]
-    segments = project.video_segments()
-    parts = project.audio_parts()
+    segments = project.video_segments() if video else []
+    parts = project.audio_parts() if audio else []
     if not segments and not parts:
         return None
     if segments and project.duration() > segments[-1][1] + _EPS:
@@ -431,8 +470,14 @@ def build_export(project, out_path, ffmpeg, video_args, audio_args=None):
             else:
                 inputs.append(["-ss", _num(_seek_s(c, s)),
                                "-t", _num(t1 - t0 + 0.5), "-i", c.src])
+            sub_vf = (subs or {}).get(source_key(c.src)) if not c.is_image else None
+            burn = ""
+            if sub_vf:
+                # Первый кадр после входного seek — кадр, на котором стоит s.
+                first = snap_to_frame(s, c.fps)
+                burn = (f"setpts=PTS-STARTPTS+{_num(first)}/TB,{sub_vf},")
             chains.append(
-                f"[{idx}:v:0]setpts=PTS-STARTPTS,"
+                f"[{idx}:v:0]{burn}setpts=PTS-STARTPTS,"
                 f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,"
                 f"fps={rate},tpad=stop_mode=clone:stop_duration=1,"
@@ -451,14 +496,12 @@ def build_export(project, out_path, ffmpeg, video_args, audio_args=None):
             f"atrim=duration={_num(c.length)},asetpts=PTS-STARTPTS,"
             f"volume={_num(c.volume)},adelay={delay}:all=1[{lab}]")
         amix.append(lab)
-    maps = []
     if labels:
         if len(labels) == 1:
             chains.append(f"[{labels[0]}]null[vout]")
         else:
             chains.append("".join(f"[{x}]" for x in labels)
                           + f"concat=n={len(labels)}:v=1:a=0[vout]")
-        maps += ["-map", "[vout]"]
     if amix:
         # Первым входом amix — тишина на всю длину проекта: amix берёт метки
         # времени у первого входа, и если им оказывался задержанный adelay
@@ -469,22 +512,33 @@ def build_export(project, out_path, ffmpeg, video_args, audio_args=None):
         chains.append("[asil]" + "".join(f"[{x}]" for x in amix)
                       + f"amix=inputs={len(amix) + 1}:normalize=0:"
                         f"dropout_transition=0:duration=first[aout]")
-        maps += ["-map", "[aout]"]
-    graph = ";".join(chains)
-    cmd = [ffmpeg, "-y", "-hide_banner"]
-    for args in inputs:
-        cmd += args
-    cmd += ["-filter_complex", graph] + maps
-    if labels:
-        cmd += list(video_args)
+    return SourceGraph(inputs, ";".join(chains), bool(labels), bool(amix),
+                       total_s, w, h, fps)
+
+
+def build_export(project, out_path, ffmpeg, video_args, audio_args=None, subs=None):
+    """Команда ffmpeg для сборки проекта.
+
+    Возвращает (cmd, graph, duration): graph — граф фильтров (его кладут в
+    файл и передают через -/filter_complex, если команда длинная), duration —
+    длина итога для прогресса. None, если собирать нечего. subs — как у
+    build_source."""
+    audio_args = audio_args or ["-c:a", "aac", "-b:a", "192k"]
+    src = build_source(project, subs=subs)
+    if src is None:
+        return None
+    cmd = [ffmpeg, "-y", "-hide_banner"] + src.input_args()
+    cmd += ["-filter_complex", src.graph]
+    if src.video:
+        cmd += ["-map", "[vout]"] + list(video_args)
         if "-pix_fmt" not in video_args:
             cmd += ["-pix_fmt", "yuv420p"]
-    if amix:
-        cmd += list(audio_args)
+    if src.audio:
+        cmd += ["-map", "[aout]"] + list(audio_args)
     else:
         cmd += ["-an"]
-    cmd += ["-t", _num(total_s), str(out_path)]
-    return cmd, graph, total_s
+    cmd += ["-t", _num(src.duration), str(out_path)]
+    return cmd, src.graph, src.duration
 
 
 def save_project(project, path):

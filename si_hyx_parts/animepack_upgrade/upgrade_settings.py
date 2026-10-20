@@ -172,7 +172,7 @@ class UpgradeSettings:
     # Перекодировать и лёгкие ролики, если они не в AV1: mp4 с H.264 из чужого
     # пака в AV1 худеет вдвое-втрое даже без ужимания разрешения.
     video_non_av1: bool = True
-    video_crf: int = _api.VIDEO_CRF           # 0–63, больше — легче и хуже
+    video_crf: int = _api.VIDEO_CRF           # 1–63, больше — легче и хуже
     video_preset: int = _api.VIDEO_PRESET     # 0–13, больше — быстрее и хуже
     video_height: int = 0                # 0 — не менять разрешение
 
@@ -212,7 +212,7 @@ class UpgradeSettings:
         s.audio_norm_lra = max(0.0, min(50.0, float(s.audio_norm_lra)))
         s.audio_norm_tp = max(-60.0, min(10.0, float(s.audio_norm_tp)))
         s.video_min_mb = max(0.1, min(2000.0, float(s.video_min_mb)))
-        s.video_crf = max(0, min(63, int(s.video_crf)))
+        s.video_crf = max(1, min(63, int(s.video_crf)))
         s.video_preset = max(0, min(13, int(s.video_preset)))
         s.video_height = _api.nearest_height(s.video_height)
         s.profile = _api.normalize_profile(s.profile)

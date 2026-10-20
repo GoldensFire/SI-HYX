@@ -110,8 +110,7 @@ class EditTabPlaybackMixin:
         # Сбрасываем режим картинки и возвращаем подпись кнопки экспорта.
         if getattr(self, "is_still_image", False):
             try:
-                self.btn_cut.setText("Обрезать")
-                self.btn_cut.setIcon(_api.get_icon('fa5s.cut', color='#1e1e2e'))
+                self._set_export_btn_mode("Экспорт", 'fa5s.file-export')
             except Exception:
                 pass
         self.is_still_image = False
@@ -241,8 +240,7 @@ class EditTabPlaybackMixin:
         if getattr(self, "is_still_image", False):
             # Возврат к обычному медиа — восстанавливаем подпись кнопки экспорта.
             try:
-                self.btn_cut.setText("Обрезать")
-                self.btn_cut.setIcon(_api.get_icon('fa5s.cut', color='#1e1e2e'))
+                self._set_export_btn_mode("Экспорт", 'fa5s.file-export')
             except Exception:
                 pass
         self.is_still_image = False   # сбрасываем; _load_still_image выставит заново
@@ -299,7 +297,7 @@ class EditTabPlaybackMixin:
         # Still-картинка (png/jpg/…) — отдельный лёгкий режим «картинка → видео»:
         # ни плеер, ни прокси, ни обрезка не применимы. Показываем кадр статично и
         # включаем только пикселизацию/кадрирование. Экспорт собирает видео из
-        # картинки (-loop 1) при «Обрезать».
+        # картинки (-loop 1) при «Экспорт».
         _ext = _api.os.path.splitext(str(path))[1].lower()
         if _ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff"):
             self._load_still_image()
@@ -393,7 +391,7 @@ class EditTabPlaybackMixin:
             self.waveform.set_data([], 0.0)
             self.waveform.set_loading(
                 f"Картинка {self._still_w}×{self._still_h} — включите «Пикселизацию» "
-                f"и нажмите «Обрезать», чтобы сделать видео-проявление",
+                f"и нажмите «Создать видео», чтобы сделать видео-проявление",
                 animated=False)
         except Exception:
             pass
@@ -403,8 +401,7 @@ class EditTabPlaybackMixin:
         except Exception: pass
         try:
             self.btn_cut.setEnabled(True)
-            self.btn_cut.setText("Создать видео")
-            self.btn_cut.setIcon(_api.get_icon('fa5s.film', color='#1e1e2e'))
+            self._set_export_btn_mode("Создать видео", 'fa5s.film')
         except Exception:
             pass
         self._report_progress(0, "")
@@ -760,6 +757,7 @@ class EditTabPlaybackMixin:
         self.player.setPosition(0); self.player.pause()
 
         self.start_waveform_loading()
+        self._project_restore_audio()
         _api.QTimer.singleShot(50, self._adjust_video_aspect_once)
         self.update_selection_label(); self.update_pan_slider_values()
         # После загрузки файла (в т.ч. через drag&drop) забираем фокус клавиатуры

@@ -367,7 +367,7 @@ class AnimePackTab(
         self.chk_poster_cache.setChecked(bool(getattr(s, "poster_cache", True)))
         self._on_poster_cache_toggled(self.chk_poster_cache.isChecked())
         self.sp_video_cut.setValue(max(3, int(s.video_cut)))
-        self.sp_video_crf.setValue(max(0, min(63, int(s.video_crf))))
+        self.sp_video_crf.setValue(max(1, min(63, int(s.video_crf))))
         self.sp_video_preset.setValue(max(0, min(13, int(s.video_preset))))
         idx = self.cb_char_roles.findData(s.char_roles)
         self.cb_char_roles.setCurrentIndex(idx if idx >= 0 else

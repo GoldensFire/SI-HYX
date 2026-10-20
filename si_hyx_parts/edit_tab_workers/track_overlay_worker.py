@@ -53,7 +53,7 @@ class TrackOverlayWorker(_api.QThread):
         # что человек видел в предпросмотре, и не тратит время на отслеживание
         # второй раз. None — считаем путь на ходу (старый одношаговый режим).
         self._boxes = list(boxes) if boxes else None
-        # Выделенный в Монтаже отрезок: «Обрезать» с активной накладкой должна и
+        # Выделенный в Монтаже отрезок: «Экспорт» с активной накладкой должна и
         # резать, и вшивать. None — берём файл целиком.
         self._trim_in = max(0.0, float(trim_in)) if trim_in else 0.0
         self._trim_out = (float(trim_out) if trim_out and trim_out > 0

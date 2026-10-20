@@ -162,6 +162,7 @@ class EditTabTracksMixin:
             self.selected_audio_abs_index = None
             self._set_audio_disabled(True)
             self._update_audio_info_labels(None)
+            self._project_retarget_audio()
             return
         self._set_audio_disabled(False)
         if kind == 'emb':
@@ -187,6 +188,8 @@ class EditTabTracksMixin:
             self._update_audio_info_labels(self._probe_audio_stream(ref))
             # Волну строим из самого файла озвучки (единственная дорожка).
             self._start_waveform(ref, None, prioritize_selection=True)
+        # Клипы этого файла в проекте — тем же звуком (просмотр и сборка).
+        self._project_retarget_audio()
 
     def _update_audio_info_labels(self, ainfo):
         """Обновляет метки «кодек/каналы» и «битрейт» под выбранную аудиодорожку

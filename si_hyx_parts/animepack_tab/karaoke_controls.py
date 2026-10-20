@@ -32,7 +32,7 @@ def build_controls(tab):
         "Обработчик и модели устанавливаются при первом использовании.")
     inner.addWidget(tab.chk_karaoke_ai, 1, 0, 1, 2)
     tab.sp_karaoke_crf = ap.QSpinBox()
-    tab.sp_karaoke_crf.setRange(0, 63)
+    tab.sp_karaoke_crf.setRange(1, 63)
     tab.sp_karaoke_crf.setValue(ap.PackSettings().karaoke_crf)
     tab.sp_karaoke_crf.setToolTip("Меньше CRF — выше качество и больше файл.")
     inner.addWidget(tab._lab("Качество караоке (CRF)"), 2, 0)

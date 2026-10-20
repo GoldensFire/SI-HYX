@@ -37,7 +37,8 @@ class EntranceEncoder:
     tune: int = 0
 
     def encoder_args(self):
-        return ["-c:v", "libsvtav1", "-crf", str(max(0, min(63, int(self.crf)))),
+        # CRF от 1: «-crf 0» libsvtav1 молча заменяет своим значением 35.
+        return ["-c:v", "libsvtav1", "-crf", str(max(1, min(63, int(self.crf)))),
                 "-preset", str(self.preset), "-pix_fmt", "yuv420p10le",
                 "-svtav1-params", f"tune={self.tune}:keyint=-1:scd=1"]
 

@@ -4,6 +4,12 @@
 """Обработка: аргументы ffmpeg — кадрирование, фильтры, кодеки и подбор CRF по метрике."""
 import workers as _api
 
+# Наименьший CRF, который libsvtav1 действительно применяет. «-crf 0» ffmpeg
+# считает «не задано» и оставляет SVT его значение по умолчанию: в логе SVT
+# «BRC mode / rate factor : CRF / 35.00», файл байт в байт как при -crf 35.
+SVT_CRF_MIN = 1
+SVT_CRF_MAX = 63
+
 
 class ProcessFiltersMixin:
     """Обработка: аргументы ffmpeg — кадрирование, фильтры, кодеки и подбор CRF по метрике."""
@@ -153,21 +159,45 @@ class ProcessFiltersMixin:
         GOP: keyint=-1 (без принудительного периода) + scd=1 (детектор смены
         сцены) — ключевые кадры ставятся ТОЛЬКО на реальных сменах сцены.
         Принудительные периодические keyframe — самая дорогая по битам часть
-        потока, поэтому это даёт максимальную оптимизацию под размер файла."""
+        потока, поэтому это даёт максимальную оптимизацию под размер файла.
+        crf зажимается в SVT_CRF_MIN..SVT_CRF_MAX: 0 молча дал бы CRF 35."""
+        crf = max(SVT_CRF_MIN, min(SVT_CRF_MAX, int(crf)))
         return ["-c:v", "libsvtav1", "-crf", str(crf),
                 "-preset", str(max(0, min(13, int(preset)))),
                 "-svtav1-params", f"tune={int(tune)}:keyint=-1:scd=1",
                 "-pix_fmt", pix_fmt]
 
-    def _measure_metric(self, orig_path, enc_path, metric):
+    def _measure_metric(self, orig_path, enc_path, metric, ref_vf=""):
         """Сравнивает enc_path с orig_path через встроенный ffmpeg-фильтр
         xpsnr, возвращает единое число (XPSNR в дБ) или None при ошибке.
-        scale2ref подстраивает оригинал под размер закодированного кадра —
-        иначе фильтр падает при несовпадении разрешений (когда в vf_list
-        есть scale/crop)."""
-        cmd = [_api.FFMPEG, "-i", enc_path, "-i", orig_path,
+
+        ref_vf — та же цепочка, что пробное кодирование применило к сэмплу
+        (см. _metric_vf): эталон обязан пройти ту же геометрию. Раньше
+        оригинал только растягивался scale2ref под размер результата, и при
+        обрезке полос сравнивались разные кадры (XPSNR уходил в минус), а со
+        сменой разрешения замер не проходил вовсе. Цепочка может быть графом
+        накладок с неподписанным входом — он берёт первый видеопоток, то есть
+        оригинал (поэтому оригинал идёт входом 0). scale2ref остаётся страховкой
+        на случай расхождения в пару пикселей; при равных размерах он пустой.
+
+        Сравниваются 8-битные кадры (format=yuv420p на обоих входах). На
+        10-битных xpsnr этой сборки ffmpeg считает мусор, когда строка
+        кадра-эталона в памяти длиннее его ширины: после scale до 854x480 или
+        обрезки полос XPSNR выходил около нуля и ниже при PSNR 41 дБ, а без
+        фильтров ломались ширины, не кратные 32 (720 у DVD). Дополнение
+        или обрезка кадра до кратной ширины не помогают. 8-битный путь верен
+        при любой ширине. Там, где 10-битный работал, 8-битная оценка выше на
+        0.1–0.2 дБ при 35–45 дБ и до 0.5–1 дБ на совсем низком качестве."""
+        if not ref_vf:
+            ref = "[0:v]"
+        elif ";" in ref_vf:
+            ref = f"{ref_vf}[pre];[pre]"
+        else:
+            ref = f"[0:v]{ref_vf}[pre];[pre]"
+        cmd = [_api.FFMPEG, "-i", orig_path, "-i", enc_path,
                "-filter_complex",
-               f"[1:v][0:v]scale2ref=flags=bicubic[ref][enc];[enc][ref]{metric}",
+               f"{ref}[1:v]scale2ref=flags=bicubic[ref][enc];"
+               f"[enc]format=yuv420p[enc8];[ref]format=yuv420p[ref8];[enc8][ref8]{metric}",
                "-f", "null", "-"]
         try:
             r = _api.subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
@@ -176,10 +206,16 @@ class ProcessFiltersMixin:
             return None
         out = (r.stderr or "") + (r.stdout or "")
         if metric == 'xpsnr':
-            m = _api.re.search(r'XPSNR\s+y:\s*([\d.]+)\s+u:\s*([\d.]+)\s+v:\s*([\d.]+)', out)
+            # Значение может быть отрицательным (кадры почти не похожи) или inf
+            # (кадры совпали) — оба случая разбираем, а не теряем замер.
+            num = r'(-?[\d.]+|inf)'
+            m = _api.re.search(rf'XPSNR\s+y:\s*{num}\s+u:\s*{num}\s+v:\s*{num}', out)
             if not m:
                 return None
-            y, u, v = float(m.group(1)), float(m.group(2)), float(m.group(3))
+            try:
+                y, u, v = float(m.group(1)), float(m.group(2)), float(m.group(3))
+            except ValueError:
+                return None
             # Взвешенное усреднение в линейной (MSE) области с весами 4:1:1
             # (яркость:цветность при 4:2:0) — стандартная формула сведения
             # XPSNR к одному числу, а не наивное среднее в дБ.
@@ -251,7 +287,7 @@ class ProcessFiltersMixin:
             ok = self._run_killable(cmd, cancel_check=cancel_check)
             if not ok or not _api.os.path.exists(tmp_out):
                 return None
-            return self._measure_metric(work_path, tmp_out, metric)
+            return self._measure_metric(work_path, tmp_out, metric, ",".join(vf_list or []))
         except Exception:
             return None
         finally:
@@ -295,13 +331,14 @@ class ProcessFiltersMixin:
 
     def _metric_crf_search(self, path, preset, pix_fmt, metric, target,
                             vf_list, cancel_check=None, on_tick=None, tune=0):
-        """Подбирает CRF (0-63) без внешних инструментов: вырезает из середины
+        """Подбирает CRF (SVT_CRF_MIN–63) без внешних инструментов: вырезает из середины
         файла короткий (~15с) сэмпл и бинарным поиском находит максимальный
         CRF (= минимальный размер), при котором SVT-AV1 (tune — тот же
         тюнинг, что и в финальном кодировании, см. _av1_encoder_args) всё ещё
         даёт метрику (xpsnr, встроенный фильтр ffmpeg) не хуже target.
 
-        Сперва проверяется CRF=0 (лучшее возможное качество) — если даже он не
+        Сперва проверяется CRF=SVT_CRF_MIN (лучшее возможное качество; 0 у
+        libsvtav1 значит «по умолчанию» = 35, см. SVT_CRF_MIN) — если даже он не
         дотягивает до target, цель физически недостижима на этом материале
         (типично для шумного/зернистого видео), и нет смысла тратить время на
         полный бинарный поиск (было — до 6 пробных кодирований вслепую, минуты
@@ -347,7 +384,8 @@ class ProcessFiltersMixin:
                     if _api.os.path.exists(tmp_out): _api.os.remove(tmp_out)
                 except Exception: pass
                 return None, ("отменено" if _cancelled() else "ошибка пробного кодирования")
-            score = self._measure_metric(sample_path, tmp_out, metric) if _api.os.path.exists(tmp_out) else None
+            score = (self._measure_metric(sample_path, tmp_out, metric, ",".join(vf_list or []))
+                     if _api.os.path.exists(tmp_out) else None)
             try:
                 if _api.os.path.exists(tmp_out): _api.os.remove(tmp_out)
             except Exception: pass
@@ -356,18 +394,18 @@ class ProcessFiltersMixin:
                 except Exception: pass
             return score, (None if score is not None else "не удалось измерить метрику")
 
-        # Проверка достижимости: лучший возможный случай — CRF=0.
-        score0, err0 = _trial(0)
+        # Проверка достижимости: лучший возможный случай — наименьший рабочий CRF.
+        score0, err0 = _trial(SVT_CRF_MIN)
         if err0 is not None:
             _cleanup_sample()
             return None, err0
         if score0 < target:
             _cleanup_sample()
-            return None, (f"даже CRF 0 (лучшее качество) даёт {metric.upper()} ≈{score0:.2f} "
+            return None, (f"даже CRF {SVT_CRF_MIN} (лучшее качество) даёт {metric.upper()} ≈{score0:.2f} "
                           f"< цели {target:.2f} — недостижимо на этом материале")
 
-        lo, hi = 0, 63
-        best_crf, best_info = 0, f"{score0:.2f}"
+        lo, hi = SVT_CRF_MIN, SVT_CRF_MAX
+        best_crf, best_info = SVT_CRF_MIN, f"{score0:.2f}"
         tries, max_tries = 0, 5
         while lo < hi and tries < max_tries:
             mid = (lo + hi + 1) // 2
@@ -699,15 +737,16 @@ class ProcessFiltersMixin:
         return ["-map", "0:V?", "-map", a_map_sel]
 
     @staticmethod
-    def _fps_args(fps_sel, src_path):
+    def _fps_args(fps_sel, src_path, src_fps=None):
         """`-r`-аргументы по выбранному в настройках fps (или [] — не менять).
 
         «Исходный (max 30)» ставит -r 30 только если источник реально быстрее
         (иначе кодер бессмысленно растянул бы VFR до CFR). Нечисловые значения
-        игнорируются. Единственная нечистота — чтение fps источника."""
+        игнорируются. Единственная нечистота — чтение fps источника; src_fps
+        (известный заранее, у проекта Монтажа) избавляет и от неё."""
         if fps_sel == "Исходный (max 30)":
             try:
-                if _api.get_fps_float(src_path) > 30.5:
+                if (src_fps or _api.get_fps_float(src_path)) > 30.5:
                     return ["-r", "30"]
             except Exception:
                 pass
@@ -721,7 +760,7 @@ class ProcessFiltersMixin:
         return []
 
     def _build_video_filters(self, sv, item, current_input, trim, t0, t0_video,
-                             speed_factor):
+                             speed_factor, src_fps=None):
         """Цепочка видеофильтров для `-vf` (порядок сохранён 1:1 с прежним
         инлайн-кодом process_media): crop чёрных полос → setpts (скорость) →
         scale → fade-in → fade-out.
@@ -794,7 +833,7 @@ class ProcessFiltersMixin:
                 # Фейд должен ЗАВЕРШИТЬСЯ до последнего кадра, иначе кадр
                 # окажется на ~96% затемнения, а не на 100%. Сдвигаем фейд
                 # на запас (≥1.5 кадра) — фильтр держит чёрный после конца.
-                try: _fps = _api.get_fps_float(current_input) or 25.0
+                try: _fps = src_fps or _api.get_fps_float(current_input) or 25.0
                 except Exception: _fps = 25.0
                 if _fps <= 0: _fps = 25.0
                 margin = max(0.08, 1.5 / _fps)
@@ -819,6 +858,21 @@ class ProcessFiltersMixin:
         fmt = item.get('overlay_format') or _api.overlay_chroma_format(
             _api.get_pix_fmt(current_input))
         return _api.overlay_filter_graph(chain, rendered, pix_fmt=fmt)
+
+    def _metric_vf(self, vf_list, item, sample_input):
+        """Цепочка для пробных кодирований подбора CRF и оценки XPSNR: только
+        геометрия кадра (crop, scale) из vf_list плюс накладки Монтажа.
+
+        Эту же цепочку проходит эталон в _measure_metric, поэтому сравниваются
+        одинаковые кадры и метрика меряет только потери кодировщика. Фейды,
+        смена скорости (setpts) и вшитые субтитры отбрасываются: фейд в начале
+        сэмпла затемнял бы первые кадры, setpts рассинхронизировал бы кадры
+        результата и эталона, а время субтитров в сэмпле всё равно не своё.
+        Элементы vf_list сравниваются целиком, без разбиения по запятым —
+        внутри scale они есть (`min(iw,854)`)."""
+        geometry = [f for f in (vf_list or [])
+                    if f.startswith("crop=") or f.startswith("scale=")]
+        return self._overlay_vf(geometry, item, sample_input)
 
     def _make_metric_sample(self, current_input, trim, max_len=20.0):
         """Вход для пробных замеров качества → (путь, временный_файл_или_None).
@@ -881,8 +935,14 @@ class ProcessFiltersMixin:
         без внешних инструментов); ручной CRF из настроек остаётся фолбэком,
         если подбор не удался. Когда подбора не было (или он не удался),
         оценку даёт одно пробное кодирование короткого сэмпла на итоговом CRF —
-        и только если оценку есть кому показать (см. _wants_metric_score)."""
+        и только если оценку есть кому показать (см. _wants_metric_score).
+
+        vf_list — полная цепочка видеофильтров файла (без накладок, их берём
+        из item); пробы идут по её геометрии, см. _metric_vf."""
         xpsnr_score = None
+        if self._wants_metric_score(sv):
+            metric_vf = self._metric_vf(vf_list, item, sample_input)
+            vf_list = [metric_vf] if metric_vf else []
         vmetric = sv.get('metric', 'none')
         if vmetric == 'xpsnr':
             target_metric = float(sv.get('target_metric', 40.0))

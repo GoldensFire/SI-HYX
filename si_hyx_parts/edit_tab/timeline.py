@@ -287,13 +287,46 @@ class EditTabTimelineMixin:
             pass
 
     def update_selection_label(self):
-        # Показываем только итоговую длительность будущего ролика — длину
-        # проекта (без проекта — выделения IN/OUT).
+        # Длительность будущего ролика — длина проекта (без проекта —
+        # выделения IN/OUT) — пишется прямо на кнопке «Экспорт».
         dur = max(0.0, self.current_out - self.current_in)
         if getattr(self, "project_timeline", None) is not None and not self.project.is_empty():
             dur = self.project.duration()
-        self.lbl_selection.setText(
-            f"{_api.icon_html('fa5s.stopwatch', 13, _api.C['text'])}  Итог: {_api.s_to_time(dur)}")
+        self._export_dur = dur
+        self._refresh_export_btn()
+
+    @staticmethod
+    def _fmt_export_dur(sec):
+        """«6.9 с», «25 мин 26 с», «1 ч 05 мин» — длительность на кнопке."""
+        if sec < 60:
+            return f"{sec:.1f} с"
+        sec = int(round(sec))
+        h, rest = divmod(sec, 3600)
+        m, s = divmod(rest, 60)
+        if h:
+            return f"{h} ч {m:02d} мин"
+        return f"{m} мин {s:02d} с" if s else f"{m} мин"
+
+    def _set_export_btn_mode(self, label, icon):
+        """Подпись и значок кнопки экспорта: «Экспорт» или «Создать видео»
+        (картинка). Длительность допишет _refresh_export_btn."""
+        self._export_btn_label = label
+        self._export_btn_icon = icon
+        b = getattr(self, "btn_cut", None)
+        if b is None or getattr(self, "_cut_btn_cancel", False):
+            return
+        b.setIcon(_api.get_icon(icon, color='#1e1e2e'))
+        self._refresh_export_btn()
+
+    def _refresh_export_btn(self):
+        b = getattr(self, "btn_cut", None)
+        if b is None or getattr(self, "_cut_btn_cancel", False):
+            return
+        label = getattr(self, "_export_btn_label", "Экспорт")
+        dur = getattr(self, "_export_dur", 0.0)
+        text = f"{label} · {self._fmt_export_dur(dur)}" if dur > 0 else label
+        if b.text() != text:
+            b.setText(text)
 
     def _resize_montage_side_btns(self, col_h):
         """Кнопки боковой панели монтажа — квадратные, в две колонки по 4 (место

@@ -827,7 +827,8 @@ class GeneratorMediaMixin:
         preset задаётся отдельно там, где скорость кодирования своя: у сакуги
         она настраивается независимо от вопросов-роликов (просьба
         пользователя)."""
-        crf = max(0, min(63, int(self.s.video_crf if crf is None else crf)))
+        # CRF от 1: «-crf 0» libsvtav1 молча заменяет своим значением 35.
+        crf = max(1, min(63, int(self.s.video_crf if crf is None else crf)))
         preset = max(0, min(13, int(self.s.video_preset if preset is None
                                     else preset)))
         return ["-c:v", "libsvtav1", "-crf", str(crf), "-preset", str(preset),
@@ -988,7 +989,7 @@ class GeneratorMediaMixin:
     # ── пиксели: кадр, который проявляется ────────────────────────────────
     def pixel_encode_args(self, vf: str) -> list[str]:
         """Флаги раскрытия кадра: свой пресет, общий с роликами CRF."""
-        crf = max(0, min(63, int(self.s.video_crf)))
+        crf = max(1, min(63, int(self.s.video_crf)))
         preset = max(0, min(13, int(self.s.frame_preset)))
         return ["-c:v", "libsvtav1", "-crf", str(crf), "-preset", str(preset),
                 "-svtav1-params", f"tune={_api.VIDEO_TUNE}:keyint=-1:scd=1",

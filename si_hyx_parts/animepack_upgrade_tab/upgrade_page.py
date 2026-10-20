@@ -703,12 +703,12 @@ class _UpgradePage(_api.QWidget):
         g.addWidget(self.chk_vid_non_av1, r, 0, 1, 2)
         r += 1
         self.sp_vid_crf = _api._no_wheel(_api.QSpinBox())
-        self.sp_vid_crf.setRange(0, 63)
+        self.sp_vid_crf.setRange(1, 63)
         self.sp_vid_crf.setValue(_api.UpgradeSettings().video_crf)
         self.sp_vid_crf.setToolTip(
             "Качество AV1 (CRF): больше — легче и хуже. 45 стоит и в "
             "генераторе паков — для ролика на экране SIGame этого хватает.")
-        g.addWidget(self._lab("CRF (0–63)"), r, 0)
+        g.addWidget(self._lab("CRF (1–63)"), r, 0)
         g.addWidget(self.sp_vid_crf, r, 1)
         r += 1
         self.sp_vid_preset = _api._no_wheel(_api.QSpinBox())
@@ -1040,7 +1040,7 @@ class _UpgradePage(_api.QWidget):
         self.grp_video.setChecked(s.compress_video)
         self.sp_vid_min.setValue(max(0.1, min(2000.0, float(s.video_min_mb))))
         self.chk_vid_non_av1.setChecked(s.video_non_av1)
-        self.sp_vid_crf.setValue(max(0, min(63, int(s.video_crf))))
+        self.sp_vid_crf.setValue(max(1, min(63, int(s.video_crf))))
         self.sp_vid_preset.setValue(max(0, min(13, int(s.video_preset))))
         height = _api.nearest_height(s.video_height)
         self.cb_vid_height.setCurrentIndex(

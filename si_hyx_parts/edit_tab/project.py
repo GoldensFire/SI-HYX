@@ -127,8 +127,8 @@ class EditTabProjectMixin:
         self.project_timeline.set_offset(value / 100.0)
 
     def _project_update_ui(self):
-        """Подписи и доступность кнопок правки, общее время, «Итог» и текст
-        кнопки сохранения."""
+        """Подписи и доступность кнопок правки, общее время и кнопка
+        «Экспорт» с длительностью итога."""
         if getattr(self, "project_timeline", None) is None:
             return
         n = len(self.project.clips)
@@ -146,10 +146,11 @@ class EditTabProjectMixin:
         b = getattr(self, "btn_cut", None)
         single = n == 0 or self._proj_single_clip() is not None
         still = getattr(self, "is_still_image", False)
-        if b is not None and b.text() != "Отмена" and not (still and single):
-            b.setText("Обрезать" if single else "Собрать видео")
-            b.setIcon(_api.get_icon('fa5s.cut' if single else 'fa5s.film', color='#1e1e2e'))
-            b.setToolTip("" if single else "Склеить клипы проекта в один файл (Ctrl+S)")
+        if (b is not None and not getattr(self, "_cut_btn_cancel", False)
+                and not (still and single)):
+            self._set_export_btn_mode("Экспорт", 'fa5s.file-export')
+            b.setToolTip("Сохранить кусок в файл" if single
+                         else "Склеить клипы проекта в один файл (Ctrl+S)")
             if n > 0:
                 b.setEnabled(True)
 
@@ -239,7 +240,7 @@ class EditTabProjectMixin:
 
     def _project_sync_source(self):
         """IN/OUT источника — по клипу одиночного проекта (по ним режет
-        «Обрезать» и встаёт воспроизведение); у проекта из нескольких кусков
+        «Экспорт» и встаёт воспроизведение); у проекта из нескольких кусков
         — весь файл: границы кусков держит сам просмотр проекта."""
         if self.duration <= 0 or getattr(self, "is_still_image", False):
             return
@@ -268,6 +269,93 @@ class EditTabProjectMixin:
             idx = self.audio_stream_index
         return str(self.actual_source_file), (int(idx) if idx is not None else -1)
 
+    def _project_burn_subs(self):
+        """Вшивание субтитров в проект: {ключ файла: фильтр subtitles=…} для
+        открытого файла, если стоит «Вшить субтитры» и выбрана дорожка и в
+        проекте есть его куски; иначе None. Выбор дорожки относится к открытому
+        файлу (индекс si= — его), поэтому куски других файлов идут без субтитров."""
+        if not (self.chk_burn_subs.isChecked() and self.cmb_subs.currentIndex() > 0):
+            return None
+        src = self.actual_source_file
+        if not src or getattr(self, "is_still_image", False):
+            return None
+        if not any(c.has_video and not c.is_image and self._proj_is_loaded(c.src)
+                   for c in self.project.clips):
+            return None
+        vf = self._subtitles_vf(src, self.selected_sub_ext_path,
+                                self.cmb_subs.currentIndex() - 1)
+        return {_mp.source_key(src): vf} if vf else None
+
+    def _project_restore_audio(self):
+        """Открыли файл, куски которого лежат в проекте, → в списке дорожек
+        выбираем звук этих кусков. Иначе список вставал на первую встроенную
+        дорожку, а проект играл и собирал запомненную в кусках озвучку."""
+        if getattr(self, "project_timeline", None) is None or self.project.is_empty():
+            return
+        if getattr(self, "is_still_image", False):
+            return
+        clip = next((c for c in sorted(self.project.clips, key=lambda c: c.start)
+                     if c.has_video and not c.is_image and self._proj_is_loaded(c.src)),
+                    None)
+        if clip is None:
+            return
+        target = None
+        if not clip.audio_path:
+            target = ('none', None)
+        elif self._proj_norm(clip.audio_path) != self._proj_norm(self.actual_source_file):
+            want = self._proj_norm(clip.audio_path)
+            target = next((e for e in self._audio_entries
+                           if e[0] == 'ext' and self._proj_norm(e[1]) == want), None)
+            if target is None and _api.os.path.exists(clip.audio_path):
+                self._add_external_audio(clip.audio_path)
+                return
+        else:
+            want = clip.audio_stream
+            for i, s in enumerate(self._audio_streams):
+                if want < 0 or s.get('index') == want:
+                    target = ('emb', i)
+                    break
+        if target is None or target not in self._audio_entries:
+            return
+        idx = self._audio_entries.index(target)
+        if idx != self.cmb_audio.currentIndex():
+            self.cmb_audio.setCurrentIndex(idx)
+
+    def _project_retarget_audio(self):
+        """В источнике выбрали другую дорожку или озвучку → видеоклипы этого
+        файла звучат ею. Клип запоминает звук, когда кладётся в проект, и
+        просмотр проекта играл прежнюю дорожку голосом, а выбранную глушил:
+        для него основной плеер звучал «не тем» звуком клипа."""
+        if getattr(self, "project_timeline", None) is None or self.project.is_empty():
+            return
+        if getattr(self, "is_still_image", False):
+            return
+        path, idx = self._source_audio()
+        changed = []
+        for c in self.project.clips:
+            if c.is_image or not c.has_video or not self._proj_is_loaded(c.src):
+                continue
+            if c.audio_path != path or c.audio_stream != idx:
+                c.audio_path, c.audio_stream = path, idx
+                changed.append(c.id)
+        if not changed:
+            return
+        try:
+            _api.os.makedirs(_api.os.path.dirname(_api.MONTAGE_PROJECT_PATH), exist_ok=True)
+            _mp.save_project(self.project, _api.MONTAGE_PROJECT_PATH)
+        except Exception:
+            pass
+        if self._proj_play is not None:
+            # Просмотр идёт: голоса со старым звуком закрыть, состав того, что
+            # слышно, — заново (часы проекта не трогаем).
+            for cid in changed:
+                self._pmix_release(cid)
+            parts = self.project.audio_parts()
+            self._pmix_parts = {c.id: c for c in parts}
+            self._pmix_need = {c.id for c in parts if self._pmix_needs_voice(c)}
+            self._pmix_tick()
+        self.project_timeline.refresh()
+
     def project_add_selection(self, where='main', snapshot=True):
         """Кладёт кусок открытого файла (IN–OUT) в проект: на основной дорожке
         — в конец, поверх кадра или звуком — у плейхеда."""
@@ -287,7 +375,7 @@ class EditTabProjectMixin:
         if still:
             in_s, out_s = 0.0, float(getattr(self, "_still_duration", 5.0) or 5.0)
         elif fps > 0:
-            # Как у «Обрезать»: кадр, который показан на IN, и кадр, на котором
+            # Как у «Экспорт»: кадр, который показан на IN, и кадр, на котором
             # стоит OUT, — границы куска ложатся на сетку кадров.
             in_s = _mp.snap_to_frame(in_s, fps)
             out_s = min(self.duration, round(out_s * fps) / fps)
@@ -838,7 +926,7 @@ class EditTabProjectMixin:
         return self.project_add_selection('main', snapshot=snapshot)
 
     def _project_export_route(self):
-        """«Обрезать» / Ctrl+S. True — проект собран здесь; False — режет
+        """«Экспорт» / Ctrl+S. True — проект собран здесь; False — режет
         прежняя «Обрезка» (проект из одного куска открытого файла)."""
         if self.project.is_empty():
             return False
@@ -1048,11 +1136,25 @@ class EditTabProjectMixin:
             _api.msgbox_warning(self, "Проект", "Не найдены файлы:\n" + "\n".join(missing))
             return
         first = next((c for c in p.clips_on(p.main_track)), None) or p.clips[0]
+        stem = _api.Path(first.src).stem
+        # «Перекодировать настройками «Обработки»» (4) и его аудио-вариант (5):
+        # проект кодирует «Обработка» своими настройками, склейка и кодирование
+        # — одним проходом ffmpeg (ProcessProjectMixin). Иначе проект молча
+        # уходил в H.264 Монтажа.
+        mode = self.cmb_mode.currentIndex()
+        if mode in (4, 5):
+            if mode == 5 and not p.audio_parts():
+                _api.msgbox_warning(self, "Проект", "В проекте нет звука — обрабатывать нечего.")
+                return
+            self.project_stop()
+            self._execute_cut_and_process(
+                0.0, p.duration(), src=first.src, audio_only=(mode == 5),
+                burn_subs=(mode == 4), project=p.to_dict(), name_stem=f"{stem}_проект")
+            return
         video = p.has_video()
         ext = ".mp4" if video else ".m4a"
         folder = (self.export_dir if self.export_dir and _api.os.path.isdir(self.export_dir)
                   else _api.os.path.dirname(first.src))
-        stem = _api.Path(first.src).stem
         default = _api._unique_output(_api.os.path.join(folder, f"{stem}_проект{ext}"))
         flt = "Видео MP4 (*.mp4)" if video else "Звук M4A (*.m4a)"
         path, _f = _api.QFileDialog.getSaveFileName(self, "Сохранить видео проекта", default, flt)
@@ -1061,8 +1163,13 @@ class EditTabProjectMixin:
         if not path.lower().endswith(ext):
             path += ext
         temp_out = self._make_temp_out(path)
-        built = _mp.build_export(p, temp_out, _api.FFMPEG, self._video_encoder_args())
+        built = _mp.build_export(p, temp_out, _api.FFMPEG, self._video_encoder_args(),
+                                 subs=self._project_burn_subs())
         if built is None:
+            try:
+                _api.os.remove(temp_out)
+            except OSError:
+                pass
             return
         cmd, graph, dur = built
         graph_file = None
@@ -1079,7 +1186,6 @@ class EditTabProjectMixin:
                 graph_file = None
         self.project_stop()
         self._report_progress(0, "Сборка проекта…")
-        self._set_cut_status("Сборка проекта… подготовка", icon='fa5s.hourglass-half')
         self._set_cut_btn_cancel(True)
         self._start_cut_phase("Сборка проекта…")
         if getattr(self, "_cut_ticker", None) is None:

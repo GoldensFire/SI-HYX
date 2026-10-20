@@ -72,7 +72,6 @@ class EditTabEntranceMixin:
         self._set_cut_btn_cancel(True, self._cancel_entrance)
         self._update_media_buttons()
         self._report_progress(-1, "Создание видео появления…")
-        self._set_cut_status("Создание видео появления…", icon="fa5s.hourglass-half")
         self.log_label.setText("Создание видео появления…")
         worker.start()
 
@@ -80,7 +79,7 @@ class EditTabEntranceMixin:
         worker = getattr(self, "_entrance_worker", None)
         if worker is not None:
             self.btn_cut.setEnabled(False)
-            self._set_cut_status("Отмена…", icon="fa5s.hourglass-half")
+            self._report_progress(-1, "Отмена…")
             worker.stop()
 
     def _finish_entrance(self):
@@ -101,5 +100,5 @@ class EditTabEntranceMixin:
             return
         self.log_label.setText("Ошибка создания видео появления")
         self._report_progress(0, "Ошибка")
-        self._clear_cut_status()
+        self.update_selection_label()
         _api.msgbox_critical(self, "Появление", f"Не удалось создать видео:\n{message}")

@@ -48,7 +48,7 @@ class MediaTabSettingsMixin:
         self.ck_metric_xpsnr = _api.QCheckBox("XPSNR")
         self.ck_metric_xpsnr.setChecked(False)
 
-        self.s_crf = _api.QSpinBox(); self.s_crf.setRange(0, 63); self.s_crf.setValue(45)
+        self.s_crf = _api.QSpinBox(); self.s_crf.setRange(1, 63); self.s_crf.setValue(45)
         self.s_pre = _api.QSpinBox(); self.s_pre.setRange(0, 13); self.s_pre.setValue(2)
         self.c_res = _api.QComboBox(); self.c_res.addItems(["Исходное", "1920x1080", "1280x720" + _api.DEFAULT_TAG, "854x480", "144x72"])
         self.c_res.setCurrentText("1280x720" + _api.DEFAULT_TAG)
@@ -67,7 +67,7 @@ class MediaTabSettingsMixin:
         self._badge_crf = _api.info_badge("Preset — скорость кодирования (0 медленно и качественно … 13 быстро, но страдает качество (Рекомендуется 1, если позволяет процессор)).")
         henc.addWidget(self._badge_crf)
         henc.addStretch()
-        fv.addRow(_api.label_with_info("CRF / Preset:", "CRF — качество (меньше = качественнее, но больше файл. Рекомендуется 40-45. Может принимать значения от 0 до 63)"), henc)
+        fv.addRow(_api.label_with_info("CRF / Preset:", "CRF — качество (меньше = качественнее, но больше файл. Рекомендуется 40-45. Может принимать значения от 1 до 63)"), henc)
 
         # ── Тюнинг SVT-AV1 (--tune) — под какую метрику оптимизирует энкодер ──
         # Реально поддерживаемые SVT-AV1 режимы тюнинга (проверено на бандленном

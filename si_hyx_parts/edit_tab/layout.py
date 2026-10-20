@@ -45,41 +45,15 @@ class EditTabLayoutMixin:
     """Монтаж: построение интерфейса, прогресс и подгонка видеовыхода."""
 
     def _build_sidebar(self):
-        """Правая боковая панель (инфо/экспорт) внутри QScrollArea.
-        Возвращает саму панель и её внутренние контейнеры — они нужны
-        секциям «прокси» и «итог», которые дозаполняют ту же панель."""
-        # ── Right sidebar (прокручиваемая) ────────────────────────────────
-        # Содержимое (инфо/экспорт) живёт в QScrollArea — если по высоте не
-        # умещается, появляется вертикальный скроллбар. Кнопки «Итог» и
-        # «Обрезать» закреплены ВНЕ прокрутки, снизу (всегда видны).
-        sidebar = _api.QFrame()
-        sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(264)
-        sidebar.setStyleSheet(f"""
-            #Sidebar {{
-                background: {_api.C['surface']};
-                border-left: 1px solid {_api.C['border']};
-            }}
-        """)
-        sb_outer = _api.QVBoxLayout(sidebar)
-        sb_outer.setContentsMargins(0, 0, 0, 0)
-        sb_outer.setSpacing(0)
-
-        sb_scroll = _api.QScrollArea()
-        sb_scroll.setObjectName("SidebarScroll")
-        sb_scroll.setWidgetResizable(True)
-        sb_scroll.setFrameShape(_api.QFrame.Shape.NoFrame)
-        sb_scroll.setHorizontalScrollBarPolicy(_api.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        sb_scroll.setVerticalScrollBarPolicy(_api.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        # Никакого собственного стиля скроллбара — берём общий стиль приложения
-        # (config.STYLESHEET), чтобы он совпадал со скроллбарами других вкладок.
-        # Фон не задаём (глобальное правило делает контент прозрачным → виден
-        # surface самого сайдбара; собственный фон давал серую «подложку»).
-        sb_scroll.setStyleSheet("QScrollArea#SidebarScroll { border: none; }")
+        """Правая колонка общей боковой панели: файл, инфо, экспорт.
+        Возвращает её виджет и layout — секции «качество» и «прокси»
+        дозаполняют ту же колонку, а _build_center_area ставит её рядом с
+        колонкой дорожек в одну прокрутку."""
         sb_content = _api.QWidget()
+        sb_content.setFixedWidth(264)
         sb_layout = _api.QVBoxLayout(sb_content)
-        # Правый отступ 14px — «дорожка» для вертикального скроллбара, чтобы он не
-        # перекрывал содержимое (панель всегда видна полностью).
+        # Правый отступ 14px — «дорожка» для вертикального скроллбара общей
+        # панели, чтобы он не перекрывал содержимое.
         sb_layout.setContentsMargins(16, 16, 14, 16)
         sb_layout.setSpacing(12)
 
@@ -278,7 +252,7 @@ class EditTabLayoutMixin:
 
         sb_layout.addWidget(export_card)
 
-        return sidebar, sb_outer, sb_scroll, sb_content, sb_layout
+        return sb_content, sb_layout
 
     def _build_quality_card(self):
         """Карточка «Качество воспроизведения» в боковой панели. Возвращает карточку
@@ -314,7 +288,7 @@ class EditTabLayoutMixin:
 
         return pbq_card
 
-    def _build_proxy_card(self, pbq_card, sb_content, sb_layout, sb_outer, sb_scroll):
+    def _build_proxy_card(self, pbq_card, sb_layout):
         """Карточка «Прокси только для части файла» — ставится под карточкой качества."""
         # ── Прокси только для части файла ─────────────────────────────────────
         # Сколько МИНУТ исходника превращать в прокси (0 = весь файл). Усечённый
@@ -353,48 +327,19 @@ class EditTabLayoutMixin:
 
         sb_layout.addStretch()
 
-        # Прокручиваемая часть готова — вставляем её в сайдбар.
-        sb_scroll.setWidget(sb_content)
-        sb_outer.addWidget(sb_scroll, 1)
-
-        # Колесо мыши над выпадающими списками правой панели прокручивает саму
-        # панель, а не меняет значение поля. Иначе при включённой в Настройках
-        # опции «колесо меняет значения» скролл «застревал» на блоке режима
-        # обрезки — комбобокс съедал событие колеса.
-        for _w in sb_content.findChildren(_api.QComboBox):
-            self._install_wheel_scroll(_w)
-
-    def _build_cut_summary(self, sb_outer):
-        """Итог обрезки и кнопка «Обрезать» — закреплены СНИЗУ, вне прокрутки."""
-        # ── Итог + кнопка обрезки — закреплены СНИЗУ (вне прокрутки) ───────
-        # Высота блока = высоте полосы таймлайна (BAND_H ниже) → «Итог»/«Обрезать»
-        # визуально на одной строке с виджетом аудио-визуализации слева.
-        sb_bottom = _api.QFrame()
-        sb_bottom.setObjectName("SidebarBottom")
-        sb_bottom.setFixedHeight(116)
-        sb_bottom.setStyleSheet(
-            f"#SidebarBottom {{ background: {_api.C['surface']}; border-top: 1px solid {_api.C['border']}; }}")
-        bottom_l = _api.QVBoxLayout(sb_bottom)
-        bottom_l.setContentsMargins(16, 10, 16, 0)
-        bottom_l.setSpacing(0)
-        bottom_l.addStretch()
-
-        self.lbl_selection = _api.QLabel("Зона: —")
-        self.lbl_selection.setAlignment(_api.Qt.AlignmentFlag.AlignCenter)
-        self.lbl_selection.setStyleSheet(f"""
-            color: {_api.C['text']};
-            font-size: 13px;
-            font-weight: 600;
-            padding: 7px 10px;
-            background: {_api.C['surface2']};
-            border: 1px solid {_api.C['border']};
-            border-radius: 6px;
-        """)
-        bottom_l.addWidget(self.lbl_selection)
-
-        self.btn_cut = _api.QPushButton("Обрезать")
-        self.btn_cut.setIcon(_api.get_icon('fa5s.cut', color='#1e1e2e'))
-        self.btn_cut.setIconSize(_api.QSize(20, 20))
+    def _build_export_button(self):
+        """Кнопка «Экспорт» (встаёт в конец строки плеера, длительность итога —
+        прямо на подписи). Прогресс экспорта — в общей полосе внизу окна:
+        отдельная метка внизу боковой панели висела поверх настроек экспорта."""
+        self.btn_cut = _api.QPushButton("Экспорт")
+        self._export_btn_label = "Экспорт"
+        self._export_btn_icon = 'fa5s.file-export'
+        self.btn_cut.setIcon(_api.get_icon('fa5s.file-export', color='#1e1e2e'))
+        self.btn_cut.setIconSize(_api.QSize(18, 18))
+        # Ширина — как у правой колонки панели над кнопкой; длинная подпись
+        # («Создать видео · …») раздвигает её.
+        self.btn_cut.setMinimumWidth(232)
+        self.btn_cut.setFocusPolicy(_api.Qt.FocusPolicy.NoFocus)
         self.btn_cut.clicked.connect(self.start_cut)
         # Зелёная, как кнопка «НАЧАТЬ» во вкладке «Обработка» (#b_run в config.py).
         self.btn_cut.setStyleSheet(f"""
@@ -403,7 +348,7 @@ class EditTabLayoutMixin:
                 color: #1e1e2e;
                 border: none;
                 border-radius: 6px;
-                padding: 9px 24px;
+                padding: 0 14px;
                 font-weight: 700;
                 font-size: 13px;
                 letter-spacing: 0.3px;
@@ -412,15 +357,6 @@ class EditTabLayoutMixin:
             QPushButton:pressed {{ background: #74c7ec; }}
             QPushButton:disabled {{ background: {_api.C['surface3']}; color: {_api.C['text3']}; }}
         """)
-        # «Обрезать» — в строке высотой с панель плеера слева (её подгоняет
-        # eventFilter по размеру панели): кнопка стоит на одной линии с
-        # кнопкой полноэкранного режима.
-        self._cut_row = _api.QWidget()
-        cut_l = _api.QHBoxLayout(self._cut_row)
-        cut_l.setContentsMargins(0, 0, 0, 0)
-        cut_l.addWidget(self.btn_cut, 0, _api.Qt.AlignmentFlag.AlignVCenter)
-        bottom_l.addWidget(self._cut_row)
-        sb_outer.addWidget(sb_bottom, 0)
 
         # progress/log_label больше не показываются в интерфейсе (прогресс идёт в
         # общий прогрессбар окна). Оставлены скрытыми, чтобы существующий код,
@@ -431,11 +367,10 @@ class EditTabLayoutMixin:
         self.log_label = _api.QLabel("")
         self.log_label.setVisible(False)
 
-        # Сайдбар добавляется ПОСЛЕ центральной области (root.addWidget ниже),
-        # чтобы видео и плеер были слева, а панель информации/экспорта — справа.
-
-    def _build_center_area(self):
-        """Центральная область: холст видео и его оверлеи. Возвращает layout center."""
+    def _build_center_area(self, sb_content):
+        """Центральная область: холст видео и справа общая боковая панель —
+        колонка дорожек и колонка файла/экспорта (sb_content) в одной
+        прокрутке. Возвращает layout center."""
         # ── Center area ───────────────────────────────────────────────────
         center = _api.QVBoxLayout()
         center.setContentsMargins(0, 0, 0, 0)
@@ -463,36 +398,45 @@ class EditTabLayoutMixin:
         # обычный дочерний виджет под ним не виден).
         video_row.addWidget(self.video_container, 1)
 
-        # Правая панель
+        # Боковая панель ОДНА: слева колонка дорожек/субтитров/кнопок, справа —
+        # файл, инфо и настройки экспорта. Раньше это были две панели, каждая
+        # со своей прокруткой; теперь общий скроллбар у правого края. В
+        # прокрутке каждый элемент держит свой размер: в невысоком окне Qt
+        # раньше ужимал виджеты НИЖЕ их минимума (список слоёв сплющивался в
+        # полоску, подпись «Прозрачность» налезала на кнопки слоя).
         side = _api.QFrame()
         side.setObjectName("SidePanel")
-        side.setFixedWidth(196)
+        side.setFixedWidth(196 + 1 + 264)
         side.setStyleSheet(f"#SidePanel {{ background: {_api.C['surface']}; border-left: 1px solid {_api.C['border']}; }}")
         side_outer = _api.QVBoxLayout(side)
         side_outer.setContentsMargins(0, 0, 0, 0)
         side_outer.setSpacing(0)
-        # Содержимое панели — в прокрутке, как в правом сайдбаре. Панель растёт
-        # динамически (список слоёв появляется вместе с наложенными картинками),
-        # и в невысоком окне Qt раньше ужимал виджеты НИЖЕ их минимума: список
-        # слоёв сплющивался в синюю полоску, а подпись «Прозрачность» налезала
-        # на кнопки слоя. Со скроллом каждый элемент держит свой размер, а при
-        # высоком окне поведение прежнее — widgetResizable растягивает
-        # содержимое на всю высоту (шкала уровня звука по-прежнему тянется).
         side_scroll = _api.QScrollArea()
         side_scroll.setObjectName("SidePanelScroll")
         side_scroll.setWidgetResizable(True)
         side_scroll.setFrameShape(_api.QFrame.Shape.NoFrame)
         side_scroll.setHorizontalScrollBarPolicy(_api.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         side_scroll.setVerticalScrollBarPolicy(_api.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # Свой стиль скроллбара не задаём — общий стиль приложения; фон тоже
+        # (контент прозрачный → виден surface самой панели).
         side_scroll.setStyleSheet("QScrollArea#SidePanelScroll { border: none; }")
+        panel = _api.QWidget()
+        panel_l = _api.QHBoxLayout(panel)
+        panel_l.setContentsMargins(0, 0, 0, 0)
+        panel_l.setSpacing(0)
         side_content = _api.QWidget()
+        side_content.setFixedWidth(196)
         side_l = _api.QVBoxLayout(side_content)
-        # Правый отступ 4px — дорожка под вертикальный скроллбар, чтобы он не
-        # наезжал на комбобоксы (общий стиль приложения даёт узкий ползунок).
-        side_l.setContentsMargins(10, 10, 4, 10)
+        side_l.setContentsMargins(10, 10, 10, 10)
         side_l.setSpacing(6)
-        side_scroll.setWidget(side_content)
-        side_outer.addWidget(side_scroll)
+        col_sep = _api.QFrame()
+        col_sep.setFixedWidth(1)
+        col_sep.setStyleSheet(f"background: {_api.C['border']};")
+        panel_l.addWidget(side_content, 0)
+        panel_l.addWidget(col_sep, 0)
+        panel_l.addWidget(sb_content, 0)
+        side_scroll.setWidget(panel)
+        side_outer.addWidget(side_scroll, 1)
 
         _combo_css = f"""
             QComboBox {{
@@ -633,7 +577,7 @@ class EditTabLayoutMixin:
         # индикатором и перекрывали подписи каналов L/R (см. скрин); теперь они
         # сбоку, и шкала уровня занимает всю доступную высоту панели.
         # «Кадрировать видео» — значок над «Сохранить кадр»: включаешь, выделяешь
-        # область прямо на видео, и при «Обрезать» итоговое ВИДЕО кадрируется по
+        # область прямо на видео, и при «Экспорт» итоговое ВИДЕО кадрируется по
         # этой рамке (а не только сохраняемый кадр). Повторное нажатие выключает и
         # сбрасывает рамку. Кадрирование требует перекодировки (copy не умеет
         # crop), поэтому при активной рамке быстрый режим переключается на
@@ -644,13 +588,13 @@ class EditTabLayoutMixin:
         self._relax_width(self.btn_crop_frame)
         self.btn_crop_frame.setCheckable(True)
         self.btn_crop_frame.setToolTip("Кадрировать видео: выделите область на видео — "
-                                       "при «Обрезать» сохранится только она "
+                                       "при «Экспорт» сохранится только она "
                                        "(требует перекодировки)")
         self.btn_crop_frame.toggled.connect(self._toggle_frame_crop)
         self.btn_crop_frame.setEnabled(False)
         # «Пикселизация — проявление»: видео стартует крупными блоками и постепенно
         # проясняется (для угадайки). Параметры задаются в диалоге, эффект
-        # применяется при «Обрезать» (требует перекодировки, как и кадрирование).
+        # применяется при «Экспорт» (требует перекодировки, как и кадрирование).
         self._pixelize_active = False
         self._pixelize_steps = 6
         self._pixelize_block = 64
@@ -661,7 +605,7 @@ class EditTabLayoutMixin:
         self.btn_pixelize.setCheckable(True)
         self.btn_pixelize.setToolTip("Пикселизация: видео начнётся крупными «пикселями» "
                                      "и постепенно станет чётким (для угадайки). "
-                                     "Применяется при «Обрезать» (перекодировка)")
+                                     "Применяется при «Экспорт» (перекодировка)")
         self.btn_pixelize.toggled.connect(self._toggle_pixelize)
         self.btn_pixelize.setEnabled(False)
         # ВИДИМОЕ состояние «включено»: make_icon_btn не стилизует :checked, и
@@ -715,12 +659,12 @@ class EditTabLayoutMixin:
             "Привязать к объекту: обведите движущийся объект (руку, лицо, "
             "машину) — нейросеть проследит за ним, и выбранный текст или "
             "картинка поедут вместе с ним. Накладка сразу видна в плеере; "
-            "в файл её вшивает «Обрезать», повторное нажатие — убирает")
+            "в файл её вшивает «Экспорт», повторное нажатие — убирает")
         self.btn_track_object.clicked.connect(self.track_object_overlay)
         self.btn_track_object.setEnabled(False)
         # «Наложить картинку» — неподвижный логотип/водяной знак/рамка поверх
         # видео: картинка появляется прямо в плеере, её двигают/тянут/крутят
-        # мышью, кадрируют отдельным окном, а «Обрезать» вшивает её в файл
+        # мышью, кадрируют отдельным окном, а «Экспорт» вшивает её в файл
         # (overlay=…, требует перекодировки — как кадрирование).
         self.btn_image_overlay = _api.make_icon_btn("")
         self.btn_image_overlay.setIcon(_api.get_icon('fa5s.image'))
@@ -732,7 +676,7 @@ class EditTabLayoutMixin:
             "сверху (Shift — шаг 15°), Ctrl+стрелки — точная сдвижка, "
             "Delete — убрать слой; обрезать саму картинку и задать "
             "прозрачность — в списке слоёв справа. "
-            "Вшивается при «Обрезать» (перекодировка)")
+            "Вшивается при «Экспорт» (перекодировка)")
         self.btn_image_overlay.clicked.connect(self.add_image_overlay)
         self.btn_image_overlay.setEnabled(False)
         self._build_more_actions()
@@ -763,10 +707,13 @@ class EditTabLayoutMixin:
         btn_col.addLayout(col_r)
         btn_col.addStretch(1)   # не растягивать колонки шире квадратных кнопок
 
-        # Правая колонка — шкала уровня звука во всю высоту (без подписи).
+        # Правая колонка — шкала уровня звука высотой с колонку кнопок (без
+        # подписи). Во всю высоту она больше не тянется: общая панель длиннее
+        # окна, и шкала уходила бы под прокрутку.
         vu_col = _api.QVBoxLayout(); vu_col.setContentsMargins(0, 0, 0, 0); vu_col.setSpacing(0)
         self.audio_meter = _api.AudioMeter()
         self.audio_meter.setFixedWidth(54)
+        self.audio_meter.setFixedHeight(4 * 40 + 3 * self._MSIDE_GAP)
         meter_row = _api.QHBoxLayout(); meter_row.setContentsMargins(0, 0, 0, 0)
         meter_row.addStretch(1)
         meter_row.addWidget(self.audio_meter)
@@ -779,7 +726,15 @@ class EditTabLayoutMixin:
         bottom_row.setSpacing(10)
         bottom_row.addLayout(btn_col, 1)
         bottom_row.addLayout(vu_col, 0)
-        side_l.addLayout(bottom_row, 1)
+        side_l.addLayout(bottom_row, 0)
+        side_l.addStretch(1)
+
+        # Колесо мыши над выпадающими списками колонки экспорта прокручивает
+        # панель, а не меняет значение поля. Иначе при включённой в Настройках
+        # опции «колесо меняет значения» скролл «застревал» на блоке режима
+        # обрезки — комбобокс съедал событие колеса.
+        for _w in sb_content.findChildren(_api.QComboBox):
+            self._install_wheel_scroll(_w)
 
         video_row.addWidget(side, 0)
         center.addLayout(video_row, stretch=1)
@@ -974,16 +929,18 @@ class EditTabLayoutMixin:
         self.btn_fullscreen.setEnabled(False)   # активна только при загруженном видео
         row.addWidget(self.btn_fullscreen)
 
+        # «Экспорт» — в конце строки плеера, под правой колонкой панели.
+        row.addSpacing(10)
+        self.btn_cut.setFixedHeight(max(32, self.btn_fullscreen.sizeHint().height()))
+        row.addWidget(self.btn_cut)
+
         pb_layout.addLayout(row)
         center.addWidget(player_bar)
-        # Высота строки «Обрезать» справа следует за этой панелью (eventFilter).
-        self._player_bar = player_bar
-        player_bar.installEventFilter(self)
 
         # Состояние полноэкранного режима (окно создаётся по запросу).
         self._fs_window = None
 
-    def _build_timeline_panel(self, center, root, sidebar):
+    def _build_timeline_panel(self, center, root):
         """Финальная сборка вкладки: таймлайн проекта во всю ширину внизу.
 
         Волна источника (WaveformWidget) больше не показывается — шкала одна,
@@ -1028,7 +985,6 @@ class EditTabLayoutMixin:
         self.pan_slider.sliderMoved.connect(self.on_pan_moved)
 
         root.addLayout(center, stretch=1)
-        root.addWidget(sidebar)
         # Таймлайн проекта (как в Filmora) — во всю ширину под всем остальным.
         self._outer_layout.addWidget(self._build_project_panel(), 0)
 

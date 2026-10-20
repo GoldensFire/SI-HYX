@@ -26,7 +26,7 @@ def build_controls(tab):
     layout.addWidget(tab._lab("Субтитры"), 0, 0)
     layout.addWidget(tab.cb_episode_subtitles, 0, 1)
     crf = api.QSpinBox()
-    crf.setRange(0, 63)
+    crf.setRange(1, 63)
     crf.setValue(tab.sp_video_crf.value())
     crf.valueChanged.connect(tab.sp_video_crf.setValue)
     tab.sp_video_crf.valueChanged.connect(crf.setValue)

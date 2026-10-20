@@ -21,7 +21,7 @@ def build_controls(tab):
     tab.sp_video_cut.setMinimumWidth(64)
     tab.sp_video_cut.setToolTip("Длина ролика в вопросе.")
     tab.sp_video_crf = api.QSpinBox()
-    tab.sp_video_crf.setRange(0, 63)
+    tab.sp_video_crf.setRange(1, 63)
     tab.sp_video_crf.setValue(api.VIDEO_CRF)
     tab.sp_video_crf.setMinimumWidth(44)
     tab.sp_video_crf.setToolTip(

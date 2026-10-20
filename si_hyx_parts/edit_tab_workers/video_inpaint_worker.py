@@ -40,7 +40,7 @@ class VideoInpaintWorker(_api.QThread):
         self._mask = mask                # numpy (H,W) uint8 {0,255}
         self._fps = float(fps) if fps and fps > 0 else 25.0
         self._out = str(out_path)
-        self._venc = list(venc)          # аргументы видеокодировщика (как у «Обрезать»)
+        self._venc = list(venc)          # аргументы видеокодировщика (как у «Экспорт»)
         self._has_audio = bool(has_audio)
         self._cancel = False
         self._proc = None                # текущий subprocess ffmpeg (для отмены)
