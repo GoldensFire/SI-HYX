@@ -88,6 +88,61 @@ class VolumeLabel(_api.QLabel):
 VolumeLabel.__module__ = _api.__name__
 _api.VolumeLabel = VolumeLabel
 
+
+class TimecodeLabel(_api.QLabel):
+    """Метка таймкода, который меняется на каждом кадре (текущее время,
+    «старт→плейхед»).
+
+    QLabel.setText всегда зовёт updateGeometry(), а у метки обычного размера
+    это пересчёт компоновки всех предков до верхнего окна: при игре ~20 раз в
+    секунду по цепочке PlayerBar → вкладка → окно, и на каждый пересчёт
+    QMainWindow ещё и заводит QPropertyAnimation. Метку фиксированного размера
+    Qt пропускает. Размер — по самому широкому таймкоду в её текущем шрифте
+    (пересчитывается, когда стиль или шрифт меняются). В компоновку её надо
+    класть с AlignVCenter: фиксированную высоту без выравнивания QBoxLayout
+    прижимает к верху строки, а растянутый QLabel центровал текст сам."""
+
+    def __init__(self, text="", sample="00:00:00.000", parent=None):
+        super().__init__(text, parent)
+        self._sample = sample
+
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        if e.type() in (_api.QEvent.Type.FontChange, _api.QEvent.Type.StyleChange):
+            self._fit_sample()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._fit_sample()          # к показу стиль уже применён (ensurePolished)
+
+    def _fit_sample(self):
+        # До polish шрифт и рамка из таблицы стилей ещё не применены, а
+        # sizeHint()/fontMetrics() здесь запустили бы polish раньше времени
+        # (и метка теряла жирность). Подгоним в showEvent.
+        if not self.testAttribute(_api.Qt.WidgetAttribute.WA_WState_Polished):
+            return
+        m = self.contentsMargins()
+        key = (self.font().toString(), m.left(), m.top(), m.right(), m.bottom())
+        if key == getattr(self, "_fit_key", None):
+            return                  # показ после смены вкладки: всё как было
+        self._fit_key = key
+        fm = self.fontMetrics()
+        widest = max("0123456789", key=fm.horizontalAdvance)
+        sample = "".join(widest if ch.isdigit() else ch for ch in self._sample)
+        # Размер по образцу считает сам QLabel (рамка, отступы стиля, indent);
+        # прежний фиксированный размер снимаем — sizeHint не меньше минимума.
+        text = self.text()
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(16777215, 16777215)
+        self.setText(sample)
+        size = self.sizeHint()
+        self.setText(text)
+        self.setFixedSize(size)
+
+
+TimecodeLabel.__module__ = _api.__name__
+_api.TimecodeLabel = TimecodeLabel
+
 # ─── Info Card ────────────────────────────────────────────────────────────────
 class InfoCard(_api.QFrame):
     def __init__(self, title, parent=None):
@@ -151,51 +206,63 @@ class AudioMeter(_api.QWidget):
         self._r = 0.0
         self._pk_l = 0.0
         self._pk_r = 0.0
-        self._fresh = False          # пришёл уровень — этот такт без спада
-        self._shown = None           # пиксели, нарисованные последними
+        self._fed_at = None      # когда плеер последний раз подал уровни
         self._timer = _api.QTimer(self)
         self._timer.setInterval(45)
         self._timer.timeout.connect(self._decay)
 
     def set_levels(self, l, r=None):
+        """Уровни от плеера (вызывается на каждом обновлении плейхеда).
+
+        Пока уровни подают, спад пик-маркеров считается здесь, по прошедшему
+        времени, а таймер спада молчит: иначе он перерисовывал шкалу между
+        подачами, и это был отдельный вывод окна на экран ~20 раз в секунду
+        (при занятом GPU каждый такой вывод ждёт GPU). Перерисовка — только
+        если что-то сдвинулось хотя бы на пиксель."""
         if r is None:
             r = l
+        now = _api.time.monotonic()
+        if self._fed_at is not None:
+            fall = 0.02 * (now - self._fed_at) / 0.045      # как у _decay
+            self._pk_l = max(0.0, self._pk_l - fall)
+            self._pk_r = max(0.0, self._pk_r - fall)
+        self._fed_at = now
+        before = self._pixels()
         self._l = max(0.0, min(1.0, float(l)))
         self._r = max(0.0, min(1.0, float(r)))
         if self._l > self._pk_l: self._pk_l = self._l
         if self._r > self._pk_r: self._pk_r = self._r
-        self._fresh = True
         if not self._timer.isActive():
             self._timer.start()
-            self._repaint_if_moved()
-
-    def reset(self):
-        self._l = self._r = self._pk_l = self._pk_r = 0.0
-        self._fresh = False
-        self._timer.stop()
-        self._repaint_if_moved()
-
-    def _decay(self):
-        if self._fresh:
-            self._fresh = False
-        else:
-            for a, d in (('_l', 0.08), ('_r', 0.08), ('_pk_l', 0.02), ('_pk_r', 0.02)):
-                v = getattr(self, a)
-                if v > 0:
-                    setattr(self, a, max(0.0, v - d))
-            if not (self._l or self._r or self._pk_l or self._pk_r):
-                self._timer.stop()          # всё погасло — такт не нужен
-        self._repaint_if_moved()
+        if self._pixels() != before:
+            self.update()
 
     def _bar_h(self):
         return max(1, self.height() - 26)
 
-    def _repaint_if_moved(self):
-        bar_h = self._bar_h()
-        shown = (int(bar_h * self._l), int(bar_h * self._r),
-                 int(bar_h * self._pk_l), int(bar_h * self._pk_r), bar_h)
-        if shown != self._shown:
-            self._shown = shown
+    def _pixels(self):
+        """Высоты полос и пик-маркеров в пикселях (как в paintEvent)."""
+        bar_h = max(1, self.height() - 26)
+        return (int(bar_h * self._l), int(bar_h * self._r),
+                int(bar_h * self._pk_l), self._pk_l > 0,
+                int(bar_h * self._pk_r), self._pk_r > 0)
+
+    def reset(self):
+        self._l = self._r = self._pk_l = self._pk_r = 0.0
+        self._fed_at = None
+        self.update()
+
+    def _decay(self):
+        if self._fed_at is not None and _api.time.monotonic() - self._fed_at < 0.15:
+            return      # уровни идут от плеера — спадом занимается set_levels
+        changed = False
+        for a, d in (('_l', 0.08), ('_r', 0.08), ('_pk_l', 0.02), ('_pk_r', 0.02)):
+            v = getattr(self, a)
+            if v > 0:
+                setattr(self, a, max(0.0, v - d)); changed = True
+        if not (self._l or self._r or self._pk_l or self._pk_r):
+            self._timer.stop()          # всё погасло — такт не нужен
+        if changed:
             self.update()
 
     def paintEvent(self, e):

@@ -237,8 +237,33 @@ class WaveformWidget(_api.QWidget):
         self.update()
 
     def set_playhead(self, t):
-        self.playhead_s = max(0.0, min(t, self.duration))
-        self.update()
+        """Перерисовывает только полоски под старым и новым плейхедом и только
+        когда он сдвинулся хотя бы на пиксель. Плейхед двигают ~30 раз в
+        секунду, а на всём фильме в окне он смещается на пиксель раз в
+        секунды: прежний update() всего виджета перерисовывал и выводил на
+        экран всю полосу волны впустую, а при занятом GPU (игра) GUI-поток
+        ждёт каждый такой вывод (BitBlt) — ~40 % времени перерисовок
+        «Монтажа» под нагрузкой уходило на это."""
+        t = max(0.0, min(t, self.duration))
+        old_x = self._playhead_x(self.playhead_s)
+        new_x = self._playhead_x(t)
+        self.playhead_s = t
+        if old_x == new_x:
+            return
+        h = self.height()
+        for x in (old_x, new_x):
+            if x is not None:
+                # Линия 2 px и треугольник ±5 px (см. paintEvent) + сглаживание.
+                self.update(x - 8, 0, 16, h)
+
+    def _playhead_x(self, t):
+        """Абсцисса плейхеда в paintEvent, или None, если он не нарисован."""
+        if self.loading_text or self.duration <= 0 or not (0.0 <= t <= self.duration):
+            return None
+        visible = max(0.001, self.duration / self.zoom)
+        if not (self.view_offset <= t <= self.view_offset + visible):
+            return None
+        return int((t - self.view_offset) / visible * self.width())
 
     def ensure_view_contains(self, a, b):
         if self.duration <= 0:

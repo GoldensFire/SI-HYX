@@ -821,7 +821,7 @@ class EditTabLayoutMixin:
         self.out_time_edit.returnPressed.connect(self.set_out_point)
         self.out_frame_spin = _api.QSpinBox(); self.out_frame_spin.setMaximum(100000000)
         self.out_frame_spin.valueChanged.connect(self.on_out_frame_changed)
-        self.lbl_seg_dur = _api.QLabel("00:00:00.000")
+        self.lbl_seg_dur = _api.TimecodeLabel("00:00:00.000")
         for _w in (self.slider, self.in_time_edit, self.in_frame_spin,
                    self.out_time_edit, self.out_frame_spin, self.lbl_seg_dur):
             hid_l.addWidget(_w)
@@ -874,7 +874,7 @@ class EditTabLayoutMixin:
         time_fl.setSpacing(3)
         _mono = _api.QFont("Courier New" if _api.os.name == 'nt' else "Courier")
         _mono.setBold(True); _mono.setPointSize(10)
-        self.lbl_current_time = _api.QLabel("00:00:00.000")
+        self.lbl_current_time = _api.TimecodeLabel("00:00:00.000")
         self.lbl_current_time.setFont(_mono)
         self.lbl_current_time.setStyleSheet(f"color: {_api.C['green2']}; background: transparent; border: none;")
         sep_time = _api.QLabel("/")

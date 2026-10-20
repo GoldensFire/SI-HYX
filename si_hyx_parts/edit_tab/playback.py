@@ -838,6 +838,7 @@ class EditTabPlaybackMixin:
         self._paint_playhead(pos_s)
         self._update_meter(pos_s)
         self._update_subtitle(pos_s)
+        self._position_painted_at = _api.time.monotonic()   # см. sync_ui
 
     def _update_meter(self, pos_s, force=False):
         """Кормит индикатор уровня значением аудиоволны на позиции плейхеда.
@@ -967,9 +968,12 @@ class EditTabPlaybackMixin:
             if proj:
                 self._proj_boundary_end()
             return
-        self._paint_playhead(disp_s)   # плейхед проекта едет за ним там же
-        self._update_meter(disp_s)
-        self._update_subtitle(disp_s)
+        # Интерфейс уже рисует positionChanged — см. _SYNC_UI_PAINT_GAP_S.
+        if (_api.time.monotonic() - getattr(self, "_position_painted_at", 0.0)
+                > self._SYNC_UI_PAINT_GAP_S):
+            self._paint_playhead(disp_s)
+            self._update_meter(disp_s)
+            self._update_subtitle(disp_s)
         # Рассинхрон внешней озвучки. Порог опущен с 220 до 130 мс: 220 мс — это
         # уже отчётливо слышимое «эхо» относительно картинки (заметно от ~40 мс),
         # а ниже сотни ставить нельзя — каждая правка это setPosition, то есть

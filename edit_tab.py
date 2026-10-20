@@ -70,7 +70,8 @@ from edit_tab_workers import (
 )
 from edit_tab_widgets import (
     AudioMeter, FullscreenVideo, InfoCard, ProjectTimeline, SeekPreview,
-    SeekSlider, SubtitleOverlay, VideoCanvas, VolumeLabel, VolumeSlider,
+    SeekSlider, SubtitleOverlay, TimecodeLabel, VideoCanvas, VolumeLabel,
+    VolumeSlider,
     WaveformWidget
 )
 from edit_tab_dialogs import (
