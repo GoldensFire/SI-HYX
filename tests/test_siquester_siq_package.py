@@ -11,7 +11,7 @@ import zipfile
 import pytest
 
 from siquester.siq_package import SiqPackage, _safe_replace
-from conftest import CONTENT_XML_V5
+from conftest import CONTENT_XML_V4, CONTENT_XML_V5
 
 pytestmark = pytest.mark.integration
 
@@ -19,6 +19,13 @@ pytestmark = pytest.mark.integration
 @pytest.fixture
 def pkg(make_siq):
     p = SiqPackage(make_siq())
+    yield p
+    p.close()
+
+
+@pytest.fixture
+def pkg_v4(make_siq):
+    p = SiqPackage(make_siq(content_xml=CONTENT_XML_V4, name="pack_v4.siq"))
     yield p
     p.close()
 
@@ -94,6 +101,198 @@ class TestParse:
         bad.write_bytes("не zip".encode("utf-8"))
         with pytest.raises(Exception):
             SiqPackage(str(bad))
+
+
+# ── разбор паков версии 4 (<scenario><atom>) ─────────────────────────────────
+class TestParseV4:
+    """Старый формат: содержимое вопроса лежит в <scenario><atom>.
+
+    Соответствие v4→v5 (типы, placement, смысл time) взято из SIQuester,
+    SIPackages/Question.cs::Upgrade — не выдумано; в Загрузках пользователя в
+    этом формате примерно 3/4 паков.
+    """
+
+    def test_meta(self, pkg_v4):
+        assert pkg_v4.pkg_meta["version"] == "4"
+        assert pkg_v4.name == "Пак четвёртой версии"
+        assert pkg_v4.pkg_authors == ["Старый автор"]
+
+    def test_every_question_has_content(self, pkg_v4):
+        """Регресс: до поддержки v4 items был пуст у ВСЕХ вопросов таких паков —
+        в редакторе вопрос выглядел пустым, играть/удалять было нечего."""
+        qs = pkg_v4.rounds[0]["themes"][0]["questions"]
+        assert [q["price"] for q in qs] == [100, 200, 300, 400]
+        assert all(q["items"] for q in qs)
+
+    def test_at_ref_and_plain_text(self, pkg_v4):
+        q100 = pkg_v4.rounds[0]["themes"][0]["questions"][0]
+        assert [(i["param"], i["type"], i["text"], i["is_ref"]) for i in q100["items"]] == [
+            ("question", "image", "pic.png", True),      # «@» отброшен
+            ("question", "text", "Текст вопроса v4", False),
+        ]
+        assert q100["answers"] == ["Ответ v4 100"]
+
+    def test_marker_splits_question_and_answer(self, pkg_v4):
+        q200 = pkg_v4.rounds[0]["themes"][0]["questions"][1]
+        assert [(i["param"], i["type"]) for i in q200["items"]] == [
+            ("question", "audio"), ("answer", "image")]
+
+    def test_voice_is_background_audio(self, pkg_v4):
+        """type="voice" в v4 — это фоновое аудио (GetPlacement → Background)."""
+        q200 = pkg_v4.rounds[0]["themes"][0]["questions"][1]
+        voice = q200["items"][0]
+        assert voice["type"] == "audio"          # не "voice": приводим к v5
+        assert voice["placement"] == "background"
+        assert voice["simultaneous"] is True
+
+    def test_say_is_replic_text(self, pkg_v4):
+        """type="say" — устный текст ведущего (Oral → text + placement=replic)."""
+        q300 = pkg_v4.rounds[0]["themes"][0]["questions"][2]
+        say = q300["items"][1]
+        assert (say["type"], say["text"], say["placement"]) == (
+            "text", "Прочитать вслух", "replic")
+        assert say["dur"] == 0.0      # устный текст в длительность не идёт
+
+    def test_time_attr_is_seconds_not_hms(self, pkg_v4):
+        """time="7" — 7 секунд. В v5-поле xml_duration кладём «чч:мм:сс»,
+        потому что редактор читает его через util._parse_hms."""
+        q300 = pkg_v4.rounds[0]["themes"][0]["questions"][2]
+        img = q300["items"][0]
+        assert img["xml_duration"] == "00:00:07"
+        assert img["dur"] == 7.0
+
+    def test_time_minus_one_means_simultaneous(self, pkg_v4):
+        """time="-1" — не таймер, а «одновременно со следующим»
+        (в v5 это waitForFinish="False")."""
+        q300 = pkg_v4.rounds[0]["themes"][0]["questions"][2]
+        joined = q300["items"][2]
+        assert joined["xml_duration"] == ""
+        assert joined["wait_for_finish"] == "False"
+        assert joined["simultaneous"] is True
+
+    def test_second_marker_ignored(self, pkg_v4):
+        """Повторный маркер не начинает третью секцию — остаток идёт в ответ."""
+        q400 = pkg_v4.rounds[0]["themes"][0]["questions"][3]
+        assert [i["param"] for i in q400["items"]] == ["question", "answer", "answer"]
+        assert [i["text"] for i in q400["items"] if i["param"] == "answer"] == [
+            "Первый ответный блок", "Второй маркер игнорируется"]
+
+    def test_cat_type_params_not_mistaken_for_content(self, pkg_v4):
+        """У «кота в мешке» параметры лежат в <type><param> — это НЕ содержимое
+        вопроса, в items они попадать не должны."""
+        q400 = pkg_v4.rounds[0]["themes"][0]["questions"][3]
+        assert all(i["param"] in ("question", "answer") for i in q400["items"])
+        assert "Кот в мешке" not in [i["text"] for i in q400["items"]]
+
+    def test_duration_counted(self, pkg_v4):
+        """Длительность считается по содержимому, а не по одному лишь ответу."""
+        qs = pkg_v4.rounds[0]["themes"][0]["questions"]
+        # 100: картинка 5 сек + текст 16 симв / 20 + текстовый ответ 3 сек
+        assert qs[0]["dur"] == pytest.approx(5.0 + 16 / 20 + 3.0)
+        # 300: картинка с таймером 7 сек — устный текст не считается, а
+        # «одновременный» текст съедается видео из своей группы
+        assert qs[2]["dur"] == pytest.approx(7.0 + 3.0)
+        # 400: картинка 5 сек + два текста в ответе (сложный ответ → без +3)
+        assert qs[3]["dur"] == pytest.approx(5.0 + 20 / 20 + 26 / 20)
+        assert pkg_v4.total_duration == pytest.approx(sum(q["dur"] for q in qs))
+
+    def test_media_ref_resolves_to_zip_entry(self, pkg_v4):
+        """«@pic.png» должен находить запись Images/pic.png в архиве."""
+        out = pkg_v4.extract_media("pic.png")
+        assert out is not None and os.path.exists(out)
+
+    def test_add_media_keeps_v4_content(self, make_siq, tmp_path):
+        """Регресс: добавление медиа в v4-вопрос создавало <params>, а params
+        при разборе выигрывает у scenario — весь старый контент вопроса
+        пропадал из виду. Теперь дописывается <atom> в сам сценарий."""
+        src = tmp_path / "added.png"
+        src.write_bytes(b"\x89PNG\r\n\x1a\nadded")
+        path = make_siq(content_xml=CONTENT_XML_V4, name="add_v4.siq")
+        p = SiqPackage(path)
+        try:
+            assert p.add_media_to_question(0, 0, 0, str(src), "question") is True
+        finally:
+            p.close()
+        p2 = SiqPackage(path)
+        try:
+            texts = [i["text"] for i in p2.rounds[0]["themes"][0]["questions"][0]["items"]]
+            assert texts == ["pic.png", "Текст вопроса v4", "added.png"]
+        finally:
+            p2.close()
+        with zipfile.ZipFile(path) as zf:
+            xml = zf.read("content.xml").decode("utf-8")
+        assert "<params" not in xml            # пак остаётся паком версии 4
+        assert "@added.png" in xml             # v4-ссылка, а не isRef="True"
+
+    def test_add_media_to_answer_lands_after_marker(self, make_siq, tmp_path):
+        src = tmp_path / "added.png"
+        src.write_bytes(b"\x89PNG\r\n\x1a\nadded")
+        path = make_siq(content_xml=CONTENT_XML_V4, name="add_v4_ans.siq")
+        p = SiqPackage(path)
+        try:
+            # вопрос 200: <voice> | marker | <image>
+            assert p.add_media_to_question(0, 0, 1, str(src), "answer") is True
+        finally:
+            p.close()
+        p2 = SiqPackage(path)
+        try:
+            items = p2.rounds[0]["themes"][0]["questions"][1]["items"]
+            assert [(i["param"], i["text"]) for i in items] == [
+                ("question", "sound.mp3"), ("answer", "pic.png"), ("answer", "added.png")]
+        finally:
+            p2.close()
+
+    def test_add_media_to_question_goes_before_marker(self, make_siq, tmp_path):
+        src = tmp_path / "added.png"
+        src.write_bytes(b"\x89PNG\r\n\x1a\nadded")
+        path = make_siq(content_xml=CONTENT_XML_V4, name="add_v4_q.siq")
+        p = SiqPackage(path)
+        try:
+            assert p.add_media_to_question(0, 0, 1, str(src), "question") is True
+        finally:
+            p.close()
+        p2 = SiqPackage(path)
+        try:
+            items = p2.rounds[0]["themes"][0]["questions"][1]["items"]
+            assert [(i["param"], i["text"]) for i in items] == [
+                ("question", "sound.mp3"), ("question", "added.png"), ("answer", "pic.png")]
+        finally:
+            p2.close()
+
+    def test_add_audio_to_v4_uses_voice_type(self, make_siq, tmp_path):
+        """В v4 аудио помечается type="voice" — так во всех настоящих паках."""
+        src = tmp_path / "added.mp3"
+        src.write_bytes(b"\xff\xfb\x90\x00" + b"\x00" * 50)
+        path = make_siq(content_xml=CONTENT_XML_V4, name="add_v4_audio.siq")
+        p = SiqPackage(path)
+        try:
+            assert p.add_media_to_question(0, 0, 0, str(src), "question") is True
+        finally:
+            p.close()
+        with zipfile.ZipFile(path) as zf:
+            xml = zf.read("content.xml").decode("utf-8")
+        assert '<atom type="voice">@added.mp3</atom>' in xml
+        p2 = SiqPackage(path)
+        try:
+            added = p2.rounds[0]["themes"][0]["questions"][0]["items"][-1]
+            assert (added["type"], added["placement"]) == ("audio", "background")
+        finally:
+            p2.close()
+
+    def test_params_win_over_scenario(self, make_siq):
+        """Переходный пак с обоими блоками: содержимое берём из params."""
+        xml = CONTENT_XML_V4.replace(
+            "<scenario>\n                <atom type=\"image\">@pic.png</atom>\n"
+            "                <atom>Текст вопроса v4</atom>\n              </scenario>",
+            "<params><param name=\"question\" type=\"content\">"
+            "<item>Из params</item></param></params>"
+            "<scenario><atom>Из scenario</atom></scenario>")
+        p = SiqPackage(make_siq(content_xml=xml, name="mixed.siq"))
+        try:
+            q100 = p.rounds[0]["themes"][0]["questions"][0]
+            assert [i["text"] for i in q100["items"]] == ["Из params"]
+        finally:
+            p.close()
 
 
 # ── защита от вредоносных пакетов ────────────────────────────────────────────
