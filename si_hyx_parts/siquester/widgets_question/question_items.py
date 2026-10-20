@@ -602,8 +602,12 @@ class QuestionViewerItemsMixin:
                                         xi.compress_type = _api.zipfile.ZIP_DEFLATED
                                         zout.writestr(xi, new_xml_bytes)
                                     else:
-                                        with zin.open(info) as src, zout.open(info, 'w') as dst:
-                                            _api._shutil.copyfileobj(src, dst, length=1 << 20)
+                                        # Запись переносим как есть: медиа уже сжато,
+                                        # распаковка ради обратной упаковки — чистое ожидание.
+                                        from zip_fastcopy import copy_zip_entry
+                                        if not copy_zip_entry(zin, zout, info):
+                                            with zin.open(info) as src, zout.open(info, 'w') as dst:
+                                                _api._shutil.copyfileobj(src, dst, length=1 << 20)
                         _api._safe_replace(tmp, siq.path)
                         siq._zip = _api.zipfile.ZipFile(siq.path, 'r')
                         siq._xml_cache = None   # invalidate XML cache after repack
