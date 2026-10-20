@@ -63,7 +63,9 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
   кодировщик, обрезка, Smart Cut; [entrance_actions](si_hyx_parts/edit_tab/entrance_actions.py) — меню «⋯»;
   [project](si_hyx_parts/edit_tab/project.py) — проект из кусков (как в Filmora):
   единственный таймлайн вкладки, правка у плейхеда, связь плейхеда с плеером,
-  просмотр цепочкой кусков, сборка.
+  просмотр цепочкой кусков, сборка;
+  [project_audio](si_hyx_parts/edit_tab/project_audio.py) — звук дорожек и
+  громкость клипов в просмотре проекта («голоса»).
 - **AnimePackGenerator** — [anime_pack_generator.py](si_hyx_parts/animepack/anime_pack_generator.py):
   создание, журнал, `run`/`assemble`, обновление базы;
   [generator_catalog](si_hyx_parts/animepack/generator_catalog.py) — исключения,
@@ -725,6 +727,11 @@ ffmpeg — [montage_project.py](montage_project.py) (основная дорож
 (`_scan_external_audio` в [tracks.py](si_hyx_parts/edit_tab/tracks.py): имя без
 тегов в скобках — `media_name_key`/`names_relate`; одиночный файл папки
 озвучки), остальное — за пунктом «Показать другие файлы в папке…».
+В просмотре проекта основной плеер даёт картинку и звук видимого куска, всё
+остальное (звуковые дорожки, звук под наложением, звук не из своего файла)
+играют «голоса» — по QMediaPlayer на клип —
+[project_audio.py](si_hyx_parts/edit_tab/project_audio.py): часы проекта по
+позиции основного плеера, рассинхрон голоса правится перемоткой выше 130 мс.
 
 Программный стиль субтитров = караоке генерации паков: цвета, обводка и тень —
 [karaoke/style.py](karaoke/style.py), превью и вшивание —

@@ -16,6 +16,8 @@
 Сохранение одной кнопкой: проект из одного куска одного файла уходит прежней
 «Обрезкой» (Smart Cut, кадрирование, субтитры — IN/OUT источника держатся по
 клипу), иначе проект собирается одной командой ffmpeg (montage_project).
+Звуковые дорожки, звук под наложением и громкость клипов в просмотре слышны
+через «голоса» (project_audio).
 
 Модель — montage_project.Project; виджет — edit_tab_widgets.ProjectTimeline.
 Проект сохраняется сам (MONTAGE_PROJECT_PATH) и переживает перезапуск."""
@@ -64,6 +66,7 @@ class EditTabProjectMixin:
         self._proj_thumb_worker = None
         self._proj_thumb_timer = None
         self._proj_waves = {}          # волна файла: путь → (сэмплы, длительность)
+        self._pmix_init()              # звук дорожек в просмотре (project_audio)
 
     # ── Панель ───────────────────────────────────────────────────────────────
     def _build_project_panel(self):
@@ -567,6 +570,7 @@ class EditTabProjectMixin:
         return self._proj_waves.get(self._proj_norm(clip.src))
 
     def _project_shutdown(self):
+        self._pmix_stop()
         worker = getattr(self, "_proj_thumb_worker", None)
         if worker is not None:
             try:
@@ -602,7 +606,14 @@ class EditTabProjectMixin:
     def _project_plan(self):
         """Цепочка для просмотра: куски подряд, соседние куски одного файла,
         идущие в нём встык (например, после разрезания), склеены в один —
-        их плеер играет без перемотки."""
+        их плеер играет без перемотки.
+
+        Проект без видео — одна «пустота» на всю длину: все звуковые клипы
+        играют голоса (project_audio) по стене, основной плеер не грузит файлы
+        на каждой смене клипа и звук не рвётся."""
+        if not self.project.has_video():
+            dur = self.project.duration()
+            return [{'t0': 0.0, 't1': dur, 'clip': None}] if dur > 0 else []
         plan = []
         for t0, t1, c in self.project.preview_segments():
             if c is None:
@@ -616,6 +627,10 @@ class EditTabProjectMixin:
                 last['t1'], last['s1'] = t1, s1
                 continue
             plan.append({'t0': t0, 't1': t1, 'clip': c, 's0': s0, 's1': s1})
+        dur = self.project.duration()
+        if plan and dur > plan[-1]['t1'] + 1e-6:
+            # Звук длиннее картинки: в файле хвост — чёрный кадр со звуком.
+            plan.append({'t0': plan[-1]['t1'], 't1': dur, 'clip': None})
         return plan
 
     def _project_seek(self, t):
@@ -772,7 +787,7 @@ class EditTabProjectMixin:
         self._proj_pending = None
         kind = pend[0]
         if kind == 'play' and self._proj_play is not None:
-            self._proj_play_segment(pend[1], pend[2])
+            self._proj_play_segment(pend[1], pend[2], cont=pend[3])
         elif kind == 'show' and self._proj_is_loaded(pend[1]):
             if not getattr(self, "is_still_image", False):
                 self.seek_to(pend[2])
@@ -846,10 +861,13 @@ class EditTabProjectMixin:
     def project_play(self):
         """Просмотр проекта с плейхеда проекта (с начала, если он в конце)."""
         plan = self._project_plan()
-        if not any(s['clip'] is not None for s in plan):
+        if not plan or (not any(s['clip'] is not None for s in plan)
+                        and not self.project.audio_parts()):
             return
         missing = sorted({s['clip'].src for s in plan
-                          if s['clip'] is not None and not _api.os.path.exists(s['clip'].src)})
+                          if s['clip'] is not None and not _api.os.path.exists(s['clip'].src)}
+                         | {c.audio_path for c in self.project.audio_parts()
+                            if not _api.os.path.exists(c.audio_path)})
         if missing:
             _api.msgbox_warning(self, "Проект", "Не найдены файлы:\n" + "\n".join(missing))
             return
@@ -859,6 +877,7 @@ class EditTabProjectMixin:
         idx = next((i for i, s in enumerate(plan) if s['t0'] <= t < s['t1']), 0)
         self._proj_active = True
         self._proj_play = plan
+        self._pmix_start()
         self._project_update_ui()
         self._proj_play_segment(idx, max(0.0, t - plan[idx]['t0']))
 
@@ -867,6 +886,7 @@ class EditTabProjectMixin:
         self._proj_limit_s = None
         self._proj_transition = False
         self._proj_pending = None
+        self._pmix_stop()
         try:
             if self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState:
                 self.player.pause()
@@ -875,13 +895,16 @@ class EditTabProjectMixin:
         self._set_play_bound(False)
         self._project_update_ui()
 
-    def _proj_play_segment(self, idx, offset):
-        """Играет кусок idx плана с offset секунд от его начала."""
+    def _proj_play_segment(self, idx, offset, cont=False):
+        """Играет кусок idx плана с offset секунд от его начала. cont — это
+        продолжение просмотра со стыка, а не прыжок (клик, старт, загрузка)."""
         plan = self._proj_play
         if plan is None:
             return
-        while idx < len(plan) and plan[idx]['clip'] is None:
-            idx += 1            # пустоту в просмотре пропускаем (в файле — чёрный кадр)
+        self._pmix_hold = None
+        while (idx < len(plan) and plan[idx]['clip'] is None
+               and not self._pmix_covers(plan[idx]['t0'] + offset, plan[idx]['t1'])):
+            idx += 1            # пустоту без звука пропускаем (в файле — чёрный кадр)
             offset = 0.0
         if idx >= len(plan):
             end = plan[-1]['t1'] if plan else 0.0
@@ -891,25 +914,55 @@ class EditTabProjectMixin:
         seg = plan[idx]
         clip = seg['clip']
         self._proj_idx = idx
-        self._proj_limit_s = seg['s1']
-        src_t = seg['s0'] + max(0.0, offset)
-        if not self._proj_ready_for(clip.src):
+        self._proj_limit_s = seg.get('s1')
+        if clip is not None and not self._proj_ready_for(clip.src):
             self._proj_transition = True
-            self._proj_pending = ('play', idx, offset)
+            # Пока грузится другой видеофайл, часы проекта стоят — и голоса
+            # тоже, там, где их застал стык; картинка потом начнёт с того же
+            # места. Картинку плеер не играет — её загрузка часов не держит:
+            # голоса идут дальше, кадр просто стоит на долю секунды меньше.
+            if cont and not clip.is_image:
+                offset = self._pmix_catch_up(seg, offset, lag=0.0)
+            self._proj_pending = ('play', idx, offset, cont)
+            if not (clip.is_image and cont):
+                self._pmix_anchor(seg['t0'] + offset, running=False)
             if not self._proj_is_loaded(clip.src):
+                # Другой файл грузим при громкости по ползунку, а не заглушённым
+                # клипом: громкость 0 на смене источника порой оставляла немым
+                # весь следующий кусок. Громкость клипа встанет перед play().
+                self._pmix_set_main_gain(None)
                 self._proj_load(clip.src)
             return
-        if clip.is_image:
-            # Картинку плеер не играет: держим её на экране время куска.
+        if clip is None or clip.is_image:
+            # Картинку плеер не играет, пустота под звуком — тоже без плеера:
+            # держим время куска, плейхед и голоса идут по стене.
             self._proj_transition = True
-            self.project_timeline.set_playhead(seg['t0'] + max(0.0, offset))
-            left = max(0.05, (seg['t1'] - seg['t0']) - max(0.0, offset))
+            if clip is None:
+                try:
+                    if (self.player.playbackState()
+                            == _api.QMediaPlayer.PlaybackState.PlayingState):
+                        self.player.pause()
+                except Exception:
+                    pass
+            start_t = seg['t0'] + max(0.0, offset)
+            if cont and self._pmix_running():
+                start_t = min(max(start_t, self._pmix_now()), seg['t1'])
+            else:
+                # После загрузки картинки (cont) голоса продолжают с места
+                # паузы, после клика по таймлайну — перематываются.
+                self._pmix_anchor(start_t, jump=not cont)
+            self._pmix_hold = (seg['t0'], seg['t1'])
+            self.project_timeline.set_playhead(start_t)
+            left = max(0.05, seg['t1'] - start_t)
             gen = getattr(self, "_proj_image_gen", 0) + 1
             self._proj_image_gen = gen
             _api.QTimer.singleShot(int(left * 1000), lambda g=gen, i=idx: (
                 self._proj_play is not None and getattr(self, "_proj_image_gen", 0) == g
-                and self._proj_play_segment(i + 1, 0.0)))
+                and self._proj_play_segment(i + 1, 0.0, cont=True)))
             return
+        if cont:
+            offset = self._pmix_catch_up(seg, offset)
+        src_t = seg['s0'] + max(0.0, offset)
         try:
             playing = (self.player.playbackState()
                        == _api.QMediaPlayer.PlaybackState.PlayingState
@@ -917,7 +970,11 @@ class EditTabProjectMixin:
         except Exception:
             playing = False
         self._proj_cur_id = self._proj_clip_at_source(seg, src_t).id
-        self.project_timeline.set_playhead(seg['t0'] + max(0.0, offset))
+        t = seg['t0'] + max(0.0, offset)
+        self.project_timeline.set_playhead(t)
+        # Громкость клипа — до старта: первый звук куска уже нужной громкости.
+        self._pmix_main_gain_at(t)
+        self._pmix_anchor(t, main=True, jump=not cont, src_ms=int(src_t * 1000))
         if playing:
             self.seek_to(src_t)
             self._set_play_bound(True)
@@ -945,7 +1002,7 @@ class EditTabProjectMixin:
 
     def _proj_boundary_end(self):
         nxt = self._proj_idx + 1
-        _api.QTimer.singleShot(0, lambda: self._proj_play_segment(nxt, 0.0))
+        _api.QTimer.singleShot(0, lambda: self._proj_play_segment(nxt, 0.0, cont=True))
 
     def _proj_on_state(self, playing):
         """Смена состояния плеера (on_playback_changed)."""
@@ -956,6 +1013,7 @@ class EditTabProjectMixin:
             # плеер остаётся на проекте, Пробел продолжит с плейхеда проекта.
             self._proj_play = None
             self._proj_limit_s = None
+            self._pmix_stop()
             self._project_update_ui()
 
     def _proj_tick(self, src_s):

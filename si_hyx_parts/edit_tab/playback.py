@@ -1367,6 +1367,9 @@ class EditTabPlaybackMixin:
                 self._scrub_sink_obj.setVolume(max(0.0, min(1.0, v / 100.0)))
             except Exception:
                 pass
+        # Просмотр проекта: громкость клипов поверх ползунка (project_audio).
+        if getattr(self, "_pmix_voices", None) is not None:
+            self._pmix_apply_volume()
         try:
             self.vol_lbl.update_glyph(v)
         except Exception:
