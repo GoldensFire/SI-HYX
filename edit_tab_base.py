@@ -36,6 +36,19 @@ import subprocess
 # d3d11 никогда не был. setdefault сохраняет приоритет за переменной окружения:
 # QSG_RHI_BACKEND=opengl снаружи по-прежнему всё переключает обратно.
 os.environ.setdefault("QSG_RHI_BACKEND", "d3d11" if os.name == "nt" else "opengl")
+# Ожидание GPU — в Present(), а не в beginFrame(). По умолчанию Qt 6.10 на D3D
+# держит очередь в 2 кадра через FRAME_LATENCY_WAITABLE_OBJECT и ждёт его в
+# beginFrame() — а поток рендера Qt Quick зовёт beginFrame() ДО синхронизации
+# сцены, пока GUI-поток стоит в polishAndSync. Когда GPU занят игрой, этот
+# объект освобождается через 30–400 мс — и столько же стоял GUI-поток на каждом
+# кадре холста «Монтажа». Без объекта ждёт Present(), уже после того как
+# GUI-поток отпущен; глубину очереди и так ограничивают два буфера цепочки
+# обмена. Замер (холст, синтетика ~100% GPU, 8–10 кадров/с): GUI-поток в
+# ожидании синхронизации 50–85% времени → 0–7%. При 15–24 кадрах/с число
+# кадров то же; при крайней перегрузке (2–6 кадров/с) их выходит ровнее, но в
+# среднем меньше (~2.5 против 2–6) — зато интерфейс не стоит.
+if os.name == "nt":
+    os.environ.setdefault("QT_D3D_MAX_FRAME_LATENCY", "0")
 # QT_FFMPEG_DECODING_HW_DEVICE_TYPES (HW-декодер H.264/HEVC) задаёт config.py,
 # импортируемый выше, — он читает настройку video_hw_decode.
 os.environ.setdefault("QT_MEDIA_BACKEND", "ffmpeg")

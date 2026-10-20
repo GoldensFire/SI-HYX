@@ -41,11 +41,17 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         # _want_cpu_copy). Отдельно от часов кадра (_last_frame_at): те ведёт и
         # точный кадр от предекодера, а нам нужен признак «идёт поток».
         self._last_player_frame_at = 0.0
-        # Кадр плеера отдаётся сцене, только когда она показала предыдущий
-        # (см. _present_frame): с какого момента сцена занята и какой кадр
-        # ждёт своей очереди (frame, pts).
+        # Кадр плеера отдаётся сцене, только когда поток рендера свободен
+        # (см. _present_frame): сколько синхронизаций сцены начато, а их кадр
+        # ещё не показан; ждёт ли отданный кадр своей синхронизации; с какого
+        # момента сцена занята; ждёт ли очереди кадр плеера (сам кадр не
+        # храним — см. _commit_pending); pts последнего отданного кадра.
+        self._scene_syncs = 0
+        self._commit_unsynced = False
         self._scene_busy_since = 0.0
-        self._pending_frame = None
+        self._frame_waiting = False
+        self._pending_timer = None
+        self._committed_pts = -1
         self._setup_quick()
         if self._quick is not None:
             # Сцена — нативное окно и перекрывает обычные дочерние виджеты
@@ -74,10 +80,13 @@ class VideoCanvas(_api._PaintedVideoCanvas):
             ovl = win.findChild(_api.QObject, "overlay")
             if sink is None or vo is None or ovl is None:
                 raise RuntimeError("в QML-сцене холста нет нужных элементов")
-            # Сигнал испускает поток рендера; очередь доставляет его в
+            # afterFrameEnd испускает поток рендера; очередь доставляет его в
             # GUI-поток, и Python в потоке рендера не выполняется вовсе.
-            win.frameSwapped.connect(self._on_scene_swapped,
-                                     _api.Qt.ConnectionType.QueuedConnection)
+            # afterAnimating испускает сам GUI-поток (внутри polishAndSync, до
+            # того как отдать сцену на синхронизацию) — слот идёт сразу.
+            win.afterFrameEnd.connect(self._on_scene_frame_end,
+                                      _api.Qt.ConnectionType.QueuedConnection)
+            win.afterAnimating.connect(self._on_scene_sync)
             cont = _api.QWidget.createWindowContainer(win, self)
             # Движок обязан пережить окно сцены: контейнер удаляет окно в
             # своём деструкторе и лишь потом — своих детей, движок в их числе.
@@ -302,7 +311,8 @@ class VideoCanvas(_api._PaintedVideoCanvas):
             return
         # Картинка вкладки главнее отложенного кадра плеера: тот показал бы
         # поверх неё прошлое.
-        self._pending_frame = None
+        self._frame_waiting = False
+        self._committed_pts = -1
         try:
             frame = _api.QVideoFrame(img)
             if not frame.isValid():
@@ -316,7 +326,8 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         """Убирает кадр со сцены (новый файл, аудио без видеоряда)."""
         self._px_size = _api.QSize()
         self._vo_geom = None
-        self._pending_frame = None
+        self._frame_waiting = False
+        self._committed_pts = -1
         sink = self._out_sink
         if sink is not None:
             try:
@@ -391,8 +402,8 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         self._present_frame(frame, pts, now)
 
     def _present_frame(self, frame, pts, now):
-        """Отдаёт кадр сцене — или, если она ещё показывает предыдущий,
-        откладывает до сигнала frameSwapped (_on_scene_swapped).
+        """Отдаёт кадр сцене — или, если поток рендера ещё занят, откладывает
+        до конца его кадра (_on_scene_frame_end).
 
         Зачем. Новый кадр запускает синхронизацию сцены, а её GUI-поток ждёт,
         пока поток рендера не освободится. Когда GPU занят чужой работой
@@ -400,25 +411,72 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         30–80 мс при кадре раз в 41 мс — и GUI-поток простаивал бы в ожидании
         почти постоянно. Отложенный кадр заменяется более свежим: на экран
         уходит последний, промежуточные пропадают — как и положено видео,
-        которое не успевает за GPU. Если сцена молчит дольше 250 мс (окно
-        скрыто, сигнал потерялся), ждать перестаём."""
-        busy = self._scene_busy_since
-        if busy and (now - busy) < 0.25:
-            # Именно копия: объект из слота — обёртка над копией кадра внутри
-            # события очереди и умирает вместе с ним сразу после возврата из
-            # слота (обращение к нему потом роняет программу). Копия делит с
-            # кадром буфер и держит его живым.
-            self._pending_frame = (_api.QVideoFrame(frame), pts)
+        которое не успевает за GPU.
+
+        Занятость считается по синхронизациям, а не по нашим кадрам (см.
+        _on_scene_sync): сцену синхронизируют и оверлеи, и геометрия, и
+        показ окна. Флаг «отдали кадр — ждём frameSwapped» на этом сбивался:
+        одна лишняя синхронизация, и frameSwapped кадра N приходил, когда
+        сцена уже взяла следующую, — флаг снимался, и каждый новый кадр
+        отдавался посреди рендера предыдущего. Пока GPU занят и кадр рисуется
+        дольше интервала между кадрами, такая фаза держалась сколько угодно:
+        GUI-поток простаивал по 30–50 мс на кадр (30–50% времени, а прогоны
+        под нагрузкой выходили то лёгкими, то тяжёлыми — смотря во что
+        попадали на старте)."""
+        if self._scene_busy(now):
+            self._frame_waiting = True
+            self._arm_pending_timer()
             return
-        self._pending_frame = None
+        self._frame_waiting = False
         self._commit_frame(frame, pts, now)
+
+    def _scene_busy(self, now):
+        """Занят ли поток рендера сцены (или вот-вот займётся отданным кадром).
+
+        Если сцена молчит дольше секунды, считаем, что сигнал потерян (окно
+        скрыто и синхронизации не будет, у окна нулевой размер, не создалась
+        цепочка обмена) — и начинаем счёт заново, иначе видео встало бы.
+        Порог щедрый: ложный сброс посреди настоящего долгого кадра вернул бы
+        ровно ту сдвинутую фазу, от которой этот счёт и спасает."""
+        if not (self._scene_syncs or self._commit_unsynced):
+            return False
+        if now - self._scene_busy_since < 1.0:
+            return True
+        self._scene_syncs = 0
+        self._commit_unsynced = False
+        return False
+
+    def _on_scene_sync(self):
+        """Сцена начинает синхронизацию: GUI-поток внутри polishAndSync, и
+        сейчас он отдаст сцену потоку рендера. Каждая такая синхронизация
+        кончается ровно одним afterFrameEnd — по нему и считаем. Не
+        frameSwapped: его нет, если кадр не дорисован (сбой beginFrame, нет
+        рендерера), а afterFrameEnd Qt шлёт и тогда."""
+        self._scene_syncs += 1
+        self._commit_unsynced = False
+        self._scene_busy_since = _api.time.monotonic()
+
+    def _arm_pending_timer(self):
+        """Страховка отложенного кадра: если конца кадра сцены не дождёмся, а
+        новых кадров нет (пауза, покадровый шаг), кадр всё равно выйдет на
+        экран."""
+        t = self._pending_timer
+        if t is None:
+            t = self._pending_timer = _api.QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._commit_pending)
+        if not t.isActive():
+            t.start(250)
 
     def _commit_frame(self, frame, pts, now):
         size = self._frame_px_size(frame)
         if size.width() > 0 and size != self._px_size:
             self._px_size = size
             self._vo_geom = None        # прямоугольник кадра пересчитать
+        # Кадр ждёт своей синхронизации (её начало — _on_scene_sync).
+        self._commit_unsynced = True
         self._scene_busy_since = now
+        self._committed_pts = pts
         self._publish_frame(frame)
         # Часы кадра — время картинки, которая СЕЙЧАС на экране.
         if pts >= 0:
@@ -438,24 +496,53 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         if self._trk is not None:
             self._schedule_overlay()
 
-    def _on_scene_swapped(self):
-        """Сцена показала кадр — можно отдавать следующий, и, если он уже
-        ждёт, отдаём сразу. Пин, граница OUT и режим «нет видео» за время
-        ожидания могли смениться — проверяем их заново."""
-        self._scene_busy_since = 0.0
-        pending = self._pending_frame
-        if pending is None:
+    def _on_scene_frame_end(self):
+        """Поток рендера закончил кадр. Если больше синхронизаций в пути нет,
+        можно отдавать следующий кадр, и, если он уже ждёт, отдаём сразу."""
+        if self._scene_syncs > 0:
+            self._scene_syncs -= 1
+        self._commit_pending()
+
+    def _commit_pending(self):
+        """Отдаёт сцене кадр, ждавший очереди, если она свободна.
+
+        Сам кадр, пока ждали, не хранили: отдаём самый свежий, который держит
+        наш QVideoSink. Копия у себя стоила бы дорого — вытесненную более
+        свежим кадром копию пришлось бы освобождать, а освобождение
+        аппаратного кадра (D3D11VA) ждёт блокировку устройства декодера,
+        которую поток рендера держит, пока копирует кадр себе (keyed mutex
+        ждёт GPU). Под нагрузкой GPU это 30–150 мс на кадр в GUI-потоке
+        (замер: 33–36% времени против 1–2% при программном декодировании).
+        Кадры, которые так и не попали на экран, освобождает поток плеера,
+        когда кладёт в QVideoSink следующий.
+
+        Пин, граница OUT и режим «нет видео» за время ожидания могли
+        смениться — проверяем их заново."""
+        if not self._frame_waiting:
             return
-        self._pending_frame = None
-        frame, pts = pending
+        now = _api.time.monotonic()
+        if self._scene_busy(now):
+            self._arm_pending_timer()
+            return
+        self._frame_waiting = False
         if self._audio_only_msg or self._out_sink is None:
+            return
+        frame = self._sink.videoFrame()
+        try:
+            if not frame.isValid():
+                return
+        except Exception:
+            return
+        pts = self._pts_of(frame)
+        # Этот кадр уже на сцене (отдали его раньше, чем дошло его событие).
+        if pts >= 0 and pts == self._committed_pts:
             return
         if self._bound_us is not None and pts >= 0 and pts >= self._bound_us:
             return
         if (self._pin_has_img and self._pin_span is not None and pts >= 0
                 and not (self._pin_span[0] <= pts < self._pin_span[1])):
             return
-        self._commit_frame(frame, pts, _api.time.monotonic())
+        self._commit_frame(frame, pts, now)
 
     # ── Кадры, которые ставит вкладка ────────────────────────────────────────
     def set_exact_frame(self, img, span_us=None, pts_us=None):
