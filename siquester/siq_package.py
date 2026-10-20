@@ -8,6 +8,7 @@ from .constants import _AUDIO_EXTS, _HTML_EXTS, _IMG_EXTS, _VIDEO_EXTS
 from .media import mp3_duration, mp4_duration
 from .util import _make_tag_fn, _qs_price_map, _unquote
 import siq_duration
+from zip_fastcopy import copy_zip_entry
 
 def _safe_replace(tmp: str, dst: str) -> None:
     """Replace *dst* with the freshly-written *tmp*, as robustly as Windows allows.
@@ -506,11 +507,17 @@ class SiqPackage:
                             xml_info.external_attr = info.external_attr
                             zout.writestr(xml_info, new_xml_bytes)
                         else:
-                            # Media (MP3/MP4/AVIF/…) is already compressed —
-                            # stream the raw compressed bytes directly without
-                            # buffering the entire file in memory.
-                            with zin.open(info) as src, zout.open(info, 'w') as dst:
-                                _shutil.copyfileobj(src, dst, length=1 << 20)
+                            # Media (MP3/MP4/AVIF/…) is already compressed — move
+                            # the entry over byte for byte, without unpacking it.
+                            # zin.open() → zout.open() would inflate it and
+                            # deflate it right back: on a 75 MB pack that was
+                            # 4.5 s of the 4.9 s repack, for a byte-identical
+                            # result (see zip_fastcopy.copy_zip_entry).
+                            if not copy_zip_entry(zin, zout, info):
+                                # Fast copy declined (encrypted/zip64/broken
+                                # header) — put the entry in the usual way.
+                                with zin.open(info) as src, zout.open(info, 'w') as dst:
+                                    _shutil.copyfileobj(src, dst, length=1 << 20)
 
             # Atomically swap the rewritten archive into place: clears a possible
             # read-only bit, retries while the file is transiently locked, then
@@ -1149,10 +1156,11 @@ class SiqPackage:
                                 xi.compress_type = zipfile.ZIP_DEFLATED
                                 zout.writestr(xi, self._xml_to_bytes(root, ns_url))
                             else:
-                                # Stream-copy compressed bytes — avoids buffering large
-                                # MP4/MP3 files entirely in memory (same fix as _rewrite_zip).
-                                with zin.open(info) as src, zout.open(info, 'w') as dst:
-                                    _shutil.copyfileobj(src, dst, length=1 << 20)
+                                # Move the entry over as-is — no inflate/deflate
+                                # round-trip (same fix as _rewrite_zip).
+                                if not copy_zip_entry(zin, zout, info):
+                                    with zin.open(info) as src, zout.open(info, 'w') as dst:
+                                        _shutil.copyfileobj(src, dst, length=1 << 20)
                         # New media: store without re-compression (already compressed).
                         # Stream from disk — avoids buffering up to 10 MB in RAM.
                         mi = zipfile.ZipInfo(zip_name)

@@ -6,14 +6,20 @@ in-memory-модель, и то, что изменения реально дое
 открытие пакета).
 """
 import os
+import struct
 import zipfile
 
 import pytest
 
+from siquester import siq_package
 from siquester.siq_package import SiqPackage, _safe_replace
 from conftest import CONTENT_XML_V5
 
 pytestmark = pytest.mark.integration
+
+# Сжимаемое «медиа»: на пустышке в десяток байт дефлейт не отличить от
+# переноса как есть, а разница в способе сжатия должна быть видна.
+BIG_MEDIA = b"media-bytes" * 3000
 
 
 @pytest.fixture
@@ -29,6 +35,39 @@ def _reopen(path):
         return p
     finally:
         p.close()
+
+
+def _siq_mixed(tmp_path, dos_attr: int = 0) -> str:
+    """Пак, в котором медиа лежит РАЗНЫМИ способами сжатия (как в жизни)."""
+    path = str(tmp_path / "mixed.siq")
+    entries = (("Audio/песня.mp3", zipfile.ZIP_DEFLATED),
+               ("Video/ролик.mp4", zipfile.ZIP_STORED),
+               ("Images/кадр.avif", zipfile.ZIP_DEFLATED))
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("content.xml", CONTENT_XML_V5, zipfile.ZIP_DEFLATED)
+        for name, ctype in entries:
+            info = zipfile.ZipInfo(name, date_time=(2021, 3, 4, 5, 6, 8))
+            info.compress_type = ctype
+            info.create_system = 0                     # DOS-атрибуты, как в Windows
+            info.external_attr = dos_attr << 16
+            zf.writestr(info, BIG_MEDIA)
+    return path
+
+
+def _raw_entries(path) -> dict:
+    """{имя: (способ сжатия, CRC, сжатые байты)} — читает данные мимо распаковки,
+    чтобы сравнение было именно побайтовым."""
+    out = {}
+    with zipfile.ZipFile(path) as zf, open(path, "rb") as fp:
+        for info in zf.infolist():
+            fp.seek(info.header_offset)
+            fields = struct.unpack(zipfile.structFileHeader,
+                                   fp.read(zipfile.sizeFileHeader))
+            fp.seek(fields[zipfile._FH_FILENAME_LENGTH]
+                    + fields[zipfile._FH_EXTRA_FIELD_LENGTH], 1)
+            out[info.filename] = (info.compress_type, info.CRC,
+                                  fp.read(info.compress_size))
+    return out
 
 
 # ── разбор ───────────────────────────────────────────────────────────────────
@@ -444,6 +483,117 @@ class TestEdits:
         assert pkg.save_theme_name(0, 0, "Y")
         out = pkg.extract_media("sound.mp3")
         assert out is not None
+
+
+# ── пересборка архива: медиа переносится как есть ────────────────────────────
+class TestRepackKeepsMedia:
+    """Пересборка не распаковывает медиа, а переносит записи байт в байт.
+
+    На этом стоит вся скорость сохранения: в паке сотня мегабайт уже сжатого
+    mp3/mp4/avif, и разжать их, чтобы тут же сжать обратно тем же дефлейтом,
+    дороже всей остальной правки (замер на живых паках из Загрузок: 75 МБ —
+    2,3 с против 0,06 с, R+V 99 МБ — 4,1 с против 0,11 с)."""
+
+    def test_media_bytes_and_compression_are_untouched(self, tmp_path):
+        path = _siq_mixed(tmp_path)
+        before = _raw_entries(path)
+        p = SiqPackage(path)
+        try:
+            assert p.save_theme_name(0, 0, "Другое имя")
+        finally:
+            p.close()
+        after = _raw_entries(path)
+        for name in ("Audio/песня.mp3", "Video/ролик.mp4", "Images/кадр.avif"):
+            assert after[name] == before[name], name
+        with zipfile.ZipFile(path) as zf:
+            assert zf.testzip() is None
+            assert zf.getinfo("Audio/песня.mp3").compress_type == zipfile.ZIP_DEFLATED
+            assert zf.getinfo("Video/ролик.mp4").compress_type == zipfile.ZIP_STORED
+            assert zf.read("Video/ролик.mp4") == BIG_MEDIA
+
+    def test_media_is_not_recompressed_at_all(self, tmp_path, monkeypatch):
+        """Собственно замер, только детерминированный: за всю пересборку дефлейт
+        заводится РОВНО ОДИН раз — на content.xml. Медиа мимо него."""
+        import zlib
+        real, calls = zlib.compressobj, []
+
+        def spy(*a, **kw):
+            calls.append(a)
+            return real(*a, **kw)
+
+        path = _siq_mixed(tmp_path)
+        p = SiqPackage(path)
+        try:
+            monkeypatch.setattr(zlib, "compressobj", spy)
+            assert p.save_theme_name(0, 0, "Без пережатия")
+        finally:
+            p.close()
+        assert len(calls) == 1
+
+    def test_media_survives_when_the_fast_copy_gives_up(self, tmp_path, monkeypatch):
+        """Быстрый перенос сдался (шифрование, битый заголовок) — запись кладётся
+        обычным путём, а не теряется."""
+        monkeypatch.setattr(siq_package, "copy_zip_entry", lambda *a, **kw: False)
+        path = _siq_mixed(tmp_path)
+        p = SiqPackage(path)
+        try:
+            assert p.save_theme_name(0, 0, "Ещё имя")
+        finally:
+            p.close()
+        with zipfile.ZipFile(path) as zf:
+            assert zf.testzip() is None
+            assert zf.read("Audio/песня.mp3") == BIG_MEDIA
+            assert zf.read("Video/ролик.mp4") == BIG_MEDIA
+
+    def test_hidden_and_system_bits_are_still_cleared(self, tmp_path):
+        """Перенос как есть не отменяет снятия атрибутов «скрытый»/«системный»:
+        они правятся в info ДО переноса."""
+        path = _siq_mixed(tmp_path, dos_attr=0x02 | 0x04)
+        p = SiqPackage(path)
+        try:
+            assert p.save_theme_name(0, 0, "Имя")
+        finally:
+            p.close()
+        with zipfile.ZipFile(path) as zf:
+            attr = (zf.getinfo("Audio/песня.mp3").external_attr >> 16) & 0xFFFF
+            assert attr & 0x02 == 0 and attr & 0x04 == 0
+
+    def test_pack_with_a_broken_entry_still_saves(self, tmp_path):
+        """Пак с испорченным роликом (CRC не сходится) раньше вообще не
+        сохранялся: распаковка падала BadZipFile. Такие паки в Загрузках есть —
+        теперь запись просто переносится как есть."""
+        path = _siq_mixed(tmp_path)
+        with open(path, "rb") as f:
+            raw = f.read()
+        with open(path, "wb") as f:
+            f.write(raw.replace(BIG_MEDIA[:8], b"broken!!", 1))
+        p = SiqPackage(path)
+        try:
+            assert p.save_theme_name(0, 0, "Живой пак")
+        finally:
+            p.close()
+        with zipfile.ZipFile(path) as zf:
+            assert zf.read("Audio/песня.mp3") == BIG_MEDIA
+            with pytest.raises(zipfile.BadZipFile):
+                zf.read("Video/ролик.mp4")   # битой была именно она
+
+    def test_add_media_keeps_the_other_entries_as_is(self, tmp_path):
+        """Второй путь пересборки — добавление файла в вопрос."""
+        path = _siq_mixed(tmp_path)
+        before = _raw_entries(path)
+        new_file = tmp_path / "постер.png"
+        new_file.write_bytes(b"\x89PNGnew")
+        p = SiqPackage(path)
+        try:
+            assert p.add_media_to_question(0, 0, 0, str(new_file))
+        finally:
+            p.close()
+        after = _raw_entries(path)
+        for name in ("Audio/песня.mp3", "Video/ролик.mp4", "Images/кадр.avif"):
+            assert after[name] == before[name], name
+        with zipfile.ZipFile(path) as zf:
+            assert zf.testzip() is None
+            assert zf.read("Images/постер.png") == b"\x89PNGnew"
 
 
 # ── _safe_replace ────────────────────────────────────────────────────────────

@@ -27,6 +27,7 @@ from .widgets_common import (
 )
 from .widgets_editors import _AnsEdit, _InlineTextEdit, PointOnImageWidget
 from .widgets_players import AudioPlayerWidget, MpvVideoPlayerWidget
+from zip_fastcopy import copy_zip_entry
 
 class QuestionViewer(QWidget):
     edit_requested = pyqtSignal(int, int, int)   # rnd_idx, theme_idx, price
@@ -1037,8 +1038,12 @@ class QuestionViewer(QWidget):
                                         xi.compress_type = zipfile.ZIP_DEFLATED
                                         zout.writestr(xi, new_xml_bytes)
                                     else:
-                                        with zin.open(info) as src, zout.open(info, 'w') as dst:
-                                            _shutil.copyfileobj(src, dst, length=1 << 20)
+                                        # Move the entry over as-is: media is
+                                        # already compressed, unpacking it just
+                                        # to pack it back is pure waiting.
+                                        if not copy_zip_entry(zin, zout, info):
+                                            with zin.open(info) as src, zout.open(info, 'w') as dst:
+                                                _shutil.copyfileobj(src, dst, length=1 << 20)
                         _safe_replace(tmp, siq.path)
                         siq._zip = zipfile.ZipFile(siq.path, 'r')
                         siq._xml_cache = None   # invalidate XML cache after repack
