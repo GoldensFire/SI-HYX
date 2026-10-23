@@ -19,6 +19,7 @@ def _clip_brief(p, c):
             "width": c.width, "height": c.height, "fps": _r(c.fps),
             "src_duration": _r(c.src_duration),
             "fit": c.fit, "transition": c.transition, "transition_s": _r(c.transition_s),
+            "reverse": c.reverse, "freeze_at": _r(c.freeze_at) if c.frozen else None,
             "overlay": ({"pos_x": _r(c.pos_x), "pos_y": _r(c.pos_y), "scale": _r(c.scale),
                          "opacity": _r(c.opacity)} if c.track != p.main_track else None),
             "audio": ({"path": c.audio_path, "stream": c.audio_stream,

@@ -743,7 +743,8 @@ ffmpeg — [montage_project.py](montage_project.py) (основная дорож
 только на кадрах нахлёста (xfade сборки работает в yuv444p — весь поток через
 него мылил цветность), верхние видеодорожки — наложения с альфой
 (scale/pos/opacity, overlay format=yuv420), вписывание fit/fill/crop на
-клип, текст проекта — ASS ([subtitle_ass.py](subtitle_ass.py), вынесен из
+клип, реверс (`reverse`, кусок до `MAX_REVERSE_S` — reverse держит кадры) и
+стоп-кадр (`freeze_at`: один кадр + tpad, длина — как у картинки), текст проекта — ASS ([subtitle_ass.py](subtitle_ass.py), вынесен из
 edit_tab_base) по меткам проекта; звук — фейды и встречные фейды перехода
 afade в сэмплах клипа, голос приглушает музыку sidechaincompress (с разгоном
 перед окном), в конце alimiter latency=1, loudnorm — в `build_export`

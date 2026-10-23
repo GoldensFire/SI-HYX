@@ -22,6 +22,7 @@ _CLIP_FIELDS = {
     "width": int, "height": int, "fps": float, "src_duration": float,
     "fit": str, "pos_x": float, "pos_y": float, "scale": float, "opacity": float,
     "transition": str, "transition_s": float, "fade_in": float, "fade_out": float,
+    "reverse": bool, "freeze_at": float,
 }
 _CLIP_REQUIRED = ("src", "in_s", "out_s", "track")
 _SETTINGS_FIELDS = {"width": int, "height": int, "fps": float, "fit": str,
@@ -365,7 +366,8 @@ def _check_clip(raw, i, kinds, main, strict, check_files, problems):
         problems.append({"path": f"{path}.out_s",
                          "message": f"клип короче {_api.MIN_CLIP_S:g} с (out_s ≤ in_s?)"})
     src_dur = _num_or(raw.get("src_duration", 0.0), 0.0)
-    if src_dur > 0 and not image and out_s > src_dur + 1e-3:
+    frozen = _num_or(raw.get("freeze_at", -1.0), -1.0) >= 0
+    if src_dur > 0 and not image and not frozen and out_s > src_dur + 1e-3:
         problems.append({"path": f"{path}.out_s",
                          "message": f"за концом исходника ({src_dur:g} с)"})
     if _num_or(raw.get("volume", 1.0), 1.0) < 0:
@@ -385,6 +387,15 @@ def _check_clip(raw, i, kinds, main, strict, check_files, problems):
                          "message": f"от {_api.MIN_SCALE:g} до {_api.MAX_SCALE:g}"})
     if not 0.0 <= _num_or(raw.get("opacity", 1.0), 1.0) <= 1.0:
         problems.append({"path": f"{path}.opacity", "message": "от 0 до 1"})
+    freeze = _num_or(raw.get("freeze_at", -1.0), -1.0)
+    if freeze >= 0:
+        if image or not has_video:
+            problems.append({"path": f"{path}.freeze_at", "message": "стоп-кадр — только у видео"})
+        elif src_dur > 0 and freeze >= src_dur:
+            problems.append({"path": f"{path}.freeze_at", "message": "за концом исходника"})
+    if raw.get("reverse") and (out_s - in_s) > _api.MAX_REVERSE_S + 1e-6:
+        problems.append({"path": f"{path}.reverse",
+                         "message": f"реверс — не длиннее {_api.MAX_REVERSE_S:g} с исходника"})
     for name in ("transition_s", "fade_in", "fade_out"):
         if _num_or(raw.get(name, 0.0), 0.0) < 0:
             problems.append({"path": f"{path}.{name}", "message": "отрицательная длина"})

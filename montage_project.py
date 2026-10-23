@@ -58,6 +58,8 @@ TRANSITIONS = (
 # Роль дорожки: голос приглушает музыку (ProjectSettings.duck).
 TRACK_ROLES = ('', 'voice', 'music')
 MIN_SCALE, MAX_SCALE = 0.02, 4.0
+# Реверс держит все кадры куска в памяти (фильтр reverse) — длиннее не берём.
+MAX_REVERSE_S = 10.0
 
 
 class ProjectError(ValueError):
@@ -154,6 +156,9 @@ class Clip:
     transition_s: float = 0.0     # его длина: клип встаёт внахлёст на предыдущий
     fade_in: float = 0.0          # нарастание и затухание звука клипа, с
     fade_out: float = 0.0
+    reverse: bool = False         # кусок исходника идёт задом наперёд (до MAX_REVERSE_S)
+    freeze_at: float = -1.0       # стоп-кадр: кадр исходника на этом времени всю длину
+                                  # клипа (in_s/out_s задают только длину, как у картинки)
 
     def __post_init__(self):
         """Типы и пределы полей — при любом создании клипа: из файла проекта,
@@ -189,13 +194,23 @@ class Clip:
         self.transition_s = _finite(self.transition_s, 0.0, low=0.0)
         self.fade_in = _finite(self.fade_in, 0.0, low=0.0)
         self.fade_out = _finite(self.fade_out, 0.0, low=0.0)
+        self.reverse = bool(self.reverse) and not self.is_image
+        freeze = _finite(self.freeze_at, -1.0)
+        self.freeze_at = freeze if freeze >= 0 and not self.is_image and self.has_video else -1.0
+        if self.frozen:
+            self.reverse, self.speed = False, 1.0
+
+    @property
+    def frozen(self):
+        """Стоп-кадр (freeze_at): длина — out_s − in_s, звука нет."""
+        return self.freeze_at >= 0
 
     @property
     def play_speed(self):
-        """Скорость на шкале в пределах MIN_SPEED…MAX_SPEED, у картинки — 1.
-        Ею считают и длину клипа, и сборку картинки и звука: speed, присвоенный
-        в обход set_speed, не разводит их."""
-        if self.is_image:
+        """Скорость на шкале в пределах MIN_SPEED…MAX_SPEED, у картинки и
+        стоп-кадра — 1. Ею считают и длину клипа, и сборку картинки и звука:
+        speed, присвоенный в обход set_speed, не разводит их."""
+        if self.is_image or self.frozen:
             return 1.0
         return max(MIN_SPEED, min(MAX_SPEED, self.speed))
 
@@ -212,7 +227,10 @@ class Clip:
         return os.path.basename(self.src)
 
     def source_time(self, t):
-        """Время исходника для времени проекта t (внутри клипа)."""
+        """Время исходника для времени проекта t (внутри клипа); у реверса —
+        от конца куска к началу."""
+        if self.reverse:
+            return self.out_s - max(0.0, t - self.start) * self.play_speed
         return self.in_s + max(0.0, t - self.start) * self.play_speed
 
 
@@ -397,8 +415,9 @@ class Project:
         c = self.clip(cid)
         if c is None:
             return None
-        cut = c.source_time(t)
-        if c.fps and not c.is_image:
+        # У стоп-кадра in/out — только длина: режем её, а не исходник.
+        cut = c.in_s + (t - c.start) if c.frozen else c.source_time(t)
+        if c.fps and not c.is_image and not c.frozen:
             cut = snap_to_frame(cut, c.fps)
         speed = c.play_speed
         if ((cut - c.in_s) / speed < MIN_CLIP_S - _EPS
@@ -409,9 +428,15 @@ class Project:
         # Переход и нарастание звука — у начала клипа, затухание — у конца.
         right.transition, right.transition_s, right.fade_in = '', 0.0, 0.0
         c.fade_out = 0.0
-        right.in_s = cut
-        right.start = c.start + (cut - c.in_s) / speed
-        c.out_s = cut
+        if c.reverse:
+            # Реверс: слева на шкале — конец куска исходника [cut, out_s).
+            right.out_s = cut
+            right.start = c.start + (c.out_s - cut) / speed
+            c.in_s = cut
+        else:
+            right.in_s = cut
+            right.start = c.start + (cut - c.in_s) / speed
+            c.out_s = cut
         self.clips.insert(self.clips.index(c) + 1, right)
         self.pack()
         return c, right
@@ -529,13 +554,16 @@ class Project:
         c = self.clip(cid)
         if c is None:
             return False
-        limit = c.src_duration if (c.src_duration > 0 and not c.is_image) else float("inf")
+        still = c.is_image or c.frozen
+        limit = c.src_duration if (c.src_duration > 0 and not still) else float("inf")
         speed = c.play_speed
         min_src = MIN_CLIP_S * speed
         free = c.track != self.main_track
         # На свободной дорожке край упирается в соседа (и в начало шкалы).
         others = [o for o in self.clips_on(c.track) if o is not c] if free else []
-        if edge == 'left':
+        if c.reverse:
+            self._trim_reversed(c, edge, t, limit, others, free)
+        elif edge == 'left':
             new_in = c.in_s + (t - c.start) * speed
             if c.fps and not c.is_image:
                 new_in = snap_to_frame(new_in, c.fps)
@@ -560,6 +588,36 @@ class Project:
             c.out_s = max(c.in_s + min_src, min(high, new_out))
         self.pack()
         return True
+
+    @staticmethod
+    def _trim_reversed(c, edge, t, limit, others, free):
+        """Подрезка клипа-реверса: левый край на шкале — конец куска
+        исходника (out_s), правый — начало (in_s)."""
+        speed = c.play_speed
+        min_src = MIN_CLIP_S * speed
+        if edge == 'left':
+            new_out = c.out_s - (t - c.start) * speed
+            if c.fps:
+                new_out = snap_to_frame(new_out, c.fps)
+            high = limit
+            if free:
+                prev_end = max((o.end for o in others if o.end <= c.start + _EPS), default=0.0)
+                high = min(high, c.out_s + (c.start - prev_end) * speed)
+            new_out = max(c.in_s + min_src, min(high, new_out))
+            shift = (c.out_s - new_out) / speed
+            c.out_s = new_out
+            if free:
+                c.start = max(0.0, c.start + shift)
+        else:
+            new_in = c.out_s - (t - c.start) * speed
+            if c.fps:
+                new_in = snap_to_frame(new_in, c.fps)
+            low = 0.0
+            if free:
+                next_start = min((o.start for o in others if o.start >= c.end - _EPS),
+                                 default=float("inf"))
+                low = max(low, c.out_s - (next_start - c.start) * speed)
+            c.in_s = min(c.out_s - min_src, max(low, new_in))
 
     # ── Что видно и что слышно ───────────────────────────────────────────────
     def _flatten(self, track_ids, keep):
@@ -604,7 +662,8 @@ class Project:
         """Клипы, чей звук попадает в итог (смешиваются все разом)."""
         return [c for c in self.clips
                 if self.tracks[c.track].enabled and not self.tracks[c.track].muted
-                and c.audio_path and not c.muted and c.volume > 0 and c.length > _EPS]
+                and c.audio_path and not c.muted and c.volume > 0 and c.length > _EPS
+                and not c.frozen]
 
     def live_preview_gaps(self):
         """Что из проекта живой плеер вкладки не покажет (он играет один
@@ -629,6 +688,8 @@ class Project:
             gaps.append("приглушение музыки под голос")
         if self.settings.loudness is not None:
             gaps.append("выравнивание громкости")
+        if any(c.reverse or c.frozen for c in self.clips):
+            gaps.append("реверс и стоп-кадр")
         return gaps
 
     def output_format(self):
@@ -729,8 +790,10 @@ class Project:
             if b - a <= _EPS:
                 continue
             part = Clip(**{f.name: getattr(c, f.name) for f in fields(Clip)})
-            part.in_s = c.source_time(a)
-            part.out_s = c.source_time(b)
+            if not c.frozen:
+                part.in_s, part.out_s = sorted((c.source_time(a), c.source_time(b)))
+            else:
+                part.in_s, part.out_s = c.in_s + (a - c.start), c.in_s + (b - c.start)
             part.start = a - t0
             p.clips.append(part)
         return p

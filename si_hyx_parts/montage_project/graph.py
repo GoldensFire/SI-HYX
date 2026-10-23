@@ -66,17 +66,35 @@ class _Graph:
 
 def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap):
     """Вход клипа c с времени проекта t_a по t_b и цепочка его кадров: ровно
-    n кадров в размере вписывания fit, метки с нуля (без метки выхода)."""
+    n кадров в размере вписывания fit, метки с нуля (без метки выхода).
+
+    Стоп-кадр — один кадр исходника на freeze_at, продлённый tpad на всю
+    длину. Реверс — кусок исходника [время на t_b, время на t_a) читается
+    ровно (-t без запаса: лишние кадры после reverse оказались бы первыми)
+    и разворачивается уже в размере проекта: reverse держит все кадры."""
     speed = c.play_speed
-    s = c.source_time(t_a)
     span = t_b - t_a
     idx = len(g.inputs)
-    if c.is_image:
-        g.inputs.append(["-loop", "1", "-framerate", rate, "-t", _api._num(span + 1.0),
-                         "-i", c.src])
-    else:
+    hold = "1"
+    pick = reverse = ""
+    if c.frozen:
+        s = c.freeze_at
+        g.inputs.append(["-ss", _api._num(_api._seek_s(c, s)), "-t", "1", "-i", c.src])
+        pick = "trim=end_frame=1,"
+        hold = _api._num(span + 1.0)
+    elif c.reverse:
+        s = c.source_time(t_b)
         g.inputs.append(["-ss", _api._num(_api._seek_s(c, s)),
-                         "-t", _api._num(span * speed + 0.5), "-i", c.src])
+                         "-t", _api._num(span * speed), "-i", c.src])
+        reverse = "reverse,"
+    else:
+        s = c.source_time(t_a)
+        if c.is_image:
+            g.inputs.append(["-loop", "1", "-framerate", rate, "-t", _api._num(span + 1.0),
+                             "-i", c.src])
+        else:
+            g.inputs.append(["-ss", _api._num(_api._seek_s(c, s)),
+                             "-t", _api._num(span * speed + 0.5), "-i", c.src])
     sub_vf = (subs or {}).get(_api.source_key(c.src)) if not c.is_image else None
     tone_vf = (tonemap or {}).get(_api.source_key(c.src)) if not c.is_image else None
     tone = f"{tone_vf}," if tone_vf else ""
@@ -89,9 +107,9 @@ def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap):
     # scale=iw*sar:ih — неквадратный пиксель (анаморфный DVD) в квадратный до
     # вписывания: вписывание шло по размеру в пикселях, а setsar=1 потом
     # показывал кадр 16:9 как 3:2. У квадратного пикселя фильтр кадр не трогает.
-    return (f"[{idx}:v:0]{tone}{burn}setpts=PTS-STARTPTS,{speed_vf}"
-            f"scale=iw*sar:ih,setsar=1,{fit}setsar=1,"
-            f"fps={rate},tpad=stop_mode=clone:stop_duration=1,"
+    return (f"[{idx}:v:0]{tone}{burn}{pick}setpts=PTS-STARTPTS,{speed_vf}"
+            f"scale=iw*sar:ih,setsar=1,{fit}setsar=1,{reverse}"
+            f"fps={rate},tpad=stop_mode=clone:stop_duration={hold},"
             f"trim=end_frame={n},setpts=PTS-STARTPTS,format={pix_fmt}")
 
 
@@ -367,7 +385,10 @@ def _audio(g, project, parts, w0, w1, total_s, pre=0.0):
         a_start, a_end = max(c.start, w0), min(c.end, w1)
         whole = a_start == c.start and a_end == c.end
         src_span = (c.length if whole else a_end - a_start) * speed
-        g.inputs.append(["-ss", _api._num(c.source_time(a_start)),
+        # Реверс: читается кусок [время на a_end, время на a_start), его
+        # первые n сэмплов разворачиваются (areverse после atrim).
+        seek = c.source_time(a_end if c.reverse else a_start)
+        g.inputs.append(["-ss", _api._num(seek),
                          "-t", _api._num(src_span + 0.25), "-i", c.audio_path])
         spec = f"{idx}:{c.audio_stream}" if c.audio_stream >= 0 else f"{idx}:a:0"
         lab = g.label("a")
@@ -394,7 +415,8 @@ def _audio(g, project, parts, w0, w1, total_s, pre=0.0):
             fade_vf += "asetpts=PTS-STARTPTS,"
         g.chains.append(
             f"[{spec}]aresample={rate},aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            f"{tempo_vf}atrim=end_sample={n},asetpts=PTS-STARTPTS,{fade_vf}"
+            f"{tempo_vf}atrim=end_sample={n},{'areverse,' if c.reverse else ''}"
+            f"asetpts=PTS-STARTPTS,{fade_vf}"
             f"volume={_api._num(c.volume)},adelay={a0}S:all=1[{lab}]")
         role = project.tracks[c.track].role
         by_role[role if role in by_role else ""].append(lab)
