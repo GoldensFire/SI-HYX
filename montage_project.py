@@ -36,6 +36,58 @@ _EPS = 1e-6
 _AUDIO_RATE = 48000          # частота звука сборки (и просмотра проекта)
 
 
+def _finite(v, default, low=None):
+    """Число v или default, если v не число (строка, None, NaN, бесконечность)."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(v):
+        return default
+    return v if low is None else max(low, v)
+
+
+def stream_display_size(stream):
+    """(ширина, высота) кадра видеопотока так, как его показывают плееры и
+    отдаёт ffmpeg после -i: неквадратный пиксель (sample_aspect_ratio)
+    растягивает ширину, поворот на 90/270° (матрица отображения или старый
+    тег rotate) меняет стороны местами. Размер потока (width/height) этого
+    не учитывает: видео с телефона (поток 1920x1080, поворот 90°) давало
+    проекту альбомный формат с полями. stream — поток из ffprobe
+    -show_streams. (0, 0) — размер неизвестен."""
+    if not isinstance(stream, dict):
+        return 0, 0
+    try:
+        w, h = int(stream.get('width') or 0), int(stream.get('height') or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+    if w <= 0 or h <= 0:
+        return 0, 0
+    num, _, den = str(stream.get('sample_aspect_ratio') or "").partition(":")
+    try:
+        num, den = int(num), int(den)
+        if num > 0 and den > 0 and num != den:
+            w = max(1, int(w * num / den))   # как iw*sar у ffmpeg
+    except ValueError:
+        pass
+    rot = 0
+    for sd in stream.get('side_data_list') or []:
+        if isinstance(sd, dict) and 'rotation' in sd:
+            try:
+                rot = int(round(float(sd['rotation'])))
+            except (TypeError, ValueError):
+                pass
+    if not rot:
+        tags = stream.get('tags') if isinstance(stream.get('tags'), dict) else {}
+        try:
+            rot = int(float(tags.get('rotate') or 0))
+        except (TypeError, ValueError):
+            rot = 0
+    if rot % 180 == 90:
+        w, h = h, w
+    return w, h
+
+
 @dataclass
 class Clip:
     """Кусок исходника на дорожке проекта."""
@@ -53,14 +105,49 @@ class Clip:
     muted: bool = False
     speed: float = 1.0            # 1.0 — как в исходнике, 2.0 — вдвое быстрее
     audio_detached: bool = False  # звук отделён в свой клип — не возвращать при смене дорожки
-    width: int = 0
+    width: int = 0                # размер кадра как на экране (stream_display_size)
     height: int = 0
     fps: float = 0.0
     src_duration: float = 0.0     # длина исходника — предел подрезки
 
+    def __post_init__(self):
+        """Типы и пределы полей — при любом создании клипа: из файла проекта,
+        копией или вручную. Строка вместо числа в файле роняла загрузку
+        проекта TypeError, а скорость мимо set_speed (Clip(speed=20)) шла в
+        картинку ×20, а в звук — ×8 (предел atempo_chain). Время клипа и
+        дорожка обязаны быть числами — иначе TypeError/ValueError; громкость,
+        fps и длина исходника, если не числа, берутся по умолчанию."""
+        self.src = str(self.src)
+        self.audio_path = str(self.audio_path or "")
+        self.id = str(self.id) if self.id else uuid.uuid4().hex[:12]
+        for name in ('has_video', 'is_image', 'muted', 'audio_detached'):
+            setattr(self, name, bool(getattr(self, name)))
+        for name in ('track', 'audio_stream', 'width', 'height'):
+            setattr(self, name, int(getattr(self, name)))
+        self.width, self.height = max(0, self.width), max(0, self.height)
+        for name in ('in_s', 'out_s', 'start'):
+            v = float(getattr(self, name))
+            if not math.isfinite(v):
+                raise ValueError(f"{name} клипа — не число")
+            setattr(self, name, v)
+        self.volume = _finite(self.volume, 1.0, low=0.0)
+        self.fps = _finite(self.fps, 0.0, low=0.0)
+        self.src_duration = _finite(self.src_duration, 0.0, low=0.0)
+        speed = _finite(self.speed, 1.0)
+        self.speed = 1.0 if self.is_image else max(MIN_SPEED, min(MAX_SPEED, speed))
+
+    @property
+    def play_speed(self):
+        """Скорость на шкале в пределах MIN_SPEED…MAX_SPEED, у картинки — 1.
+        Ею считают и длину клипа, и сборку картинки и звука: speed, присвоенный
+        в обход set_speed, не разводит их."""
+        if self.is_image:
+            return 1.0
+        return max(MIN_SPEED, min(MAX_SPEED, self.speed))
+
     @property
     def length(self):
-        return max(0.0, (self.out_s - self.in_s) / max(MIN_SPEED, self.speed))
+        return max(0.0, (self.out_s - self.in_s) / self.play_speed)
 
     @property
     def end(self):
@@ -72,7 +159,7 @@ class Clip:
 
     def source_time(self, t):
         """Время исходника для времени проекта t (внутри клипа)."""
-        return self.in_s + max(0.0, t - self.start) * max(MIN_SPEED, self.speed)
+        return self.in_s + max(0.0, t - self.start) * self.play_speed
 
 
 @dataclass
@@ -204,7 +291,7 @@ class Project:
         cut = c.source_time(t)
         if c.fps and not c.is_image:
             cut = snap_to_frame(cut, c.fps)
-        speed = max(MIN_SPEED, c.speed)
+        speed = c.play_speed
         if ((cut - c.in_s) / speed < MIN_CLIP_S - _EPS
                 or (c.out_s - cut) / speed < MIN_CLIP_S - _EPS):
             return None
@@ -331,7 +418,7 @@ class Project:
         if c is None:
             return False
         limit = c.src_duration if (c.src_duration > 0 and not c.is_image) else float("inf")
-        speed = max(MIN_SPEED, c.speed)
+        speed = c.play_speed
         min_src = MIN_CLIP_S * speed
         free = c.track != self.main_track
         # На свободной дорожке край упирается в соседа (и в начало шкалы).
@@ -432,27 +519,25 @@ class Project:
         p = cls()
         if not isinstance(data, dict):
             return p
+        # Списки — только списками: «"tracks": 5» в файле ронял загрузку
+        # TypeError (итерация по числу) вместо пустого проекта.
+        raw_tracks = data.get('tracks')
+        raw_clips = data.get('clips')
         tracks = [Track(kind=t.get('kind', 'video'), enabled=bool(t.get('enabled', True)),
                         muted=bool(t.get('muted', False)))
-                  for t in data.get('tracks') or [] if isinstance(t, dict)
-                  and t.get('kind') in ('video', 'audio')]
+                  for t in (raw_tracks if isinstance(raw_tracks, list) else [])
+                  if isinstance(t, dict) and t.get('kind') in ('video', 'audio')]
         if any(t.kind == 'video' for t in tracks):
             p.tracks = tracks
         names = {f.name for f in fields(Clip)}
-        for raw in data.get('clips') or []:
+        for raw in raw_clips if isinstance(raw_clips, list) else []:
             if not isinstance(raw, dict):
                 continue
             try:
+                # Типы и пределы (скорость) приводит Clip.__post_init__.
                 c = Clip(**{k: v for k, v in raw.items() if k in names})
-            except TypeError:
-                continue
-            try:
-                speed = float(c.speed)
             except (TypeError, ValueError):
-                speed = 1.0
-            if not math.isfinite(speed):
-                speed = 1.0
-            c.speed = 1.0 if c.is_image else max(MIN_SPEED, min(MAX_SPEED, speed))
+                continue                 # нет обязательных полей или они не числа
             if 0 <= c.track < len(p.tracks) and c.length > _EPS:
                 p.clips.append(c)
         p.pack()
@@ -584,7 +669,7 @@ def build_source(project, video=True, audio=True, subs=None, tonemap=None):
                           f"setsar=1,format=yuv420p[{lab}]")
         else:
             idx = len(inputs)
-            speed = 1.0 if c.is_image else max(MIN_SPEED, c.speed)
+            speed = c.play_speed
             s = c.source_time(t0)
             span = t1 - t0
             if c.is_image:
@@ -602,8 +687,13 @@ def build_source(project, video=True, audio=True, subs=None, tonemap=None):
                 first = snap_to_frame(s, c.fps)
                 burn = (f"setpts=PTS-STARTPTS+{_num(first)}/TB,{sub_vf},")
             speed_vf = "" if abs(speed - 1.0) <= 1e-6 else f"setpts=(PTS-STARTPTS)/{_num(speed)},"
+            # scale=iw*sar:ih — неквадратный пиксель (анаморфный DVD) в
+            # квадратный до вписывания: вписывание шло по размеру в пикселях,
+            # а setsar=1 потом показывал кадр 16:9 как 3:2. У квадратного
+            # пикселя размер тот же — фильтр кадр не трогает.
             chains.append(
                 f"[{idx}:v:0]{tone}{burn}setpts=PTS-STARTPTS,{speed_vf}"
+                f"scale=iw*sar:ih,setsar=1,"
                 f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,"
                 f"fps={rate},tpad=stop_mode=clone:stop_duration=1,"
@@ -612,7 +702,7 @@ def build_source(project, video=True, audio=True, subs=None, tonemap=None):
     amix = []
     for c in parts:
         idx = len(inputs)
-        speed = max(MIN_SPEED, c.speed)
+        speed = c.play_speed
         inputs.append(["-ss", _num(c.in_s), "-t", _num(c.length * speed + 0.25),
                        "-i", c.audio_path])
         spec = f"{idx}:{c.audio_stream}" if c.audio_stream >= 0 else f"{idx}:a:0"

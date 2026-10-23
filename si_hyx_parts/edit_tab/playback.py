@@ -2,6 +2,8 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """Монтаж: загрузка файла, прокси для просмотра и плеер."""
+import montage_project as _mp
+
 import edit_tab as _api
 
 
@@ -339,6 +341,9 @@ class EditTabPlaybackMixin:
             except Exception: self._src_video_h = 0
             try: self._src_video_w = int(vinfo.get('width') or 0)
             except Exception: self._src_video_w = 0
+            # Размер кадра как на экране (поворот, неквадратный пиксель) — его
+            # получает клип проекта: по нему собирается формат итога.
+            self._src_display_w, self._src_display_h = _mp.stream_display_size(vinfo)
             self._src_video_fps = self._parse_fps(vinfo)
             scale = self._proxy_scale_for(is_av1)
             # Прокси нужен если: исходник AV1 (QtMultimedia его не тянет плавно), ИЛИ

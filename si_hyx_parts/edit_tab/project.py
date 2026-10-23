@@ -406,8 +406,10 @@ class EditTabProjectMixin:
         if still:
             width, height = int(getattr(self, "_still_w", 0)), int(getattr(self, "_still_h", 0))
         else:
-            width = int(getattr(self, "_src_video_w", 0) or 0)
-            height = int(getattr(self, "_src_video_h", 0) or 0)
+            # Как на экране, а не размер потока: у видео с телефона поток
+            # 1920x1080 с поворотом 90° давал проекту альбомный формат.
+            width = int(getattr(self, "_src_display_w", 0) or 0)
+            height = int(getattr(self, "_src_display_h", 0) or 0)
         p = self.project
         playhead = self.project_timeline.playhead
         if where == 'audio' and has_video is False and p.is_empty():
