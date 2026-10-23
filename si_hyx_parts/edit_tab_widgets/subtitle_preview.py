@@ -3,6 +3,7 @@
 # See LICENSE and the public module for attribution and API.
 """_SubtitlePreview. Public namespace: edit_tab_widgets."""
 import edit_tab_widgets as _api
+from sip_notify import prime_disconnect_notify
 
 
 class _SubtitlePreview(_api.QWidget):
@@ -92,7 +93,7 @@ class _SubtitlePreview(_api.QWidget):
         self._ext_audio_output = None
 
         self.player = _api.QMediaPlayer(self)
-        self.audio_output = _api.QAudioOutput(self)
+        self.audio_output = prime_disconnect_notify(_api.QAudioOutput(self))
         self.player.setAudioOutput(self.audio_output)
         self._audio_dev_watch = _api.install_audio_device_recovery(self.audio_output, self)
         self.player.setVideoSink(self.canvas.videoSink())
@@ -221,7 +222,7 @@ class _SubtitlePreview(_api.QWidget):
             pass
         if self._ext_audio_player is None:
             self._ext_audio_player = _api.QMediaPlayer(self)
-            self._ext_audio_output = _api.QAudioOutput(self)
+            self._ext_audio_output = prime_disconnect_notify(_api.QAudioOutput(self))
             self._ext_audio_player.setAudioOutput(self._ext_audio_output)
         try:
             self._ext_audio_output.setVolume(self.audio_output.volume())
@@ -320,7 +321,7 @@ class _SubtitlePreview(_api.QWidget):
     def _ensure_blip_player(self):
         if self._blip_player is None:
             self._blip_player = _api.QMediaPlayer(self)
-            self._blip_output = _api.QAudioOutput(self)
+            self._blip_output = prime_disconnect_notify(_api.QAudioOutput(self))
             self._blip_player.setAudioOutput(self._blip_output)
         try:
             self._blip_output.setVolume(self.audio_output.volume())

@@ -64,7 +64,8 @@ from edit_tab_base import (
 )
 from edit_tab_workers import (
     AssExtractor, AudioSegmentWaveformLoader, AudioWaveformLoader,
-    FfmpegWorker, ProjectThumbWorker, ProxyWorker, ShareDeleteIODevice,
+    FfmpegWorker, ProjectSoundEngine, ProjectThumbWorker, ProxyWorker,
+    ShareDeleteIODevice,
     SmartCutWorker, SubtitleExtractor, TrackOverlayWorker, TrackPathWorker,
     VideoInpaintWorker, open_share_delete_file
 )
@@ -75,8 +76,8 @@ from edit_tab_widgets import (
     WaveformWidget
 )
 from edit_tab_dialogs import (
-    SubtitleCreatorDialog, SubtitleEditDialog, _PixelizeDialog,
-    _TrackAttachDialog, _VideoMaskDialog
+    SubtitleCreatorDialog, _ExportSettingsDialog,
+    _PixelizeDialog, _TrackAttachDialog, _VideoMaskDialog
 )
 from edit_tab_frames import (AudioScrubber, FrameGrid, FramePrefetcher,
                              probe_frame_size)

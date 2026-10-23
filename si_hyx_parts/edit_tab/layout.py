@@ -337,8 +337,13 @@ class EditTabLayoutMixin:
         self.btn_cut.setIcon(_api.get_icon('fa5s.file-export', color='#1e1e2e'))
         self.btn_cut.setIconSize(_api.QSize(18, 18))
         # Ширина — как у правой колонки панели над кнопкой; длинная подпись
-        # («Создать видео · …») раздвигает её.
-        self.btn_cut.setMinimumWidth(232)
+        # («Создать видео · …») раздвигает её. Жёсткого минимума нет: строка
+        # плеера не влезала в окно шириной меньше ~1400 px, и правый край кнопки уходил
+        # за край окна. Теперь в тесноте кнопка сжимается, а длительность из
+        # подписи прячет _refresh_export_btn (пределы ширины ставит он же).
+        self.btn_cut.setSizePolicy(_api.QSizePolicy.Policy.Expanding,
+                                   _api.QSizePolicy.Policy.Fixed)
+        self.btn_cut.installEventFilter(self)
         self.btn_cut.setFocusPolicy(_api.Qt.FocusPolicy.NoFocus)
         self.btn_cut.clicked.connect(self.start_cut)
         # Зелёная, как кнопка «НАЧАТЬ» во вкладке «Обработка» (#b_run в config.py).
@@ -357,6 +362,18 @@ class EditTabLayoutMixin:
             QPushButton:pressed {{ background: #74c7ec; }}
             QPushButton:disabled {{ background: {_api.C['surface3']}; color: {_api.C['text3']}; }}
         """)
+
+        # Шестерёнка рядом — настройки «Обработки» для режимов «Перекодировать
+        # настройками «Обработки»» (_open_export_settings). Её место отнято у
+        # «Экспорт»: вместе они не шире правой колонки (см. _refresh_export_btn).
+        self.btn_export_settings = _api.make_icon_btn("", icon='fa5s.cog')
+        self.btn_export_settings.setIconSize(_api.QSize(16, 16))
+        self.btn_export_settings.setFixedWidth(self._EXPORT_GEAR_W)
+        self.btn_export_settings.setFocusPolicy(_api.Qt.FocusPolicy.NoFocus)
+        self.btn_export_settings.setToolTip(
+            "Настройки экспорта «Перекодировать настройками «Обработки»»: звук и "
+            "видео — те же, что во вкладке «Обработка» (связаны в обе стороны)")
+        self.btn_export_settings.clicked.connect(self._open_export_settings)
 
         # progress/log_label больше не показываются в интерфейсе (прогресс идёт в
         # общий прогрессбар окна). Оставлены скрытыми, чтобы существующий код,
@@ -393,6 +410,15 @@ class EditTabLayoutMixin:
         # задаётся в _adjust_video_height → внутри виджета полей нет, а свободное
         # место по бокам — это фон цвета интерфейса.
         vc_layout.addWidget(self.video_widget, 0, _api.Qt.AlignmentFlag.AlignCenter)
+        # Размер холста задаёт _adjust_video_height по месту, которое осталось
+        # контейнеру, а не наоборот: иначе минимум холста держал контейнер, и
+        # когда таймлайн рос (добавились дорожки), раскладка сжимала контейнер
+        # ниже этого минимума — холст (нативное окно сцены, его соседи не
+        # перекрывают) вылезал на строку кнопок. Поэтому пересчёт — на каждый
+        # ресайз самого контейнера (eventFilter), а не только вкладки.
+        _ign = _api.QSizePolicy.Policy.Ignored
+        self.video_container.setSizePolicy(_ign, _ign)
+        self.video_container.installEventFilter(self)
         # Оверлей субтитров (VLC-стиль) создаётся лениво как отдельное окно поверх
         # видео — см. _ensure_overlay/_position_overlay (QVideoWidget нативный,
         # обычный дочерний виджет под ним не виден).
@@ -498,7 +524,9 @@ class EditTabLayoutMixin:
         self.btn_edit_subs.setIconSize(_api.QSize(row_h - 3, row_h - 3))
         self.btn_edit_subs.setFixedSize(row_h + 4, row_h)
         self.btn_edit_subs.setCursor(_api.Qt.CursorShape.PointingHandCursor)
-        self.btn_edit_subs.setToolTip("Редактировать текст выбранных субтитров")
+        self.btn_edit_subs.setToolTip(
+            "Редактировать выбранные субтитры в окне «Создать субтитры»: "
+            "текст, тайминг и стиль реплик")
         self.btn_edit_subs.setStyleSheet(f"""
             QPushButton {{ background: transparent; border: none; border-radius: 4px; }}
             QPushButton:hover {{ background: {_api.C['surface3']}; }}
@@ -545,7 +573,8 @@ class EditTabLayoutMixin:
         # По умолчанию — «Как в оригинале» (стиль из самих субтитров, ничего не навязываем).
         self.cmb_sub_style.setCurrentIndex(2)
         self.cmb_sub_style.setToolTip(
-            "Стиль субтитров при вшивании в кадр. Стиль программы — как у караоке\n"
+            "Стиль субтитров при вшивании в кадр — им же они видны в плеере.\n"
+            "Стиль программы — как у караоке\n"
             "в генерации паков: шрифт Karaoke Rounded, обводка и тень.\n"
             "Авто — стиль программы для SRT/VTT и субтитров MP4, у ASS/SSA свой.\n"
             "Как в программе — стиль программы даже поверх ASS/SSA.\n"
@@ -555,6 +584,8 @@ class EditTabLayoutMixin:
         self.cmb_sub_style.setSizeAdjustPolicy(
             _api.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.cmb_sub_style.setMinimumContentsLength(6)
+        # Превью рисует субтитры тем же стилем, что вшьёт экспорт.
+        self.cmb_sub_style.currentIndexChanged.connect(self._on_sub_style_changed)
         side_l.addWidget(self.cmb_sub_style)
 
         # Чекбокс «Вшить субтитры» — НАД индикатором уровня звука (по просьбе
@@ -765,8 +796,9 @@ class EditTabLayoutMixin:
         self.slider.setRange(0, 1000)
         self.slider.sliderMoved.connect(self.on_slider_moved)
         self.slider.setStyleSheet(self._slider_style(_api.C["playhead"]))
-        # Превью кадров при наведении на полосу полноэкранного режима.
-        self.seek_preview = _api.SeekPreview(lambda: getattr(self, "duration", 0.0) or 0.0)
+        # Превью кадров при наведении на полосу полноэкранного режима — по
+        # шкале проекта, как сама полоса (EditTabFullscreenMixin).
+        self.seek_preview = _api.SeekPreview(self._fs_span, self._fs_preview_locate)
         self.slider.attach_preview(self.seek_preview)
         self.in_time_edit = _api.QLineEdit("00:00:00.000")
         self.in_time_edit.returnPressed.connect(self.set_in_point)
@@ -932,7 +964,12 @@ class EditTabLayoutMixin:
         # «Экспорт» — в конце строки плеера, под правой колонкой панели.
         row.addSpacing(10)
         self.btn_cut.setFixedHeight(max(32, self.btn_fullscreen.sizeHint().height()))
-        row.addWidget(self.btn_cut)
+        # Большой коэффициент: свободное место сперва дотягивает кнопку до
+        # полной подписи (максимум ширины), остаток уходит распорке.
+        row.addWidget(self.btn_cut, 1000)
+        self.btn_export_settings.setFixedHeight(self.btn_cut.maximumHeight())
+        row.addWidget(self.btn_export_settings)
+        self._refresh_export_btn()
 
         pb_layout.addLayout(row)
         center.addWidget(player_bar)
@@ -1112,6 +1149,8 @@ class EditTabLayoutMixin:
             self.video_widget.cropCancelled.connect(self._on_crop_cancelled)
             self.video_widget.overlaysChanged.connect(self._on_overlays_changed)
             self.video_widget.overlaySelected.connect(self._on_overlay_picked)
+            # Формат кадров плеера — точным кадрам предекодера (HDR).
+            self.video_widget.playerFrameFormat.connect(self._on_player_frame_format)
         try:
             self.video_widget.setAcceptDrops(True)
             self.video_widget.installEventFilter(self)
@@ -1175,8 +1214,10 @@ class EditTabLayoutMixin:
             if fit_h > ch:
                 fit_h = ch
                 fit_w = int(round(fit_h * aspect))
-            fit_w = max(80, min(fit_w, cw))
-            fit_h = max(60, min(fit_h, ch))
+            # Нижние пределы — не больше самого контейнера: холст крупнее
+            # контейнера перекрыл бы соседние кнопки.
+            fit_w = min(max(80, fit_w), cw)
+            fit_h = min(max(60, fit_h), ch)
             self.video_widget.setMinimumSize(fit_w, fit_h)
             self.video_widget.setMaximumSize(fit_w, fit_h)
             # Оверлей субтитров подгоняем под экранную область видео.
@@ -1208,6 +1249,8 @@ class EditTabLayoutMixin:
         # доставался toggle_play, а не случайному виджету боковой панели.
         if self._ready:
             _api.QTimer.singleShot(0, self.setFocus)
+            # Первый показ — плейхед, вид таймлайна и кадр прошлого запуска.
+            self._session_schedule_restore()
 
     def hideEvent(self, ev):
         super().hideEvent(ev)

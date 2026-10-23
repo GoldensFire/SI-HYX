@@ -52,6 +52,7 @@ def _stub(tmp_path, mode=4, overlays=True, encodes_video=True):
         main=None,
         log_label=SimpleNamespace(setText=lambda *a: None,
                                   setStyleSheet=lambda *a: None),
+        _project_export_route=lambda: False,
     )
     st._execute_cut = lambda *a, **k: calls['cut'].append((a, k))
     st._execute_cut_and_process = lambda *a, **k: calls['process'].append((a, k))
@@ -113,6 +114,7 @@ def _run_cut_and_process(tmp_path, *, audio_only=False, rendered=None):
         chk_overwrite=SimpleNamespace(isChecked=lambda: False),
         selected_audio_abs_index=None, _audio_streams=[],
         _cut_ticker=SimpleNamespace(start=lambda: None, stop=lambda: None),
+        _start_cut_phase=lambda phase: None,
         _report_progress=lambda *a, **k: None,
         log_label=SimpleNamespace(setText=lambda *a: None),
         _set_cut_status=lambda *a, **k: None,
@@ -184,8 +186,9 @@ def _video_worker(tmp_path, monkeypatch, settings):
     # «self» вызов, а для staticmethod — просто функцию: одна строка на оба вида.
     for name in ('_sanitize_name', '_out_suffix', '_af_arg', '_map_av_args',
                  '_build_audio_filters', '_trim_seek_args', '_fps_args',
-                 '_build_video_filters', '_overlay_vf', '_av1_encoder_args',
-                 '_choose_pix_fmt', '_source_has_alpha', '_bt709_color_args',
+                 '_build_video_filters', '_overlay_vf', '_sdr_tonemap_vf',
+                 '_color_args', '_av1_encoder_args', '_choose_pix_fmt',
+                 '_source_has_alpha', '_bt709_color_args',
                  '_wants_metric_score', '_make_metric_sample', '_scale_vf'):
         setattr(st, name, inspect.getattr_static(ProcessWorker, name).__get__(
             st, ProcessWorker))

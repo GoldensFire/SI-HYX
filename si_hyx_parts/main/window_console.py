@@ -52,6 +52,16 @@ class UnifiedWindowConsoleMixin:
         try: self._taskbar.clear(self._tb_hwnd())
         except Exception: pass
 
+    def _warn_taskbar_broken(self):
+        """Панель задач Windows не принимает прогресс (см. TaskbarProgress.init_hr):
+        без этой строки выглядело так, будто значок сломан в самой программе."""
+        hr = getattr(self._taskbar, "init_hr", None)
+        if getattr(self._taskbar, "available", False) and isinstance(hr, int) and hr:
+            self.log(f"Панель задач Windows не показывает прогресс на значках "
+                     f"(HrInit 0x{hr:08X}) — ни у одной программы. Помогает "
+                     f"перезапуск Проводника: Диспетчер задач → «Проводник» → "
+                     f"«Перезапустить»; SI-HYX перезапускать не нужно.")
+
     def _sync_console_visibility(self, index=None):
         """Нижняя консоль и прогрессбар. Консоль скрыта на «Монтаж» и
         «SiQuesterHYX» (там она лишь занимает место). Прогрессбар скрыт на

@@ -16,6 +16,7 @@ from si_hyx_parts.animepack.manga_page_context import download
 def test_short_manhwa_chunk_is_scanned_and_its_blank_top_is_trimmed():
     client = Gemini(verdict(tile_index=0, box=[0, 0, 1000, 1000]))
     gen = SimpleNamespace(gemini_manga=client, db_cache=_Cache(),
+                          s=SimpleNamespace(visual_checker="gemini"),
                           stopped=lambda: False, _log_rare=lambda *args: None)
     cand = SimpleNamespace(anime={"kind": "manhwa"}, title_ru="Webtoon")
     data = page((400, 1100))
@@ -41,6 +42,7 @@ def test_selector_acceptance_cannot_bypass_review_of_cropped_pixels(problem):
 
     client.generate_json = respond
     gen = SimpleNamespace(gemini_manga=client, db_cache=_Cache(),
+                          s=SimpleNamespace(visual_checker="gemini"),
                           stopped=lambda: False, _log_rare=lambda *args: None)
     cand = SimpleNamespace(anime={}, title_ru="Comic")
     assert crop(gen, cand, page(), ".png") is None

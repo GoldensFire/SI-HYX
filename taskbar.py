@@ -32,6 +32,7 @@ class TaskbarProgress:
 
     def __init__(self):
         self._ok = False
+        self.init_hr = None              # HRESULT HrInit (0 — панель задач готова)
         self._taskbar = None
         self._set_value = None
         self._set_state = None
@@ -90,7 +91,12 @@ class TaskbarProgress:
         #   ITaskbarList:  3 HrInit ...
         #   ITaskbarList3: 9 SetProgressValue, 10 SetProgressState
         HrInit = ctypes.WINFUNCTYPE(HRESULT, c_void_p)(funcs[3])
-        HrInit(ppv)
+        # Остальные методы отвечают S_OK даже для чужого HWND, поэтому только
+        # HrInit и говорит, рисует ли панель прогресс вообще. Проводник,
+        # поднявшийся в сбойном состоянии, отвечает E_NOTIMPL и не рисует
+        # прогресс никому (проверено 20.10.2026: и окну .NET тоже), пока его
+        # не перезапустят; объект после перезапуска снова работает сам.
+        self.init_hr = HrInit(ppv) & 0xFFFFFFFF
         self._set_value = ctypes.WINFUNCTYPE(
             HRESULT, c_void_p, HWND, ULONGLONG, ULONGLONG)(funcs[9])
         self._set_state = ctypes.WINFUNCTYPE(

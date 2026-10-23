@@ -2,6 +2,8 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """Монтаж: кадрирование, пикселизация, накладки, удаление объекта и трекинг."""
+import hdr_tonemap
+
 import edit_tab as _api
 
 
@@ -390,13 +392,21 @@ class EditTabEffectsMixin:
 
         Формат работы overlay берём ПО ИСХОДНИКУ (см. overlay_chroma_format):
         при `format=auto` граф с RGBA-накладкой уводил ВЕСЬ кадр в RGB, libx264
-        писал gbrp — и итог получался кислотно-зелёным/малиновым."""
+        писал gbrp — и итог получался кислотно-зелёным/малиновым.
+
+        HDR10-источник (PQ) сперва сводится в SDR так, как кадр виден в
+        просмотре (hdr_tonemap): накладки, субтитры и эффекты ложатся уже на
+        SDR-кадр, а файл выходит BT.709. Поэтому звать только для
+        перекодирования — к копии потока фильтры неприменимы."""
+        path = str(src or getattr(self, "actual_source_file", "") or "")
+        tone = hdr_tonemap.tonemap_filter(path, self._escape_filter_path) if path else ""
         rendered = self._render_export_overlays()
         if not rendered:
-            return chain or ""
+            return ",".join(c for c in (tone, chain) if c)
         return _api.overlay_filter_graph(chain or "", rendered,
                                     self._escape_filter_path,
-                                    pix_fmt=self._overlay_pix_fmt(src))
+                                    pix_fmt="yuv420" if tone else self._overlay_pix_fmt(src),
+                                    pre_chain=tone)
 
     def _overlay_pix_fmt(self, src=None):
         """Значение `format=` для overlay под pix_fmt исходника (кэшируется на

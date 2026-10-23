@@ -226,6 +226,10 @@ from si_hyx_parts.utils.kodik import (
     kodik_get_info,
 )
 
+from si_hyx_parts.utils.dreamerscast import (
+    is_dreamerscast_site,
+    resolve_dreamerscast,
+)
 from si_hyx_parts.utils.kodik import resolve_kodik
 from si_hyx_parts.utils.ffmpeg_tools import parse_version, check_ffmpeg
 from si_hyx_parts.utils.web import default_download_dir, clean_url

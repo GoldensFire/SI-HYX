@@ -7,14 +7,16 @@ import edit_tab_workers as _api
 
 class AssExtractor(_api.QThread):
     """Извлекает выбранную дорожку субтитров в .ass (для рендера через libass) —
-    в фоне. Эмитит (token, путь_к_ass|None)."""
+    в фоне. Эмитит (token, путь_к_ass|None). post(path) — доводка готового
+    файла в том же потоке (холст mov_text, см. subtitle_style.fit_canvas_file)."""
     done = _api.pyqtSignal(int, object)   # (token, ass_path|None)
 
-    def __init__(self, src, sub_index, token):
+    def __init__(self, src, sub_index, token, post=None):
         super().__init__()
         self.src = str(src)
         self.sub_index = int(sub_index)
         self.token = int(token)
+        self.post = post
 
     def run(self):
         out = None
@@ -32,6 +34,8 @@ class AssExtractor(_api.QThread):
                 try: _api.os.remove(out)
                 except Exception: pass
                 out = None
+            elif self.post is not None:
+                self.post(out)
         except Exception:
             if out:
                 try: _api.os.remove(out)
@@ -46,7 +50,7 @@ class _SeekThumbnailer(_api.QThread):
     """Фоновый извлекатель кадров для превью полосы воспроизведения. Держит одну
     «целевую» позицию; пока идёт извлечение, новые запросы лишь обновляют цель
     (промежуточные отбрасываются — на быстром движении мыши не копится очередь)."""
-    ready = _api.pyqtSignal(float, object)   # quantized_sec, QImage
+    ready = _api.pyqtSignal(object, object)   # (файл, quantized_sec), QImage
 
     def __init__(self):
         super().__init__()
@@ -60,9 +64,11 @@ class _SeekThumbnailer(_api.QThread):
             self._src = str(src) if src else None
             self._pending = None
 
-    def request(self, sec):
+    def request(self, sec, src=None):
+        """Кадр в sec файла src (None — файла set_source): у проекта «Монтажа»
+        кадры полосы идут из разных файлов."""
         with self._cond:
-            self._pending = float(sec)
+            self._pending = (float(sec), str(src) if src else None)
             self._cond.notify()
 
     def stop(self):
@@ -77,13 +83,14 @@ class _SeekThumbnailer(_api.QThread):
                     self._cond.wait()
                 if self._stop:
                     return
-                sec = self._pending; src = self._src
+                sec, src = self._pending
+                src = src or self._src
                 self._pending = None
             if src is None:
                 continue
             img = self._extract(src, sec)
             if img is not None and not img.isNull():
-                self.ready.emit(sec, img)
+                self.ready.emit((src, sec), img)
 
     @staticmethod
     def _extract(src, sec):

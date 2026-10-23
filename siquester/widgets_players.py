@@ -15,6 +15,7 @@ from .media import (
     _measure_lufs, _mp4_video_size
 )
 from .util import _lbl, fmt_dur
+from sip_notify import prime_disconnect_notify
 
 
 class SeekSlider(QSlider):
@@ -213,7 +214,7 @@ class VideoPlayerWidget(QWidget):
 
         # ── Player ─────────────────────────────────────────────
         self._player = QMediaPlayer(self)
-        self._aout = QAudioOutput(self)
+        self._aout = prime_disconnect_notify(QAudioOutput(self))
         self._player.setAudioOutput(self._aout)
         self._aout.setVolume(1.0)
         self._player.setVideoOutput(self._video)
@@ -521,7 +522,7 @@ class AudioPlayerWidget(QWidget):
         self._drag_origin = None; self._dragging = False
 
         self._player = QMediaPlayer(self)
-        self._aout = QAudioOutput(self)
+        self._aout = prime_disconnect_notify(QAudioOutput(self))
         self._player.setAudioOutput(self._aout)
         self._aout.setVolume(1.0)
 

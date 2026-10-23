@@ -5,6 +5,51 @@
 import edit_tab_dialogs as _api
 
 
+class _CueTextEdit(_api.QPlainTextEdit):
+    """Поле текста реплики в списке «Субтитр»: растёт по высоте вместе с
+    текстом (перенос по словам) и своего скроллбара не имеет. Раньше высота
+    была фиксированной (две строки), и длинная реплика пряталась под полосу
+    прокрутки поля. on_height — вызывается, когда высота поменялась (строке
+    списка нужно обновить размер)."""
+
+    MIN_H = 44
+
+    def __init__(self, text, on_height=None):
+        super().__init__(text)
+        self._on_height = on_height
+        self.setVerticalScrollBarPolicy(_api.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(_api.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setWordWrapMode(_api.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        self.setSizePolicy(_api.QSizePolicy.Policy.Expanding, _api.QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(self.MIN_H)
+        self.document().documentLayout().documentSizeChanged.connect(self._fit_height)
+
+    def _fit_height(self, *_):
+        # Высота текста — по раскладке блоков (с переносами), а не по числу
+        # строк × fontMetrics: шрифт задаёт стиль диалога, и счёт по метрикам
+        # недобирал строку.
+        doc_h = 0.0
+        block = self.document().begin()
+        while block.isValid():
+            doc_h += self.blockBoundingRect(block).height()
+            block = block.next()
+        m = self.contentsMargins()
+        h = int(doc_h + 2 * self.document().documentMargin()) + m.top() + m.bottom() + 2
+        h = max(self.MIN_H, h)
+        if h != self.height():
+            self.setFixedHeight(h)
+            if self._on_height is not None:
+                self._on_height()
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._fit_height()
+
+
+_CueTextEdit.__module__ = _api.__name__
+_api._CueTextEdit = _CueTextEdit
+
+
 class SubtitleCreatorDialog(_api.QDialog):
     """Создание субтитров с нуля — интерфейс в духе Filmora: тулбар стиля текста
     сверху, слева живое превью с транспортом, справа вкладки Субтитр/Пресет/
@@ -14,7 +59,13 @@ class SubtitleCreatorDialog(_api.QDialog):
     общего стиля по умолчанию (self._default_style) — см. _effective_style.
     Правка тулбара/вкладок пишет в стиль ВЫБРАННОЙ реплики, а если ничего не
     выбрано — в общий стиль по умолчанию; «Применить ко всем» копирует
-    эффективный стиль текущей реплики на все остальные."""
+    эффективный стиль текущей реплики на все остальные.
+
+    Это же окно правит существующую дорожку («Редактировать субтитры»). Реплика
+    дорожки ASS приходит словарём (subtitle_style.edit_cues): 'src' — её
+    события в файле, 'base' — их стиль в единицах окна (так реплика видна
+    похожей на оригинал). Оба ключа уходят обратно в cues(): по ним
+    rebuild_ass возвращает правку в те же события."""
 
     _POS_LABELS = {
         7: "↖", 8: "↑", 9: "↗",
@@ -31,9 +82,9 @@ class SubtitleCreatorDialog(_api.QDialog):
     def __init__(self, source_path=None, cues=None, start_hint=0.0,
                  range_start=0.0, range_end=None, ignore_media_duration=False,
                  default_style=None, audio_track_index=None, audio_ext_path=None,
-                 parent=None):
+                 title=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Создать субтитры")
+        self.setWindowTitle(title or "Создать субтитры")
         self.resize(1060, 700)
         self._source_path = source_path
         self._audio_track_index = audio_track_index
@@ -57,7 +108,10 @@ class SubtitleCreatorDialog(_api.QDialog):
         # списка шрифтов — иначе QFontComboBox его не знает и подставил бы
         # первый попавшийся вместо «Karaoke Rounded».
         _api._karaoke_font_family()
-        self._cues = []          # [{'start','end','text','style'(override|None)}]
+        # [{'start','end','text','style'(override|None), 'src','tmpl','base'}]:
+        # src — события исходного ASS, tmpl — событие-образец дубля, base —
+        # стиль реплики оригинала под переопределением (см. класс).
+        self._cues = []
         self._selected = -1
         self._presets = _api._load_subtitle_presets()
         # Undo/redo (Ctrl+Z/Ctrl+Y) — снимки (реплики + общий стиль) перед
@@ -247,8 +301,14 @@ class SubtitleCreatorDialog(_api.QDialog):
             self.preview.set_range(self._range_start, self._range_end)
         if cues:
             for c in cues:
-                self._cues.append({'start': float(c[0]), 'end': float(c[1]),
-                                   'text': str(c[2]), 'style': None})
+                if isinstance(c, dict):
+                    self._cues.append({'start': float(c['start']), 'end': float(c['end']),
+                                       'text': str(c['text']), 'style': None,
+                                       'src': c.get('src'), 'tmpl': None,
+                                       'base': c.get('base')})
+                else:
+                    self._cues.append({'start': float(c[0]), 'end': float(c[1]),
+                                       'text': str(c[2]), 'style': None})
             self._resync_all()
         else:
             self._add_cue()
@@ -454,6 +514,10 @@ class SubtitleCreatorDialog(_api.QDialog):
         self.search_box.textChanged.connect(lambda _t: self._rebuild_list())
         lay.addWidget(self.search_box)
         self.list_cues = _api.QListWidget()
+        # Строки — во всю ширину списка, без горизонтальной прокрутки: поле
+        # текста переносит длинную реплику и растёт вниз (см. _CueTextEdit).
+        self.list_cues.setHorizontalScrollBarPolicy(_api.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_cues.viewport().installEventFilter(self)
         self.list_cues.currentItemChanged.connect(self._on_list_current_changed)
         lay.addWidget(self.list_cues, 1)
         row = _api.QHBoxLayout(); row.setSpacing(6)
@@ -473,10 +537,11 @@ class SubtitleCreatorDialog(_api.QDialog):
                     continue
                 item = _api.QListWidgetItem()
                 row_w = self._build_row_widget(i, c)
-                item.setSizeHint(row_w.sizeHint())
+                row_w._list_item = item
                 item.setData(_api.Qt.ItemDataRole.UserRole, i)
                 self.list_cues.addItem(item)
                 self.list_cues.setItemWidget(item, row_w)
+                self._fit_row(row_w)
                 if i == self._selected:
                     self.list_cues.setCurrentItem(item)
         finally:
@@ -489,8 +554,7 @@ class SubtitleCreatorDialog(_api.QDialog):
         lbl_time.setStyleSheet(f"color: {_api.C['text3']}; font-size: 10px;")
         lbl_time.setFixedWidth(56)
         row.addWidget(lbl_time)
-        txt = _api.QPlainTextEdit(cue['text'])
-        txt.setFixedHeight(44)
+        txt = _api._CueTextEdit(cue['text'], on_height=_api.partial(self._fit_row, w))
         txt.textChanged.connect(_api.partial(self._on_row_text_changed, txt, idx))
         orig_focus_in = txt.focusInEvent
 
@@ -509,6 +573,26 @@ class SubtitleCreatorDialog(_api.QDialog):
         btn_del.clicked.connect(_api.partial(self._delete_cue, idx))
         row.addWidget(btn_dup); row.addWidget(btn_del)
         return w
+
+    def _fit_row(self, row_w):
+        """Размер строки списка: ширина — как у области списка, высота — по
+        полю текста (оно растёт с длиной реплики)."""
+        item = getattr(row_w, "_list_item", None)
+        if item is None:
+            return
+        size = _api.QSize(self.list_cues.viewport().width(), row_w.sizeHint().height())
+        if item.sizeHint() != size:
+            item.setSizeHint(size)
+
+    def eventFilter(self, watched, event):
+        lst = getattr(self, "list_cues", None)
+        if (lst is not None and event.type() == _api.QEvent.Type.Resize
+                and watched is lst.viewport()):
+            for i in range(lst.count()):
+                row_w = lst.itemWidget(lst.item(i))
+                if row_w is not None:
+                    self._fit_row(row_w)
+        return super().eventFilter(watched, event)
 
     def _on_row_text_changed(self, txt_widget, idx):
         if self._syncing or not (0 <= idx < len(self._cues)):
@@ -665,6 +749,7 @@ class SubtitleCreatorDialog(_api.QDialog):
     def _effective_style(self, idx):
         base = dict(self._default_style)
         if 0 <= idx < len(self._cues):
+            base.update(self._cues[idx].get('base') or {})
             ov = self._cues[idx].get('style')
             if ov:
                 base.update(ov)
@@ -738,8 +823,12 @@ class SubtitleCreatorDialog(_api.QDialog):
         new_end = min(hi, lo + dur)
         if new_end <= lo:
             new_end = lo + 0.1
+        # Дубль реплики оригинала — новое событие по образцу её первого
+        # события (тот же стиль и теги), см. subtitle_style.rebuild_ass.
+        tmpl = src['src'][0] if src.get('src') else src.get('tmpl')
         new_cue = {'start': lo, 'end': new_end, 'text': src['text'],
-                  'style': dict(src['style']) if src.get('style') else None}
+                  'style': dict(src['style']) if src.get('style') else None,
+                  'src': None, 'tmpl': tmpl, 'base': src.get('base')}
         self._cues.insert(idx + 1, new_cue)
         self._resync_all()
         self._select_cue(idx + 1)
@@ -837,14 +926,18 @@ class SubtitleCreatorDialog(_api.QDialog):
 
     def cues(self):
         """Список словарей {start,end,text,style} с уже разрешённым (эффективным)
-        стилем — только непустые реплики, start < end. Передаётся в _cues_to_ass."""
+        стилем — только непустые реплики, start < end. Передаётся в _cues_to_ass,
+        а при правке дорожки ASS — в rebuild_ass: ей же src/tmpl (события
+        файла) и restyled (стиль реплике меняли в окне)."""
         out = []
         for i, c in enumerate(self._cues):
             text = (c.get('text') or '').strip()
             if not text or c['end'] <= c['start']:
                 continue
             out.append({'start': c['start'], 'end': c['end'], 'text': text,
-                       'style': self._effective_style(i)})
+                       'style': self._effective_style(i),
+                       'src': c.get('src'), 'tmpl': c.get('tmpl'),
+                       'restyled': bool(c.get('style'))})
         out.sort(key=lambda c: c['start'])
         return out
 

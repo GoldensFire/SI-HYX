@@ -2,6 +2,9 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """VideoInpaintWorker. Public namespace: edit_tab_workers."""
+import hdr_tonemap
+from utils import escape_filter_path
+
 import edit_tab_workers as _api
 
 
@@ -100,8 +103,14 @@ class VideoInpaintWorker(_api.QThread):
             patt = _api.os.path.join(frames_dir, "%08d.png")
 
             # 1) Разбор видео на кадры (полное разрешение, дисплейная ориентация).
+            #    В RGB и обратно — одной матрицей, HDR10 сводится в SDR, как в
+            #    просмотре (hdr_tonemap): иначе кадры шли 16-битным PQ, а итог
+            #    — 8 бит с PQ-тегами; у BT.709-видео уезжал цвет.
             self.progress.emit(-1, "Разбор видео на кадры…")
-            if self._run_ffmpeg([_api.FFMPEG, "-y", "-i", self._src, patt]) != 0 or self._cancel:
+            to_rgb = hdr_tonemap.rgb_decode_filter(self._src, escape_filter_path, "rgb24")
+            to_yuv = hdr_tonemap.rgb_encode_filter(self._src) if to_rgb else ""
+            if self._run_ffmpeg([_api.FFMPEG, "-y", "-i", self._src]
+                                + (["-vf", to_rgb] if to_rgb else []) + [patt]) != 0 or self._cancel:
                 raise RuntimeError("Отменено" if self._cancel
                                    else "Не удалось извлечь кадры из видео")
 
@@ -148,6 +157,8 @@ class VideoInpaintWorker(_api.QThread):
                             else ["-c:a", "aac", "-b:a", "192k"])
                 else:
                     cmd += ["-map", "0:v:0"]
+                if to_yuv:
+                    cmd += ["-vf", to_yuv]
                 cmd += self._venc + ["-pix_fmt", "yuv420p",
                                      "-movflags", "+faststart", "-shortest", out_tmp]
                 return self._run_ffmpeg(cmd)

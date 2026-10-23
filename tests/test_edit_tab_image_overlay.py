@@ -150,6 +150,7 @@ def _stub_cut(tmp_path, mode=0, overlays=True):
         main=None,
         log_label=SimpleNamespace(setText=lambda *a: None,
                                   setStyleSheet=lambda *a: None),
+        _project_export_route=lambda: False,
     )
     st._execute_cut = lambda *a, **k: calls['cut'].append(a)
     st._execute_smartcut = lambda *a, **k: calls['smart'].append(a)

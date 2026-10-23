@@ -306,11 +306,16 @@ _api.kodik_get_info = kodik_get_info
 
 def resolve_kodik(page_url: str, want_height: int = 720, proxy: str = "",
                   episode=None, translation: str = "", log_fn=None) -> dict:
-    """Полный резолв страницы с плеером Kodik в прямой m3u8.
+    """Полный резолв встроенного плеера страницы в прямой HLS/m3u8.
     episode — номер серии (int) или None = серия по умолчанию.
     translation — подстрока названия озвучки или '' = озвучка по умолчанию.
-    Возвращает {'url','referer','height'} или {} если Kodik не найден.
-    """
+    Возвращает {'url','referer','height'} или {} если плеер не найден.
+
+    Имя историческое: кроме Kodik/animego функция обслуживает и другие
+    встраиваемые плееры (сейчас — Dream Cast)."""
+    if _api.is_dreamerscast_site(page_url):
+        return _api.resolve_dreamerscast(page_url, want_height=want_height,
+                                         proxy=proxy, log_fn=log_fn)
     if _api._is_animego(page_url):
         ku = _api._animego_resolve_kodik_url(page_url, episode=episode,
                                         translation=translation, proxy=proxy, log_fn=log_fn)

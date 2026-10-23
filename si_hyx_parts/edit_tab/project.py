@@ -7,9 +7,11 @@
 Открытый файл сразу целиком ложится на основную дорожку «Видео 1». Дальше всё
 на таймлайне: Ctrl+B режет клип у плейхеда, Shift+C / Shift+V обрезают начало
 и конец клипа до плейхеда, края клипов тянутся мышью, Delete удаляет (на
-основной дорожке дыра закрывается сама). Ещё файлы — «＋» или бросок на
+основной дорожке дыра закрывается сама), Ctrl+C копирует выделенные клипы, а
+Ctrl+V вставляет их у плейхеда (Project.paste). Ещё файлы — «＋» или бросок на
 таймлайн: встают в конец. Клипы уходят на верхнюю видеодорожку (перекрывают
-кадр) или на звуковые через меню.
+кадр) или на звуковые через меню; «Отделить звук» выносит звук видеоклипа
+отдельным клипом, «Скорость» ускоряет видео и звук клипа.
 
 Плеер всегда показывает проект: плейхед таймлайна и плеер связаны в обе
 стороны (клик по шкале — плеер на клипе; шаг кадра, игра — плейхед за ним).
@@ -22,8 +24,10 @@
 Модель — montage_project.Project; виджет — edit_tab_widgets.ProjectTimeline.
 Проект сохраняется сам (MONTAGE_PROJECT_PATH) и переживает перезапуск."""
 import bisect
+import dataclasses
 from collections import OrderedDict
 
+import hdr_tonemap
 import montage_project as _mp
 
 import edit_tab as _api
@@ -66,7 +70,9 @@ class EditTabProjectMixin:
         self._proj_thumb_worker = None
         self._proj_thumb_timer = None
         self._proj_waves = {}          # волна файла: путь → (сэмплы, длительность)
+        self._proj_clipboard = []      # копии клипов для Ctrl+V (project_copy)
         self._pmix_init()              # звук дорожек в просмотре (project_audio)
+        self._snd_init()               # звук просмотра своим трактом (project_sound)
 
     # ── Панель ───────────────────────────────────────────────────────────────
     def _build_project_panel(self):
@@ -83,6 +89,7 @@ class EditTabProjectMixin:
         tl = _api.ProjectTimeline(self.project)
         tl.thumb_provider = self._project_thumb
         tl.wave_provider = self._project_wave
+        tl.can_paste = lambda: bool(self._proj_clipboard)
         tl.seekRequested.connect(self._project_seek)
         tl.scrubStarted.connect(self._project_scrub_started)
         tl.scrubFinished.connect(self._project_scrub_finished)
@@ -182,6 +189,7 @@ class EditTabProjectMixin:
         self.project_timeline.refresh()
         self._project_sync_source()
         self._project_update_ui()
+        self._snd_schedule_prepare()
 
     def _project_replace(self, project):
         self.project = project
@@ -226,12 +234,15 @@ class EditTabProjectMixin:
         # Видео — на основной дорожке; звуковой файл — где угодно.
         if (first.has_video and first.track != p.main_track) or not p.tracks[first.track].enabled:
             return None
+        if p.tracks[first.track].muted:
+            return None                 # звук дорожки выключен — «Обрезка» его не знает
         run = p.clips_on(first.track)
         for a, b in zip(run, run[1:]):
             if (b.src != a.src or b.audio_path != a.audio_path
                     or abs(b.in_s - a.out_s) > 1e-3 or abs(b.start - a.end) > 1e-3):
                 return None
-        if any(c.muted or abs(c.volume - 1.0) > 1e-6 for c in run):
+        if any(c.muted or abs(c.volume - 1.0) > 1e-6
+               or abs(c.speed - 1.0) > 1e-6 or c.audio_detached for c in run):
             return None
         if len(run) == 1:
             return run[0]
@@ -289,16 +300,18 @@ class EditTabProjectMixin:
     def _project_restore_audio(self):
         """Открыли файл, куски которого лежат в проекте, → в списке дорожек
         выбираем звук этих кусков. Иначе список вставал на первую встроенную
-        дорожку, а проект играл и собирал запомненную в кусках озвучку."""
+        дорожку, а проект играл и собирал запомненную в кусках озвучку.
+        True — звук этого файла задают куски проекта."""
         if getattr(self, "project_timeline", None) is None or self.project.is_empty():
-            return
+            return False
         if getattr(self, "is_still_image", False):
-            return
+            return False
         clip = next((c for c in sorted(self.project.clips, key=lambda c: c.start)
-                     if c.has_video and not c.is_image and self._proj_is_loaded(c.src)),
+                     if c.has_video and not c.is_image and not c.audio_detached
+                     and self._proj_is_loaded(c.src)),
                     None)
         if clip is None:
-            return
+            return False
         target = None
         if not clip.audio_path:
             target = ('none', None)
@@ -308,7 +321,7 @@ class EditTabProjectMixin:
                            if e[0] == 'ext' and self._proj_norm(e[1]) == want), None)
             if target is None and _api.os.path.exists(clip.audio_path):
                 self._add_external_audio(clip.audio_path)
-                return
+                return True
         else:
             want = clip.audio_stream
             for i, s in enumerate(self._audio_streams):
@@ -316,10 +329,11 @@ class EditTabProjectMixin:
                     target = ('emb', i)
                     break
         if target is None or target not in self._audio_entries:
-            return
+            return True
         idx = self._audio_entries.index(target)
         if idx != self.cmb_audio.currentIndex():
             self.cmb_audio.setCurrentIndex(idx)
+        return True
 
     def _project_retarget_audio(self):
         """В источнике выбрали другую дорожку или озвучку → видеоклипы этого
@@ -333,7 +347,8 @@ class EditTabProjectMixin:
         path, idx = self._source_audio()
         changed = []
         for c in self.project.clips:
-            if c.is_image or not c.has_video or not self._proj_is_loaded(c.src):
+            if (c.is_image or not c.has_video or c.audio_detached
+                    or not self._proj_is_loaded(c.src)):
                 continue
             if c.audio_path != path or c.audio_stream != idx:
                 c.audio_path, c.audio_stream = path, idx
@@ -345,6 +360,13 @@ class EditTabProjectMixin:
             _mp.save_project(self.project, _api.MONTAGE_PROJECT_PATH)
         except Exception:
             pass
+        if self._proj_play is not None and self._snd_active:
+            # Звук тракта сведён со старой дорожкой — просмотр заново с того
+            # же места: звук и картинка стартуют вместе уже с новой.
+            self.project_timeline.refresh()
+            self.project_stop()
+            self.project_play()
+            return
         if self._proj_play is not None:
             # Просмотр идёт: голоса со старым звуком закрыть, состав того, что
             # слышно, — заново (часы проекта не трогаем).
@@ -452,6 +474,61 @@ class EditTabProjectMixin:
         self._proj_cur_id = parts[1].id
         self._project_changed()
 
+    def project_set_speed(self, cid, speed):
+        """Меняет скорость клипа (видео и его звук или звуковой клип).
+        Кусок исходника тот же — на шкале он становится короче или длиннее."""
+        clip = self.project.clip(cid)
+        if clip is None or clip.is_image:
+            return
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            return
+        if not _api.math.isfinite(speed):
+            return
+        speed = max(_mp.MIN_SPEED, min(_mp.MAX_SPEED, speed))
+        if abs(clip.speed - speed) < 1e-6:
+            return
+        self._project_snapshot()
+        if not self.project.set_speed(clip.id, speed):
+            self._proj_undo.pop()
+            return
+        self.project_timeline.selected = clip.id
+        self._proj_cur_id = clip.id
+        self._project_changed()
+        t = min(clip.start, max(0.0, self.project.duration() - 0.04))
+        self.project_timeline.set_playhead(t, follow=False)
+        self._project_seek(t)
+
+    def project_detach_audio(self, cid):
+        """«Отделить звук»: звук видеоклипа становится отдельным клипом на
+        звуковой дорожке. Видеоклип остаётся без звука, оба можно двигать,
+        резать и ускорять независимо."""
+        clip = self.project.clip(cid)
+        if clip is None or not clip.has_video or clip.is_image or not clip.audio_path:
+            return
+        self._project_snapshot()
+        p = self.project
+        # Дорожка без клипов на этом месте: отделённый звук остаётся ровно под
+        # видео. Занято на всех — новая дорожка, а не сдвиг в конец соседа.
+        track = next((ti for ti in p.tracks_of('audio')
+                      if all(o.end <= clip.start + 1e-6 or o.start >= clip.end - 1e-6
+                             for o in p.clips_on(ti))), None)
+        if track is None:
+            track = p.add_track('audio')
+        audio = _mp.Clip(src=clip.audio_path, in_s=clip.in_s, out_s=clip.out_s,
+                         track=track, start=clip.start, has_video=False,
+                         audio_path=clip.audio_path, audio_stream=clip.audio_stream,
+                         volume=clip.volume, muted=clip.muted, speed=clip.speed,
+                         fps=clip.fps, src_duration=clip.src_duration)
+        clip.audio_path = ""
+        clip.audio_stream = -1
+        clip.audio_detached = True
+        p.append(audio)
+        self.project_timeline.selected = audio.id
+        self._proj_cur_id = audio.id
+        self._project_changed()
+
     def project_trim_to_playhead(self, edge):
         """Обрезать начало (edge='left') или конец клипа до плейхеда — как
         «Обрезать начало/конец до плейхеда» в Filmora. На основной дорожке
@@ -477,17 +554,56 @@ class EditTabProjectMixin:
             self._project_seek(clip.end)
 
     def project_delete(self, cid=None):
-        cid = cid or self.project_timeline.selected
-        if not cid or self.project.clip(cid) is None:
+        """Удаляет клип cid, а если он среди выделенных (или cid не задан) —
+        все выделенные (рамкой / Ctrl+клик), одним шагом отмены."""
+        sel = self.project_timeline.selected_ids()
+        ids = sel if (not cid or cid in sel) else [cid]
+        ids = [i for i in ids if self.project.clip(i) is not None]
+        if not ids:
             return
         self._project_snapshot()
-        self.project.remove(cid)
+        for i in ids:
+            self.project.remove(i)
         self.project_timeline.selected = ""
         self._project_changed()
         if not self.project.is_empty():
             t = min(self.project_timeline.playhead,
                     max(0.0, self.project.duration() - 0.04))
             self._project_seek(t)
+
+    def project_copy(self, cid=None):
+        """Ctrl+C: клип cid, а если он среди выделенных (или cid не задан) —
+        все выделенные; без выделения — клип под плейхедом. В буфере копии:
+        дальнейшая правка клипов на таймлайне его не меняет."""
+        sel = self.project_timeline.selected_ids()
+        ids = sel if (not cid or cid in sel) else [cid]
+        clips = [c for c in (self.project.clip(i) for i in ids) if c is not None]
+        if not clips:
+            c = self._project_target()
+            clips = [c] if c is not None else []
+        if not clips:
+            self._proj_status("нечего копировать — выделите клип")
+            return
+        self._proj_clipboard = [dataclasses.replace(c) for c in clips]
+        self._proj_status("клип скопирован — Ctrl+V вставит его у плейхеда" if len(clips) == 1
+                          else f"скопировано клипов: {len(clips)} — Ctrl+V вставит их у плейхеда")
+
+    def project_paste(self):
+        """Ctrl+V: клипы из буфера — у плейхеда, одним шагом отмены. Плейхед
+        встаёт за вставкой: следующая вставка ляжет следом."""
+        if not self._proj_clipboard:
+            self._proj_status("вставлять нечего — сначала скопируйте клип (Ctrl+C)")
+            return
+        self._project_snapshot()
+        new = self.project.paste(self._proj_clipboard, self.project_timeline.playhead)
+        if not new:
+            self._proj_undo.pop()
+            return
+        main = [c for c in new if c.track == self.project.main_track]
+        self.project_timeline.select({c.id for c in new}, (main or new)[0].id)
+        self._project_changed()
+        end = max(c.end for c in (main or new))
+        self._project_seek(min(end, self._proj_last_frame_t()))
 
     def project_clear(self):
         """Убирает все клипы (отмена — Ctrl+Z). Вызывается из «Очистить»."""
@@ -515,6 +631,10 @@ class EditTabProjectMixin:
             self.project_split(cid)
         elif action == 'delete':
             self.project_delete(cid)
+        elif action == 'copy':
+            self.project_copy(cid)
+        elif action == 'paste':
+            self.project_paste()
         elif action.startswith('trim:') and clip is not None:
             self.project_timeline.selected = clip.id
             self.project_trim_to_playhead(action.split(':', 1)[1])
@@ -530,6 +650,25 @@ class EditTabProjectMixin:
                 self._project_snapshot()
                 clip.volume = val / 100.0
                 self._project_changed()
+        elif action == 'detach_audio' and clip is not None:
+            self.project_detach_audio(clip.id)
+        elif action.startswith('speed:') and clip is not None:
+            value = action.split(':', 1)[1]
+            if value == 'custom':
+                val, ok = _api.QInputDialog.getInt(
+                    self, "Скорость клипа", "Скорость, % (100 — как в исходнике):",
+                    int(round(clip.speed * 100)),
+                    int(round(_mp.MIN_SPEED * 100)),
+                    int(round(_mp.MAX_SPEED * 100)), 5)
+                if not ok:
+                    return
+                speed = val / 100.0
+            else:
+                try:
+                    speed = float(value)
+                except ValueError:
+                    return
+            self.project_set_speed(clip.id, speed)
         elif action.startswith('track:') and clip is not None:
             try:
                 ti = int(action.split(':', 1)[1])
@@ -659,6 +798,7 @@ class EditTabProjectMixin:
 
     def _project_shutdown(self):
         self._pmix_stop()
+        self._snd_shutdown()
         worker = getattr(self, "_proj_thumb_worker", None)
         if worker is not None:
             try:
@@ -710,7 +850,9 @@ class EditTabProjectMixin:
             s0, s1 = c.source_time(t0), c.source_time(t1)
             last = plan[-1] if plan else None
             if (last is not None and last['clip'] is not None
-                    and last['clip'].src == c.src and abs(last['t1'] - t0) < 1e-6
+                    and last['clip'].src == c.src
+                    and abs(last['clip'].speed - c.speed) < 1e-6
+                    and abs(last['t1'] - t0) < 1e-6
                     and abs(last['s1'] - s0) < 0.002):
                 last['t1'], last['s1'] = t1, s1
                 continue
@@ -736,12 +878,18 @@ class EditTabProjectMixin:
                 self.project_stop()
             else:
                 self._proj_play = plan
+                if self._snd_active:
+                    # Звук — с нового места; картинка встанет и подождёт его
+                    # (иначе после прыжка она убегала бы вперёд звука).
+                    self._snd_jump(t)
+                    self._proj_hold_player()
                 self._proj_play_segment(idx, t - plan[idx]['t0'])
             return
         if idx is None or plan[idx]['clip'] is None:
             return                      # пустота: показывать нечего, стоит плейхед
         seg = plan[idx]
-        src_t = seg['s0'] + (t - seg['t0'])
+        speed = max(_mp.MIN_SPEED, seg['clip'].speed) if seg['clip'] is not None else 1.0
+        src_t = self._proj_clamp_src(seg, seg['s0'] + (t - seg['t0']) * speed)
         clip = self._proj_clip_at_source(seg, src_t)
         self._proj_cur_id = clip.id
         if not self._proj_ready_for(clip.src):
@@ -751,6 +899,18 @@ class EditTabProjectMixin:
             return
         if not clip.is_image:
             self.seek_to(src_t)
+
+    def _proj_clamp_src(self, seg, src_t):
+        """Время файла внутри куска плана — не дальше середины его последнего
+        кадра: кадр, начинающийся ровно на s1, вырезан, а index_at (допуск
+        1.5 мс) у самой границы отдавал именно его."""
+        clip = seg.get('clip')
+        fps = clip.fps if clip is not None and clip.fps and not clip.is_image else 0.0
+        src_t = max(seg['s0'], src_t)
+        if fps > 0 and 's1' in seg:
+            _first, last = self._proj_seg_frames(seg, fps)
+            src_t = min(src_t, (last + 0.5) / fps)
+        return src_t
 
     def _proj_clip_at_source(self, seg, src_t):
         """Склеенный кусок плана может состоять из нескольких клипов (разрезали
@@ -766,6 +926,7 @@ class EditTabProjectMixin:
         lbl = getattr(self, "lbl_current_time", None)
         if lbl is not None:
             lbl.setText(_api.s_to_time(t))
+        self._fs_sync_position()
 
     def _proj_follow_source(self, src_s):
         """Плеер показал кадр src_s файла (_paint_playhead) — плейхед проекта
@@ -778,14 +939,17 @@ class EditTabProjectMixin:
             self._paint_project_time(tl.playhead)
             return True
         c = self.project.clip(self._proj_cur_id)
-        eps = 1e-4
+        # Первый кадр клипа, разрезанного не по сетке кадров, начинается чуть
+        # раньше его in — допуск в полкадра, иначе плейхед на нём не двигался.
+        lead = (0.5 / c.fps) if c is not None and c.fps else 1e-4
         if (c is None or not self._proj_is_loaded(c.src)
-                or not (c.in_s - eps <= src_s <= c.out_s + eps)):
+                or not (c.in_s - lead <= src_s <= c.out_s + 1e-4)):
             c = self._proj_clip_for_source(src_s)
             if c is None:
                 return False
             self._proj_cur_id = c.id
-        t = c.start + (min(max(src_s, c.in_s), c.out_s) - c.in_s)
+        t = c.start + (min(max(src_s, c.in_s), c.out_s) - c.in_s) / max(
+            _mp.MIN_SPEED, c.speed)
         tl.set_playhead(t)
         self._paint_project_time(t)
         return True
@@ -796,12 +960,37 @@ class EditTabProjectMixin:
         t = self.project_timeline.playhead
         best, dist = None, None
         for c in self.project.clips:
-            if not self._proj_is_loaded(c.src) or not (c.in_s - 1e-4 <= src_s < c.out_s):
+            lead = (0.5 / c.fps) if c.fps else 1e-4
+            if not self._proj_is_loaded(c.src) or not (c.in_s - lead <= src_s < c.out_s):
                 continue
-            d = abs(c.start + (src_s - c.in_s) - t)
+            d = abs(c.start + (src_s - c.in_s) / max(_mp.MIN_SPEED, c.speed) - t)
             if best is None or d < dist:
                 best, dist = c, d
         return best
+
+    def _proj_time_of_source(self, src_s):
+        """Время проекта для кадра src_s открытого файла в текущем клипе или
+        None (кадр не из него)."""
+        c = self.project.clip(getattr(self, "_proj_cur_id", ""))
+        if c is None or c.is_image or not self._proj_is_loaded(c.src):
+            return None
+        lead = (0.5 / c.fps) if c.fps else 1e-4
+        if not (c.in_s - lead <= src_s < c.out_s):
+            return None
+        return c.start + (max(src_s, c.in_s) - c.in_s) / max(_mp.MIN_SPEED, c.speed)
+
+    def _proj_audio_at(self, t):
+        """Звук, который слышно в точке t проекта: (клип, время его звука) или
+        None — там тишина (дорожка выключена, клип заглушён, звук убран или
+        отделён в выключенную дорожку, пустота). Звучат несколько — свой звук
+        показанного клипа, иначе верхняя звуковая дорожка: шагу кадра нужен
+        один источник."""
+        parts = [c for c in self.project.audio_parts() if c.start - 1e-6 <= t < c.end]
+        if not parts:
+            return None
+        cur = getattr(self, "_proj_cur_id", "")
+        c = next((p for p in parts if p.id == cur), None) or min(parts, key=lambda p: p.track)
+        return c, c.source_time(t)
 
     def _proj_step(self, step):
         """Шаг кадра по проекту. True — шаг сделан здесь (через стык клипов
@@ -809,6 +998,18 @@ class EditTabProjectMixin:
         проекта приедет за плеером сам."""
         if getattr(self, "project_timeline", None) is None or self.project.is_empty():
             return False
+        c = self.project.clip(self._proj_cur_id)
+        if c is not None and abs(c.speed - 1.0) > 1e-6:
+            # Ускоренный клип: шаг кадра проекта — это speed кадров файла,
+            # обычный шаг плеера дал бы speed-ю долю кадра.
+            fps = c.fps or self.fps or 30.0
+            t = self.project_timeline.playhead + int(step) / fps
+            t = max(0.0, min(t, self.project.duration() - 1.0 / fps))
+            self._project_seek(t)
+            return True
+        done = self._proj_step_frames(int(step))
+        if done is not None:
+            return done
         tl = self.project_timeline
         c = self.project.clip(self._proj_cur_id)
         fps = (c.fps if c is not None and c.fps else 0.0) or self.fps or 30.0
@@ -821,6 +1022,60 @@ class EditTabProjectMixin:
         self._project_seek(nt)
         return True
 
+    @staticmethod
+    def _proj_seg_frames(seg, fps):
+        """Кадры файла (первый, последний), которые кусок плана показывает:
+        [s0, s1) — от кадра, на котором стоит s0, до кадра перед s1 (кадр,
+        начинающийся ровно на s1, уже вырезан). Так же режет и сборка."""
+        first = int(_api.math.floor(seg['s0'] * fps + 1e-3))
+        last = int(_api.math.ceil(seg['s1'] * fps - 1e-3)) - 1
+        return first, max(first, last)
+
+    def _proj_step_frames(self, step):
+        """Шаг кадра у плейхеда, стоящего на видео открытого файла, — в НОМЕРАХ
+        кадров. False — шаг внутри куска (обычный шаг по файлу), True — шаг
+        через стык сделан, None — не этот случай (пустота, картинка, другой
+        файл, нет сетки кадров).
+
+        Прежде шаг через стык считался во времени проекта (плейхед ± 1/fps), и
+        у стыка всё решали доли миллисекунды: шаг вправо с последнего кадра
+        куска вставал на кадр, который начинается ровно на конце куска, —
+        вырезанный, а следующий шаг перепрыгивал первый кадр нового куска."""
+        grid = self._grid
+        c = self.project.clip(self._proj_cur_id)
+        if (c is None or c.is_image or not grid.valid or self._frame_idx is None
+                or not self._proj_ready_for(c.src)):
+            return None
+        fps = grid.fps
+        cur = self._current_frame_index()
+        t = c.start + (grid.center_of(cur) - c.in_s) / max(_mp.MIN_SPEED, c.speed)
+        plan = self._project_plan()
+        i = next((k for k, s in enumerate(plan) if s['t0'] <= t < s['t1']), None)
+        if i is None or plan[i]['clip'] is None or not self._proj_is_loaded(plan[i]['clip'].src):
+            return None
+        first, last = self._proj_seg_frames(plan[i], fps)
+        if not first <= cur <= last:
+            return None
+        if first <= cur + step <= last:
+            return False
+        j = i + (1 if step > 0 else -1)
+        if not 0 <= j < len(plan):
+            return True                         # край проекта — стоим на месте
+        seg = plan[j]
+        clip = seg['clip']
+        if clip is not None and not clip.is_image and self._proj_is_loaded(clip.src):
+            f2, l2 = self._proj_seg_frames(seg, fps)
+            idx = f2 if step > 0 else l2
+            t2 = seg['t0'] + (grid.center_of(idx) - seg['s0']) / max(
+                _mp.MIN_SPEED, clip.speed)
+        else:
+            # Другой файл, картинка или пустота: их край во времени проекта
+            # (середина крайнего кадра — так плейхед не попадёт на стык).
+            half = 0.5 / (clip.fps if clip is not None and clip.fps else fps)
+            t2 = seg['t0'] + half if step > 0 else seg['t1'] - half
+        self._project_seek(min(max(t2, seg['t0']), seg['t1'] - 1e-6))
+        return True
+
     def jump_to_end(self):
         """«В конец»: последний кадр проекта (без проекта — OUT файла)."""
         if self.project.is_empty():
@@ -828,15 +1083,23 @@ class EditTabProjectMixin:
             return
         if self._proj_play is not None:
             self.project_stop()
+        self._project_seek(self._proj_last_frame_t())
+
+    def _proj_last_frame_t(self):
+        """Время последнего кадра проекта. Конец таймлайна для плейхеда —
+        здесь, а не на самой длине проекта: там он стоит ЗА последним кадром,
+        и шаг влево оттуда не возвращался шагом вправо (шаг не пускает дальше
+        последнего кадра)."""
         end = self.project.duration()
-        last = max(self.project.clips, key=lambda c: c.end)
-        fps = last.fps or self.fps or 30.0
-        self._project_seek(max(0.0, end - 1.0 / fps))
+        last = max(self.project.clips, key=lambda c: c.end, default=None)
+        fps = (last.fps if last is not None else 0.0) or self.fps or 30.0
+        return max(0.0, end - 1.0 / fps)
 
     def _project_leave(self):
         """Просмотр проекта прерван (открывают другой файл и т. п.)."""
         if self._proj_play is not None:
             self.project_stop()
+        self._proj_set_rate(1.0)
         self._proj_active = not self.project.is_empty()
         self._proj_pending = None
 
@@ -960,28 +1223,46 @@ class EditTabProjectMixin:
             _api.msgbox_warning(self, "Проект", "Не найдены файлы:\n" + "\n".join(missing))
             return
         t = self.project_timeline.playhead
-        if t >= plan[-1]['t1'] - 0.05:
-            t = 0.0
+        if t >= min(plan[-1]['t1'] - 0.05, self._proj_last_frame_t() - 1e-3):
+            t = 0.0                     # с последнего кадра — заново с начала
         idx = next((i for i, s in enumerate(plan) if s['t0'] <= t < s['t1']), 0)
         self._proj_active = True
         self._proj_play = plan
+        self._snd_begin(t)
         self._pmix_start()
         self._project_update_ui()
         self._proj_play_segment(idx, max(0.0, t - plan[idx]['t0']))
 
     def project_stop(self):
+        if self._proj_play is not None:
+            # До _pmix_stop: тот возвращает громкость ползунка, и хвост очереди
+            # устройства заглушённого клипа зазвучал бы в полную силу.
+            self._mute_pause_tail()
         self._proj_play = None
         self._proj_limit_s = None
+        self._proj_seam = None
+        self._bridge_stop()
         self._proj_transition = False
         self._proj_pending = None
         self._pmix_stop()
+        self._snd_stop()
         try:
             if self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState:
                 self.player.pause()
         except Exception:
             pass
+        self._proj_set_rate(1.0)
         self._set_play_bound(False)
         self._project_update_ui()
+
+    def _proj_set_rate(self, speed):
+        """Скорость основного плеера под клип проекта (1 — обычная)."""
+        try:
+            rate = max(0.1, min(8.0, float(speed)))
+            if abs(self.player.playbackRate() - rate) > 1e-3:
+                self.player.setPlaybackRate(rate)
+        except Exception:
+            pass
 
     def _proj_play_segment(self, idx, offset, cont=False):
         """Играет кусок idx плана с offset секунд от его начала. cont — это
@@ -995,12 +1276,15 @@ class EditTabProjectMixin:
             idx += 1            # пустоту без звука пропускаем (в файле — чёрный кадр)
             offset = 0.0
         if idx >= len(plan):
-            end = plan[-1]['t1'] if plan else 0.0
             self.project_stop()
-            self.project_timeline.set_playhead(end)
+            # Конец просмотра — на последнем кадре, как «В конец». На самой
+            # длине проекта плейхед стоял за последним кадром, а на экране был
+            # кадр, начинающийся ровно на out клипа, то есть уже вырезанный.
+            self._project_seek(self._proj_last_frame_t())
             return
         seg = plan[idx]
         clip = seg['clip']
+        self._proj_set_rate(1.0 if clip is None or clip.is_image else clip.speed)
         self._proj_idx = idx
         self._proj_limit_s = seg.get('s1')
         if clip is not None and not self._proj_ready_for(clip.src):
@@ -1040,6 +1324,7 @@ class EditTabProjectMixin:
                 # паузы, после клика по таймлайну — перематываются.
                 self._pmix_anchor(start_t, jump=not cont)
             self._pmix_hold = (seg['t0'], seg['t1'])
+            self._snd_ensure_playing()
             self.project_timeline.set_playhead(start_t)
             left = max(0.05, seg['t1'] - start_t)
             gen = getattr(self, "_proj_image_gen", 0) + 1
@@ -1050,7 +1335,8 @@ class EditTabProjectMixin:
             return
         if cont:
             offset = self._pmix_catch_up(seg, offset)
-        src_t = seg['s0'] + max(0.0, offset)
+        src_t = self._proj_clamp_src(seg, seg['s0'] + max(0.0, offset) * max(
+            _mp.MIN_SPEED, clip.speed))
         try:
             playing = (self.player.playbackState()
                        == _api.QMediaPlayer.PlaybackState.PlayingState
@@ -1078,8 +1364,17 @@ class EditTabProjectMixin:
     def _proj_start_player(self):
         """«Воспроизвести» с текущего кадра — тем же путём, что кнопка
         (подхват прогретого звука), но без прыжка на IN: у проекта свои
-        границы."""
-        self._play_from_here()
+        границы. Звук своим трактом — картинка стартует вместе с ним."""
+        self._snd_start_with(self._play_from_here)
+
+    def _proj_hold_player(self):
+        """Остановить картинку на время перехода (не конец просмотра)."""
+        try:
+            if self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState:
+                self._proj_transition = True
+                self.player.pause()
+        except Exception:
+            pass
 
     def _proj_boundary_begin(self):
         """Плеер упёрся в конец куска — пауза будет переходом, а не остановкой."""
@@ -1092,6 +1387,16 @@ class EditTabProjectMixin:
         nxt = self._proj_idx + 1
         _api.QTimer.singleShot(0, lambda: self._proj_play_segment(nxt, 0.0, cont=True))
 
+    def _proj_play_span(self):
+        """Текущий кусок просмотра во времени источника (s0, s1) или None."""
+        plan = self._proj_play
+        if plan is None or not 0 <= self._proj_idx < len(plan):
+            return None
+        seg = plan[self._proj_idx]
+        if seg['clip'] is None or 's0' not in seg:
+            return None
+        return seg['s0'], seg['s1']
+
     def _proj_on_state(self, playing):
         """Смена состояния плеера (on_playback_changed)."""
         if playing:
@@ -1101,7 +1406,9 @@ class EditTabProjectMixin:
             # плеер остаётся на проекте, Пробел продолжит с плейхеда проекта.
             self._proj_play = None
             self._proj_limit_s = None
+            self._proj_set_rate(1.0)
             self._pmix_stop()
+            self._snd_stop()
             self._project_update_ui()
 
     def _proj_tick(self, src_s):
@@ -1112,8 +1419,9 @@ class EditTabProjectMixin:
         seg = plan[self._proj_idx]
         if seg['clip'] is None:
             return
-        t = seg['t0'] + (src_s - seg['s0'])
+        t = seg['t0'] + (src_s - seg['s0']) / max(_mp.MIN_SPEED, seg['clip'].speed)
         self.project_timeline.set_playhead(min(seg['t1'], max(seg['t0'], t)))
+        self._bridge_prefetch(src_s)
 
     def _proj_play_limit(self):
         """Конец текущего куска во времени источника, пока идёт просмотр."""
@@ -1163,8 +1471,11 @@ class EditTabProjectMixin:
         if not path.lower().endswith(ext):
             path += ext
         temp_out = self._make_temp_out(path)
+        # HDR10-куски сводятся в SDR так, как их видно в просмотре.
+        tonemap = hdr_tonemap.tonemap_filters(
+            (c.src for c in p.clips if c.has_video and not c.is_image), self._escape_filter_path)
         built = _mp.build_export(p, temp_out, _api.FFMPEG, self._video_encoder_args(),
-                                 subs=self._project_burn_subs())
+                                 subs=self._project_burn_subs(), tonemap=tonemap)
         if built is None:
             try:
                 _api.os.remove(temp_out)

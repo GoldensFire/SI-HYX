@@ -50,6 +50,7 @@ def _run(tmp_path, *, overwrite=True, out_path=None, loaded=None, temp_name=None
         chk_overwrite=SimpleNamespace(isChecked=lambda: overwrite),
         selected_audio_abs_index=None, _audio_streams=[],
         _cut_ticker=SimpleNamespace(start=lambda: None, stop=lambda: None),
+        _start_cut_phase=lambda phase: None,
         _report_progress=lambda *a, **k: None,
         log_label=SimpleNamespace(setText=lambda *a: None),
         _set_cut_status=lambda *a, **k: None,

@@ -121,11 +121,62 @@ class EditTabFullscreenMixin:
             pass
 
     def _fs_sync_position(self):
-        """Обновляет полосу/тайминги в полноэкранном окне (вызывается из sync_ui
-        и on_position_changed, когда оно открыто)."""
+        """Обновляет полосу/тайминги в полноэкранном окне (вызывается из
+        _paint_playhead и _paint_project_time, когда оно открыто)."""
         fs = getattr(self, "_fs_window", None)
         if fs is not None:
             try:
                 fs.sync_from_player()
             except Exception:
                 pass
+
+    # ── Шкала полноэкранной панели ──────────────────────────────────────────
+    # Та же, что под видео: время и длина ПРОЕКТА (обрезанные куски, порядок
+    # клипов), а без проекта — файла. Прежде панель жила по файлу целиком:
+    # длина, полоса и превью показывали необрезанное видео, а клик по полосе
+    # уводил плеер в вырезанные места.
+    def _fs_on_project(self):
+        return (getattr(self, "project_timeline", None) is not None
+                and not self.project.is_empty())
+
+    def _fs_span(self):
+        """Длина шкалы полноэкранной панели, с."""
+        if self._fs_on_project():
+            return self.project.duration()
+        return self.duration or 0.0
+
+    def _fs_time(self):
+        """Время для полноэкранной панели, с — то же, что у метки под видео."""
+        if self._fs_on_project():
+            return self.project_timeline.playhead
+        return self._ui_time_s()
+
+    def _fs_seek(self, frac):
+        """Клик или протяжка по полосе полноэкранной панели (доля 0..1) — как
+        по таймлайну."""
+        frac = max(0.0, min(1.0, float(frac)))
+        if self._fs_on_project():
+            # Край полосы — последний кадр проекта (как «В конец»): сама длина
+            # проекта лежит ЗА ним, и там плееру показать нечего.
+            self._project_seek(min(frac * self.project.duration(),
+                                   self._proj_last_frame_t()))
+            return
+        if self.duration > 0:
+            self.seek_to(frac * self.duration)
+
+    def _fs_preview_locate(self, t):
+        """Кадр превью над полосой для времени шкалы t: (файл, время в нём)
+        или None — там пусто (чёрный кадр проекта)."""
+        if not self._fs_on_project():
+            src = self.actual_source_file
+            return (str(src), t) if src else None
+        segs = self.project.preview_segments()
+        if not segs:
+            return None
+        t = min(max(0.0, t), segs[-1][1] - 1e-3)
+        for t0, t1, clip in segs:
+            if t0 <= t < t1:
+                if clip is None or not clip.has_video:
+                    return None
+                return clip.src, (0.0 if clip.is_image else clip.source_time(t))
+        return None

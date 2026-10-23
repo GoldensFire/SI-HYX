@@ -2,6 +2,8 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """Монтаж: аргументы кодировщика, обрезка, Smart Cut и завершение экспорта."""
+import hdr_tonemap
+
 import edit_tab as _api
 from si_hyx_parts.edit_tab.tracks import drop_audio
 
@@ -22,6 +24,7 @@ class EditTabExportMixin:
 
     def _start_cut_phase(self, phase):
         """Начало экспорта: подпись этапа и отсчёт времени для _report_cut."""
+        self._cut_cancelled = False
         self._cut_phase = phase
         self._cut_t0 = _api.time.time()
         self._cut_lastp = 0.0
@@ -171,6 +174,7 @@ class EditTabExportMixin:
         """Отменяет текущую обрезку/перекодировку/Smart Cut (self.ffmpeg_thread)."""
         th = getattr(self, "ffmpeg_thread", None)
         if th is not None and th.isRunning():
+            self._cut_cancelled = True
             self._report_progress(-1, "Отмена…")
             self.btn_cut.setEnabled(False)
             th.stop()
@@ -179,6 +183,7 @@ class EditTabExportMixin:
         """Отменяет «Обрезать и обработать» (worker вкладки «Обработка»)."""
         w = getattr(tab_media, 'worker', None)
         if w is not None and w.isRunning():
+            self._cut_cancelled = True
             self._report_progress(-1, "Отмена…")
             self.btn_cut.setEnabled(False)
             w.stop()
@@ -322,11 +327,18 @@ class EditTabExportMixin:
 
         in_s  = self.current_in
         out_s = self.current_out
+        # Поля IN/OUT берём, только если их правили руками (без Enter): в поле
+        # время округлено до миллисекунд, а точка, поставленная по кадру, лежит
+        # ровно на pts кадра. При дробном fps округлённое значение бывает
+        # меньше pts на доли миллисекунды, и привязка к кадру ниже уводила старт
+        # на ПРЕДЫДУЩИЙ кадр — экспорт начинался не с того кадра, что в превью.
         try:
-            manual_in  = _api.time_to_s(self.in_time_edit.text())
-            manual_out = _api.time_to_s(self.out_time_edit.text())
-            in_s  = max(0.0, min(manual_in,  self.duration))
-            out_s = max(0.0, min(manual_out, self.duration))
+            in_text = self.in_time_edit.text()
+            out_text = self.out_time_edit.text()
+            if in_text != _api.s_to_time(self.current_in):
+                in_s = max(0.0, min(_api.time_to_s(in_text), self.duration))
+            if out_text != _api.s_to_time(self.current_out):
+                out_s = max(0.0, min(_api.time_to_s(out_text), self.duration))
         except Exception:
             pass
 
@@ -689,14 +701,15 @@ class EditTabExportMixin:
             # Внешняя озвучка без вшивания субтитров. Видео берём по режиму
             # (copy/перекодировка), звук — из внешнего файла (перекодируем в AAC,
             # т.к. контейнер/кодек могут не совпадать).
-            vargs = (["-c:v", "copy"]
-                     if (mode == 0 and not crop_vf and not pix_on and not ovl_on)
-                     else venc)
+            copy_video = (mode == 0 and not crop_vf and not pix_on and not ovl_on)
+            vargs = ["-c:v", "copy"] if copy_video else venc
             # ВХОДНОЙ seek по видео (-ss до -i src) → фильтрграф стартует с 0.
+            # Копии -vf не положено: _vf_args у HDR-источника не пуст (сведение в SDR).
             cmd = [_api.FFMPEG, "-y", "-ss", in_str, "-i", str(src),
                    "-ss", in_str, "-i", ext_audio, "-t", dur_str,
                    "-map", "0:v:0", "-map", "1:a:0"] \
-                  + _vf_args(0.0) + vargs + ["-c:a", "aac", "-b:a", "192k", temp_out]
+                  + ([] if copy_video else _vf_args(0.0)) + vargs \
+                  + ["-c:a", "aac", "-b:a", "192k", temp_out]
         elif mode == 0:
             # Быстрая обрезка (copy) — ВХОДНОЙ seek к точке реза (-ss ДО -i).
             #
@@ -935,6 +948,16 @@ class EditTabExportMixin:
         if not src or not src.exists():
             _api.msgbox_warning(self, "Внимание", "Файл не загружен.")
             return
+        if hdr_tonemap.pq_source(src) is not None:
+            # HDR10 экспорт сводит в SDR, как в просмотре, а середину Smart Cut
+            # копирует как есть — склейка вышла бы наполовину HDR. Только
+            # полная перекодировка.
+            if self.main is not None and hasattr(self.main, "log"):
+                self.main.log("Монтаж: HDR-видео сводится в SDR — Smart Cut "
+                              "заменён полной перекодировкой.")
+            self._execute_cut(in_s, out_s, 1, False, force_overwrite=bool(out_path),
+                              out_path=out_path)
+            return
         stem = src.stem; suffix = src.suffix
         out_dir = (_api.Path(self.export_dir)
                    if (self.export_dir and _api.os.path.isdir(self.export_dir)) else src.parent)
@@ -1018,6 +1041,23 @@ class EditTabExportMixin:
 
         self.ffmpeg_thread.finished.connect(_on_finished)
         self.ffmpeg_thread.start()
+
+    def _open_export_settings(self):
+        """Шестерёнка у «Экспорт»: окно настроек «Обработки» (звук, скорость,
+        видео) для режимов «Перекодировать настройками «Обработки»». Окно
+        одно на вкладку: показываем и прячем, а не создаём заново (его связи
+        с виджетами «Обработки» заводятся один раз)."""
+        tm = getattr(self.main, 'tab_media', None) if self.main is not None else None
+        if tm is None:
+            _api.msgbox_warning(self, "Внимание", "Вкладка «Обработка» недоступна.")
+            return
+        dlg = getattr(self, "_export_settings_dlg", None)
+        if dlg is None:
+            dlg = _api._ExportSettingsDialog(tm, mode_combo=self.cmb_mode, parent=self)
+            self._export_settings_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def _process_tab_encodes_video(self):
         """Перекодирует ли «Обработка» видео прямо сейчас (её галочка
@@ -1143,6 +1183,9 @@ class EditTabExportMixin:
                     'audio_only': bool(audio_only),
                     # Пункт «Нет» в списке дорожек — как галочка «Удалить аудио».
                     'remove_audio': bool(getattr(self, "audio_disabled", False))}
+        # HDR10 из Монтажа выходит SDR, как в просмотре (hdr_tonemap): сама
+        # «Обработка» HDR-файлы оставляет HDR, этот флаг — только для Монтажа.
+        item['sdr_tonemap'] = not audio_only
         # Наложенные картинки едут в «Обработку» готовыми PNG (уже отрисованы
         # под размер ИСХОДНОГО кадра, координаты — в его пикселях). process_media
         # подмешивает их фильтром overlay ПЕРЕД своей цепочкой (crop чёрных
@@ -1199,8 +1242,11 @@ class EditTabExportMixin:
             self._set_cut_btn_cancel(False)
             temp_out = _item.get('out_path')
             if not _item.get('is_done') or not temp_out or not _api.os.path.exists(temp_out):
+                # Остановленная «Обработка» результата и не должна была создать.
+                cancelled = bool(getattr(proc_worker, 'stop_flag', False))
                 self.on_ffmpeg_finished(
-                    False, "«Обработка» не создала результат (см. лог вкладки «Обработка»)")
+                    False, "Отменено" if cancelled else
+                    "«Обработка» не создала результат (см. лог вкладки «Обработка»)")
                 return
             try:
                 # process_media сам собрал имя с суффиксами применённых настроек
@@ -1260,6 +1306,7 @@ class EditTabExportMixin:
 
     def on_ffmpeg_finished(self, success, message):
         if success:
+            self._cut_cancelled = False
             result_path = str(getattr(self, "_progress_result_path", "") or "")
             if (result_path and self.main is not None
                     and hasattr(self.main, "set_global_result")):
@@ -1278,10 +1325,13 @@ class EditTabExportMixin:
                     strip.force_refresh()
             except Exception:
                 pass
-        elif message == "Отменено":
-            self.log_label.setText("Отменено")
-            self.log_label.setStyleSheet(f"color: {_api.C['text2']}; font-size: 12px;")
-            self._report_progress(0, "Отменено")
+        elif message == "Отменено" or getattr(self, "_cut_cancelled", False):
+            # Остановку попросил сам пользователь: ни окна ошибки, ни красной
+            # подписи — просто возвращаемся в покой. Воркеры не всегда отвечают
+            # «Отменено» (убитый ffmpeg даёт «Код: 1»), поэтому решает флаг.
+            self._cut_cancelled = False
+            self.log_label.setText("")
+            self._report_progress(0, "")
             self.update_selection_label()
         else:
             self.log_label.setText(_api.icon_html('fa5s.times', 12, _api.C['red2']) + " Ошибка")

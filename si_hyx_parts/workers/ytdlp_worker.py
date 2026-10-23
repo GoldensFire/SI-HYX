@@ -5,6 +5,10 @@
 import workers as _api
 from .download_network import is_network_error, network_hint
 from .download_process import stop_process
+from .vk_direct import (
+    USER_AGENT as VK_USER_AGENT, VkResolveError, best_mp4, is_vk_video_url,
+    resolve_vk_media, safe_filename,
+)
 from si_hyx_parts.workers.download_network import terminal_ffmpeg_error
 from si_hyx_parts.workers.download_validation import positive_seconds
 from si_hyx_parts.workers.download_result import verified_download
@@ -235,6 +239,125 @@ class YtdlpWorker(_api.QThread):
         m = _api.re.search(r"height<=?(\d+)", fmt or "")
         return int(m.group(1)) if m else 720
 
+    def _download_vk_direct(self, media: dict, out_dir: str, iid: str,
+                            is_audio_only: bool, start_s, end_s):
+        """Качает видео VK по прямой ссылке из API (ffmpeg, без перекодирования).
+
+        Возвращает путь готового файла или "" (тогда вызывающий код откатывается
+        на yt-dlp). Прогресс считается по `out_time` ffmpeg относительно длины
+        ролика/отрезка."""
+        picked = best_mp4(media.get("files") or {})
+        if not picked:
+            return ""
+        quality, media_url = picked
+        title = safe_filename(media.get("title") or "", "vk_video")
+        start = max(0, int(start_s or 0))
+        end = int(end_s) if end_s else None
+        if end is not None and end <= start:
+            end = None
+        tag = f" [{start}s-{end}s]" if (start or end) else ""
+        ext = "m4a" if is_audio_only else "mp4"
+        out_path = _api.os.path.join(out_dir, f"{title}{tag}.{ext}")
+        # ffmpeg пишет напрямую в конечный файл — при обрыве/СТОПе остался бы
+        # битый файл с «готовым» именем, и повторная загрузка сочла бы его
+        # скачанным. Поэтому сначала .part, потом атомарная замена.
+        root, suffix = _api.os.path.splitext(out_path)
+        tmp_path = f"{root}.part{suffix}"
+
+        if _api.os.path.exists(out_path) and not self.c.get("overwrite"):
+            self.log_sig.emit(f"VK: файл уже скачан — {out_path}")
+            return out_path
+
+        duration = float(media.get("duration") or 0)
+        total = float(end - start) if end else max(0.0, duration - start)
+        self.log_sig.emit(f"VK: качаю {quality} → {_api.os.path.basename(out_path)}")
+        self._enter_download_phase()
+        self._last_real_progress = _api.time.time()
+
+        cmd = [
+            _api.FFMPEG, "-hide_banner", "-loglevel", "error", "-nostats",
+            "-progress", "pipe:1", "-y",
+            "-user_agent", VK_USER_AGENT,
+            "-headers", "Referer: https://vkvideo.ru/\r\n",
+            "-i", media_url,
+        ]
+        if start:
+            cmd += ["-ss", str(start)]
+        if end:
+            cmd += ["-t", str(end - start)]
+        if is_audio_only:
+            cmd += ["-vn", "-c:a", "copy", tmp_path]
+        else:
+            cmd += ["-c", "copy", "-movflags", "+faststart", tmp_path]
+
+        self._proc = _api.subprocess.Popen(
+            cmd, stdout=_api.subprocess.PIPE, stderr=_api.subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=_api.CREATE_NO_WINDOW, bufsize=1, env=_api.subprocess_env())
+        _api.threading.Thread(target=self._watchdog, args=(self._proc,), daemon=True).start()
+
+        tail = _api.deque(maxlen=20)
+        us_seen = False
+        ignored = ("frame=", "fps=", "bitrate=", "total_size=", "out_time=",
+                   "out_time_us=", "out_time_ms=", "dup_frames=", "drop_frames=",
+                   "speed=", "progress=", "stream_")
+        for raw in self._iter_stream_lines(self._proc.stdout):
+            if not self.is_running:
+                break
+            line = raw.strip()
+            if not line:
+                continue
+            # ffmpeg печатает и out_time_us, и out_time_ms (оба в микросекундах) —
+            # берём первый, иначе каждый процент приходит дважды.
+            m = _api.re.match(r"out_time_us=(\d+)", line)
+            if m:
+                us_seen = True
+            elif not us_seen:
+                m = _api.re.match(r"out_time_ms=(\d+)", line)
+            if m:
+                if total > 0:
+                    pct = min(99.0, int(m.group(1)) / 1_000_000 / total * 100.0)
+                    self._last_real_progress = _api.time.time()
+                    self._last_pct = pct
+                    self.progress_sig.emit(iid, pct, "Скачивание…")
+                continue
+            if line.startswith(ignored):
+                continue
+            tail.append(line)
+        self._proc.wait()
+        rc = self._proc.returncode
+
+        if not self.is_running:
+            try:
+                if _api.os.path.exists(tmp_path):
+                    _api.os.remove(tmp_path)
+            except Exception:
+                pass
+            raise Exception("остановлена пользователем")
+        if rc != 0 or not _api.os.path.exists(tmp_path):
+            detail = tail[-1] if tail else f"ffmpeg rc={rc}"
+            try:
+                if _api.os.path.exists(tmp_path):
+                    _api.os.remove(tmp_path)
+            except Exception:
+                pass
+            raise Exception(detail)
+        try:
+            size = _api.os.path.getsize(tmp_path)
+        except OSError:
+            size = 0
+        if size <= 0:
+            try:
+                _api.os.remove(tmp_path)
+            except Exception:
+                pass
+            raise Exception("получен пустой файл")
+        try:
+            _api.os.replace(tmp_path, out_path)
+        except OSError as e:
+            raise Exception(f"не удалось сохранить файл: {e}")
+        return out_path
+
     def run(self):
         iid = self.c.get('iid', '')
         self._iid = iid
@@ -292,10 +415,11 @@ class YtdlpWorker(_api.QThread):
                         break
                     if kodik_try < KODIK_MAX:
                         self.log_sig.emit(
-                            f"Kodik: пустой ответ — повтор {kodik_try}/{KODIK_MAX}…")
+                            f"Плеер: пустой ответ — повтор {kodik_try}/{KODIK_MAX}…")
                         self._sleep_interruptible(1.5)
             if kodik:
-                self.log_sig.emit(f"Встроенный плеер Kodik → качаю {kodik['height']}p (m3u8)")
+                player = kodik.get('name') or 'Kodik'
+                self.log_sig.emit(f"Встроенный плеер {player} → качаю {kodik['height']}p (m3u8)")
                 url = kodik['url']
             elif _api.is_animego_site(url):
                 # Аниме-сайт без полученного Kodik-плеера: yt-dlp его не качает.
@@ -303,6 +427,12 @@ class YtdlpWorker(_api.QThread):
                 # URL), а сразу честно сообщаем об ошибке.
                 raise Exception("Не удалось получить видео с аниме-сайта: Kodik-плеер не отдал ссылку. "
                                 "Проверьте выбор серии/озвучки или повторите позже.")
+            elif (_api.is_dreamerscast_site(url)
+                  and not url.lower().split("?", 1)[0].endswith((".m3u8", ".mpd"))):
+                # Страница Dream Cast без ссылки от плеера — yt-dlp видит только
+                # HTML и падает в generic. Сообщаем причину, а не «Unsupported URL».
+                raise Exception("Не удалось получить видео с Dream Cast: плеер не отдал ссылку. "
+                                "Повторите позже.")
 
             outtmpl = _api.os.path.join(out_dir, '%(title)s.%(ext)s')
 
@@ -473,6 +603,34 @@ class YtdlpWorker(_api.QThread):
                 self.log_sig.emit(f"OK: Используем общие cookies: {_api.COOKIE_PATHS['default']}")
             if chosen_cookie:
                 cmd += ["--cookies", chosen_cookie]
+
+            # ── VK: прямой путь через API нового веб-плеера ──────────────────
+            # yt-dlp-экстрактор VK упирается в «нужен вход»: старый al_video.php
+            # больше не отдаёт данные даже с валидными куками, а новый SPA-плеер
+            # берёт их из api.vk.ru/method/video.getByIds. Повторяем путь браузера
+            # (headless Chrome + куки) и качаем найденный файл напрямую.
+            if not kodik and is_vk_video_url(url):
+                media = None
+                try:
+                    media = resolve_vk_media(url, chosen_cookie or "",
+                                             log_fn=self.log_sig.emit)
+                except VkResolveError as e:
+                    self.log_sig.emit(f"VK: {e} — пробую yt-dlp")
+                if media:
+                    try:
+                        vk_path = self._download_vk_direct(
+                            media, out_dir, iid, is_audio_only, start_s, end_s)
+                    except Exception as e:
+                        if not self.is_running:
+                            raise
+                        self.log_sig.emit(f"VK: прямая загрузка не удалась ({e}) — пробую yt-dlp")
+                        vk_path = ""
+                    if vk_path:
+                        res = (f"{media['width']}x{media['height']}"
+                               if media.get("width") and media.get("height") else "")
+                        self.progress_sig.emit(iid, 100.0, "Готово")
+                        self.finished_sig.emit(iid, "Готово", res, vk_path)
+                        return
 
             if self.c.get('sub_lang') and self.c['sub_lang'] != 'Выкл':
                 cmd += ["--write-subs", "--sub-langs",
@@ -665,6 +823,15 @@ class YtdlpWorker(_api.QThread):
         if "Sign in to confirm" in err_msg or "not a bot" in err_msg:
             self.log_sig.emit("СОВЕТ: YouTube требует «не бот» — куки без данных входа.")
             self.log_sig.emit("  Экспортируйте куки залогиненного YouTube (нужны LOGIN_INFO, __Secure-1PSID, SID, SAPISID).")
+        if ("[vk]" in low or "vkvideo" in low) and (
+                "registered users" in low or "login required" in low):
+            self.log_sig.emit(
+                "СОВЕТ (VK): новый веб-плеер VK не отдаёт видео старому API "
+                "(al_video.php), поэтому yt-dlp его не поддерживает. "
+                "Прямой путь через браузер тоже не сработал.")
+            self.log_sig.emit(
+                "  Проверьте: cookies.txt содержит remixsid залогиненного VK, "
+                "установлен Chrome или Edge, страница видео открывается в браузере.")
 
     # Добавить ПЕРЕД блоком: elif "Forbidden" in err_msg or "403" in err_msg:
         elif ("tiktok" in low and (

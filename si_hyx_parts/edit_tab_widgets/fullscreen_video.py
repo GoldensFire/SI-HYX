@@ -79,6 +79,13 @@ class FullscreenVideo(_api.QWidget):
         self.slider.setStyleSheet(self._fs_slider_style())
         # Полоса не должна перехватывать фокус — иначе Пробел уходит ей, а не окну.
         self.slider.setFocusPolicy(_api.Qt.FocusPolicy.NoFocus)
+        # Полоса — та же шкала, что таймлайн проекта (EditTab._fs_seek): клик
+        # переходит сразу, протяжка ставит воспроизведение на паузу до
+        # отпускания — как протяжка плейхеда по таймлайну.
+        self._slider_moves = 0         # перемоток с нажатия кнопки мыши
+        self._slider_dragging = False
+        self.slider.sliderPressed.connect(self._on_slider_pressed)
+        self.slider.sliderReleased.connect(self._on_slider_released)
         self.slider.sliderMoved.connect(self._on_slider_moved)
         # Тот же контроллер превью кадров, что и у полосы в окне.
         try:
@@ -139,20 +146,20 @@ class FullscreenVideo(_api.QWidget):
             row.addWidget(b)
             return b
 
+        # Те же команды, что у кнопок под видео во вкладке (layout._build_player_bar).
         self.btn_stop = _fsbtn(_api.QStyle.StandardPixmap.SP_MediaStop,
-                               "Стоп — к началу зоны", self.edit.stop_playback)
+                               "Стоп — в начало", self.edit.stop_playback)
         self.btn_step_back = _fsbtn(_api.QStyle.StandardPixmap.SP_MediaSeekBackward,
-                                    "Кадр назад (←)",
+                                    "Кадр назад (← / A)",
                                     _api.partial(self.edit.step_frame_scrub, -1))
         self.btn_play = _fsbtn(_api.QStyle.StandardPixmap.SP_MediaPlay,
                                "Воспроизвести / пауза (Пробел)",
                                self.edit.toggle_play, size=(50, 34), accent=True)
         self.btn_step_fwd = _fsbtn(_api.QStyle.StandardPixmap.SP_MediaSeekForward,
-                                   "Кадр вперёд (→)",
+                                   "Кадр вперёд (→ / D)",
                                    _api.partial(self.edit.step_frame_scrub, 1))
         self.btn_jump_end = _fsbtn(_api.QStyle.StandardPixmap.SP_MediaSkipForward,
-                                   "Перейти к концу зоны (OUT)",
-                                   lambda: self.edit.seek_to(self.edit.current_out))
+                                   "В конец", self.edit.jump_to_end)
 
         row.addSpacing(10)
         self.btn_save_frame = _fsbtn(None,
@@ -279,14 +286,16 @@ class FullscreenVideo(_api.QWidget):
 
     # ── Синхронизация со плеером ─────────────────────────────────────────────
     def sync_from_player(self):
+        """Время, длина и полоса — по шкале вкладки: у проекта это время
+        проекта (обрезанные куски), как метка под видео и таймлайн."""
         e = self.edit
-        dur = e.duration or 0.0
-        pos_s = e.player.position() / 1000.0
+        dur = e._fs_span()
+        pos_s = e._fs_time()
         self.lbl_cur.setText(_api.s_to_time(pos_s))
         self.lbl_tot.setText(_api.s_to_time(dur))
         if dur > 0 and not self.slider.is_user_seeking():
-            # Плеер авто-паузится за кадр до конца, поэтому у самого конца
-            # «дотягиваем» полосу до 100%, чтобы она доходила до края.
+            # Последний кадр начинается за кадр до конца шкалы, поэтому у самого
+            # конца «дотягиваем» полосу до 100%, чтобы она доходила до края.
             frac = 1.0 if pos_s >= (dur - 0.08) else (pos_s / dur)
             self.slider.blockSignals(True)
             self.slider.setValue(int(frac * 1000))
@@ -296,11 +305,26 @@ class FullscreenVideo(_api.QWidget):
         ic = _api.QStyle.StandardPixmap.SP_MediaPause if playing else _api.QStyle.StandardPixmap.SP_MediaPlay
         self.btn_play.setIcon(self.style().standardIcon(ic))
 
+    def _on_slider_pressed(self):
+        self._slider_moves = 0
+        self._slider_dragging = False
+
     def _on_slider_moved(self, value):
-        dur = self.edit.duration or 0.0
-        if dur > 0:
-            self.edit.seek_to((value / 1000.0) * dur)
+        # Первая перемотка нажатия — это клик; дальше — протяжка: на её время
+        # воспроизведение встаёт (EditTab._project_scrub_started), иначе плеер
+        # перематывался бы на каждое движение мыши и звук рассыпался.
+        self._slider_moves += 1
+        if (self._slider_moves > 1 and not self._slider_dragging
+                and self.slider.is_user_seeking()):
+            self._slider_dragging = True
+            self.edit._project_scrub_started()
+        self.edit._fs_seek(value / 1000.0)
         self._show_bar()
+
+    def _on_slider_released(self):
+        if self._slider_dragging:
+            self._slider_dragging = False
+            self.edit._project_scrub_finished()
 
     def _on_volume_changed(self, v):
         # Звуком управляет основной ползунок вкладки — отражаем туда значение

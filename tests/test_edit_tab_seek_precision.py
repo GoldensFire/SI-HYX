@@ -107,6 +107,7 @@ def _stub(pos=10_000, playing=False, fps=25.0, duration=100.0):
     st._preroll_cancel = lambda: EditTab._preroll_cancel(st)
     st._preroll_finish = lambda *a, **k: EditTab._preroll_finish(st, *a, **k)
     st._preroll_handoff_finish = lambda: EditTab._preroll_handoff_finish(st)
+    st._play_from_here = lambda **k: EditTab._play_from_here(st, **k)
     st.waveform = SimpleNamespace(set_playhead=lambda *a: None)
     st.lbl_current_time = SimpleNamespace(setText=lambda *a: None)
     st.on_playback_changed = lambda *a: None

@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import QDialog, QFileDialog, QHBoxLayout, QLabel, QPushButt
 from chiptune.runtime import install_runtime, run_process
 from chiptune.service import ChiptuneService
 from config import FFMPEG
+from sip_notify import prime_disconnect_notify
 
 
 class PreviewJob(QThread):
@@ -63,7 +64,7 @@ class MusicPreview(QDialog):
         self.storage = tempfile.TemporaryDirectory(prefix="sihyx_chip_preview_")
         self.directory = Path(self.storage.name)
         self.player = QMediaPlayer(self)
-        self.audio = QAudioOutput(self)
+        self.audio = prime_disconnect_notify(QAudioOutput(self))
         self.player.setAudioOutput(self.audio)
         self.audio.setVolume(.7)
         layout = QVBoxLayout(self)

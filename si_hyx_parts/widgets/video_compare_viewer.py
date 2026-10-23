@@ -3,6 +3,7 @@
 # See LICENSE and the public module for attribution and API.
 """VideoCompareViewer. Public namespace: widgets."""
 import widgets as _api
+from sip_notify import prime_disconnect_notify
 
 
 class VideoCompareViewer(_api.QDialog):
@@ -98,8 +99,8 @@ class VideoCompareViewer(_api.QDialog):
 
         self.player_src = _api.QMediaPlayer(self)
         self.player_out = _api.QMediaPlayer(self)
-        self.audio_src = _api.QAudioOutput(self)
-        self.audio_out = _api.QAudioOutput(self)
+        self.audio_src = prime_disconnect_notify(_api.QAudioOutput(self))
+        self.audio_out = prime_disconnect_notify(_api.QAudioOutput(self))
         self.player_src.setVideoOutput(self.view_src.video_item)
         self.player_out.setVideoOutput(self.view_out.video_item)
         self.player_src.setAudioOutput(self.audio_src)

@@ -309,18 +309,45 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         sink = self._out_sink
         if sink is None or img is None or img.isNull():
             return
-        # Картинка вкладки главнее отложенного кадра плеера: тот показал бы
-        # поверх неё прошлое.
-        self._frame_waiting = False
-        self._committed_pts = -1
         try:
             frame = _api.QVideoFrame(img)
             if not frame.isValid():
                 frame = _api.QVideoFrame(img.convertToFormat(_api.QImage.Format.Format_RGB32))
+        except Exception:
+            return
+        self._publish_own_frame(frame)
+
+    def _publish_own_frame(self, frame):
+        """Кадр вкладки (не плеера) — на сцену. QVideoFrame точного HDR-кадра
+        идёт как есть: сцена рисует его тем же шейдером, что и кадры плеера."""
+        sink = self._out_sink
+        if sink is None:
+            return
+        # Кадр вкладки главнее отложенного кадра плеера: тот показал бы поверх
+        # него прошлое.
+        self._frame_waiting = False
+        self._committed_pts = -1
+        try:
             if frame.isValid():
                 sink.setVideoFrame(frame)
         except Exception:
             pass
+
+    def _show_own_video_frame(self, frame):
+        """Точный HDR-кадр (QVideoFrame) на сцену; False — показывать нечего."""
+        try:
+            if frame is None or not frame.isValid():
+                return False
+        except Exception:
+            return False
+        size = self._frame_px_size(frame)
+        if size.width() > 0 and size != self._px_size:
+            self._px_size = size
+            self._vo_geom = None
+        self._publish_own_frame(frame)
+        self._frame_img = None
+        self._exact_vf = frame
+        return True
 
     def _clear_scene_frame(self):
         """Убирает кадр со сцены (новый файл, аудио без видеоряда)."""
@@ -381,16 +408,18 @@ class VideoCanvas(_api._PaintedVideoCanvas):
                 return
         except Exception:
             return
+        self._note_player_format(frame)
         pts = self._pts_of(frame)
         # Граница OUT по PTS — ДО показа кадра: кадр за границей не показываем
         # вовсе и просим плеер на паузу (анти-overshoot правой границы).
         if self._bound_us is not None and pts >= 0 and pts >= self._bound_us:
             self.boundaryReached.emit()
             return
+        if self._below_floor(pts):
+            return
         # Пин кадра N: пока на холсте стоит ТОЧНЫЙ кадр, кадры плеера с чужим
         # pts на экран не пускаем — иначе шаг стрелкой показывает не тот кадр.
-        if (self._pin_has_img and self._pin_span is not None and pts >= 0
-                and not (self._pin_span[0] <= pts < self._pin_span[1])):
+        if self._pin_rejects(pts):
             return
         # ЦП-копию снимаем здесь же, пока объект кадра из слота жив (см.
         # _grab_cpu_copy). Кадр, отложенный до готовности сцены, копии не
@@ -477,6 +506,8 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         self._commit_unsynced = True
         self._scene_busy_since = now
         self._committed_pts = pts
+        self._player_seq += 1
+        self._exact_vf = None
         self._publish_frame(frame)
         # Часы кадра — время картинки, которая СЕЙЧАС на экране.
         if pts >= 0:
@@ -540,20 +571,41 @@ class VideoCanvas(_api._PaintedVideoCanvas):
             return
         if self._bound_us is not None and pts >= 0 and pts >= self._bound_us:
             return
-        if (self._pin_has_img and self._pin_span is not None and pts >= 0
-                and not (self._pin_span[0] <= pts < self._pin_span[1])):
+        if self._below_floor(pts):
+            return
+        if self._pin_rejects(pts):
             return
         self._commit_frame(frame, pts, now)
 
     # ── Кадры, которые ставит вкладка ────────────────────────────────────────
     def set_exact_frame(self, img, span_us=None, pts_us=None):
-        if (getattr(self, "_quick", None) is not None
-                and img is not None and not img.isNull()):
-            if img.size() != self._px_size:
-                self._px_size = img.size()
-                self._vo_geom = None
-            self._publish_image(img)
+        if getattr(self, "_quick", None) is not None:
+            if isinstance(img, _api.QVideoFrame):
+                if self._show_own_video_frame(img):
+                    self._mark_exact_frame(span_us, pts_us)
+                return
+            if img is not None and not img.isNull():
+                if img.size() != self._px_size:
+                    self._px_size = img.size()
+                    self._vo_geom = None
+                self._publish_image(img)
         super().set_exact_frame(img, span_us, pts_us)
+
+    def show_bridge_frame(self, img, pts_us):
+        if getattr(self, "_quick", None) is not None:
+            if isinstance(img, _api.QVideoFrame):
+                if self._show_own_video_frame(img):
+                    self._last_pts_us = int(pts_us)
+                    self._last_frame_at = _api.time.monotonic()
+                    if self.isVisible():
+                        self.update()
+                return
+            if img is not None and not img.isNull():
+                if img.size() != self._px_size:
+                    self._px_size = img.size()
+                    self._vo_geom = None
+                self._publish_image(img)
+        super().show_bridge_frame(img, pts_us)
 
     def set_static_image(self, qimg):
         if getattr(self, "_quick", None) is not None:

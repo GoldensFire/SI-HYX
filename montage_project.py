@@ -19,17 +19,21 @@
 звук всех клипов смешивается.
 
 Время везде в секундах: start — место клипа на шкале проекта, in_s/out_s —
-кусок исходника."""
+кусок исходника. Скорость клипа (speed) меняет только длину на шкале: кусок
+исходника тот же, а на проект он идёт быстрее или медленнее."""
 import json
 import math
 import os
 import uuid
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from fractions import Fraction
 
 PROJECT_VERSION = 1
 MIN_CLIP_S = 0.04          # короче клип не бывает (подрезка, разрезание)
+MIN_SPEED = 0.1            # пределы скорости клипа (доли и разы)
+MAX_SPEED = 8.0
 _EPS = 1e-6
+_AUDIO_RATE = 48000          # частота звука сборки (и просмотра проекта)
 
 
 @dataclass
@@ -47,6 +51,8 @@ class Clip:
     audio_stream: int = -1        # абсолютный индекс потока в audio_path; -1 — первый звуковой
     volume: float = 1.0
     muted: bool = False
+    speed: float = 1.0            # 1.0 — как в исходнике, 2.0 — вдвое быстрее
+    audio_detached: bool = False  # звук отделён в свой клип — не возвращать при смене дорожки
     width: int = 0
     height: int = 0
     fps: float = 0.0
@@ -54,7 +60,7 @@ class Clip:
 
     @property
     def length(self):
-        return max(0.0, self.out_s - self.in_s)
+        return max(0.0, (self.out_s - self.in_s) / max(MIN_SPEED, self.speed))
 
     @property
     def end(self):
@@ -66,13 +72,14 @@ class Clip:
 
     def source_time(self, t):
         """Время исходника для времени проекта t (внутри клипа)."""
-        return self.in_s + (t - self.start)
+        return self.in_s + max(0.0, t - self.start) * max(MIN_SPEED, self.speed)
 
 
 @dataclass
 class Track:
     kind: str                     # 'video' | 'audio'
     enabled: bool = True
+    muted: bool = False           # звук клипов дорожки выключен (картинка остаётся)
 
 
 def snap_to_frame(t, fps):
@@ -120,6 +127,10 @@ class Project:
 
     def tracks_of(self, kind):
         return [i for i, t in enumerate(self.tracks) if t.kind == kind]
+
+    def track_has_audio(self, ti):
+        """На дорожке есть клип со звуком (видео со своим звуком, озвучка)."""
+        return any(c.track == ti and c.audio_path for c in self.clips)
 
     # ── Клипы ────────────────────────────────────────────────────────────────
     def clip(self, cid):
@@ -193,16 +204,95 @@ class Project:
         cut = c.source_time(t)
         if c.fps and not c.is_image:
             cut = snap_to_frame(cut, c.fps)
-        if cut - c.in_s < MIN_CLIP_S - _EPS or c.out_s - cut < MIN_CLIP_S - _EPS:
+        speed = max(MIN_SPEED, c.speed)
+        if ((cut - c.in_s) / speed < MIN_CLIP_S - _EPS
+                or (c.out_s - cut) / speed < MIN_CLIP_S - _EPS):
             return None
         right = Clip(**{f.name: getattr(c, f.name) for f in fields(Clip)})
         right.id = uuid.uuid4().hex[:12]
         right.in_s = cut
-        right.start = c.start + (cut - c.in_s)
+        right.start = c.start + (cut - c.in_s) / speed
         c.out_s = cut
         self.clips.insert(self.clips.index(c) + 1, right)
         self.pack()
         return c, right
+
+    def paste(self, clips, t):
+        """Вставляет копии clips у времени проекта t, сохраняя их взаимное
+        расположение. Возвращает вставленные клипы (у копий новые id).
+
+        Клипы основной дорожки встают подряд с t, а всё правее сдвигается —
+        дорожка магнитная; клип под t разрезается (у самого его края вставка
+        идёт к ближнему краю). Клипы свободных дорожек держатся за первый
+        клип основной (без него — за t) и встают на свою дорожку, а если там
+        на этом месте занято — на другую того же рода (нигде — на новую)."""
+        clips = sorted(clips, key=lambda c: (c.start, c.track))
+        if not clips:
+            return []
+        main = self.main_track
+        base = clips[0].start
+        on_main = [c for c in clips if c.track == main and c.has_video]
+        free = [c for c in clips if not (c.track == main and c.has_video)]
+        dst = max(0.0, float(t))
+        new = []
+        if on_main:
+            at = self._main_insert_point(dst)
+            shift = sum(c.length for c in on_main)
+            for o in self.clips_on(main):
+                if o.start >= at - _EPS:
+                    o.start += shift
+            pos = at
+            for c in on_main:
+                nc = replace(c, id=uuid.uuid4().hex[:12], track=main, start=pos)
+                pos += nc.length
+                self.clips.append(nc)
+                new.append(nc)
+            dst = at - (on_main[0].start - base)
+        for c in free:
+            kind = 'video' if c.has_video else 'audio'
+            nc = replace(c, id=uuid.uuid4().hex[:12],
+                         start=max(0.0, dst + (c.start - base)))
+            own = (0 <= c.track < len(self.tracks) and c.track != main
+                   and self.tracks[c.track].kind == kind)
+            cands = ([c.track] if own else []) + [
+                ti for ti in self.tracks_of(kind) if ti != main and ti != c.track]
+            track = next((ti for ti in cands if all(
+                o.end <= nc.start + _EPS or o.start >= nc.end - _EPS
+                for o in self.clips_on(ti))), None)
+            nc.track = self.add_track(kind) if track is None else track
+            self.clips.append(nc)
+            new.append(nc)
+        self.pack()
+        return new
+
+    def _main_insert_point(self, t):
+        """Стык основной дорожки, куда встаёт вставка у времени t: клип под t
+        разрезается, а у самого его края (кусок вышел бы короче MIN_CLIP_S) —
+        ближний край. За концом дорожки — её конец."""
+        main = self.main_track
+        c = self.clip_at(main, t)
+        if c is None:
+            return min(t, self.duration_of(main))
+        parts = self.split(c.id, t)
+        if parts is not None:
+            return parts[0].end
+        return c.start if t - c.start <= c.end - t else c.end
+
+    def set_speed(self, cid, speed):
+        """Скорость клипа: та же вырезка исходника идёт по шкале быстрее или
+        медленнее. Длина клипа меняется — соседи на дорожке сдвигаются."""
+        c = self.clip(cid)
+        if c is None or c.is_image:
+            return False
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(speed):
+            return False
+        c.speed = max(MIN_SPEED, min(MAX_SPEED, speed))
+        self._settle(c)
+        return True
 
     def move(self, cid, track, start):
         """Переносит клип на дорожку track. На основной дорожке start задаёт
@@ -241,32 +331,34 @@ class Project:
         if c is None:
             return False
         limit = c.src_duration if (c.src_duration > 0 and not c.is_image) else float("inf")
+        speed = max(MIN_SPEED, c.speed)
+        min_src = MIN_CLIP_S * speed
         free = c.track != self.main_track
         # На свободной дорожке край упирается в соседа (и в начало шкалы).
         others = [o for o in self.clips_on(c.track) if o is not c] if free else []
         if edge == 'left':
-            new_in = c.in_s + (t - c.start)
+            new_in = c.in_s + (t - c.start) * speed
             if c.fps and not c.is_image:
                 new_in = snap_to_frame(new_in, c.fps)
             low = 0.0
             if free:
                 prev_end = max((o.end for o in others if o.end <= c.start + _EPS), default=0.0)
-                low = max(low, c.in_s - (c.start - prev_end))
-            new_in = min(max(low, new_in), c.out_s - MIN_CLIP_S)
-            shift = new_in - c.in_s
+                low = max(low, c.in_s - (c.start - prev_end) * speed)
+            new_in = min(max(low, new_in), c.out_s - min_src)
+            shift = (new_in - c.in_s) / speed
             c.in_s = new_in
             if free:
                 c.start = max(0.0, c.start + shift)
         else:
-            new_out = c.in_s + (t - c.start)
+            new_out = c.in_s + (t - c.start) * speed
             if c.fps and not c.is_image:
                 new_out = snap_to_frame(new_out, c.fps)
             high = limit
             if free:
                 next_start = min((o.start for o in others if o.start >= c.end - _EPS),
                                  default=float("inf"))
-                high = min(high, c.in_s + (next_start - c.start))
-            c.out_s = max(c.in_s + MIN_CLIP_S, min(high, new_out))
+                high = min(high, c.in_s + (next_start - c.start) * speed)
+            c.out_s = max(c.in_s + min_src, min(high, new_out))
         self.pack()
         return True
 
@@ -312,8 +404,8 @@ class Project:
     def audio_parts(self):
         """Клипы, чей звук попадает в итог (смешиваются все разом)."""
         return [c for c in self.clips
-                if self.tracks[c.track].enabled and c.audio_path and not c.muted
-                and c.volume > 0 and c.length > _EPS]
+                if self.tracks[c.track].enabled and not self.tracks[c.track].muted
+                and c.audio_path and not c.muted and c.volume > 0 and c.length > _EPS]
 
     def output_format(self):
         """(ширина, высота, fps) итогового видео — по первому видеоклипу
@@ -340,7 +432,8 @@ class Project:
         p = cls()
         if not isinstance(data, dict):
             return p
-        tracks = [Track(kind=t.get('kind', 'video'), enabled=bool(t.get('enabled', True)))
+        tracks = [Track(kind=t.get('kind', 'video'), enabled=bool(t.get('enabled', True)),
+                        muted=bool(t.get('muted', False)))
                   for t in data.get('tracks') or [] if isinstance(t, dict)
                   and t.get('kind') in ('video', 'audio')]
         if any(t.kind == 'video' for t in tracks):
@@ -353,6 +446,13 @@ class Project:
                 c = Clip(**{k: v for k, v in raw.items() if k in names})
             except TypeError:
                 continue
+            try:
+                speed = float(c.speed)
+            except (TypeError, ValueError):
+                speed = 1.0
+            if not math.isfinite(speed):
+                speed = 1.0
+            c.speed = 1.0 if c.is_image else max(MIN_SPEED, min(MAX_SPEED, speed))
             if 0 <= c.track < len(p.tracks) and c.length > _EPS:
                 p.clips.append(c)
         p.pack()
@@ -365,7 +465,7 @@ class Project:
         """Копия проекта, где осталось только время [t0, t1) — сдвинутое к
         нулю. Клипы обрезаются по краям окна, раскладка не пересчитывается."""
         p = Project()
-        p.tracks = [Track(t.kind, t.enabled) for t in self.tracks]
+        p.tracks = [Track(t.kind, t.enabled, t.muted) for t in self.tracks]
         for c in self.clips:
             a, b = max(c.start, t0), min(c.end, t1)
             if b - a <= _EPS:
@@ -381,6 +481,22 @@ class Project:
 # ── Сборка итогового видео ───────────────────────────────────────────────────
 def _num(v):
     return f"{float(v):.6f}".rstrip("0").rstrip(".") or "0"
+
+
+def atempo_chain(speed):
+    """Цепочка atempo для смены скорости звука: ffmpeg принимает звено от
+    0.5 до 2.0, поэтому большие разы собираются из нескольких."""
+    chain = []
+    t = max(MIN_SPEED, min(MAX_SPEED, float(speed)))
+    while t > 2.0:
+        chain.append("atempo=2.0")
+        t /= 2.0
+    while t < 0.5:
+        chain.append("atempo=0.5")
+        t *= 2.0
+    if abs(t - 1.0) > 0.001:
+        chain.append(f"atempo={t:.6f}")
+    return chain
 
 
 def fps_expr(fps):
@@ -421,9 +537,14 @@ class SourceGraph:
         return [a for args in self.inputs for a in args]
 
 
-def build_source(project, video=True, audio=True, subs=None):
+def build_source(project, video=True, audio=True, subs=None, tonemap=None):
     """Граф проекта без кодирования: SourceGraph или None, если собирать
     нечего. video/audio=False выбрасывают соответствующую часть.
+
+    tonemap — HDR-куски в SDR: {source_key(файл): цепочка фильтров}
+    (hdr_tonemap.tonemap_filters). Цепочка встаёт первой, на кадр исходника:
+    субтитры потом рисуются уже в SDR, а куски HDR и SDR файлов склеиваются
+    в одном цветовом пространстве.
 
     subs — вшивание субтитров: {source_key(файл): фильтр subtitles=…}. Куски
     этих файлов получают фильтр на кадре исходника (до масштаба под проект)
@@ -463,21 +584,26 @@ def build_source(project, video=True, audio=True, subs=None):
                           f"setsar=1,format=yuv420p[{lab}]")
         else:
             idx = len(inputs)
+            speed = 1.0 if c.is_image else max(MIN_SPEED, c.speed)
             s = c.source_time(t0)
+            span = t1 - t0
             if c.is_image:
                 inputs.append(["-loop", "1", "-framerate", rate,
-                               "-t", _num(t1 - t0 + 1.0), "-i", c.src])
+                               "-t", _num(span + 1.0), "-i", c.src])
             else:
                 inputs.append(["-ss", _num(_seek_s(c, s)),
-                               "-t", _num(t1 - t0 + 0.5), "-i", c.src])
+                               "-t", _num(span * speed + 0.5), "-i", c.src])
             sub_vf = (subs or {}).get(source_key(c.src)) if not c.is_image else None
+            tone_vf = (tonemap or {}).get(source_key(c.src)) if not c.is_image else None
+            tone = f"{tone_vf}," if tone_vf else ""
             burn = ""
             if sub_vf:
                 # Первый кадр после входного seek — кадр, на котором стоит s.
                 first = snap_to_frame(s, c.fps)
                 burn = (f"setpts=PTS-STARTPTS+{_num(first)}/TB,{sub_vf},")
+            speed_vf = "" if abs(speed - 1.0) <= 1e-6 else f"setpts=(PTS-STARTPTS)/{_num(speed)},"
             chains.append(
-                f"[{idx}:v:0]{burn}setpts=PTS-STARTPTS,"
+                f"[{idx}:v:0]{tone}{burn}setpts=PTS-STARTPTS,{speed_vf}"
                 f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,"
                 f"fps={rate},tpad=stop_mode=clone:stop_duration=1,"
@@ -486,15 +612,22 @@ def build_source(project, video=True, audio=True, subs=None):
     amix = []
     for c in parts:
         idx = len(inputs)
-        inputs.append(["-ss", _num(c.in_s), "-t", _num(c.length + 0.25),
+        speed = max(MIN_SPEED, c.speed)
+        inputs.append(["-ss", _num(c.in_s), "-t", _num(c.length * speed + 0.25),
                        "-i", c.audio_path])
         spec = f"{idx}:{c.audio_stream}" if c.audio_stream >= 0 else f"{idx}:a:0"
         lab = f"a{len(amix)}"
-        delay = int(round(c.start * 1000.0))
+        tempo = atempo_chain(speed)
+        tempo_vf = (",".join(tempo) + ",") if tempo else ""
+        # Место и длина — в сэмплах, от общей сетки шкалы: конец клипа и
+        # начало следующего попадают в один и тот же сэмпл. С миллисекундами
+        # (adelay округлял начало) на стыке оставалась дыра до 0.5 мс — щелчок.
+        a0 = int(round(c.start * _AUDIO_RATE))
+        n = max(1, int(round((c.start + c.length) * _AUDIO_RATE)) - a0)
         chains.append(
-            f"[{spec}]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            f"atrim=duration={_num(c.length)},asetpts=PTS-STARTPTS,"
-            f"volume={_num(c.volume)},adelay={delay}:all=1[{lab}]")
+            f"[{spec}]aresample={_AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,"
+            f"{tempo_vf}atrim=end_sample={n},asetpts=PTS-STARTPTS,"
+            f"volume={_num(c.volume)},adelay={a0}S:all=1[{lab}]")
         amix.append(lab)
     if labels:
         if len(labels) == 1:
@@ -508,7 +641,8 @@ def build_source(project, video=True, audio=True, subs=None):
         # кусок (клип не с начала шкалы), ffmpeg выдавал битые метки — звук
         # обрывался на первых 20 мс («Error submitting a packet to the muxer»).
         # Тишина с нуля даёт ровную шкалу, а duration=first — точную длину.
-        chains.append(f"anullsrc=r=48000:cl=stereo,atrim=duration={_num(total_s)}[asil]")
+        chains.append(f"anullsrc=r={_AUDIO_RATE}:cl=stereo,"
+                      f"atrim=end_sample={max(1, int(round(total_s * _AUDIO_RATE)))}[asil]")
         chains.append("[asil]" + "".join(f"[{x}]" for x in amix)
                       + f"amix=inputs={len(amix) + 1}:normalize=0:"
                         f"dropout_transition=0:duration=first[aout]")
@@ -516,15 +650,16 @@ def build_source(project, video=True, audio=True, subs=None):
                        total_s, w, h, fps)
 
 
-def build_export(project, out_path, ffmpeg, video_args, audio_args=None, subs=None):
+def build_export(project, out_path, ffmpeg, video_args, audio_args=None, subs=None,
+                 tonemap=None):
     """Команда ffmpeg для сборки проекта.
 
     Возвращает (cmd, graph, duration): graph — граф фильтров (его кладут в
     файл и передают через -/filter_complex, если команда длинная), duration —
-    длина итога для прогресса. None, если собирать нечего. subs — как у
-    build_source."""
+    длина итога для прогресса. None, если собирать нечего. subs и tonemap —
+    как у build_source."""
     audio_args = audio_args or ["-c:a", "aac", "-b:a", "192k"]
-    src = build_source(project, subs=subs)
+    src = build_source(project, subs=subs, tonemap=tonemap)
     if src is None:
         return None
     cmd = [ffmpeg, "-y", "-hide_banner"] + src.input_args()

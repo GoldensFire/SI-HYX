@@ -9,12 +9,18 @@ mov_text (MP4/M4V) хранит размер шрифта в пикселях к
 51/288 ≈ 18 % высоты на строку — субтитры «в полэкрана». Здесь холст ASS
 подставляется по размеру видео.
 
-Правка текста идёт через SRT (редактор), и без этого модуля сохранённый файл
-терял все стили оригинала. rebuild_ass возвращает правленый текст в события
-исходного ASS: стиль, позиция и теги реплики остаются её собственными."""
+Правка идёт в окне «Создать субтитры»: edit_cues даёт ему реплики ASS с
+номерами их событий и похожим стилем, rebuild_ass возвращает правку в те же
+события — время и текст новые, стиль, позиция и теги остаются своими, даже
+если реплику сдвинули по времени."""
 import re
 
 import edit_tab as _api
+from edit_tab_base import (
+    DEFAULT_SUBTITLE_STYLE, _ASS_MARGIN_L, _ASS_MARGIN_R, _ASS_MARGIN_V,
+    _ASS_PLAYRES_X, _ASS_PLAYRES_Y, _animation_override_tags, _hex_to_ass_color,
+    _style_num
+)
 
 
 _PLAYRES_RE = re.compile(r"^(PlayRes[XY])\s*:.*$", re.MULTILINE | re.IGNORECASE)
@@ -54,21 +60,28 @@ def set_play_res(ass_text, size):
     return out
 
 
-def play_res_y(ass_text):
-    """Высота холста ASS так, как её берёт libass: PlayResY, а без него — из
-    PlayResX (1280 → 1024, иначе ¾ ширины), а без обоих — 288."""
+def play_res(ass_text):
+    """(PlayResX, PlayResY) холста ASS так, как их берёт libass: недостающий
+    достраивается из другого (1280 ↔ 1024, иначе 4:3), без обоих — 384×288."""
     values = {}
     for m in _PLAYRES_RE.finditer(ass_text or ""):
         try:
             values[m.group(1).lower()] = int(m.group(0).split(":", 1)[1].strip())
         except ValueError:
             pass
-    y, x = values.get("playresy", 0), values.get("playresx", 0)
-    if y > 0:
-        return y
-    if x > 0:
-        return 1024 if x == 1280 else max(1, x * 3 // 4)
-    return 288
+    x, y = values.get("playresx", 0), values.get("playresy", 0)
+    if x <= 0 and y <= 0:
+        return 384, 288
+    if y <= 0:
+        y = 1024 if x == 1280 else max(1, x * 3 // 4)
+    if x <= 0:
+        x = 1280 if y == 1024 else max(1, y * 4 // 3)
+    return x, y
+
+
+def play_res_y(ass_text):
+    """Высота холста ASS так, как её берёт libass (см. play_res)."""
+    return play_res(ass_text)[1]
 
 
 def extract_ass(src, rel_idx, codec=""):
@@ -112,6 +125,18 @@ def mov_text_burn_file(src, rel_idx):
         return path
     except Exception:
         return None
+
+
+def fit_canvas_file(src, path):
+    """Холст .ass-копии mov_text — по размеру кадра src, на месте: превью
+    «как в оригинале» рисует её так же, как вшивание (mov_text_burn_file)."""
+    size = video_size(src)
+    if not size:
+        return
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(set_play_res(text, size))
 
 
 def _ass_ts(sec):
@@ -192,66 +217,274 @@ def shift_ass(ass_text, offset):
     return "\n".join(out) + "\n"
 
 
-def rebuild_ass(ass_text, cues):
-    """Исходный ASS с текстом из правленых реплик cues [(start, end, text)].
+_STYLE_FORMAT = ["name", "fontname", "fontsize", "primarycolour", "secondarycolour",
+                 "outlinecolour", "backcolour", "bold", "italic", "underline",
+                 "strikeout", "scalex", "scaley", "spacing", "angle", "borderstyle",
+                 "outline", "shadow", "alignment", "marginl", "marginr", "marginv",
+                 "encoding"]
+_AN_RE = re.compile(r"\\an([1-9])")
 
-    Реплика находит своё событие по времени (точность — сотые секунды ASS):
-    текст тот же — строка остаётся как была, иначе меняется только текст,
-    а стиль, поля и ведущие теги ({\\an8\\pos…}) остаются. Событие, у которого
-    реплики не нашлось, удалено правкой — кроме безтекстовых (рисунки \\p1:
-    в SRT их нет вовсе). Реплика без события получает первый стиль файла.
-    None — разобрать оригинал не удалось."""
+
+def _styles(lines):
+    """Стили раздела [V4+ Styles]: (поля Format, {имя: поля}, номер строки,
+    после которой дописывать свои стили, или None — раздела нет)."""
+    fmt, styles, in_styles, last = None, {}, False, None
+    for i, line in enumerate(lines):
+        low = line.strip().lower()
+        if low.startswith("["):
+            in_styles = low in ("[v4+ styles]", "[v4 styles]")
+            if in_styles:
+                last = i
+            continue
+        if not in_styles:
+            continue
+        if low.startswith("format:"):
+            fmt = [p.strip().lower() for p in line.split(":", 1)[1].split(",")]
+            last = i
+        elif low.startswith("style:") and fmt:
+            parts = line.split(":", 1)[1].lstrip().split(",", len(fmt) - 1)
+            if len(parts) == len(fmt):
+                st = dict(zip(fmt, (p.strip() for p in parts)))
+                styles[st.get("name", "")] = st
+            last = i
+    return fmt, styles, last
+
+
+def _event_style(styles, ev):
+    """Стиль события так, как его ищет libass: имя без «*», иначе Default."""
+    name = str(ev.get("style", "")).strip().lstrip("*")
+    return (styles.get(name) or styles.get("Default")
+            or next(iter(styles.values()), {}))
+
+
+def _ass_colour(value):
+    """Цвет ASS («&HAABBGGRR» или число) → ('#RRGGBB', прозрачность 0..255)."""
+    v = str(value or "").strip().upper().rstrip("&")
+    try:
+        n = int(v[2:], 16) if v.startswith("&H") else int(v)
+    except ValueError:
+        return "#FFFFFF", 0
+    a, b, g, r = (n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255
+    return f"#{r:02X}{g:02X}{b:02X}", a
+
+
+def editor_style(st, res, lead=""):
+    """Стиль ASS → стиль реплики окна «Создать субтитры» (единицы его холста
+    384×288, см. DEFAULT_SUBTITLE_STYLE): окно правки показывает реплику
+    похожей на оригинал. lead — ведущие теги события (их \\an — выравнивание)."""
+    k = _ASS_PLAYRES_Y / float(res[1])
+
+    def num(key, default=0.0):
+        try:
+            return float(st.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    color, _alpha = _ass_colour(st.get("primarycolour"))
+    outline_color, _alpha = _ass_colour(st.get("outlinecolour"))
+    _back, back_alpha = _ass_colour(st.get("backcolour"))
+    align = int(num("alignment", 2))
+    an = _AN_RE.search(lead or "")
+    if an:
+        align = int(an.group(1))
+    return {
+        'font': st.get("fontname") or "Arial",
+        # Кегль и интервал — без округления до целых: сменишь реплике только
+        # цвет, а размер в файле остаётся прежним.
+        'size': max(1.0, round(num("fontsize", 20) * k, 3)),
+        'bold': num("bold") != 0, 'italic': num("italic") != 0,
+        'underline': num("underline") != 0,
+        'align': align if 1 <= align <= 9 else 2,
+        'spacing': round(num("spacing") * k, 3),
+        'color': color, 'outline_color': outline_color,
+        'outline': round(num("outline") * k, 2), 'shadow': round(num("shadow") * k, 2),
+        'shadow_alpha': back_alpha,
+        'scale_x': num("scalex", 100), 'scale_y': num("scaley", 100),
+        'animation': 'none',
+    }
+
+
+def edit_cues(ass_text):
+    """Реплики ASS для окна правки: [{'start','end','text','src','base'}] по
+    времени. src — номера строк событий в файле: по ним rebuild_ass вернёт
+    правку в те же события, даже если реплику сдвинули по времени. Слои одной
+    реплики (то же время и текст — подложка и сам текст опенинга) идут одной
+    репликой. Рисунки без текста в список не попадают и остаются в файле."""
     lines, fmt, events = _events(ass_text)
-    if not fmt or "text" not in fmt or "start" not in fmt:
-        return None
-    timed = []
+    if not fmt or not {"start", "end", "text"} <= set(fmt):
+        return []
+    _sfmt, styles, _last = _styles(lines)
+    res = play_res(ass_text)
+    merged, out = {}, []
     for idx, ev in events:
         st, en = _parse_ass_ts(ev.get("start", "")), _parse_ass_ts(ev.get("end", ""))
-        if st is not None and en is not None:
-            timed.append((idx, ev, st, en))
-    used, new_lines, keep = set(), {}, set()
-    fallback = next((ev for _i, ev, _s, _e in timed), None)
-    extra = []
-    for start, end, body in cues:
-        match = None
-        for idx, ev, st, en in timed:
-            if idx in used or abs(st - start) > 0.02 or abs(en - end) > 0.02:
-                continue
-            if _plain(ev["text"]) == body.strip():
-                match = (idx, ev); break
-            if match is None:
-                match = (idx, ev)
-        text = body.replace("{", "｛").replace("}", "｝")
-        text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\N")
-        if match is None:
-            extra.append((start, end, text))
+        text = _plain(ev.get("text", ""))
+        if st is None or en is None or en <= st or not text:
             continue
-        idx, ev = match
-        used.add(idx)
-        if _plain(ev["text"]) == body.strip():
-            keep.add(idx)
+        key = (round(st, 2), round(en, 2), text)
+        if key in merged:
+            merged[key]['src'].append(idx)
             continue
         lead = _LEAD_OVERRIDE_RE.match(ev["text"])
-        fields = dict(ev, text=(lead.group(0) if lead else "") + text)
-        new_lines[idx] = "Dialogue: " + ",".join(fields[k] for k in fmt)
-    by_line = {idx: ev for idx, ev, _s, _e in timed}
+        cue = {'start': st, 'end': en, 'text': text, 'src': [idx],
+               'base': editor_style(_event_style(styles, ev), res,
+                                    lead.group(0) if lead else "")}
+        merged[key] = cue
+        out.append(cue)
+    out.sort(key=lambda c: (c['start'], c['end']))
+    for cue in out:
+        cue['src'] = tuple(cue['src'])
+    return out
+
+
+def _style_fields(name, style, res):
+    """Поля стиля ASS из стиля окна правки — в единицах холста файла res."""
+    k = res[1] / float(_ASS_PLAYRES_Y)
+    kx = res[0] / float(_ASS_PLAYRES_X)
+
+    def num(key, default, scale=1.0):
+        value = _style_num(style, key, default) * scale
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+
+    return {
+        "name": name,
+        "fontname": style.get('font') or DEFAULT_SUBTITLE_STYLE['font'],
+        "fontsize": num('size', DEFAULT_SUBTITLE_STYLE['size'], k),
+        "primarycolour": _hex_to_ass_color(style.get('color') or '#FFFFFF'),
+        "secondarycolour": "&H000000FF",
+        "outlinecolour": _hex_to_ass_color(style.get('outline_color') or '#000000'),
+        "backcolour": _hex_to_ass_color(
+            '#000000', int(_style_num(style, 'shadow_alpha', 0))),
+        "bold": "-1" if style.get('bold') else "0",
+        "italic": "-1" if style.get('italic') else "0",
+        "underline": "-1" if style.get('underline') else "0",
+        "strikeout": "0",
+        "scalex": num('scale_x', 100), "scaley": num('scale_y', 100),
+        "spacing": num('spacing', 0, k), "angle": "0", "borderstyle": "1",
+        "outline": num('outline', 1, k), "shadow": num('shadow', 0, k),
+        "alignment": str(int(style.get('align') or 2)),
+        "marginl": str(int(round(_ASS_MARGIN_L * kx))),
+        "marginr": str(int(round(_ASS_MARGIN_R * kx))),
+        "marginv": str(int(round(_ASS_MARGIN_V * k))),
+        "encoding": "1", "alphalevel": "0",
+    }
+
+
+def _ass_text(body):
+    """Текст реплики окна → поле Text события: фигурные скобки не должны стать
+    тегами, переносы строк — \\N."""
+    text = body.replace("{", "｛").replace("}", "｝")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text.replace("\n", "\\N")
+
+
+def rebuild_ass(ass_text, cues):
+    """Исходный ASS с правкой из окна субтитров. cues — его реплики
+    [{'start','end','text','style','src','tmpl','restyled'}] (см.
+    SubtitleCreatorDialog.cues).
+
+    Реплика с src возвращается в свои события: время и текст — новые, стиль,
+    поля и ведущие теги ({\\an8\\pos…}) — свои; текст не правили — остаются и
+    теги внутри строки. Раньше событие искалось по времени, и сдвинутая
+    реплика теряла свой стиль — получала стиль первого события файла (у
+    Kanon — опенинга, прижатого вправо). Новая реплика берёт событие-образец
+    tmpl (так дублируется реплика оригинала). Реплика, которой в окне сменили
+    стиль (restyled), и новая без образца получают стиль из окна в единицах
+    холста файла — как их показывало окно, без старых ведущих тегов. Событие
+    с текстом, которого нет ни в одной реплике, удалено правкой; рисунки без
+    текста остаются. None — разобрать оригинал не удалось."""
+    lines, fmt, events = _events(ass_text)
+    if not fmt or not {"start", "end", "text"} <= set(fmt):
+        return None
+    by_line = dict(events)
+    sfmt, styles, styles_last = _styles(lines)
+    res = play_res(ass_text)
+    margins = (int(round(_ASS_MARGIN_L * res[0] / float(_ASS_PLAYRES_X))),
+               int(round(_ASS_MARGIN_R * res[0] / float(_ASS_PLAYRES_X))),
+               int(round(_ASS_MARGIN_V * res[1] / float(_ASS_PLAYRES_Y))))
+    taken, new_styles = set(styles), []
+
+    def own_style(style):
+        n = len(new_styles) + 1
+        while f"SIHYX{n}" in taken:
+            n += 1
+        name = f"SIHYX{n}"
+        taken.add(name)
+        fields = _style_fields(name, style, res)
+        new_styles.append("Style: " + ",".join(fields.get(k, "0")
+                                               for k in (sfmt or _STYLE_FORMAT)))
+        return name
+
+    def anim(style, start, end):
+        return _animation_override_tags(
+            style.get('animation', 'none'), int(style.get('align') or 2),
+            max(0.01, end - start), play_res=res, margins=margins)
+
+    def dialogue(fields):
+        return "Dialogue: " + ",".join(fields.get(k, "") for k in fmt)
+
+    new_lines, keep, extra = {}, set(), []
+    for cue in cues:
+        start, end = float(cue['start']), float(cue['end'])
+        body = str(cue.get('text') or '').strip()
+        style = cue.get('style') or {}
+        restyled = bool(cue.get('restyled'))
+        src = [i for i in (cue.get('src') or ()) if i in by_line]
+        if src:
+            # Слои одной реплики в новом стиле — одним событием: иначе
+            # одинаковый текст лёг бы сам на себя.
+            name = own_style(style) if restyled else None
+            for idx in (src[:1] if restyled else src):
+                ev = by_line[idx]
+                fields = dict(ev)
+                if (abs((_parse_ass_ts(ev["start"]) or 0.0) - start) >= 0.005
+                        or abs((_parse_ass_ts(ev["end"]) or 0.0) - end) >= 0.005):
+                    fields["start"], fields["end"] = _ass_ts(start), _ass_ts(end)
+                if name:
+                    fields["style"] = name
+                    fields["text"] = anim(style, start, end) + _ass_text(body)
+                elif _plain(ev["text"]) != body:
+                    lead = _LEAD_OVERRIDE_RE.match(ev["text"])
+                    fields["text"] = (lead.group(0) if lead else "") + _ass_text(body)
+                keep.add(idx)
+                new_lines[idx] = dialogue(fields)
+            continue
+        tmpl = by_line.get(cue.get('tmpl'))
+        if tmpl is not None and not restyled:
+            lead = _LEAD_OVERRIDE_RE.match(tmpl["text"])
+            fields = dict(tmpl, start=_ass_ts(start), end=_ass_ts(end),
+                          text=(lead.group(0) if lead else "") + _ass_text(body))
+        else:
+            fields = {k: "" for k in fmt}
+            fields.update({"layer": "0", "start": _ass_ts(start), "end": _ass_ts(end),
+                           "style": own_style(style), "marginl": "0", "marginr": "0",
+                           "marginv": "0", "text": anim(style, start, end) + _ass_text(body)})
+        extra.append(dialogue(fields))
+
+    # Новые события — в конец раздела [Events] (за ним бывают [Fonts] и др.).
+    events_hdr = next((i for i, line in enumerate(lines)
+                       if line.strip().lower() == "[events]"), 0)
+    events_last = events_hdr
+    for i in range(events_hdr + 1, len(lines)):
+        if lines[i].strip().startswith("["):
+            break
+        if lines[i].strip():
+            events_last = i
     out = []
     for i, line in enumerate(lines):
+        if i == events_hdr and new_styles and styles_last is None:
+            out += ["[V4+ Styles]",
+                    "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+                    "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+                    "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+                    "Alignment, MarginL, MarginR, MarginV, Encoding"]
+            out += new_styles + [""]
         if i in new_lines:
             out.append(new_lines[i])
-            continue
-        ev = by_line.get(i)
-        if ev is not None and i not in keep and _plain(ev["text"]):
-            continue   # реплику удалили в редакторе
-        out.append(line)
-    for start, end, text in extra:
-        fields = dict(fallback or {k: "" for k in fmt})
-        fields.update({"layer": fields.get("layer") or "0", "start": _ass_ts(start),
-                       "end": _ass_ts(end), "name": "", "effect": "", "text": text})
-        for k in ("marginl", "marginr", "marginv"):
-            if k in fields:
-                fields[k] = "0"
-        if fallback is None:
-            fields["style"] = "Default"
-        out.append("Dialogue: " + ",".join(fields.get(k, "") for k in fmt))
+        elif not (i in by_line and i not in keep and _plain(by_line[i]["text"])):
+            out.append(line)    # иначе реплику удалили в окне правки
+        if i == styles_last:
+            out += new_styles
+        if i == events_last:
+            out += extra
     return "\n".join(out) + "\n"

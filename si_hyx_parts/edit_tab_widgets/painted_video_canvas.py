@@ -37,6 +37,10 @@ class _PaintedVideoCanvas(_api.QWidget):
     # подвинули/растянули/повернули мышью — вкладка обновляет список слоёв.
     overlaysChanged = _api.pyqtSignal()
     overlaySelected = _api.pyqtSignal(int)
+    # Первый кадр плеера после watch_player_format(): его QVideoFrameFormat.
+    # По нему предекодер отдаёт точные HDR-кадры в том же формате — тогда
+    # сцена рисует их тем же шейдером, что и воспроизведение.
+    playerFrameFormat = _api.pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -45,7 +49,13 @@ class _PaintedVideoCanvas(_api.QWidget):
         self._sink = _api.QVideoSink(self)
         self._sink.videoFrameChanged.connect(self._on_frame)
         self._bound_us = None          # граница OUT (µs) для блокировки кадров
+        self._floor_us = None          # начало куска проекта (µs): кадры раньше — не показывать
+        self._player_seq = 0           # счётчик показанных кадров плеера (см. player_frame_seq)
         self._frame_img = None
+        # Точный кадр HDR-источника — QVideoFrame (см. set_exact_frame); ЦП-копия
+        # из него делается, только когда её спросят (current_frame_image).
+        self._exact_vf = None
+        self._player_fmt_seen = False  # формат первого кадра плеера уже сообщён
         # ── Покадровая точность (см. edit_tab_frames.py) ──────────────────────
         # «Пин» — заявка «на холсте стоит кадр N»: пока он держится, кадры
         # плеера с ЧУЖИМ pts (а плеер после seek'а любит отдать соседний)
@@ -53,6 +63,9 @@ class _PaintedVideoCanvas(_api.QWidget):
         # вкладка на воспроизведении (там кадры плеера и есть истина).
         self._pin_span = None          # (lo_us, hi_us) — pts, считающиеся кадром N
         self._pin_has_img = False      # точный кадр уже нарисован (не только заявка)
+        # Строгий пин (прогрев звука «с разбега»): чужие кадры не пускаем и
+        # пока точной картинки нет — иначе на экран лезли кадры разбега.
+        self._pin_strict = False
         # Часы кадра: pts последнего ПОКАЗАННОГО кадра. Это единственное время,
         # которое реально совпадает с картинкой на экране, поэтому по нему
         # вкладка и ведёт метку таймлайна во время воспроизведения.
@@ -645,6 +658,7 @@ class _PaintedVideoCanvas(_api.QWidget):
 
     def clear_frame(self):
         self._frame_img = None
+        self._exact_vf = None
         self.clear_frame_pin()
         self._last_pts_us = -1
         self._last_frame_at = 0.0
@@ -659,6 +673,7 @@ class _PaintedVideoCanvas(_api.QWidget):
         self._audio_only_msg = ""
         self.clear_frame_pin()
         self._frame_img = qimg if (qimg is not None and not qimg.isNull()) else None
+        self._exact_vf = None
         self.reset_view()
         self.update()
 
@@ -667,11 +682,38 @@ class _PaintedVideoCanvas(_api.QWidget):
         разрешение видео, без субтитров — они рисуются отдельно). Нужна для
         «Сохранить кадр»: берём ровно то, что видит пользователь, а не
         пере-извлекаем кадр через ffmpeg по позиции (там seek по HEVC мог
-        отдать СЛЕДУЮЩИЙ кадр)."""
+        отдать СЛЕДУЮЩИЙ кадр). У HDR-кадра копию рисует Qt тем же шейдером,
+        что и экран (toImage) — PNG выходит в цветах воспроизведения."""
         img = self._frame_img
         if img is not None and not img.isNull():
             return img.copy()
+        if self._exact_vf is not None:
+            return self._frame_as_image(self._exact_vf)
         return None
+
+    @staticmethod
+    def _frame_as_image(frame):
+        try:
+            img = frame.toImage()
+        except Exception:
+            return None
+        return img if (img is not None and not img.isNull()) else None
+
+    def watch_player_format(self):
+        """Сообщить формат следующего кадра плеера (новый источник)."""
+        self._player_fmt_seen = False
+
+    def _note_player_format(self, frame):
+        if self._player_fmt_seen:
+            return
+        try:
+            if frame is None or not frame.isValid():
+                return
+            fmt = frame.surfaceFormat()
+        except Exception:
+            return
+        self._player_fmt_seen = True
+        self.playerFrameFormat.emit(fmt)
 
     def set_audio_only_message(self, text):
         """Текст по центру холста, когда видеоряда нет (редактируется аудио).
@@ -882,10 +924,27 @@ class _PaintedVideoCanvas(_api.QWidget):
             return
         super().mouseReleaseEvent(ev)
 
-    def set_play_bound(self, out_seconds):
-        """Граница OUT для блокировки кадров при воспроизведении (None — снять)."""
+    def set_play_bound(self, out_seconds, floor_seconds=None):
+        """Граница OUT для блокировки кадров при воспроизведении (None — снять).
+
+        floor_seconds — начало куска проекта: после перемотки на ходу плеер
+        успевает отдать кадры прежнего места или кадр перед целью, а это
+        вырезанное — их молча пропускаем (паузы, в отличие от OUT, не просим)."""
         self._bound_us = (int(out_seconds * 1_000_000)
                           if (out_seconds and out_seconds > 0) else None)
+        self._floor_us = (int(floor_seconds * 1_000_000)
+                          if (floor_seconds and floor_seconds > 0) else None)
+
+    def raise_play_floor(self, seconds):
+        """Мост на стыке уже показал кадр seconds: кадры плеера раньше него
+        опоздали (пока плеер перематывался, его часы ушли вперёд, а первым он
+        всё равно отдаёт кадр цели) — картинка откатилась бы назад."""
+        us = int(seconds * 1_000_000)
+        if self._floor_us is None or us > self._floor_us:
+            self._floor_us = us
+
+    def _below_floor(self, pts):
+        return self._floor_us is not None and 0 <= pts < self._floor_us
 
     # ── Покадровый пин ───────────────────────────────────────────────────────
     def arm_frame_pin(self, span_us):
@@ -898,21 +957,50 @@ class _PaintedVideoCanvas(_api.QWidget):
         self._pin_has_img = False
 
     def set_exact_frame(self, img, span_us=None, pts_us=None):
-        """Показать точный кадр, декодированный вкладкой (FramePrefetcher).
+        """Показать точный кадр, декодированный вкладкой (FramePrefetcher):
+        QImage или — у HDR — QVideoFrame в формате кадров плеера.
 
         pts_us — время САМОГО кадра (начало показа): по нему вкладка ведёт метку
         таймлайна, поэтому оно должно быть точным, а не серединой диапазона."""
+        if isinstance(img, _api.QVideoFrame):
+            img = self._frame_as_image(img)     # ЦП-холст рисует QPainter'ом
         if img is None or img.isNull():
             return
+        self._frame_img = img
+        self._exact_vf = None
+        self._mark_exact_frame(span_us, pts_us)
+
+    def _mark_exact_frame(self, span_us, pts_us):
+        """Пин и часы точного кадра, который только что встал на холст."""
         if span_us is not None:
             self._pin_span = span_us
         self._pin_has_img = True
-        self._frame_img = img
         if pts_us is not None and pts_us >= 0:
             self._last_pts_us = int(pts_us)
             self._last_frame_at = _api.time.monotonic()
         if self.isVisible():
             self.update()
+
+    def show_bridge_frame(self, img, pts_us):
+        """Кадр предекодера на стыке кусков проекта, пока плеер перематывается
+        на ходу (EditTabSpliceBridgeMixin). Без пина: первый же кадр плеера с
+        нового места его сменит. Часы кадра идут по нему — метка времени и
+        плейхед не стоят, пока на экране мост."""
+        if isinstance(img, _api.QVideoFrame):
+            img = self._frame_as_image(img)
+        if img is None or img.isNull():
+            return
+        self._frame_img = img
+        self._exact_vf = None
+        self._last_pts_us = int(pts_us)
+        self._last_frame_at = _api.time.monotonic()
+        if self.isVisible():
+            self.update()
+
+    def player_frame_seq(self):
+        """Сколько кадров плеера показано: мост на стыке ждёт, когда счёт
+        сдвинется (плеер привёз кадр нового места)."""
+        return self._player_seq
 
     def _adopt_pin_frame(self, pts_us):
         """Плеер сам привёз кадр, заявленный пином (перемотка на паузе), — он и
@@ -927,6 +1015,21 @@ class _PaintedVideoCanvas(_api.QWidget):
         """Снять пин — кадры плеера снова главные (воспроизведение)."""
         self._pin_span = None
         self._pin_has_img = False
+        self._pin_strict = False
+
+    def set_pin_strict(self, strict):
+        """Строгий пин на время беззвучного прогрева: плеер играет разбег (за
+        полсекунды ДО кадра), и, пока точный кадр не доехал, эти кадры шли на
+        экран — картинка отскакивала назад и бежала к цели. Кадр самой цели
+        (в диапазоне пина) по-прежнему принимается (_adopt_pin_frame)."""
+        self._pin_strict = bool(strict)
+
+    def _pin_rejects(self, pts):
+        """Кадр плеера с этим pts чужой для пина и на экран не идёт."""
+        span = self._pin_span
+        return (span is not None and pts >= 0
+                and (self._pin_has_img or self._pin_strict)
+                and not (span[0] <= pts < span[1]))
 
     def has_frame_pin(self):
         return self._pin_span is not None
@@ -964,6 +1067,7 @@ class _PaintedVideoCanvas(_api.QWidget):
         # старое видео вновь заполнит _frame_img и перекроет сообщение «нет видео».
         if self._audio_only_msg:
             return
+        self._note_player_format(frame)
         # Граница OUT по PTS кадра — ПРОВЕРЯЕМ ДО конвертации в QImage и показа.
         # Кадр за границей не рисуем и просим плеер на паузу (анти-overshoot).
         if frame is not None and self._bound_us is not None:
@@ -972,15 +1076,17 @@ class _PaintedVideoCanvas(_api.QWidget):
             if pts >= 0 and pts >= self._bound_us:
                 self.boundaryReached.emit()
                 return
+            if self._below_floor(pts):
+                return
         # Пин кадра N: пока на холсте стоит ТОЧНЫЙ кадр, чужие pts от плеера
         # (а после seek'а он нередко отдаёт соседний) на экран не пускаем —
         # иначе шаг стрелкой показывает не тот кадр, что просили.
-        if self._pin_has_img and self._pin_span is not None:
+        if self._pin_span is not None:
             try:
                 pts = frame.startTime() if frame is not None else -1
             except Exception:
                 pts = -1
-            if pts >= 0 and not (self._pin_span[0] <= pts < self._pin_span[1]):
+            if self._pin_rejects(pts):
                 return
         img = None
         try:
@@ -990,6 +1096,8 @@ class _PaintedVideoCanvas(_api.QWidget):
             img = None
         if img is not None and not img.isNull():
             self._frame_img = img
+            self._exact_vf = None
+            self._player_seq += 1
             # Часы кадра — время картинки, которая СЕЙЧАС на экране.
             try:
                 pts_us = frame.startTime()

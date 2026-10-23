@@ -51,7 +51,9 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
   аудиодорожки и субтитры; [playback](si_hyx_parts/edit_tab/playback.py) —
   загрузка, прокси, плеер; [fullscreen](si_hyx_parts/edit_tab/fullscreen.py) —
   полный экран; [timeline](si_hyx_parts/edit_tab/timeline.py) —
-  волна, отметки, undo, покадровый шаг, предпрокрутка, звук скраба;
+  волна, отметки, undo, покадровый шаг, предпрокрутка, звук скраба (в проекте —
+  то, что слышно в точке плейхеда: `_scrub_audio_target` + `project._proj_audio_at`;
+  выключенная дорожка или заглушённый клип — шаг без звука);
   [timeline_seek](si_hyx_parts/edit_tab/timeline_seek.py) — перемещение по
   таймлайну: звук после перемотки на ходу (громкость 0 и плавный возврат по
   первому буферу нового места), протяжка плейхеда мышью (пауза на время
@@ -60,12 +62,21 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
   субтитров по звуку (сдвиг ±5 с, копия `…_sync.srt/.ass`);
   [effects](si_hyx_parts/edit_tab/effects.py) — кадрирование, пикселизация,
   накладки, удаление объекта, трекинг; [export](si_hyx_parts/edit_tab/export.py) —
-  кодировщик, обрезка, Smart Cut; [entrance_actions](si_hyx_parts/edit_tab/entrance_actions.py) — меню «⋯»;
+  кодировщик, обрезка, Smart Cut, шестерёнка у «Экспорт» — окно
+  [export_settings_dialog](si_hyx_parts/edit_tab_dialogs/export_settings_dialog.py)
+  (звук/скорость/видео «Обработки» зеркалом её виджетов, связь в обе стороны); [entrance_actions](si_hyx_parts/edit_tab/entrance_actions.py) — меню «⋯»;
   [project](si_hyx_parts/edit_tab/project.py) — проект из кусков (как в Filmora):
   единственный таймлайн вкладки, правка у плейхеда, связь плейхеда с плеером,
-  просмотр цепочкой кусков, сборка;
+  просмотр цепочкой кусков, сборка, отделение звука и скорость клипов;
   [project_audio](si_hyx_parts/edit_tab/project_audio.py) — звук дорожек и
-  громкость клипов в просмотре проекта («голоса»).
+  громкость клипов в просмотре проекта («голоса»);
+  [splice_bridge](si_hyx_parts/edit_tab/splice_bridge.py) — стык кусков одного
+  файла на ходу: перемотка без паузы и «мост» из заранее раскодированных кадров;
+  [project_sound](si_hyx_parts/edit_tab/project_sound.py) — звук просмотра
+  проекта своим трактом (ProjectSoundEngine), плеер в просмотре — только картинка;
+  [session_state](si_hyx_parts/edit_tab/session_state.py) — состояние между
+  запусками: плейхед и вид таймлайна (первый показ вкладки открывает файл под
+  плейхедом), дорожки звука и субтитров каждого файла.
 - **AnimePackGenerator** — [anime_pack_generator.py](si_hyx_parts/animepack/anime_pack_generator.py):
   создание, журнал, `run`/`assemble`, обновление базы;
   [generator_catalog](si_hyx_parts/animepack/generator_catalog.py) — исключения,
@@ -111,8 +122,13 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
 
 Загрузка: `si_hyx_parts/workers/download_result.py` — проверка результата и повторы;
 `download_validation.py` — полнота дорожек, `download_network.py` — сетевые ошибки,
-`download_process.py` — остановка дочерних процессов. Поведение и zapret:
-[downloads](docs/downloads.md).
+`download_process.py` — остановка дочерних процессов. Встроенные плееры резолвит
+`si_hyx_parts/utils/kodik.py` (Kodik/animego), Dream Cast —
+[si_hyx_parts/utils/dreamerscast.py](si_hyx_parts/utils/dreamerscast.py).
+VK-видео (новый SPA-плеер, недоступный экстрактору yt-dlp) —
+[si_hyx_parts/workers/vk_direct.py](si_hyx_parts/workers/vk_direct.py): прямая ссылка
+из `video.getByIds` через headless Chrome с куками.
+Поведение и zapret: [downloads](docs/downloads.md).
 
 Караоке OP/ED/OST: [karaoke](karaoke/) — источники, проверка записи, ASS/TTML,
 тайминги и рендер; интеграция — [karaoke_processing](si_hyx_parts/animepack/karaoke_processing.py),
@@ -661,6 +677,20 @@ Shikimori (`studios` в `ANIME_FIELDS`); у карточек из старой �
 [test_packs.py](si_hyx_parts/animepack/test_packs.py). Настройки —
 [description_controls.py](si_hyx_parts/animepack_tab/description_controls.py).
 
+HDR10 (PQ) при экспорте «Монтажа» сводится в SDR BT.709 так, как кадр виден в
+просмотре — [hdr_tonemap.py](hdr_tonemap.py): 3D-таблица lut3d по формуле
+шейдера Qt (`qt_pq_to_srgb`), теги BT.709 через
+`setparams` (одни `-color_*` теги кадра не перебивают) и без HDR-метаданных.
+Подключено в сборку проекта (`build_source(tonemap=…)`), «Обрезку» с
+перекодировкой (`EditTab._wrap_vf`, до накладок), Smart Cut (у HDR — полная
+перекодировка), режим «настройками «Обработки»» (`item['sdr_tonemap']`:
+`ProcessWorker._overlay_vf` / `process_project`), привязку к объекту и
+удаление объекта (кадры в RGB: `rgb_decode_filter` / `rgb_encode_filter` —
+HDR сводится, SDR туда и обратно идёт одной матрицей по тегу файла, без тега
+SD — BT.601, HD — BT.709). Копия «Быстро» остаётся HDR, сама «Обработка»
+HDR-файлы не сводит. `edit_tab_frames.qt_pq_image` берёт формулу отсюда же
+(`qt_pq_to_srgb`).
+
 `-movflags +faststart` у любого MP4/MOV-выхода — [ffmpeg_faststart.py](ffmpeg_faststart.py):
 подставляется там, где команда уходит в процесс (`FfmpegWorker`, Smart Cut,
 `run_ffmpeg_capture` «Обработки»), а не в каждом построителе команды.
@@ -670,10 +700,18 @@ Shikimori (`studios` в `ANIME_FIELDS`); у карточек из старой �
 URL держало замок минутами и при медленном пресете висело по 600 с × 3.
 
 Покадровый слой «Монтажа» разнесён по двум файлам:
-[edit_tab_frames.py](edit_tab_frames.py) — сетка кадров и предекодер картинки,
+[edit_tab_frames.py](edit_tab_frames.py) — сетка кадров и предекодер картинки
+(у HDR — кадр QVideoFrame в формате кадров плеера: сцена рисует его тем же
+шейдером Qt с тонмаппингом, что и воспроизведение; формат берётся у первого
+кадра плеера, до него — угадывается, `setMaxLuminance` через экспорт
+Qt6Multimedia.dll — PyQt6 его не оборачивает; `qt_pq_image` — та же формула
+на ЦП для полосы кадров таймлайна),
 [edit_tab_audio_scrub.py](edit_tab_audio_scrub.py) — звук покадрового шага
 (`AudioScrubber`). Прежний импорт `from edit_tab_frames import AudioScrubber`
-работает: класс реэкспортируется.
+работает: класс реэкспортируется. Буфер точных кадров (`FramePrefetcher.request`)
+греется в сторону последнего шага (`EditTab._frame_dir`): назад — одним
+запуском ffmpeg вместе с кадрами позади и без перебивания запуска, пока кадр
+экрана в буфере (каждый запуск — раскрутка GOP от ключевого кадра).
 
 Холст видео «Монтажа» — [video_canvas.py](si_hyx_parts/edit_tab_widgets/video_canvas.py)
 (вывод кадра; пин, граница OUT, часы кадра и мышь — в предке
@@ -702,17 +740,25 @@ ffmpeg — [montage_project.py](montage_project.py) (основная дорож
 задержанный первый вход ломал метки звука). Таймлайн —
 [project_timeline.py](si_hyx_parts/edit_tab_widgets/project_timeline.py)
 (неподвижный слой в кэше, шаг плейхеда перерисовывает две полоски: полная
-отрисовка на каждый шаг занимала главный поток во время игры), полоса кадров
+отрисовка на каждый шаг занимала главный поток во время игры; выделение —
+`selected` (главный клип) и `selected_ids()`: рамка по пустому месту дорожек
+и Ctrl+клик, Delete удаляет все выделенные, Ctrl+C / Ctrl+V копируют их и
+вставляют у плейхеда — `project_copy`/`project_paste` во вкладке,
+`Project.paste` в модели; динамик в заголовке видеодорожки
+со звуком — `Track.muted`, звук дорожки выпадает из `audio_parts`), полоса кадров
 вдоль клипа (как в Filmora) —
 [project_thumbs.py](si_hyx_parts/edit_tab_workers/project_thumbs.py): ключевой
 кадр на ячейку, три ffmpeg с низким приоритетом, дисковый кэш
 `montage_thumbs/` рядом с файлом проекта; пока кадра нет — ближайший готовый.
 Вкладка — [project.py](si_hyx_parts/edit_tab/project.py); проект сохраняется
-сам в `MONTAGE_PROJECT_PATH`. Шкала у «Монтажа» одна — этот таймлайн: открытый
+сам в `MONTAGE_PROJECT_PATH`, плейхед, вид таймлайна и дорожки файлов — в
+настройках Монтажа (ключ `session`, [session_state.py](si_hyx_parts/edit_tab/session_state.py)). Шкала у «Монтажа» одна — этот таймлайн: открытый
 пользователем файл ложится на «Видео 1» целиком (`_project_on_user_load`;
 файлы, которые грузит сам проект, — через `_proj_load`), плейхед проекта едет
 за плеером из `_paint_playhead` (`_proj_follow_source`), шаг через стык —
-`_proj_step`. Волна источника (`WaveformWidget`) скрыта: она строит волну для
+`_proj_step`. Полноэкранная панель идёт по той же шкале проекта
+(`_fs_span`/`_fs_time`/`_fs_seek` в [fullscreen.py](si_hyx_parts/edit_tab/fullscreen.py),
+превью над полосой — `_fs_preview_locate`). Волна источника (`WaveformWidget`) скрыта: она строит волну для
 клипов и держит IN/OUT, по которым одиночный кусок режет прежняя «Обрезка»
 (`_proj_single_clip`, `_project_export_route`); несколько кусков собирает
 `project_export`.
@@ -734,15 +780,52 @@ ffmpeg — [montage_project.py](montage_project.py) (основная дорож
 играют «голоса» — по QMediaPlayer на клип —
 [project_audio.py](si_hyx_parts/edit_tab/project_audio.py): часы проекта по
 позиции основного плеера, рассинхрон голоса правится перемоткой выше 130 мс.
+Стык кусков одного файла плеер проходит не останавливаясь
+([splice_bridge.py](si_hyx_parts/edit_tab/splice_bridge.py)): перемотка на ходу,
+а пока плеер раскручивает GOP (~0.3 с), холст показывает кадры начала
+следующего куска, заранее заказанные у FramePrefetcher. Кадры вне куска
+(`set_play_bound(bound, floor)`) холст не показывает: на стыке мелькали кадры
+вырезанного. Звук просмотра проекта играет не плеер, а свой тракт
+([project_sound.py](si_hyx_parts/edit_tab_workers/project_sound.py),
+`ProjectSoundEngine`): ffmpeg рендерит звук выдержки проекта тем же графом,
+что и сборка (`montage_project.build_source`, места клипов в сэмплах), окнами
+по 30 с, поток QAudioSink подаёт его в устройство — стыки без пауз, в том
+числе между разными файлами. Плеер, пока звук проекта — трактом, без
+аудиовыхода и на паузе (`_snd_stop`): его часы идут по стене, после перемотки
+на ходу картинка не отстаёт от звука, а снятие выхода на каждом старте
+пересобирало конвейер — картинка опаздывала на 0.2–0.5 с. Выход возвращается,
+когда звук нужен самому плееру (`_snd_begin`, `_play_from_here`,
+`_preroll_at`), и меняет его только `route_player_audio`
+([tracks.py](si_hyx_parts/edit_tab/tracks.py)): Qt при смене выхода теряет
+перемотку на паузе — позиция ставится заново. Пропавшее устройство (сменился
+выход по умолчанию) тракт не выключает: `_SinkWorker._fail` сбрасывает
+QAudioSink, следующий prepare открывает его заново. На
+паузе звук заранее готовится с позиции плеера; голоса (project_audio) в этом
+режиме не создаются, часы проекта — часы тракта; прогрев звука плеера
+(`_preroll_at`) не нужен и не делается. Шаг кадра через стык — в номерах
+кадров (`_proj_step_frames`): у куска [s0, s1) кадр на s1 уже вырезан; конец
+просмотра и «В конец» ставят плейхед на последний кадр (`_proj_last_frame_t`),
+а не на длину проекта.
+Каждый QAudioOutput плееров (здесь, в SIQuester и превью) создаётся через
+`prime_disconnect_notify` ([sip_notify.py](sip_notify.py)): первый
+disconnectNotify — в главном потоке. Иначе его зовёт поток ffmpeg-плагина под
+мьютексом Qt и ждёт GIL — окно зависало намертво на старте просмотра проекта.
 
 Программный стиль субтитров = караоке генерации паков: цвета, обводка и тень —
 [karaoke/style.py](karaoke/style.py), превью и вшивание —
 `_paint_ass_text` / `prog_sub_force_style` в [edit_tab_base.py](edit_tab_base.py)
 (кегль ASS переводится в пиксели по правилам libass, превью совпадает с файлом). Фильтр вшивания субтитров общий для обоих путей экспорта —
-[tracks.py](si_hyx_parts/edit_tab/tracks.py). Стиль «как в оригинале» —
+[tracks.py](si_hyx_parts/edit_tab/tracks.py); там же `_sub_prog_style` — одно
+правило «стиль программы или свой» для превью и вшивания. «Как в программе»
+поверх ASS: превью отдаёт libass тот же force_style (`ass_set_style_overrides`),
+что и ffmpeg; force_style сбрасывает ScaleX/ScaleY/интервал/выравнивание
+оригинала (ScaleX/ScaleY там доли, 1 = 100 %). Стиль «как в оригинале» —
 [subtitle_style.py](si_hyx_parts/edit_tab/subtitle_style.py): mov_text вшивается
-ASS-копией с холстом по размеру кадра (иначе шрифт вырастает в разы), а правка
-текста ASS/mov_text сохраняется в .ass со стилями исходных реплик.
+и показывается ASS-копией с холстом по размеру кадра (иначе шрифт вырастает в
+разы). Правка субтитров — окно «Создать субтитры» и для существующей дорожки:
+реплики ASS приходят с номерами своих событий (`edit_cues`), `rebuild_ass`
+возвращает время/текст в те же события, стиль меняется, только если его
+сменили в окне.
 Строку прогресса обрезки (и значок на панели задач) ведёт только
 `_report_cut` в [export.py](si_hyx_parts/edit_tab/export.py); этапы воркеров
 идут в неё подписью `_cut_phase`.

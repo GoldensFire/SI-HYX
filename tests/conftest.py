@@ -164,12 +164,16 @@ def isolate_settings(tmp_path, monkeypatch):
         if mod is not None and hasattr(mod, "SETTINGS_FILE"):
             monkeypatch.setattr(mod, "SETTINGS_FILE", fake, raising=True)
     # Проект «Монтажа» сохраняется сам при открытии файла — вкладка в тесте
-    # иначе затёрла бы настоящий проект пользователя.
+    # иначе затёрла бы настоящий проект пользователя. Настройки Монтажа — тоже:
+    # выбор дорожки запоминается в них сразу (session_state).
     for mod_name in ("edit_tab_base", "edit_tab"):
         mod = sys.modules.get(mod_name)
         if mod is not None and hasattr(mod, "MONTAGE_PROJECT_PATH"):
             monkeypatch.setattr(mod, "MONTAGE_PROJECT_PATH",
                                 str(tmp_path / "montage_project.json"), raising=True)
+        if mod is not None and hasattr(mod, "EDITOR_SETTINGS_PATH"):
+            monkeypatch.setattr(mod, "EDITOR_SETTINGS_PATH",
+                                str(tmp_path / "editor_settings.json"), raising=True)
     # Генератор аниме-паков держит рядом с настройками кэш каталога Shikimori и
     # память о показанных кадрах — они тоже в настоящем %APPDATA%.
     animepack = sys.modules.get("animepack")

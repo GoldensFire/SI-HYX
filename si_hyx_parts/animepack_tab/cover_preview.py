@@ -29,6 +29,7 @@ from config import FFMPEG, ytdlp_base_cmd
 from cover_meta_rules import TYPE_LABELS
 from cover_service import CoverService, run_capture, ytdlp_command
 from si_hyx_parts.animepack.cover_processing import wanted_cover
+from sip_notify import prime_disconnect_notify
 
 AUDIO = "Музыка (*.mp3 *.m4a *.opus *.flac *.wav *.ogg *.webm);;Все файлы (*)"
 
@@ -109,7 +110,7 @@ class CoverPreview(QDialog):
         self.storage = tempfile.TemporaryDirectory(prefix="sihyx_cover_preview_")
         self.directory = Path(self.storage.name)
         self.player = QMediaPlayer(self)
-        self.audio = QAudioOutput(self)
+        self.audio = prime_disconnect_notify(QAudioOutput(self))
         self.player.setAudioOutput(self.audio)
         self.audio.setVolume(.7)
 

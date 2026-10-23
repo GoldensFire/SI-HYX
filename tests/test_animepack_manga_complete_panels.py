@@ -67,6 +67,7 @@ def test_review_compares_source_context_and_actual_crop():
     picture.save(data, "PNG")
     client = Gemini(verdict(tile_index=0, box=[210, 500, 410, 1000]))
     gen = SimpleNamespace(gemini_manga=client, db_cache=_Cache(),
+                          s=SimpleNamespace(visual_checker="gemini"),
                           stopped=lambda: False, _log_rare=lambda *args: None)
     cand = SimpleNamespace(anime={"kind": "manhwa"}, title_ru="Comic")
     assert crop(gen, cand, data.getvalue(), ".png") is not None

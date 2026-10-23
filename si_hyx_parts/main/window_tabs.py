@@ -31,11 +31,19 @@ class UnifiedWindowTabsMixin:
             # За подсказку значка вкладки отвечает фильтр QTabBar. Сам QLabel и
             # общий фильтр приложения не должны показывать её повторно.
             badge.setProperty("tabTipManaged", True)
-            badge.setStyleSheet("#infoBadge{color:#89b4fa;}")
             # Бейдж ⓘ (16×16, значок 13px по центру) визуально садится на ~1px
             # ниже центра текста вкладки. Нижний отступ сдвигает значок вверх,
             # чтобы он встал на одну высоту с надписью (и с левым значком вкладки).
-            badge.setContentsMargins(0, 0, 0, 2)
+            # Правый: QTabBar прижимает кнопку вкладки к самой рамке, не глядя
+            # на padding, — отступ отодвигает ⓘ от края, и он встаёт посередине
+            # между надписью и концом вкладки (padding-right у таббара снят,
+            # см. unified_window). Отступ — margin стиля, а не ширина значка,
+            # чтобы кружок подсветки при наведении остался 16×16.
+            badge.setStyleSheet(
+                "#infoBadge{color:#89b4fa;margin:0px 8px 2px 0px;}")
+            badge.setFixedSize(24, 16)
+            badge.setAlignment(_api.Qt.AlignmentFlag.AlignLeft
+                               | _api.Qt.AlignmentFlag.AlignVCenter)
             self.tabs.tabBar().setTabButton(
                 idx, _api.QTabBar.ButtonPosition.RightSide, badge)
             badge.installEventFilter(self)

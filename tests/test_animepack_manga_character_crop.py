@@ -49,6 +49,7 @@ class Gemini:
 def test_scans_the_whole_original_strip_and_crops_the_selected_scene():
     client = Gemini(verdict())
     gen = SimpleNamespace(gemini_manga=client, db_cache=_Cache(),
+                          s=SimpleNamespace(visual_checker="gemini"),
                           stopped=lambda: False, _log_rare=lambda *args: None)
     cand = SimpleNamespace(anime={"name": "Comic"}, title_ru="Comic")
     data = page()

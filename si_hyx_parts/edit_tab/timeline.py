@@ -324,7 +324,29 @@ class EditTabTimelineMixin:
             return
         label = getattr(self, "_export_btn_label", "Экспорт")
         dur = getattr(self, "_export_dur", 0.0)
-        text = f"{label} · {self._fmt_export_dur(dur)}" if dur > 0 else label
+        full = f"{label} · {self._fmt_export_dur(dur)}" if dur > 0 else label
+        # Пределы ширины — от подписей, а не от текущего текста: иначе
+        # укороченная подпись уменьшала бы sizeHint, и кнопка больше не
+        # растягивалась обратно. Минимум — значок и «Экспорт», максимум — вся
+        # подпись (но вместе с шестерёнкой настроек не уже правой колонки
+        # панели над кнопкой, 232). В совсем тесной строке остаётся один значок.
+        b.ensurePolished()
+        fm = b.fontMetrics()
+        pad = 2 * 14 + 6                 # поля из стиля + запас
+        icon_w = b.iconSize().width() + 4
+
+        def need(t):                     # letter-spacing 0.3px на букву
+            return fm.horizontalAdvance(t) + int(0.3 * len(t)) + 1 + icon_w + pad
+
+        need_full = need(full)
+        b.setMinimumWidth(icon_w + pad)
+        b.setMaximumWidth(max(232 - self._EXPORT_GEAR_W - 5, need_full))
+        if b.width() >= need_full:
+            text = full
+        elif b.width() >= need(label):
+            text = label
+        else:
+            text = ""
         if b.text() != text:
             b.setText(text)
 
@@ -413,14 +435,17 @@ class EditTabTimelineMixin:
                 return self._play_seek_hold_ms()
             if not self._grid.valid or self._frame_idx is None:
                 return None
-            return int(round(self._grid.start_of(self._frame_idx) * 1000.0))
+            # Без округления до миллисекунд: по этому времени плейхед проекта
+            # ищет свой клип, и у первого кадра клипа округление вниз уводило
+            # время на доли миллисекунды ДО начала клипа — плейхед не двигался.
+            return self._grid.start_of(self._frame_idx) * 1000.0
         # Истина у интерфейса одна — НАЧАЛО кадра, на котором стоит монтаж
         # (плееру мы отдаём середину кадра, чтобы он не промахнулся мимо него,
         # но метка обязана совпадать с картинкой). Раньше прогрев отдавал сюда
         # свою цель в миллисекундах, то есть СЕРЕДИНУ кадра, и метка времени
         # после каждого шага дёргалась на полкадра: 00:01:00.017 → .025 → .017.
         if self._grid.valid and self._frame_idx is not None:
-            return int(round(self._grid.start_of(self._frame_idx) * 1000.0))
+            return self._grid.start_of(self._frame_idx) * 1000.0
         if (getattr(self, "_prerolling", False)
                 or getattr(self, "_preroll_handoff", False)):
             tgt = getattr(self, "_preroll_target_ms", None)
@@ -482,8 +507,15 @@ class EditTabTimelineMixin:
         frame_ms = (1000.0 / self.fps) if (self.fps and self.fps > 0) else 40.0
         tol = max(80.0, 2.0 * frame_ms)
         # Новый кадр начинается не раньше цели (минус кадр) и не позже, чем
-        # плеер успел уехать от неё с момента клика.
-        if target_ms - tol <= now_ms <= target_ms + elapsed * 1000.0 + tol:
+        # плеер успел уехать от неё с момента клика — на своей скорости: у
+        # ускоренного клипа проекта (8×) кадры уходят от цели в 8 раз быстрее
+        # стены, окно без скорости не ловило ни одного, и плейхед после
+        # «Пробела» стоял все 2 с предела (замер на живом окне).
+        try:
+            rate = max(1.0, float(self.player.playbackRate()))
+        except Exception:
+            rate = 1.0
+        if target_ms - tol <= now_ms <= target_ms + elapsed * 1000.0 * rate + tol:
             self._play_seek_hold = None
             return None
         return target_ms
@@ -534,6 +566,16 @@ class EditTabTimelineMixin:
         жёлтая полоса стоят там, куда встал пользователь, и никуда не едут."""
         if self.duration <= 0.1 or not self.filepath:
             return
+        snd_wanted = getattr(self, "_snd_wanted", None)
+        if snd_wanted is not None and snd_wanted():
+            # Просмотр проекта звучит своим трактом (project_sound), а звук
+            # плеера там не играет — греть нечего. Разбег только мешал бы
+            # шагам кадра и тратил процессор.
+            return
+        if getattr(self, "_snd_detached", False):
+            # Выход остался снятым после просмотра проекта (_snd_stop), а греть
+            # нужно именно звук плеера: «Только звук», тракт отказал.
+            self._snd_attach_player()
         if getattr(self, "_prerolling", False):
             # Разбег уже идёт. Если греем ровно эту точку — не мешаем ему. А вот
             # если пользователь тем временем перемотал в другое место, старый
@@ -578,8 +620,13 @@ class EditTabTimelineMixin:
             # его заново из миллисекунд цели — способ потерять кадр на границе.
             if self._grid.valid and self._frame_idx is None:
                 self._frame_idx = self._grid.index_at(ms / 1000.0)
-            # Пин цели ДО старта разбега — экран остаётся на нужном кадре.
+            # Пин цели ДО старта разбега — экран остаётся на нужном кадре. Пин
+            # строгий: пока точный кадр не доехал, кадры разбега (на полсекунды
+            # раньше цели) на экран не идут — картинка отскакивала назад.
             self._show_exact_frame(self._frame_idx)
+            vw = getattr(self, "video_widget", None)
+            if isinstance(vw, _api.VideoCanvas) and vw.has_frame_pin():
+                vw.set_pin_strict(True)
             if lead < ms:
                 self.player.setPosition(lead)
             self.player.play()
@@ -615,10 +662,17 @@ class EditTabTimelineMixin:
             self._preroll_timer().stop()
         except Exception:
             pass
+        vw = getattr(self, "video_widget", None)
+        if isinstance(vw, _api.VideoCanvas):
+            vw.set_pin_strict(False)
+        # Пауза конца разбега — не остановка воспроизведения: см. _preroll_finish.
+        self._preroll_pausing = True
         try:
             self.player.pause()
         except Exception:
             pass
+        finally:
+            self._preroll_pausing = False
         self._restore_preroll_mute()
 
     def _restore_preroll_mute(self, delay_ms=None):
@@ -648,6 +702,26 @@ class EditTabTimelineMixin:
         gen = self._preroll_unmute_gen
         _api.QTimer.singleShot(int(delay_ms),
                                lambda g=gen: self._finish_preroll_unmute(g))
+
+    def _mute_pause_tail(self):
+        """Остановка воспроизведения: звук плеера глушим ДО pause() и
+        возвращаем, когда устройство доиграет очередь вхолостую (тем же
+        отложенным возвратом, что после разбега, — _restore_preroll_mute).
+
+        Без этого после паузы ещё до ~200 мс звучал хвост очереди. Хуже всего
+        в проекте с выключенным звуком клипа: плеер играет его на нулевой
+        громкости (project_audio), а остановка тут же возвращала громкость
+        ползунка — и хвост звучал в полную силу. Замер WASAPI-метром на живом
+        окне: тишина всю игру, пик 0.15 с +85 по +185 мс после паузы."""
+        try:
+            if self.player.audioOutput() is None:
+                return          # звук не у плеера: тракт проекта, пункт «Нет»
+            if not getattr(self, "_preroll_unmute_pending", False):
+                self._preroll_prev_muted = self.audio_output.isMuted()
+            self.audio_output.setMuted(True)
+        except Exception:
+            return
+        self._restore_preroll_mute()
 
     def _finish_preroll_unmute(self, gen=None):
         if gen is not None and gen != getattr(self, "_preroll_unmute_gen", 0):
@@ -761,8 +835,22 @@ class EditTabTimelineMixin:
             pass
         tgt = getattr(self, "_preroll_target_ms", None)
         self._preroll_target_ms = None
+        vw = getattr(self, "video_widget", None)
+        if isinstance(vw, _api.VideoCanvas):
+            vw.set_pin_strict(False)
         try:
-            self.player.pause()
+            # Пауза конца разбега — не остановка воспроизведения, и
+            # on_playback_changed её пропускает (_preroll_pausing): иначе он,
+            # получив сигнал прямо из pause(), пересчитывал кадр остановки по
+            # картинке на экране, а там, пока точный кадр не доехал, стоит кадр
+            # плеера — разбега или прошлого шага. Номер кадра уезжал на кадр-
+            # другой назад, а то и на полсекунды: шаг «не двигал» плейхед или
+            # улетал далеко влево. Кадр знает вкладка — его и держим.
+            self._preroll_pausing = True
+            try:
+                self.player.pause()
+            finally:
+                self._preroll_pausing = False
             if tgt is not None:
                 # Возвращаемся назад ТОЛЬКО при ГРУБОМ промахе: лишний seek — это
                 # та самая раскрутка конвейера, ради избавления от которой прогрев
@@ -795,6 +883,7 @@ class EditTabTimelineMixin:
         """Отпускает покадровый слой перед воспроизведением: снимает пин с холста
         и отменяет фоновое декодирование кадров."""
         self._frame_idx = None
+        self._frame_dir = 1             # после игры буфер снова греется вперёд
         vw = getattr(self, "video_widget", None)
         if isinstance(vw, _api.VideoCanvas):
             vw.clear_frame_pin()
@@ -828,8 +917,35 @@ class EditTabTimelineMixin:
             self._frames_src = None
             return
         eng = self._frames_engine()
-        eng.set_source(src, self.fps or 0.0)
+        # Формат HDR-кадров плеера (P010 у аппаратного декодера, YUV420P10 у
+        # программного) до его первого кадра угадываем по настройке; первый
+        # же кадр плеера уточнит (_on_player_frame_format).
+        hw = bool(_api.os.environ.get("QT_FFMPEG_DECODING_HW_DEVICE_TYPES"))
+        eng.set_source(src, self.fps or 0.0, hw_decode=hw)
+        vw = getattr(self, "video_widget", None)
+        if isinstance(vw, _api.VideoCanvas):
+            vw.watch_player_format()
         self._frames_src = src
+
+    def _on_player_frame_format(self, fmt):
+        """Плеер показал первый кадр источника: точные кадры — в его формате
+        (HDR рисуется его тонмаппингом, см. edit_tab_frames). Сменился вид
+        кадров — показанный точный кадр заказываем заново. Отложенно: сигнал
+        приходит из обработки кадра на холсте."""
+        _api.QTimer.singleShot(0, lambda f=fmt: self._apply_player_frame_format(f))
+
+    def _apply_player_frame_format(self, fmt):
+        eng = getattr(self, "_frames", None)
+        if eng is None or not eng.set_frame_format(fmt):
+            return
+        try:
+            playing = (self.player.playbackState()
+                       == _api.QMediaPlayer.PlaybackState.PlayingState
+                       and not getattr(self, "_prerolling", False))
+        except Exception:
+            playing = False
+        if not playing and self._frame_idx is not None:
+            self._show_exact_frame(self._frame_idx)
 
     def _refresh_frame_grid(self):
         """Пересобирает сетку кадров (fps/длительность могли измениться)."""
@@ -926,13 +1042,19 @@ class EditTabTimelineMixin:
             return grid.start_of(idx)
         return pos_s
 
-    def _show_exact_frame(self, idx=None, direction=1):
+    def _show_exact_frame(self, idx=None, direction=None):
         """Ставит на холст ТОЧНЫЙ кадр idx и заказывает соседние в буфер.
 
         Кадр из буфера рисуется мгновенно (0 мс, без ожидания плеера), чего от
         QMediaPlayer добиться нельзя в принципе; если кадра ещё нет — «пин»
         просто объявляет, какой кадр сейчас правильный, и холст перестаёт
-        показывать чужие кадры, как только точный доедет."""
+        показывать чужие кадры, как только точный доедет.
+
+        direction None — в сторону последнего шага (step_frame_scrub): прогрев
+        и остановка серии шагов влево заказывали кадры впереди и перебивали
+        декодирование кадров позади — следующий шаг влево ждал их заново."""
+        if direction is None:
+            direction = getattr(self, "_frame_dir", 1)
         grid = self._grid
         vw = getattr(self, "video_widget", None)
         if (not grid.valid or not isinstance(vw, _api.VideoCanvas)
@@ -982,6 +1104,10 @@ class EditTabTimelineMixin:
         # Плейхед таймлайна и время под видео — во времени ПРОЕКТА.
         if getattr(self, "project_timeline", None) is not None:
             self._proj_follow_source(t_s)
+            prep = getattr(self, "_snd_schedule_prepare", None)
+            if (prep is not None and not getattr(self, "_snd_active", False)
+                    and getattr(self, "_proj_play", None) is None):
+                prep()                          # звук просмотра — с нового места
         self._fs_sync_position()
 
     def _on_exact_frame(self, idx, img):
@@ -1126,12 +1252,18 @@ class EditTabTimelineMixin:
         if getattr(self, "_prerolling", False):
             self._preroll_cancel()
         playing = (self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState)
+        # Куда идём — туда и греется буфер кадров, в том числе у прогрева и
+        # точного кадра после серии (см. _show_exact_frame).
+        self._frame_dir = -1 if step < 0 else 1
         # Шаг через стык клипов (или с плейхеда в пустоте) — переход по
         # проекту; внутри клипа — обычный шаг по файлу.
+        painted = isinstance(self.video_widget, _api.VideoCanvas)
         if (not playing and getattr(self, "project_timeline", None) is not None
                 and self._proj_step(step)):
+            # Шаг по проекту (ускоренный клип, стык, пустота) — звук той точки
+            # проекта, куда встал плейхед; раньше здесь шаг был беззвучным.
+            self._scrub_audio_blip(painted, proj_t=self.project_timeline.playhead)
             return
-        painted = isinstance(self.video_widget, _api.VideoCanvas)
         # Серия шагов: при удержании ←/→ считаем от _scrub_target (детерминизм),
         # а на ПЕРВОМ шаге серии — от живой позиции плеера.
         if not playing and not getattr(self, "_scrubbing", False):
@@ -1224,9 +1356,38 @@ class EditTabTimelineMixin:
         idx = getattr(self, "selected_audio_abs_index", None)
         return (str(src), str(int(idx)) if idx is not None else "a:0")
 
-    def _sync_scrub_audio_source(self):
-        """Держит источник скраб-звука в согласии с выбранной дорожкой."""
-        src, stream = self._scrub_audio_source()
+    def _scrub_audio_target(self, proj_t=None):
+        """Что звучит на шаге: (движок с нужным источником, время звука) или
+        None — шаг беззвучный. В проекте — то, что слышно в его точке (кадра
+        файла или proj_t): выключенная дорожка, заглушённый или убранный звук
+        клипа — тишина, звук на своей дорожке — он. Без проекта — выбранная
+        дорожка открытого файла."""
+        t_s = None
+        if proj_t is None:
+            t_s = self._scrub_audio_time_s()
+            if t_s is None:
+                return None
+            if (getattr(self, "project_timeline", None) is not None
+                    and not self.project.is_empty()):
+                proj_t = self._proj_time_of_source(t_s)
+        if proj_t is not None:
+            hit = self._proj_audio_at(proj_t)
+            if hit is None:
+                return None
+            clip, t_a = hit
+            src = clip.audio_path
+            stream = str(int(clip.audio_stream)) if clip.audio_stream >= 0 else "a:0"
+        else:
+            src, stream = self._scrub_audio_source()
+            t_a = t_s
+        eng = self._sync_scrub_audio_source(src, stream)
+        return (eng, max(0.0, t_a)) if eng is not None else None
+
+    def _sync_scrub_audio_source(self, src=None, stream=None):
+        """Держит источник скраб-звука в согласии с выбранной дорожкой (или
+        с переданным src/stream)."""
+        if src is None:
+            src, stream = self._scrub_audio_source()
         if not src:
             return None
         eng = self._scrub_audio_engine()
@@ -1361,34 +1522,33 @@ class EditTabTimelineMixin:
                 return None
         return max(0.0, ms / 1000.0)
 
-    def _scrub_audio_blip(self, painted=True):
+    def _scrub_audio_blip(self, painted=True, proj_t=None):
         """Короткий звук нового кадра: точный PCM-срез с pts кадра в устройство.
+        proj_t — шаг сделан по проекту (_proj_step): звук его точки.
 
         В overlay-режиме (QVideoWidget) кадр доставляется коротким play()
         основного плеера, который несёт и звук, — там мы молчим. Исключение —
         выбранная внешняя озвучка: звук видео тогда заглушён, и слышно только
         то, что сыграем здесь."""
+        self._scrub_wait = None
         if not getattr(self, "_scrub_audio_enabled", True):
             return
         if not painted and not getattr(self, "_ext_audio_active", False):
             return
-        t_s = self._scrub_audio_time_s()
-        if t_s is None:
+        hit = self._scrub_audio_target(proj_t)
+        if hit is None:
             return
-        eng = self._sync_scrub_audio_source()
-        if eng is None:
-            return
-        eng.request(t_s)                    # окно вокруг плейхеда — заранее
-        data = eng.slice_at(t_s, self._scrub_blip_seconds())
+        eng, t_a = hit
+        eng.request(t_a)                    # окно вокруг плейхеда — заранее
+        data = eng.slice_at(t_a, self._scrub_blip_seconds())
         if data:
             self._play_scrub_slice(data)
-            self._scrub_wait = None
             return
         # Окна ещё нет (первый шаг после загрузки/перемотки) — доиграем, как
         # только фоновый декодер его принесёт (см. _on_scrub_audio_window).
         # Раньше в этом месте звука просто не было — жалоба «при AV1 звук на
         # шаге появляется не всегда».
-        self._scrub_wait = (t_s, _api.time.monotonic())
+        self._scrub_wait = (proj_t, t_a, _api.time.monotonic())
 
     def _on_scrub_audio_window(self):
         """Окно PCM доехало: если шаг был только что и с тех пор никуда не
@@ -1397,14 +1557,15 @@ class EditTabTimelineMixin:
         self._scrub_wait = None
         if not pending or not getattr(self, "_scrub_audio_enabled", True):
             return
-        t_s, at = pending
+        proj_t, t_a, at = pending
         if _api.time.monotonic() - at > 0.4:
             return                          # поздно, звук был бы «из прошлого»
-        cur = self._scrub_audio_time_s()
-        if cur is None or abs(cur - t_s) > 0.001:
+        if proj_t is not None and abs(self.project_timeline.playhead - proj_t) > 0.001:
+            return                          # плейхед проекта уже ушёл
+        hit = self._scrub_audio_target(proj_t)
+        if hit is None or abs(hit[1] - t_a) > 0.001:
             return                          # плейхед уже ушёл — играть нечего
-        eng = getattr(self, "_audio_scrub", None)
-        data = eng.slice_at(t_s, self._scrub_blip_seconds()) if eng else None
+        data = hit[0].slice_at(t_a, self._scrub_blip_seconds())
         if data:
             self._play_scrub_slice(data)
 

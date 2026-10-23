@@ -21,12 +21,18 @@
 # никаких новых зависимостей, см. SI-HYX.spec: PyAV намеренно исключён).
 # Плеер остаётся ровно тем, чем он хорош: непрерывным воспроизведением.
 
+import ctypes
+import json
+import os
 import subprocess
 import threading
 from collections import OrderedDict
 
+import hdr_tonemap
 from config import (CREATE_NO_WINDOW, FFMPEG, FFPROBE, QThread, pyqtSignal)
+from PyQt6.QtCore import (QSize)
 from PyQt6.QtGui import (QImage)
+from PyQt6.QtMultimedia import (QVideoFrame, QVideoFrameFormat)
 
 
 # ── Сетка кадров ─────────────────────────────────────────────────────────────
@@ -127,11 +133,82 @@ class FrameGrid:
 
 
 # ── Предекодирование кадров вокруг плейхеда ──────────────────────────────────
-def probe_frame_size(path):
-    """(ширина, высота) первого видеопотока через ffprobe. (0, 0) — не вышло.
+def probe_video_props(path):
+    """Свойства первого видеопотока через ffprobe: размер В ПОТОКЕ (до
+    поворота), поворот из метаданных (градусы) и цветовые теги. {} — не вышло.
 
-    Нужны РЕАЛЬНЫЕ размеры декодированного кадра: сырой поток (`-f rawvideo`)
-    приходит без заголовков, и разобрать его можно, только зная размер кадра."""
+    JSON, а не csv: в csv ffprobe ставит разделитель и в конце строки
+    («960x540x», сборки 2026 года) — прежний разбор давал int("540x") →
+    (0, 0), и предекодер молча не декодировал ни одного кадра."""
+    try:
+        out = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
+             "-show_entries",
+             "stream=width,height,sample_aspect_ratio,pix_fmt,color_transfer,"
+             "color_space,color_range"
+             ":stream_tags=rotate:stream_side_data=rotation",
+             "-of", "json", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=CREATE_NO_WINDOW, timeout=15)
+        streams = json.loads(out.stdout or "{}").get("streams") or []
+    except Exception:
+        return {}
+    if not streams:
+        return {}
+    st = streams[0]
+    rot = 0
+    for sd in st.get("side_data_list") or []:
+        if "rotation" in sd:
+            try:
+                rot = int(round(float(sd["rotation"])))
+            except (TypeError, ValueError):
+                pass
+    if not rot:
+        try:
+            rot = int(float((st.get("tags") or {}).get("rotate") or 0))
+        except (TypeError, ValueError):
+            rot = 0
+    try:
+        w, h = int(st.get("width") or 0), int(st.get("height") or 0)
+    except (TypeError, ValueError):
+        w = h = 0
+    sar = (1, 1)
+    num, _, den = str(st.get("sample_aspect_ratio") or "").partition(":")
+    try:
+        if int(num) > 0 and int(den) > 0:
+            sar = (int(num), int(den))
+    except ValueError:
+        pass
+    return {"width": w, "height": h, "rotation": rot, "sar": sar,
+            "pix_fmt": st.get("pix_fmt") or "",
+            "transfer": st.get("color_transfer") or "",
+            "space": st.get("color_space") or "",
+            "range": st.get("color_range") or ""}
+
+
+def qt_frame_size(w, h, sar):
+    """Размер кадра так, как его отдаёт плеер Qt (ffmpeg-бэкенд) у файла с
+    неквадратным пикселем: qCalculateFrameSize растягивает ОДНУ сторону —
+    ширину, если пиксель шире квадрата, иначе высоту (целочисленно, как в C++).
+    Анаморфный DVD 712x472 с SAR 472:519 плеер показывает как 712x519; кадр
+    паузы из ffmpeg шёл сырым 712x472, и картинка на паузе сплющивалась."""
+    num, den = sar if sar else (1, 1)
+    if num == den or num < 1 or den < 1:
+        return (w, h)
+    if num > den:
+        return (w * num // den, h)
+    return (w, h * den // num)
+
+
+def probe_frame_size(path):
+    """(ширина, высота) кадра, КАК ЕГО ОТДАЁТ ffmpeg (-f rawvideo), — с
+    учётом поворота: ffmpeg по умолчанию разворачивает кадр по метаданным, и
+    у вертикального видео с телефона (поток 1920x1080, поворот 90°) кадр
+    приходит 1080x1920. Прежде брался размер потока — байты те же, а картинка
+    выходила кашей. (0, 0) — не вышло.
+
+    Нужны РЕАЛЬНЫЕ размеры декодированного кадра: сырой поток приходит без
+    заголовков, и разобрать его можно, только зная размер кадра."""
     try:
         out = subprocess.run(
             [FFPROBE, "-v", "error", "-select_streams", "v:0",
@@ -140,18 +217,214 @@ def probe_frame_size(path):
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             creationflags=CREATE_NO_WINDOW, timeout=15)
         lines = (out.stdout or "").strip().splitlines()
-        if lines:
-            # ffprobe ставит разделитель И В КОНЦЕ строки: «960x540x» (сборки
-            # 2026 года; раньше было «960x540»). Прежний partition("x") давал
-            # int("540x") → исключение → (0, 0) → предекодер молча не декодировал
-            # НИ ОДНОГО кадра, и вся покадровая точность держалась на одном
-            # плеере. Поэтому разбираем терпимо: берём непустые поля.
-            nums = [p for p in lines[0].split("x") if p.strip()]
-            if len(nums) >= 2:
-                return (int(nums[0]), int(nums[1]))
+        # ffprobe ставит разделитель И В КОНЦЕ строки: «960x540x» (сборки
+        # 2026 года; раньше было «960x540»). Прежний partition("x") давал
+        # int("540x") → исключение → (0, 0) → предекодер молча не декодировал
+        # НИ ОДНОГО кадра. Поэтому разбираем терпимо: берём непустые поля.
+        nums = [p for p in lines[0].split("x") if p.strip()] if lines else []
+        if len(nums) < 2:
+            return (0, 0)
+        w, h = int(nums[0]), int(nums[1])
+    except Exception:
+        return (0, 0)
+    if abs(probe_video_props(path).get("rotation", 0)) % 180 == 90:
+        w, h = h, w
+    return (w, h)
+
+
+# ── Кадр в формате плеера (HDR) ──────────────────────────────────────────────
+# HDR-кадр (PQ/HLG) плеер (QtMultimedia, ffmpeg-бэкенд) рисует СВОИМ шейдером:
+# при аппаратном декодировании кадр приходит P010, и шейдер nv12_bt2020_pq
+# сводит его в SDR (тонмаппинг BT.2390 по яркости мастеринга, PQ → линейный
+# свет, BT.2020 → sRGB). Кадр, который ffmpeg отдаёт в rgb24, ничего этого не
+# знает: на паузе картинка выходила белёсой и серой, а при игре — сочной.
+# Повторить шейдер на ЦП один в один нельзя (у Qt свои особенности: яркость
+# мастеринга он берёт ×10000, отрицательные R'G'B' уходят в чёрный), поэтому
+# точный кадр для HDR отдаётся НЕ картинкой, а QVideoFrame в формате кадров
+# самого плеера — и сцена холста рисует его тем же шейдером с теми же
+# параметрами (сверено: разница 0 по всем пикселям).
+_HDR_TRANSFERS = {"smpte2084": QVideoFrameFormat.ColorTransfer.ColorTransfer_ST2084,
+                  "arib-std-b67": QVideoFrameFormat.ColorTransfer.ColorTransfer_STD_B67}
+
+# Пиксельный формат кадров плеера → сырой вывод ffmpeg и его плоскости:
+# (делитель ширины, делитель высоты, байт на точку плоскости).
+_PF = QVideoFrameFormat.PixelFormat
+_RAW_LAYOUTS = {
+    _PF.Format_P010: ("p010le", ((1, 1, 2), (2, 2, 4))),
+    _PF.Format_P016: ("p016le", ((1, 1, 2), (2, 2, 4))),
+    _PF.Format_YUV420P10: ("yuv420p10le", ((1, 1, 2), (2, 2, 2), (2, 2, 2))),
+}
+
+
+def _raw_planes(layout, w, h):
+    """[(байт в строке, строк)] плоскостей сырого кадра ffmpeg."""
+    return [(-(-w // wd) * bpp, -(-h // hd)) for wd, hd, bpp in layout]
+
+
+_QT_MAX_LUM = None
+
+
+def _qt_max_luminance_api():
+    """(установить, прочитать) яркость мастеринга у QVideoFrameFormat.
+
+    PyQt6 этих методов не оборачивает, а Qt по ним выбирает тонмаппинг HDR.
+    Они экспортируются из Qt6Multimedia.dll — зовём напрямую. Нет библиотеки
+    или символов (другая сборка Qt) — (None, None), и формат остаётся без
+    яркости: кадр всё равно HDR-шейдером, но тонмаппинг чуть другой."""
+    global _QT_MAX_LUM
+    if _QT_MAX_LUM is not None:
+        return _QT_MAX_LUM
+    _QT_MAX_LUM = (None, None)
+    if os.name != "nt":
+        return _QT_MAX_LUM
+    try:
+        import PyQt6
+        dll = ctypes.WinDLL(os.path.join(os.path.dirname(PyQt6.__file__),
+                                         "Qt6", "bin", "Qt6Multimedia.dll"))
+        setter = dll["?setMaxLuminance@QVideoFrameFormat@@QEAAXM@Z"]
+        getter = dll["?maxLuminance@QVideoFrameFormat@@QEBAMXZ"]
+        setter.argtypes, setter.restype = [ctypes.c_void_p, ctypes.c_float], None
+        getter.argtypes, getter.restype = [ctypes.c_void_p], ctypes.c_float
+        _QT_MAX_LUM = (setter, getter)
     except Exception:
         pass
-    return (0, 0)
+    return _QT_MAX_LUM
+
+
+def _max_luminance(fmt):
+    getter = _qt_max_luminance_api()[1]
+    if getter is None:
+        return None
+    try:
+        from PyQt6 import sip
+        return round(float(getter(sip.unwrapinstance(fmt))), 3)
+    except Exception:
+        return None
+
+
+def probe_mastering_nits(path):
+    """Яркость мастеринга (кд/м²) из первого кадра или None — как её берёт
+    ffmpeg-бэкенд Qt (side data «Mastering display metadata»)."""
+    try:
+        out = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
+             "-read_intervals", "%+#1", "-show_frames",
+             "-show_entries", "frame=side_data_list", "-of", "json", str(path)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            creationflags=CREATE_NO_WINDOW, timeout=20)
+        frames = json.loads(out.stdout or "{}").get("frames") or []
+    except Exception:
+        return None
+    for fr in frames[:1]:
+        for sd in fr.get("side_data_list") or []:
+            val = sd.get("max_luminance")
+            if not val:
+                continue
+            try:
+                num, _sep, den = str(val).partition("/")
+                return float(num) / float(den or 1)
+            except (TypeError, ValueError, ZeroDivisionError):
+                return None
+    return None
+
+
+def guess_player_format(props, nits, hw_decode):
+    """Формат, в котором плеер отдаст HDR-кадр, пока он не показал ни одного
+    (сразу после открытия файла точный кадр приходит раньше кадров плеера):
+    аппаратный декодер даёт P010, программный — YUV420P10. None — не HDR."""
+    trc = _HDR_TRANSFERS.get(props.get("transfer") or "")
+    w, h = qt_frame_size(props.get("width", 0), props.get("height", 0),
+                         props.get("sar"))
+    if trc is None or w <= 0 or h <= 0 or props.get("rotation", 0) % 360:
+        # С поворотом ждём настоящий формат кадра плеера: поворот в нём
+        # записан так, как его применит сцена.
+        return None
+    pf = _PF.Format_P010 if hw_decode else _PF.Format_YUV420P10
+    fmt = QVideoFrameFormat(QSize(w, h), pf)
+    fmt.setColorTransfer(trc)
+    if (props.get("space") or "").startswith("bt2020"):
+        fmt.setColorSpace(QVideoFrameFormat.ColorSpace.ColorSpace_BT2020)
+    fmt.setColorRange(QVideoFrameFormat.ColorRange.ColorRange_Full
+                      if props.get("range") == "pc"
+                      else QVideoFrameFormat.ColorRange.ColorRange_Video)
+    if nits and nits > 0:
+        # Qt умножает яркость мастеринга на 10000 (QFFmpegVideoBuffer::maxNits)
+        # — повторяем, иначе тонмаппинг выйдет другим, чем у кадров плеера.
+        setter = _qt_max_luminance_api()[0]
+        if setter is not None:
+            try:
+                from PyQt6 import sip
+                setter(sip.unwrapinstance(fmt), float(nits) * 10000.0)
+            except Exception:
+                pass
+    return fmt
+
+
+def qt_pq_max_luminance(nits):
+    """maxLuminance кадра у ffmpeg-бэкенда Qt: яркость мастеринга × 10000
+    (QFFmpegVideoBuffer::maxNits), без метаданных — 10000 (предел PQ)."""
+    return float(nits) * 10000.0 if nits and nits > 0 else 10000.0
+
+
+def qt_pq_image(yuv16, max_luminance, max_nits=100.0):
+    """Картинка (QImage RGB888) из PQ-кадра BT.2020 ровно так, как его рисует
+    шейдер Qt nv12_bt2020_pq — для мелких картинок (полоса кадров таймлайна),
+    где отдать QVideoFrame сцене нельзя. yuv16 — плоскости yuv444p16le
+    (3, h, w) uint16. Сверено с QVideoFrame.toImage(): ±1 уровень."""
+    import numpy as np
+
+    yuv = yuv16.astype(np.float32) * np.float32(1023.0 * 64.0 / 65535.0 / 65535.0)
+    Y, U, V = yuv[0], yuv[1], yuv[2]
+    rgb = (1.1644 * Y + 1.6787 * V - 0.9157,
+           1.1644 * Y - 0.1874 * U - 0.6504 * V + 0.3475,
+           1.1644 * Y + 2.1418 * U - 1.1483)
+    y = (Y - np.float32(0.0625)) * np.float32(256 / 219)
+    # Сама формула — общая с экспортом (таблица lut3d в hdr_tonemap).
+    out = hdr_tonemap.qt_pq_to_srgb(y, rgb, max_luminance, max_nits)
+    rgb8 =np.ascontiguousarray((np.stack(out, axis=-1) * 255.0 + 0.5).astype(np.uint8))
+    h, w = rgb8.shape[:2]
+    return QImage(rgb8.tobytes(), w, h, w * 3, QImage.Format.Format_RGB888).copy()
+
+
+def _video_frame(buf, fmt, planes):
+    """QVideoFrame формата fmt из сырого кадра ffmpeg (плоскости подряд)."""
+    vf = QVideoFrame(fmt)
+    if not vf.isValid() or not vf.map(QVideoFrame.MapMode.WriteOnly):
+        return None
+    try:
+        src = memoryview(buf)
+        off = 0
+        for i, (row, rows) in enumerate(planes):
+            bpl = vf.bytesPerLine(i)
+            ptr = vf.bits(i)
+            if ptr is None or bpl < row:
+                return None
+            ptr.setsize(vf.mappedBytes(i))
+            dst = memoryview(ptr).cast("B")
+            if bpl == row:
+                dst[:row * rows] = src[off:off + row * rows]
+            else:
+                for r in range(rows):
+                    dst[r * bpl:r * bpl + row] = src[off + r * row:off + (r + 1) * row]
+            off += row * rows
+    except Exception:
+        return None
+    finally:
+        vf.unmap()
+    return vf
+
+
+def _format_key(fmt):
+    """Всё, от чего зависит вид кадра на сцене: пиксельный формат, размер,
+    цвет, поворот и яркость мастеринга."""
+    try:
+        rot = fmt.rotation()
+        rot = int(getattr(rot, "value", rot))
+    except Exception:
+        rot = 0
+    return (fmt.pixelFormat(), fmt.frameWidth(), fmt.frameHeight(),
+            fmt.colorSpace(), fmt.colorTransfer(), fmt.colorRange(),
+            rot, _max_luminance(fmt))
 
 
 class FramePrefetcher(QThread):
@@ -163,10 +436,12 @@ class FramePrefetcher(QThread):
     берётся из кэша мгновенно, без нового seek'а.
 
     Кадры отдаются сырым RGB (`-f rawvideo -pix_fmt rgb24`), без промежуточного
-    JPEG: он бы портил и «Сохранить кадр», и сам стоп-кадр.
+    JPEG: он бы портил и «Сохранить кадр», и сам стоп-кадр. У HDR-источника —
+    QVideoFrame в формате кадров плеера (см. «Кадр в формате плеера» выше):
+    плеер рисует такой кадр своим тонмаппингом, и rgb24 с ним не совпадает.
     """
 
-    ready = pyqtSignal(int, object)      # номер кадра, QImage
+    ready = pyqtSignal(int, object)      # номер кадра, QImage или QVideoFrame (HDR)
 
     # Сколько памяти отдаём под кэш кадров. 1080p RGB — ~6 МБ на кадр, так что
     # это ~20 кадров FullHD или ~5 кадров 4K.
@@ -192,25 +467,110 @@ class FramePrefetcher(QThread):
         self._gen = 0                    # поколение запроса (старые результаты не нужны)
         self._stop = False
         self._proc = None
-        self._cache = OrderedDict()      # idx -> QImage
+        self._cache = OrderedDict()      # idx -> QImage | QVideoFrame
         self._cache_lock = threading.Lock()
         self._center = 0
-        self._running = None             # (first, end) — окно, которое декодируется СЕЙЧАС
+        # Середина заказанного окна: вокруг неё буфер и держится (_trim_cache).
+        # При шаге назад окно лежит позади плейхеда — кадры впереди него уже
+        # пройдены, и вытеснять первыми надо их, а не кадры следующих шагов.
+        self._focus = 0.0
+        self._budget = 0                 # кадров в бюджете памяти (0 — размер ещё не известен)
+        # (first, end) — окно задания, которое декодируется сейчас или ждёт
+        # своей очереди (заказ ставит его сразу, см. request).
+        self._running = None
+        # Вид кадра: None — ещё не выяснен (первый заказ проверит файл),
+        # (None, None) — rgb24; (формат QVideoFrameFormat, раскладка) — кадр в
+        # формате плеера. _player_fmt — формат, который показал сам плеер.
+        self._out = None
+        self._props = None
+        self._player_fmt = None
+        self._hw_decode = True
 
     # ── публичный API (главный поток) ────────────────────────────────────────
-    def set_source(self, path, fps=0.0):
+    def set_source(self, path, fps=0.0, hw_decode=True):
         """Новый источник кадров (оригинал или превью-прокси — тот же файл, что
-        играет плеер, иначе стоп-кадр отличался бы от воспроизведения)."""
+        играет плеер, иначе стоп-кадр отличался бы от воспроизведения).
+        hw_decode — включено ли аппаратное декодирование у плеера: от него
+        зависит формат HDR-кадров плеера, пока он не показал ни одного."""
         with self._cache_lock:
             self._cache.clear()
         with self._cond:
             self._src = str(path) if path else None
             self._fps = float(fps or 0.0)
             self._size = (0, 0)
+            self._budget = 0
+            self._queue = []
+            self._running = None
+            self._out = None
+            self._props = None
+            self._player_fmt = None
+            self._hw_decode = bool(hw_decode)
+            self._gen += 1
+        self._kill_proc()
+
+    def set_frame_format(self, fmt):
+        """Плеер показал первый кадр этого источника — его формат и есть
+        правда о том, как сцена рисует кадр. True — вид точных кадров
+        поменялся (буфер сброшен, показанный кадр надо заказать заново)."""
+        if fmt is None:
+            return False
+        try:
+            fmt = QVideoFrameFormat(fmt)
+            key = _format_key(fmt)
+        except Exception:
+            return False
+        with self._cond:
+            if self._src is None:
+                return False
+            old = self._player_fmt
+            self._player_fmt = (fmt, key)
+            if old is not None and old[1] == key:
+                return False
+            if self._out is None:
+                return False            # вид ещё не выбран — выберет с этим форматом
+            props = self._props or {}
+            out = self._pick_out(props, self._player_fmt, self._hw_decode)
+            if self._same_out(out, self._out):
+                return False
+            self._out = out
+            self._size = (0, 0)
+            self._budget = 0
             self._queue = []
             self._running = None
             self._gen += 1
+        with self._cache_lock:
+            self._cache.clear()
         self._kill_proc()
+        return True
+
+    @staticmethod
+    def _pick_out(props, player_fmt, hw_decode):
+        """Вид точных кадров: (формат, раскладка) или (None, None) — rgb24.
+
+        Формат плеера — если это HDR и его кадр ffmpeg умеет отдать в той же
+        раскладке и того же размера; без него — догадка по настройке
+        аппаратного декодирования. SDR рисуется без тонмаппинга, и rgb24 с ним
+        совпадает (сверено: ±1 уровень)."""
+        w, h = qt_frame_size(props.get("width", 0), props.get("height", 0),
+                             props.get("sar"))
+        if player_fmt is not None:
+            fmt = player_fmt[0]
+            layout = _RAW_LAYOUTS.get(fmt.pixelFormat())
+            hdr = fmt.colorTransfer() in _HDR_TRANSFERS.values()
+            if hdr and layout is not None and (fmt.frameWidth(), fmt.frameHeight()) == (w, h):
+                return (fmt, layout)
+            return (None, None)
+        if (props.get("transfer") or "") not in _HDR_TRANSFERS:
+            return (None, None)
+        return None                      # HDR: догадку строит _decide_out
+
+    @staticmethod
+    def _same_out(a, b):
+        if a is None or b is None:
+            return a is b
+        if a[0] is None or b[0] is None:
+            return a[0] is b[0]
+        return _format_key(a[0]) == _format_key(b[0])
 
     def clear(self):
         with self._cache_lock:
@@ -229,36 +589,83 @@ class FramePrefetcher(QThread):
             return int(idx) in self._cache
 
     def request(self, center, ahead=6, behind=4):
-        """Заказать окно кадров вокруг center. Первым декодируется САМ center
-        (его ждёт экран), следом — кадры перед ним."""
+        """Заказать окно кадров [center - behind, center + ahead).
+
+        Вперёд (ahead >= behind): первым декодируется САМ center (его ждёт
+        экран), следом — кадры перед ним; пока плейхед идёт вперёд, тот же
+        запуск продолжает отдавать кадры (_decode_run).
+
+        Назад (behind > ahead) так нельзя: ffmpeg идёт только вперёд, и каждый
+        запуск — это раскрутка GOP от ключевого кадра (на длинных GOP — сотни
+        кадров). Раньше шаг влево ставил два запуска (center, затем окно
+        позади), окно позади на каждом шаге сдвигалось на кадр, и следующий шаг
+        перебивал недоделанный запуск — раскрутка начиналась заново на каждый
+        шаг, и чем чаще жали стрелку, тем сильнее кадр опаздывал. Теперь окно
+        без center декодируется одним запуском вместе с кадрами позади, а пока
+        center в буфере, запуск не перебивается, и следующая пачка кадров
+        позади заказывается, только когда их недостаёт половины окна."""
         center = max(0, int(center))
         self._center = center
         ahead = max(1, min(self.MAX_WINDOW, int(ahead)))
         behind = max(0, min(self.MAX_WINDOW, int(behind)))
+        first_back = max(0, center - behind)
+        backward = behind > ahead
+        lo, n = self._fit_window(first_back, center + ahead - first_back, center, self._budget)
+        self._focus = lo + (n - 1) / 2.0
         with self._cond:
             run = self._running
+        have_center = self.has(center)
         # Нужный кадр уже декодируется текущим запуском — НЕ перебиваем его.
         # Иначе удержание стрелки (автоповтор ОС — десятки шагов в секунду)
         # убивало бы ffmpeg на каждом шаге, и ни одно окно не доезжало бы до
         # конца: буфер вечно пустой, а процессор занят перезапусками.
-        if run is not None and run[0] <= center < run[1]:
+        if run is not None and (run[0] <= center < run[1] or (backward and have_center)):
             return
         need_fwd = [i for i in range(center, center + ahead) if not self.has(i)]
-        first_back = max(0, center - behind)
         need_back = [i for i in range(first_back, center) if not self.has(i)]
         jobs = []
-        if need_fwd:
-            jobs.append((center, ahead))
-        if need_back:
-            jobs.append((first_back, center - first_back))
+        if not backward:
+            if need_fwd:
+                jobs.append((center, ahead))
+            if need_back:
+                jobs.append((first_back, center - first_back))
+        elif not have_center:
+            start = need_back[0] if need_back else center
+            jobs.append((start, need_fwd[-1] + 1 - start))
+        elif len(need_back) >= max(1, behind // 2):
+            jobs.append((need_back[0], need_back[-1] + 1 - need_back[0]))
         if not jobs:
             return
+        jobs = [self._fit_window(first, count, center, self._budget) + (center,)
+                for first, count in jobs]
         with self._cond:
             if self._src is None:
                 return
             self._queue = jobs
             self._gen += 1
+            self._running = (jobs[0][0], jobs[0][0] + jobs[0][1])
+            # Прежний запуск больше не нужен: он не везёт кадр экрана. Сам он
+            # заметил бы это лишь после следующего кадра — а до него может быть
+            # вся раскрутка GOP, которую новый запуск ждал бы впустую. Процесс
+            # берём под замком: новое задание поток ещё не мог забрать.
+            stale = self._proc
             self._cond.notify()
+        if stale is not None:
+            try:
+                stale.kill()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _fit_window(first, count, anchor, budget):
+        """Окно [first, first + count) не длиннее budget кадров (0 — бюджет ещё
+        не известен): срезается дальний от anchor край — хвост окна вытеснил
+        бы из буфера его же начало. (first, count)."""
+        count = max(1, int(count))
+        if budget > 0 and count > budget:
+            first = max(first, min(anchor, first + count - budget))
+            count = budget
+        return first, count
 
     def cancel(self):
         """Снять текущее задание (пользователь нажал «играть» — кадры не нужны,
@@ -286,14 +693,14 @@ class FramePrefetcher(QThread):
                 pass
 
     def _trim_cache(self, frame_bytes):
-        """Выкидывает кадры, самые далёкие от текущего центра, пока кэш не
-        влезет в бюджет памяти."""
+        """Выкидывает кадры, самые далёкие от середины заказанного окна, пока
+        кэш не влезет в бюджет памяти."""
         if frame_bytes <= 0:
             return
         limit = max(3, int(self.BUDGET_BYTES // frame_bytes))
         with self._cache_lock:
             while len(self._cache) > limit:
-                far = max(self._cache, key=lambda i: abs(i - self._center))
+                far = max(self._cache, key=lambda i: abs(i - self._focus))
                 self._cache.pop(far, None)
 
     def run(self):
@@ -307,31 +714,68 @@ class FramePrefetcher(QThread):
                 self._queue = []
                 src = self._src
                 gen = self._gen
-                size = self._size
-            if not src:
-                continue
-            if size == (0, 0):
-                size = probe_frame_size(src)
-                with self._cond:
-                    if gen == self._gen:
-                        self._size = size
-            w, h = size
-            if w <= 0 or h <= 0:
-                continue                 # без размеров сырой поток не разобрать
-            for first, count in jobs:
-                if self._stop or gen != self._gen:
-                    break
-                self._decode_run(src, first, count, w, h, gen)
+            out = self._decide_out(src, gen) if src else None
+            if out is not None:          # без размеров сырой поток не разобрать
+                for first, count, anchor in jobs:
+                    if self._stop or gen != self._gen:
+                        break
+                    self._decode_run(src, first, count, anchor, out, gen)
+            with self._cond:
+                if gen == self._gen:
+                    self._running = None  # задание кончилось (или не началось)
 
-    def _decode_run(self, src, first, count, w, h, gen):
-        """Один запуск ffmpeg: count подряд идущих кадров начиная с first."""
+    def _decide_out(self, src, gen):
+        """(ширина, высота, формат, раскладка) кадров источника — выясняется
+        один раз на источник. None — размеров нет (сырой поток не разобрать)."""
+        with self._cond:
+            size, out, props = self._size, self._out, self._props
+            player_fmt, hw = self._player_fmt, self._hw_decode
+        if size != (0, 0) and out is not None:
+            return (size[0], size[1]) + tuple(out)
+        if props is None:
+            props = probe_video_props(src)
+        if out is None:
+            out = self._pick_out(props, player_fmt, hw)
+        if out is None:
+            fmt = guess_player_format(props, probe_mastering_nits(src), hw)
+            layout = _RAW_LAYOUTS.get(fmt.pixelFormat()) if fmt is not None else None
+            out = (fmt, layout) if layout is not None else (None, None)
+        with self._cond:
+            if gen != self._gen:
+                return None
+            if self._player_fmt is not player_fmt:
+                # Пока проверяли файл, плеер показал свой первый кадр.
+                out = self._pick_out(props, self._player_fmt, hw)
+            self._props = props
+            self._out = out
+            # Размер — как у кадров плеера (с поправкой на SAR), иначе на
+            # паузе кадр ляжет в другой letterbox, чем при воспроизведении.
+            w, h = qt_frame_size(props.get("width", 0), props.get("height", 0),
+                                 props.get("sar"))
+            if out[0] is None and abs(props.get("rotation", 0)) % 180 == 90:
+                w, h = h, w              # rgb24: ffmpeg разворачивает кадр сам
+            self._size = (w, h)
+        if w <= 0 or h <= 0:
+            return None
+        return (w, h) + tuple(out)
+
+    def _decode_run(self, src, first, count, anchor, out, gen):
+        """Один запуск ffmpeg: count подряд идущих кадров начиная с first.
+        anchor — кадр плейхеда, у которого окно заказано (см. request)."""
         fps = self._fps
         if fps <= 0:
             return
+        w, h, fmt, layout = out
+        if fmt is None:
+            pix_fmt, planes = "rgb24", [(w * 3, h)]
+        else:
+            pix_fmt, planes = layout[0], _raw_planes(layout[1], w, h)
+        frame_bytes = sum(row * rows for row, rows in planes)
         # Больше, чем влезает в бюджет памяти, декодировать бессмысленно —
         # хвост окна вытеснил бы его же начало.
-        budget = max(3, self.BUDGET_BYTES // max(1, w * h * 3))
-        count = max(1, min(int(count), budget))
+        budget = max(3, self.BUDGET_BYTES // max(1, frame_bytes))
+        self._budget = budget
+        first, count = self._fit_window(first, count, anchor, budget)
         # Процесс запускаем с ЗАПАСОМ по кадрам, а останавливаем по делу (см.
         # цикл ниже): пока пользователь держит стрелку вправо, тот же ffmpeg
         # продолжает отдавать следующие кадры — без нового seek'а и без новой
@@ -340,11 +784,20 @@ class FramePrefetcher(QThread):
         run_cap = max(count, min(self.MAX_RUN, budget + self.RUN_LEAD))
         ss = max(0.0, (first - 0.25) / fps)
         cmd = [FFMPEG, "-nostdin", "-loglevel", "error",
-               "-probesize", "8M", "-analyzeduration", "2M",
-               "-ss", f"{ss:.4f}", "-i", str(src),
-               "-frames:v", str(int(run_cap)), "-an", "-sn",
-               "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
-        frame_bytes = w * h * 3
+               "-probesize", "8M", "-analyzeduration", "2M"]
+        if fmt is not None:
+            # Поворот применит сцена (он записан в формате, как у кадров
+            # плеера) — кадр нужен в том виде, в каком он лежит в потоке.
+            cmd += ["-noautorotate"]
+        cmd += ["-ss", f"{ss:.4f}", "-i", str(src),
+                "-frames:v", str(int(run_cap)), "-an", "-sn"]
+        props = self._props or {}
+        if (props.get("width"), props.get("height")) not in ((w, h), (h, w)):
+            # Неквадратный пиксель: растягиваем, как плеер (см. qt_frame_size).
+            # Автоповорот ffmpeg стоит в графе раньше -vf, так что w/h здесь
+            # уже в осях повёрнутого кадра.
+            cmd += ["-vf", f"scale={w}:{h}:flags=bicubic,setsar=1"]
+        cmd += ["-f", "rawvideo", "-pix_fmt", pix_fmt, "-"]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.DEVNULL,
@@ -354,18 +807,20 @@ class FramePrefetcher(QThread):
         self._proc = proc
         end = first + count
         with self._cond:
-            self._running = (first, end)
+            if gen == self._gen:
+                self._running = (first, end)
         try:
             idx = first
             while not self._stop and gen == self._gen:
                 if idx >= end:
                     # Заказ выполнен. Если плейхед всё это время ШЁЛ ВПЕРЁД
-                    # (ушёл от начала окна) и уже подобрался к его концу — не
-                    # бросаем процесс, а продлеваем: следующие кадры достаются
-                    # даром. Если плейхед стоит на месте (одиночный шаг) —
-                    # заканчиваем, лишнего не декодируем.
+                    # (ушёл от кадра, у которого заказали окно) и уже подобрался
+                    # к его концу — не бросаем процесс, а продлеваем: следующие
+                    # кадры достаются даром. Если плейхед стоит на месте
+                    # (одиночный шаг) или идёт назад — заканчиваем, лишнего не
+                    # декодируем: кадры впереди при шаге назад уже пройдены.
                     center = self._center
-                    if not (first < center < idx + self.RUN_LEAD
+                    if not (anchor < center < idx + self.RUN_LEAD
                             and idx - center < self.RUN_LEAD
                             and idx < first + run_cap):
                         break
@@ -373,14 +828,20 @@ class FramePrefetcher(QThread):
                     with self._cond:
                         # Пока окно живёт, request() не должен его перебивать
                         # (см. проверку _running там же).
-                        self._running = (first, end)
+                        if gen == self._gen:
+                            self._running = (first, end)
                     if idx >= end:
                         break
                 buf = proc.stdout.read(frame_bytes)
                 if not buf or len(buf) < frame_bytes:
                     break
-                img = QImage(buf, w, h, w * 3, QImage.Format.Format_RGB888).copy()
-                if not img.isNull():
+                if fmt is None:
+                    img = QImage(buf, w, h, w * 3, QImage.Format.Format_RGB888).copy()
+                    if img.isNull():
+                        img = None
+                else:
+                    img = _video_frame(buf, fmt, planes)
+                if img is not None:
                     with self._cache_lock:
                         self._cache[idx] = img
                         self._cache.move_to_end(idx)
@@ -404,7 +865,9 @@ class FramePrefetcher(QThread):
             if self._proc is proc:
                 self._proc = None
             with self._cond:
-                if self._running is not None and self._running[0] == first:
+                # Новый заказ уже поставил своё окно — его не трогаем.
+                if (gen == self._gen and self._running is not None
+                        and self._running[0] == first):
                     self._running = None
 
 # Звук покадрового шага живёт отдельным файлом (см. edit_tab_audio_scrub.py);

@@ -137,6 +137,19 @@ class QuestionViewer(QuestionViewerItemsMixin, _api.QWidget):
     def _section_drag_leave(self, widget: _api.QWidget):
         widget.setStyleSheet("background:#181825;")
 
+    def _schedule_once(self, msec: int, callback):
+        """Отложить вызов на цикл событий, не переживая виджета.
+
+        Статический QTimer.singleShot не привязан к получателю: если виджет
+        успели удалить, лямбда всё равно сработает, а PyQt превратит
+        RuntimeError в qFatal. Таймер-ребёнок умирает вместе с виджетом.
+        """
+        timer = _api.QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(callback)
+        timer.timeout.connect(timer.deleteLater)
+        timer.start(msec)
+
     def show_question(self, q_obj: dict, rnd_idx: int = 0, theme_idx: int = 0):
         price = q_obj["price"]; dur = q_obj["dur"]
         self._hdr.setText(f"Вопрос  •  Цена: {price}  •  ⏱ {_api.fmt_dur(dur)}")
@@ -162,9 +175,9 @@ class QuestionViewer(QuestionViewerItemsMixin, _api.QWidget):
                            if w.strip() and
                            ("." not in w or _api.Path(w.strip()).suffix.lower() not in _api._MEDIA_EXTS)]
             answers_snap = q_obj.get("answers", [])
-            _api.QTimer.singleShot(0, lambda a=answers_snap, w=clean_wrong:
-                              self._rebuild_answer_editor(a, w))
-        _api.QTimer.singleShot(30, lambda: self._scroll.verticalScrollBar().setValue(0))
+            self._schedule_once(0, lambda a=answers_snap, w=clean_wrong:
+                                self._rebuild_answer_editor(a, w))
+        self._schedule_once(30, lambda: self._scroll.verticalScrollBar().setValue(0))
 
     def _on_edit_clicked(self):
         self.edit_requested.emit(self._current_rnd, self._current_th, self._current_price)
@@ -408,8 +421,13 @@ class QuestionViewer(QuestionViewerItemsMixin, _api.QWidget):
                 try: stop()
                 except Exception as _e: _api._logger.debug(str(_e))
             to_delete.append(w)
+        # Без setParent(None): отвязанный виджет становится собственностью
+        # Python, и сборщик мусора мог удалить его C++-объект сам — с захваченным
+        # GIL. Внутри AudioPlayerWidget живёт QMediaPlayer, его деструктор ждёт
+        # поток ffmpeg-плагина, а тот ждёт GIL → вечное зависание (2026-10-21,
+        # стеки: gc → ~QWidget → ~QMediaPlayer → QLatch). Пусть удаляет Qt
+        # из цикла событий, где GIL свободен.
         for w in to_delete:
-            w.setParent(None)
             _api.QTimer.singleShot(0, w.deleteLater)
 
     def _fill_lay(self, lay: _api.QVBoxLayout, items: list,

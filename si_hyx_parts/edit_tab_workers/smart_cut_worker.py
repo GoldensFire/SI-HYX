@@ -253,7 +253,9 @@ class SmartCutWorker(_api.QThread):
                     shutil.rmtree(self._tmpdir, ignore_errors=True)
             except Exception:
                 pass
-            self.finished.emit(ok and not self._stopped, msg)
+            if self._stopped:
+                ok, msg = False, "Отменено"
+            self.finished.emit(ok, msg)
 
         try:
             self.status.emit("Smart Cut: анализ ключевых кадров…")

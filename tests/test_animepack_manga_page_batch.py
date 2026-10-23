@@ -50,6 +50,7 @@ class Gemini:
 
 def gen(client):
     return SimpleNamespace(gemini_manga=client, db_cache=_Cache(),
+                           s=SimpleNamespace(visual_checker="gemini"),
                            stopped=lambda: False, _log_rare=lambda *args: None,
                            log=lambda *args: None)
 

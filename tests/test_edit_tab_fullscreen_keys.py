@@ -37,8 +37,6 @@ class _Edit(edit_tab.EditTab):
     def step_frame_scrub(self, direction): self.calls.append(("step", direction))
     def toggle_fullscreen(self): self.calls.append("fullscreen")
     def exit_fullscreen(self): self.calls.append("exit")
-    def set_in_point(self): self.calls.append("in")
-    def set_out_point(self): self.calls.append("out")
     def start_cut(self): self.calls.append("cut")
     def undo(self): self.calls.append("undo")
     def redo(self): self.calls.append("redo")
@@ -90,7 +88,8 @@ def test_same_keyboard_commands(qapp, player, surface):
         ("Space", "play"), ("Left", ("step", -1)), ("Right", ("step", 1)),
         ("A", ("step", -1)), ("S", ("step", -1)),
         ("D", ("step", 1)), ("W", ("step", 1)),
-        ("F", "fullscreen"), ("I", "in"), ("O", "out"),
+        ("F", "fullscreen"),
+        ("I", ("trim", 10.0, 60.0)), ("O", ("trim", 10.0, 10.04)),
         ("Ctrl+S", "cut"), ("Ctrl+Z", "undo"),
         ("Ctrl+Y", "redo"), ("Ctrl+Shift+Z", "redo"),
     ]:
@@ -140,8 +139,8 @@ def test_physical_keys_in_russian_layout(qapp, player, surface):
     for letter, vk, modifiers, expected in [
         ("ф", 0x41, Qt.KeyboardModifier.NoModifier, ("step", -1)),
         ("ц", 0x57, Qt.KeyboardModifier.NoModifier, ("step", 1)),
-        ("ш", 0x49, Qt.KeyboardModifier.NoModifier, "in"),
-        ("щ", 0x4F, Qt.KeyboardModifier.NoModifier, "out"),
+        ("ш", 0x49, Qt.KeyboardModifier.NoModifier, ("trim", 10.0, 60.0)),
+        ("щ", 0x4F, Qt.KeyboardModifier.NoModifier, ("trim", 10.0, 10.04)),
         ("а", 0x46, Qt.KeyboardModifier.NoModifier, "fullscreen"),
         ("ы", 0x53, Qt.KeyboardModifier.ControlModifier, "cut"),
         ("я", 0x5A, Qt.KeyboardModifier.ControlModifier, "undo"),

@@ -30,6 +30,7 @@ import math
 import time
 
 import edit_tab as _api
+from sip_notify import prime_disconnect_notify
 
 _TICK_MS = 40            # шаг сверки голосов с часами проекта
 _LOOKAHEAD_S = 2.5       # за сколько до клипа голос открывает файл
@@ -99,7 +100,10 @@ class EditTabProjectAudioMixin:
         parts = p.audio_parts()
         self._pmix_parts = {c.id: c for c in parts}
         self._pmix_vis = list(p.preview_segments())
-        self._pmix_need = {c.id for c in parts if self._pmix_needs_voice(c)}
+        # Звук своим трактом (project_sound) сводит все дорожки сам — голоса
+        # не нужны; часы проекта тогда — его часы (_pmix_now).
+        self._pmix_need = (set() if getattr(self, "_snd_active", False)
+                           else {c.id for c in parts if self._pmix_needs_voice(c)})
         self._pmix_clock = None
         self._pmix_hold = None
         self._pmix_wait = None
@@ -122,6 +126,10 @@ class EditTabProjectAudioMixin:
 
     # ── Часы проекта ─────────────────────────────────────────────────────────
     def _pmix_now(self):
+        if getattr(self, "_snd_active", False):
+            t = self._snd_now()
+            if t is not None:
+                return t
         clk = self._pmix_clock
         if clk is None:
             return None
@@ -129,6 +137,8 @@ class EditTabProjectAudioMixin:
         return t + (time.monotonic() - at) if running else t
 
     def _pmix_running(self):
+        if getattr(self, "_snd_active", False) and self._snd_now() is not None:
+            return True
         return self._pmix_clock is not None and self._pmix_clock[2]
 
     def _pmix_anchor(self, t, running=True, main=False, jump=False, src_ms=None):
@@ -168,6 +178,8 @@ class EditTabProjectAudioMixin:
         plan = self._proj_play
         if plan is None or self._proj_transition or self._pmix_hold is not None:
             return
+        if getattr(self, "_snd_active", False):
+            return                      # часы проекта — часы звука тракта
         if not (0 <= self._proj_idx < len(plan)):
             return
         seg = plan[self._proj_idx]
@@ -181,7 +193,8 @@ class EditTabProjectAudioMixin:
         except Exception:
             return
         now = time.monotonic()
-        t_main = seg['t0'] + (pos_ms / 1000.0 - seg['s0'])
+        speed = max(0.1, clip.speed)
+        t_main = seg['t0'] + (pos_ms / 1000.0 - seg['s0']) / speed
         wait = self._pmix_wait
         if wait is not None:
             if pos_ms < wait[0] + 15 and now - wait[1] < _ROLL_WAIT_S:
@@ -189,7 +202,7 @@ class EditTabProjectAudioMixin:
             # Тронулся — часы пошли. Позиция ступенчатая и могла уже
             # убежать на шаг: считаем, что плеер тронулся только что.
             self._pmix_wait = None
-            t_req = seg['t0'] + (wait[0] / 1000.0 - seg['s0'])
+            t_req = seg['t0'] + (wait[0] / 1000.0 - seg['s0']) / speed
             self._pmix_clock = (min(t_main, t_req + _TICK_MS / 2000.0), now, True)
             self._pmix_main_since = now
             return
@@ -218,6 +231,8 @@ class EditTabProjectAudioMixin:
         голоса играли дальше. Картинка начинает с того места, где они сейчас
         (lag — поправка на разгон плеера), а не стоит на месте — иначе звук
         дорожек уходил бы вперёд на каждом стыке."""
+        if getattr(self, "_snd_active", False):
+            return self._pmix_catch_up_sound(seg, offset)
         if not self._pmix_running() or not any(
                 v.ready and v.gain and v.playing() for v in self._pmix_voices.values()):
             return offset
@@ -225,11 +240,33 @@ class EditTabProjectAudioMixin:
         if late <= offset or late > _CATCH_UP_MAX_S:
             return offset
         fps = seg['clip'].fps
+        speed = max(0.1, seg['clip'].speed)
         if fps and fps > 0:
             # На начало кадра: плейхед иначе откатывался бы к нему на ходу.
-            late = math.ceil((seg['s0'] + late) * fps - 1e-3) / fps - seg['s0']
+            frame = math.ceil((seg['s0'] + late * speed) * fps - 1e-3) / fps
+            late = (frame - seg['s0']) / speed
         self._pmix_main_check = True     # замерим, угадали ли разгон плеера
         return min(late, max(0.0, seg['t1'] - seg['t0'] - 0.05))
+
+    def _pmix_catch_up_sound(self, seg, offset):
+        """То же для звука своим трактом: он не ждёт ни перемотки, ни загрузки
+        файла, и картинка начинает с того места, где звучит звук, — без
+        предела: картинка без аудиовыхода плеера идёт ровно по стене и потом
+        от звука не отстаёт. До ближайшего кадра (не вверх): на стыке звук и
+        картинка расходятся на миллисекунды, и округление вверх съедало бы
+        первый кадр куска."""
+        now = self._snd_now()
+        if now is None:
+            return offset
+        late = now - seg['t0']
+        if late <= offset:
+            return offset
+        fps = seg['clip'].fps if seg['clip'] is not None else 0.0
+        speed = max(0.1, seg['clip'].speed) if seg['clip'] is not None else 1.0
+        if fps and fps > 0:
+            frame = round((seg['s0'] + late * speed) * fps) / fps
+            late = (frame - seg['s0']) / speed
+        return min(max(offset, late), max(0.0, seg['t1'] - seg['t0'] - 0.05))
 
     # ── Основной плеер ───────────────────────────────────────────────────────
     def _pmix_norm(self, path):
@@ -316,19 +353,20 @@ class EditTabProjectAudioMixin:
             return 1.0
 
     def _pmix_set_main_gain(self, gain, force=False):
-        """gain=None — громкость основного плеера снова по ползунку."""
-        if gain == self._pmix_gain and not force:
-            return
+        """gain=None — громкость основного плеера снова по ползунку.
+
+        Множитель живёт в _output_volume: ползунок и плавный возврат звука
+        после перемотки на ходу (timeline_seek) пересчитывают громкость с ним
+        и не включают звук, выключенный в проекте (дорожка, клип, отделённый
+        звук). Иначе возврат громкости после клика по шкале обходил эту
+        настройку — и звук выключенной дорожки снова играл из плеера."""
+        if gain is not None:
+            gain = max(0.0, min(1.0, float(gain)))
         self._pmix_gain = gain
-        base = self._pmix_base_volume()
-        vol = base if gain is None else max(0.0, min(1.0, base * gain))
-        for out in (getattr(self, "audio_output", None),
-                    getattr(self, "_ext_audio_output", None)):
-            if out is not None:
-                try:
-                    out.setVolume(vol)
-                except Exception:
-                    pass
+        # Ставим каждый раз, даже если множитель тот же: громкость выхода могли
+        # тронуть мимо нас (ползунок, возврат после перемотки на ходу) — она
+        # должна снова считаться с тем, что выключено в проекте.
+        self._apply_output_volume()
 
     def _pmix_apply_volume(self):
         """Ползунок громкости сдвинули во время просмотра."""
@@ -355,7 +393,7 @@ class EditTabProjectAudioMixin:
         if v is not None:
             return v
         player = _api.QMediaPlayer(self)
-        output = _api.QAudioOutput(self)
+        output = prime_disconnect_notify(_api.QAudioOutput(self))
         output.setVolume(0.0)
         player.setAudioOutput(output)
         v = _Voice(clip.id, player, output)
@@ -388,7 +426,8 @@ class EditTabProjectAudioMixin:
             # Встаём на нужное место заранее: старт по часам будет быстрее.
             t = self._pmix_now()
             off = 0.0 if t is None else min(max(0.0, t - clip.start), clip.length)
-            v.player.setPosition(int((clip.in_s + off) * 1000))
+            v.player.setPosition(int((clip.in_s + off * max(0.1, clip.speed)) * 1000))
+            self._pmix_set_rate(v.player, clip.speed)
         except Exception:
             pass
         v.ready = True
@@ -419,8 +458,21 @@ class EditTabProjectAudioMixin:
         for cid in list(getattr(self, "_pmix_voices", {})):
             self._pmix_release(cid)
 
+    @staticmethod
+    def _pmix_set_rate(player, speed):
+        """Скорость голоса под ускоренный клип (1 — обычная)."""
+        try:
+            rate = max(0.1, min(8.0, float(speed)))
+            if abs(player.playbackRate() - rate) > 1e-3:
+                player.setPlaybackRate(rate)
+        except Exception:
+            pass
+
     def _pmix_drive(self, v, target, gain, now):
         """Голос играет место target (с) исходника с громкостью клипа gain."""
+        clip = self._pmix_parts.get(v.cid)
+        if clip is not None:
+            self._pmix_set_rate(v.player, clip.speed)
         if not v.playing():
             if not v.started:
                 self._pmix_seek(v, target, 'fresh')
@@ -485,6 +537,12 @@ class EditTabProjectAudioMixin:
         running = self._pmix_running()
         if hold is not None and running:
             self.project_timeline.set_playhead(min(hold[1], max(hold[0], t)))
+        if getattr(self, "_snd_active", False):
+            if hold is None and self._proj_transition and running:
+                # Грузится файл следующего куска: звук тракта не ждёт загрузки
+                # — и плейхед идёт за ним, а не стоит.
+                self.project_timeline.set_playhead(t)
+            return                      # звук всех дорожек — у тракта, голосов нет
         if self._pmix_on_segment(t):
             # Громкость основного плеера — только пока он на своём куске: на
             # «перебеге» за стык и в загрузке не трогаем (замерено: громкость
@@ -517,8 +575,9 @@ class EditTabProjectAudioMixin:
                     v = self._pmix_voice(c)
                 if v is None or not v.ready:
                     continue
-                if running and lead <= _RUNUP_S and c.in_s - lead >= 0.0:
-                    self._pmix_drive(v, c.in_s - lead, 0.0, now)
+                speed = max(0.1, c.speed)
+                if running and lead <= _RUNUP_S and c.in_s - lead * speed >= 0.0:
+                    self._pmix_drive(v, c.in_s - lead * speed, 0.0, now)
                 elif v.playing():
                     v.player.pause()          # перемотали назад, до клипа
                     v.player.setPosition(int(c.in_s * 1000))
@@ -532,7 +591,7 @@ class EditTabProjectAudioMixin:
                     continue
                 v = self._pmix_voice(c)
             if v.ready and not v.failed and running:
-                self._pmix_drive(v, c.in_s + (t - c.start),
+                self._pmix_drive(v, c.in_s + (t - c.start) * max(0.1, c.speed),
                                  float(c.volume) if audible else 0.0, now)
         # Клип начинается раньше следующего тика — стартуем голос ровно в срок.
         if nearest is not None and nearest * 1000 < _TICK_MS:

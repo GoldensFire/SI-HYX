@@ -47,18 +47,32 @@ def _fmt_len(t):
     return f"{int(m)}:{s:04.1f}" if m >= 1 else f"{s:.1f} с"
 
 
+def _fmt_speed(speed):
+    """Подпись скорости клипа: 2×, 0.5× — без лишних нулей."""
+    try:
+        v = float(speed)
+    except (TypeError, ValueError):
+        return "1×"
+    txt = f"{v:.2f}".rstrip("0").rstrip(".")
+    return f"{txt}×"
+
+
 class ProjectTimeline(_api.QWidget):
     """Дорожки проекта сверху вниз: видео (верхние перекрывают нижние),
     основная «Видео 1» (магнитная), затем звук.
 
-    Мышь: клик по линейке или пустому месту — плейхед (и протяжка); клик по
-    клипу — выделение; перетаскивание — перенос (на основной дорожке —
+    Мышь: клик по линейке или пустому месту — плейхед (по линейке — и
+    протяжка); перетаскивание по пустому месту дорожек — рамка выделения, как
+    в Filmora (выделяются все клипы, которых она коснулась; с Ctrl — к уже
+    выделенным); клик по клипу — выделение, Ctrl+клик — добавить/убрать клип
+    из выделения; перетаскивание клипа — перенос (на основной дорожке —
     смена порядка, можно и на другую дорожку того же рода); край клипа —
     подрезка; двойной клик — плейхед в эту точку клипа; ПКМ — меню. Колесо —
-    прокрутка, Ctrl+колесо — масштаб, клик по заголовку дорожки — вкл/выкл.
-    На клипах со звуком — волна (wave_provider).
+    прокрутка, Ctrl+колесо — масштаб, клик по заголовку дорожки — вкл/выкл;
+    у видеодорожки со звуком в заголовке ещё динамик — звук дорожки вкл/выкл
+    (картинка остаётся). На клипах со звуком — волна (wave_provider).
 
-    Правки модели делает сам (перенос, подрезка, вкл/выкл дорожки), объявляя
+    Правки модели делает сам (перенос, подрезка, вкл/выкл дорожки и её звука), объявляя
     editStarted ДО первой правки (вкладка снимает снимок для отмены) и edited
     после. Остальные команды уходят во вкладку через actionRequested.
 
@@ -95,6 +109,10 @@ class ProjectTimeline(_api.QWidget):
         self.pps = 40.0              # пикселей на секунду
         self.offset = 0.0            # время у левого края дорожек
         self.playhead = 0.0
+        # Выделение: selected — «главный» клип (с ним работают правки у
+        # плейхеда и меню), _sel_ids — все выделенные (рамкой или Ctrl+клик).
+        # Присваивание selected выделяет ровно этот клип.
+        self._sel_ids = set()
         self.selected = ""
         # thumb_provider(clip, время файла, высота в px) -> QPixmap|None: кадр
         # для полосы превью вдоль клипа, как в Filmora (вкладка достаёт кадры
@@ -104,6 +122,8 @@ class ProjectTimeline(_api.QWidget):
         # wave_provider(clip) -> (сэмплы 0..1 на весь файл, длительность файла)
         # или None: волна звука на клипе.
         self.wave_provider = None
+        # can_paste() -> bool: в буфере вкладки есть клипы (пункт «Вставить»).
+        self.can_paste = None
         self._drag = None
         self._hover = None
         self._static = None          # кэш неподвижного слоя (см. докстроку класса)
@@ -114,11 +134,47 @@ class ProjectTimeline(_api.QWidget):
         self.setMinimumHeight(self.content_height())
         self.setMaximumHeight(self.content_height())
 
+    # ── Выделение ────────────────────────────────────────────────────────────
+    @property
+    def selected(self):
+        return self._selected
+
+    @selected.setter
+    def selected(self, cid):
+        self._selected = cid or ""
+        self._sel_ids = {self._selected} if self._selected else set()
+
+    def selected_ids(self):
+        """Все выделенные клипы — id в порядке модели."""
+        return [c.id for c in self.project.clips if c.id in self._sel_ids]
+
+    def select(self, ids, primary=None):
+        """Выделить клипы ids (например, только что вставленные), главный —
+        primary."""
+        self._set_selection(ids, primary)
+
+    def _set_selection(self, ids, primary=None):
+        """Выделяет набор клипов; главный — primary, если он в наборе, иначе
+        прежний главный, если он остался, иначе первый по времени."""
+        ids = {i for i in ids if self.project.clip(i) is not None}
+        if primary not in ids:
+            primary = self._selected if self._selected in ids else None
+        if primary is None and ids:
+            primary = min(ids, key=lambda i: (self.project.clip(i).start, i))
+        changed = (primary or "") != self._selected
+        self._selected = primary or ""
+        self._sel_ids = ids
+        if changed:
+            self.selectionChanged.emit(self._selected)
+        self.update()
+
     # ── Геометрия ────────────────────────────────────────────────────────────
     def set_project(self, project):
         self.project = project
-        if self.project.clip(self.selected) is None:
+        if self.project.clip(self._selected) is None:
             self.selected = ""
+        else:
+            self._sel_ids = {i for i in self._sel_ids if self.project.clip(i) is not None}
         self.refresh()
 
     def refresh(self):
@@ -166,6 +222,21 @@ class ProjectTimeline(_api.QWidget):
             if ry <= y < ry + rh:
                 return ti, ry, rh
         return None
+
+    def _header_box(self, y, rh):
+        return QRectF(4, y + 2, self.HEADER_W - 8, rh - 4)
+
+    def _mute_rect(self, ti, y, rh):
+        """Кнопка звука дорожки в заголовке: только у видеодорожки, на которой
+        есть клипы со звуком (или звук уже выключен). У основной дорожки — под
+        глазом, на уровне волны клипа; у узких — слева от глаза. None — нет."""
+        tr = self.project.tracks[ti]
+        if tr.kind != 'video' or not (tr.muted or self.project.track_has_audio(ti)):
+            return None
+        box = self._header_box(y, rh)
+        if rh >= 44:
+            return QRectF(box.right() - 19, box.bottom() - 17, 16, 16)
+        return QRectF(box.right() - 35, box.center().y() - 8, 16, 16)
 
     def clip_rect(self, c, start=None, track=None):
         row = next((r for r in self.rows() if r[0] == (c.track if track is None else track)), None)
@@ -281,25 +352,51 @@ class ProjectTimeline(_api.QWidget):
             if row is not None:
                 self.editStarted.emit()
                 tr = self.project.tracks[row[0]]
-                tr.enabled = not tr.enabled
+                mute = self._mute_rect(*row)
+                if mute is not None and mute.contains(pos):
+                    tr.muted = not tr.muted
+                else:
+                    tr.enabled = not tr.enabled
                 self.edited.emit()
                 self.update()
             return
+        ctrl = bool(ev.modifiers() & _api.Qt.KeyboardModifier.ControlModifier)
         clip, edge = self.hit(pos)
+        if clip is None and pos.y() >= self.RULER_H:
+            # Пустое место дорожек: рамка выделения. Клик без сдвига мыши —
+            # прежний клик (плейхед сюда), его шлём на отпускании.
+            if not ctrl and self._sel_ids:
+                self._set_selection(())
+            self._drag = {'mode': 'marquee', 't0': self.t_of(pos.x()), 'y0': pos.y(),
+                          'x1': pos.x(), 'y1': pos.y(), 'moved': False,
+                          'base': set(self._sel_ids) if ctrl else set()}
+            return
         if clip is None:
-            if self.selected:
-                self.selected = ""
-                self.selectionChanged.emit("")
+            if self._sel_ids:
+                self._set_selection(())
             self._drag = {'mode': 'scrub', 'x0': pos.x(), 'moved': False}
             self.seekRequested.emit(max(0.0, self.t_of(pos.x())))
             self.update()
             return
-        if clip.id != self.selected:
-            self.selected = clip.id
-            self.selectionChanged.emit(clip.id)
+        if ctrl and not edge:
+            # Ctrl+клик — клип в выделение или из него, без переноса.
+            ids = set(self._sel_ids)
+            if clip.id in ids:
+                ids.discard(clip.id)
+                self._set_selection(ids)
+            else:
+                ids.add(clip.id)
+                self._set_selection(ids, clip.id)
+            return
+        # Клик по клипу из нескольких выделенных не сбрасывает выделение сразу
+        # (это может быть начало переноса) — сбросит отпускание без переноса.
+        collapse = clip.id in self._sel_ids and len(self._sel_ids) > 1
+        if not collapse and (clip.id != self.selected or len(self._sel_ids) > 1):
+            self._set_selection({clip.id}, clip.id)
         self._drag = {'mode': 'trim' if edge else 'press', 'edge': edge,
                       'id': clip.id, 'x0': pos.x(), 'y0': pos.y(),
-                      'grab': self.t_of(pos.x()) - clip.start, 'started': False}
+                      'grab': self.t_of(pos.x()) - clip.start, 'started': False,
+                      'collapse': collapse}
         self.update()
 
     def mouseMoveEvent(self, ev):
@@ -307,8 +404,10 @@ class ProjectTimeline(_api.QWidget):
         d = self._drag
         if d is None:
             clip, edge = self.hit(pos)
+            header = pos.x() < self.HEADER_W and self.row_of(pos.y()) is not None
             cur = (_api.Qt.CursorShape.SizeHorCursor if edge else
                    _api.Qt.CursorShape.OpenHandCursor if clip is not None else
+                   _api.Qt.CursorShape.PointingHandCursor if header else
                    _api.Qt.CursorShape.ArrowCursor)
             self.setCursor(cur)
             return
@@ -319,6 +418,18 @@ class ProjectTimeline(_api.QWidget):
                 d['moved'] = True
                 self.scrubStarted.emit()
             self.seekRequested.emit(max(0.0, self.t_of(pos.x())))
+            return
+        if d['mode'] == 'marquee':
+            d['x1'], d['y1'] = pos.x(), pos.y()
+            if not d['moved']:
+                x0 = self.x_of(d['t0'])
+                if abs(pos.x() - x0) < self.DRAG_PX and abs(pos.y() - d['y0']) < self.DRAG_PX:
+                    return
+                d['moved'] = True
+            band = self._marquee_rect(d)
+            hit = {c.id for c in self.project.clips if self.clip_rect(c).intersects(band)}
+            self._set_selection(d['base'] | hit)
+            self.update()
             return
         clip = self.project.clip(d['id'])
         if clip is None:
@@ -361,7 +472,11 @@ class ProjectTimeline(_api.QWidget):
         self.unsetCursor()
         if d is None:
             return
-        if d['mode'] == 'scrub' and d['moved']:
+        if d['mode'] == 'marquee' and not d['moved']:
+            self.seekRequested.emit(max(0.0, d['t0']))
+        elif d['mode'] == 'press' and d.get('collapse'):
+            self._set_selection({d['id']}, d['id'])
+        elif d['mode'] == 'scrub' and d['moved']:
             self.scrubFinished.emit()
         elif d['mode'] == 'trim' and d['started']:
             self.edited.emit()
@@ -384,10 +499,10 @@ class ProjectTimeline(_api.QWidget):
         clip, _edge = self.hit(_api.QPointF(pos))
         menu = QMenu(self)
         if clip is not None:
-            if clip.id != self.selected:
-                self.selected = clip.id
-                self.selectionChanged.emit(clip.id)
-                self.update()
+            if clip.id not in self._sel_ids:
+                self._set_selection({clip.id}, clip.id)
+            elif clip.id != self.selected:
+                self._set_selection(self._sel_ids, clip.id)
             act = menu.addAction("Разрезать у плейхеда\tCtrl+B",
                                  lambda: self.actionRequested.emit('split', clip.id))
             under = clip.start < self.playhead < clip.end
@@ -398,7 +513,13 @@ class ProjectTimeline(_api.QWidget):
             act = menu.addAction("Обрезать конец до плейхеда",
                                  lambda: self.actionRequested.emit('trim:right', clip.id))
             act.setEnabled(under)
-            menu.addAction("Удалить\tDel", lambda: self.actionRequested.emit('delete', clip.id))
+            n_sel = len(self._sel_ids)
+            menu.addAction(f"Удалить выделенные ({n_sel})\tDel" if n_sel > 1 else "Удалить\tDel",
+                           lambda: self.actionRequested.emit('delete', clip.id))
+            menu.addAction(f"Копировать выделенные ({n_sel})\tCtrl+C" if n_sel > 1
+                           else "Копировать\tCtrl+C",
+                           lambda: self.actionRequested.emit('copy', clip.id))
+            self._add_paste_action(menu)
             menu.addSeparator()
             if clip.audio_path:
                 act = menu.addAction("Без звука",
@@ -407,21 +528,36 @@ class ProjectTimeline(_api.QWidget):
                 act.setChecked(clip.muted)
                 menu.addAction(f"Громкость… ({int(round(clip.volume * 100))} %)",
                                lambda: self.actionRequested.emit('volume', clip.id))
-            kind = 'video' if clip.has_video else 'audio'
-            sub = menu.addMenu("На дорожку")
-            for ti in self.project.display_order():
-                if self.project.tracks[ti].kind != kind or ti == clip.track:
-                    continue
-                sub.addAction(self.project.track_name(ti),
-                              lambda _t=ti: self.actionRequested.emit(f'track:{_t}', clip.id))
-            sub.setEnabled(not sub.isEmpty())
+                if clip.has_video and not clip.is_image:
+                    menu.addAction("Отделить звук",
+                                   lambda: self.actionRequested.emit('detach_audio', clip.id))
+            if not clip.is_image:
+                sub = menu.addMenu("Скорость")
+                for val in (0.25, 0.5, 1.0, 1.5, 2.0, 4.0):
+                    act = sub.addAction(_fmt_speed(val))
+                    act.setCheckable(True)
+                    act.setChecked(abs(clip.speed - val) < 1e-6)
+                    act.triggered.connect(
+                        lambda _checked=False, v=val:
+                        self.actionRequested.emit(f'speed:{v}', clip.id))
+                sub.addSeparator()
+                sub.addAction("Другая…",
+                              lambda: self.actionRequested.emit('speed:custom', clip.id))
         else:
+            self._add_paste_action(menu)
+            menu.addSeparator()
             menu.addAction("Добавить видеодорожку",
                            lambda: self.actionRequested.emit('add_track:video', ''))
             menu.addAction("Добавить аудиодорожку",
                            lambda: self.actionRequested.emit('add_track:audio', ''))
             menu.addAction("Весь проект в окне", self.zoom_to_fit)
         menu.exec(ev.globalPos())
+
+    def _add_paste_action(self, menu):
+        """«Вставить у плейхеда» — доступно, когда в буфере вкладки есть клипы."""
+        act = menu.addAction("Вставить у плейхеда\tCtrl+V",
+                             lambda: self.actionRequested.emit('paste', ''))
+        act.setEnabled(bool(self.can_paste()) if self.can_paste is not None else False)
 
     def keyPressEvent(self, ev):
         if ev.key() in (_api.Qt.Key.Key_Delete, _api.Qt.Key.Key_Backspace) and self.selected:
@@ -440,13 +576,14 @@ class ProjectTimeline(_api.QWidget):
         и сам виджет, и вкладка — поэтому сверяем сами клипы), перетаскивание
         и номер invalidate()."""
         proj = self.project
-        clips = tuple((c.id, c.track, c.start, c.in_s, c.out_s, c.muted, c.volume)
+        clips = tuple((c.id, c.track, c.start, c.in_s, c.out_s, c.speed, c.muted, c.volume)
                       for c in proj.clips)
-        tracks = tuple((t.kind, t.enabled) for t in proj.tracks)
+        tracks = tuple((t.kind, t.enabled, t.muted) for t in proj.tracks)
         d = self._drag or {}
         drag = (d.get('id'), d.get('track'), d.get('start')) if d.get('mode') == 'move' else None
         return (self.width(), self.height(), self.devicePixelRatioF(), self.offset,
-                self.pps, self.selected, id(proj), clips, tracks, drag, self._version)
+                self.pps, self.selected, frozenset(self._sel_ids), id(proj), clips,
+                tracks, drag, self._version)
 
     def paintEvent(self, ev):
         key = self._static_signature()
@@ -455,8 +592,25 @@ class ProjectTimeline(_api.QWidget):
             self._static_key = key
         p = _api.QPainter(self)
         p.drawPixmap(0, 0, self._static)
+        d = self._drag
+        if d is not None and d['mode'] == 'marquee' and d['moved']:
+            band = self._marquee_rect(d)
+            col = _api.QColor(_api.C['accent'])
+            p.setPen(_api.QPen(col, 1))
+            col.setAlpha(40)
+            p.setBrush(col)
+            p.drawRect(band)
         self._paint_playhead(p)
         p.end()
+
+    def _marquee_rect(self, d):
+        """Рамка выделения: от точки нажатия (по времени — она едет вместе с
+        прокруткой) до мыши, в пределах дорожек."""
+        x0 = self.x_of(d['t0'])
+        lane = QRectF(self.HEADER_W, self.RULER_H, self.lane_width(),
+                      self.height() - self.RULER_H)
+        return QRectF(_api.QPointF(min(x0, d['x1']), min(d['y0'], d['y1'])),
+                      _api.QPointF(max(x0, d['x1']), max(d['y0'], d['y1']))).intersected(lane)
 
     def _paint_playhead(self, p):
         """Плейхед — жёлтая линия через все дорожки."""
@@ -547,7 +701,7 @@ class ProjectTimeline(_api.QWidget):
                 strip = self._paint_filmstrip(p, c, body, path, dim=(not enabled or faded))
         if body.width() > 24:
             self._paint_clip_label(p, c, body, over_frames=strip)
-        if c.id == self.selected and not ghost:
+        if c.id in self._sel_ids and not ghost:
             p.setPen(_api.QPen(_api.QColor(C['playhead']), 2))
         else:
             p.setPen(_api.QPen(fill.darker(160), 1))
@@ -562,6 +716,8 @@ class ProjectTimeline(_api.QWidget):
         p.setFont(font)
         fm = _api.QFontMetrics(font)
         label = f"{c.name}  ·  {_fmt_len(c.length)}"
+        if abs(c.speed - 1.0) > 1e-6:
+            label = f"{c.name}  ·  {_fmt_len(c.length)}  ·  {_fmt_speed(c.speed)}"
         if c.muted and c.audio_path:
             label = "без звука · " + label
         elif c.audio_path and c.volume != 1.0:
@@ -605,7 +761,8 @@ class ProjectTimeline(_api.QWidget):
         k0 = max(0, int((vis_l - body.left()) // tw))
         k1 = int((vis_r - body.left()) // tw)
         tile_s = tw / self.pps
-        step = 2.0 ** round(math.log2(max(0.25, tile_s)))
+        speed = max(0.01, c.speed)
+        step = 2.0 ** round(math.log2(max(0.25, tile_s * speed)))
         last = max(c.in_s, c.out_s - 0.05)
         height = int(round(th))
         drew = False
@@ -614,7 +771,7 @@ class ProjectTimeline(_api.QWidget):
         if dim:
             p.setOpacity(0.4)
         for k in range(k0, k1 + 1):
-            t = c.in_s + (k + 0.5) * tile_s
+            t = c.in_s + (k + 0.5) * tile_s * speed
             t = min(max(c.in_s, round(t / step) * step), last)
             pm = self.thumb_provider(c, t, height)
             if pm is None or pm.isNull():
@@ -673,9 +830,10 @@ class ProjectTimeline(_api.QWidget):
         half = band.height() / 2.0 - 1
         top, bottom = [], []
         per_s = n / dur
+        speed = max(0.01, c.speed)
         for x in range(x0, x1 + 1):
-            t0 = c.in_s + (x - band.left()) / self.pps
-            t1 = t0 + 1.0 / self.pps
+            t0 = c.in_s + (x - band.left()) / self.pps * speed
+            t1 = t0 + 1.0 / self.pps * speed
             i0 = max(0, min(n - 1, int(t0 * per_s)))
             i1 = max(i0 + 1, min(n, int(t1 * per_s) + 1))
             v = max(samples[i0:i1])
@@ -687,7 +845,9 @@ class ProjectTimeline(_api.QWidget):
         if c.has_video:
             p.fillRect(band, _api.QColor(0, 0, 0, 70))
         p.setPen(_api.Qt.PenStyle.NoPen)
-        p.setBrush(_api.QColor(255, 255, 255, 120 if c.has_video else 150))
+        # Звук не звучит (клип или вся дорожка без звука) — волна бледная.
+        silent = c.muted or self.project.tracks[c.track].muted
+        p.setBrush(_api.QColor(255, 255, 255, 45 if silent else 120 if c.has_video else 150))
         p.drawPolygon(poly)
         p.restore()
 
@@ -724,7 +884,7 @@ class ProjectTimeline(_api.QWidget):
         for ti, y, rh in rows:
             tr = self.project.tracks[ti]
             main = ti == self.project.main_track
-            box = QRectF(4, y + 2, self.HEADER_W - 8, rh - 4)
+            box = self._header_box(y, rh)
             p.setPen(_api.Qt.PenStyle.NoPen)
             p.setBrush(_api.QColor(C['surface3'] if tr.enabled else C['surface2']))
             p.drawRoundedRect(box, 4, 4)
@@ -738,8 +898,19 @@ class ProjectTimeline(_api.QWidget):
                 p.drawPixmap(int(box.right()) - 16, int(box.center().y()) - 6, pm)
             except Exception:
                 pass
+            mute = self._mute_rect(ti, y, rh)
+            if mute is not None:
+                # Выключенный звук — красным: видно и у выключенной дорожки.
+                mcol = C['red'] if tr.muted else col
+                try:
+                    pm = _api.get_icon_pixmap(
+                        'fa5s.volume-mute' if tr.muted else 'fa5s.volume-up', 12, mcol)
+                    p.drawPixmap(int(mute.center().x()) - 6, int(mute.center().y()) - 6, pm)
+                except Exception:
+                    pass
+            text_w = box.width() - (38 if mute is not None and rh < 44 else 22)
             p.setPen(_api.QColor(C['accent'] if main and tr.enabled else col))
-            p.drawText(QRectF(box.left() + 6, box.top(), box.width() - 22, box.height()),
+            p.drawText(QRectF(box.left() + 6, box.top(), text_w, box.height()),
                        int(_api.Qt.AlignmentFlag.AlignVCenter | _api.Qt.AlignmentFlag.AlignLeft),
                        self.project.track_short(ti))
         p.setPen(_api.QPen(_api.QColor(C['border']), 1))

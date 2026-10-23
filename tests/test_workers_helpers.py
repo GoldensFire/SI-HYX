@@ -1015,6 +1015,7 @@ class TestProcessMediaProfiles:
         def _out_dir_for(self, path): return "out"
         def _source_has_alpha(self, path): return False
         def _bt709_color_args(self, path): return []
+        def _color_args(self, item, path): return []
         def _build_video_filters(self, *a, **k): return []
         def _overlay_vf(self, vf_list, item, current_input): return ""
         def _make_metric_sample(self, ci, trim, **k): return ci, None

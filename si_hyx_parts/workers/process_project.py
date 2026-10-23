@@ -2,6 +2,7 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """ProcessWorker: проект «Монтажа» настройками «Обработки» за одно кодирование."""
+import hdr_tonemap
 import montage_project as _mp
 import workers as _api
 
@@ -39,8 +40,13 @@ class ProcessProjectMixin:
         remove_audio = is_video and (bool(sa.get('remove')) or bool(item.get('remove_audio')))
         if not is_video and not has_audio:
             raise Exception("В проекте нет звука — обрабатывать нечего.")
+        # HDR10-куски сводятся в SDR, как в просмотре Монтажа (hdr_tonemap).
+        tonemap = (hdr_tonemap.tonemap_filters(
+            (c.src for c in proj.clips if c.has_video and not c.is_image),
+            _api.escape_filter_path) if is_video and item.get('sdr_tonemap') else {})
         src = _mp.build_source(proj, video=is_video, audio=has_audio and not remove_audio,
-                               subs=item.get('project_subs') if is_video else None)
+                               subs=item.get('project_subs') if is_video else None,
+                               tonemap=tonemap)
         if src is None:
             raise Exception("Проект пуст — собирать нечего.")
         if is_video and video_enabled and not self.svt_available:
@@ -71,7 +77,8 @@ class ProcessProjectMixin:
 
             if is_video:
                 video_args = self._project_video_args(item, proj, src, sv, crf, speed_factor,
-                                                      video_enabled, chains, temp_files, cb)
+                                                      video_enabled, chains, temp_files, cb,
+                                                      tonemap)
                 maps = ["-map", "[vfin]"] + video_args
             else:
                 maps = ["-vn"]
@@ -133,13 +140,13 @@ class ProcessProjectMixin:
                     pass
 
     def _project_video_args(self, item, proj, src, sv, crf, speed_factor, video_enabled,
-                            chains, temp_files, cb):
+                            chains, temp_files, cb, tonemap):
         """Дописывает в chains видеоцепочку «Обработки» ([vout] → [vfin]) и
-        возвращает аргументы кодирования видео."""
+        возвращает аргументы кодирования видео. tonemap — как у build_source."""
         crop_black = bool(sv.get('crop_black'))
         sample = None
         if crop_black or (video_enabled and self._wants_metric_score(sv)):
-            sample = self._project_sample(proj, temp_files)
+            sample = self._project_sample(proj, temp_files, tonemap)
         vf_list = []
         if crop_black:
             crop = self._detect_crop(sample) if sample else None
@@ -156,7 +163,10 @@ class ProcessProjectMixin:
         fps_args = self._fps_args(sv.get('fps', 'Исходный') or 'Исходный', None,
                                   src_fps=src.fps)
         first = next((c for c in proj.clips if c.has_video and not c.is_image), None)
-        color = self._bt709_color_args(first.src) if first is not None else []
+        if tonemap:
+            color = list(hdr_tonemap.SDR_COLOR_ARGS)
+        else:
+            color = self._bt709_color_args(first.src) if first is not None else []
         if not video_enabled:
             # Копировать нечего: кадр проекта склеен из кусков. Видео кодирует
             # кодер Монтажа, всё остальное — по настройкам «Обработки».
@@ -180,13 +190,14 @@ class ProcessProjectMixin:
         return (fps_args + color + self._av1_encoder_args(crf, preset, pix_fmt, video_tune)
                 + ["-threads", "0"])
 
-    def _project_sample(self, proj, temp_files):
+    def _project_sample(self, proj, temp_files, tonemap):
         """Короткий кусок из середины проекта почти без потерь — вход для
-        обрезки чёрных полос и подбора CRF. None, если не получилось."""
+        обрезки чёрных полос и подбора CRF (уже сведённый в SDR, как итог).
+        None, если не получилось."""
         dur = proj.duration()
         take = min(_SAMPLE_MAX_S, dur)
         t0 = max(0.0, (dur - take) / 2.0)
-        part = _mp.build_source(proj.excerpt(t0, t0 + take), audio=False)
+        part = _mp.build_source(proj.excerpt(t0, t0 + take), audio=False, tonemap=tonemap)
         if part is None or not part.video:
             return None
         tmp = _api.os.path.join(_api.TEMP_DIR, f"projsample_{_api.uuid.uuid4().hex}.mkv")

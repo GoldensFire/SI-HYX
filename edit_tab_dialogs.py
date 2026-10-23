@@ -27,17 +27,19 @@ from edit_tab_base import (
     make_icon_btn, s_to_time
 )
 from edit_tab_widgets import (_SubtitlePreview, _SubtitleTimeline)
-from PyQt6.QtGui import (QShortcut)
+from PyQt6.QtCore import (QEvent, QSize)
+from PyQt6.QtGui import (QShortcut, QTextOption)
 from PyQt6.QtWidgets import (
-    QButtonGroup, QColorDialog, QDialogButtonBox, QFontComboBox, QGridLayout,
-    QInputDialog, QListWidget, QListWidgetItem, QPlainTextEdit, QRadioButton,
-    QScrollBar, QTabWidget, QToolButton
+    QAbstractButton, QButtonGroup, QColorDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFontComboBox, QGridLayout, QGroupBox, QInputDialog,
+    QListWidget, QListWidgetItem, QPlainTextEdit, QRadioButton, QScrollBar,
+    QSizePolicy, QTabWidget, QToolButton
 )
 
 from si_hyx_parts.edit_tab_dialogs.video_mask_dialog import _VideoMaskDialog
 
 from si_hyx_parts.edit_tab_dialogs.track_attach_dialog import _TrackAttachDialog
 
-from si_hyx_parts.edit_tab_dialogs.subtitle_edit_dialog import SubtitleEditDialog
 from si_hyx_parts.edit_tab_dialogs.subtitle_creator_dialog import SubtitleCreatorDialog
 from si_hyx_parts.edit_tab_dialogs.pixelize_dialog import _PixelizeDialog
+from si_hyx_parts.edit_tab_dialogs.export_settings_dialog import _ExportSettingsDialog

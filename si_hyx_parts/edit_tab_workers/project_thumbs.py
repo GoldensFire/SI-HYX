@@ -41,6 +41,7 @@ class ProjectThumbWorker(_api.QThread):
         self._helpers = []
         self._cache_dir = cache_dir
         self._folders = {}                   # (файл, размер, mtime) → папка кэша
+        self._hdr = {}                       # файл → яркость для тонмаппинга HDR или None
 
     def request(self, key, src, sec, height):
         with self._cond:
@@ -79,10 +80,12 @@ class ProjectThumbWorker(_api.QThread):
                     return
                 key, src, sec, height = self._jobs.pop()
                 self._queued.discard(key)
-            path = self._disk_path(src, sec, height)
+            hdr = self._hdr_of(src)
+            path = self._disk_path(src, sec, height, hdr)
             img = self._load(path)
             if img is None:
-                img = self._extract(src, sec, height)
+                img = (self._extract_hdr(src, sec, height, hdr) if hdr is not None
+                       else self._extract(src, sec, height))
                 if img is not None and path:
                     try:
                         img.save(path, "PNG")
@@ -93,9 +96,30 @@ class ProjectThumbWorker(_api.QThread):
             self.ready.emit(key, img)
 
     # ── Дисковый кэш ─────────────────────────────────────────────────────────
-    def _disk_path(self, src, sec, height):
+    def _hdr_of(self, src):
+        """HDR-файл (PQ), который плеер рисует своим тонмаппингом, — яркость
+        для формулы шейдера Qt (edit_tab_frames.qt_pq_image); иначе None.
+        Тонмаппит Qt только кадры аппаратного декодера (P010) — при
+        программном кадр на экране без тонмаппинга, и полоса тоже."""
+        with self._cond:
+            if src in self._hdr:
+                return self._hdr[src]
+        hdr = None
+        if _api.os.environ.get("QT_FFMPEG_DECODING_HW_DEVICE_TYPES"):
+            props = _api.edit_tab_frames.probe_video_props(src)
+            if (props.get("transfer") == "smpte2084" and props.get("width", 0) > 0
+                    and props.get("height", 0) > 0 and not props.get("rotation", 0) % 360):
+                nits = _api.edit_tab_frames.probe_mastering_nits(src)
+                hdr = (_api.edit_tab_frames.qt_pq_max_luminance(nits),
+                       props["width"], props["height"])
+        with self._cond:
+            self._hdr[src] = hdr
+        return hdr
+
+    def _disk_path(self, src, sec, height, hdr=None):
         """Путь кадра в кэше: папка на файл — по пути, размеру и времени
-        изменения (заменённый файл получит новые кадры)."""
+        изменения (заменённый файл получит новые кадры). У HDR — своё имя:
+        прежние кадры этих файлов в кэше белёсые (без тонмаппинга)."""
         if not self._cache_dir:
             return None
         try:
@@ -113,7 +137,8 @@ class ProjectThumbWorker(_api.QThread):
             except OSError:
                 return None
             self._folders[ident] = folder
-        return _api.os.path.join(folder, f"{sec:.3f}_{height}.png")
+        tag = "_qpq" if hdr is not None else ""
+        return _api.os.path.join(folder, f"{sec:.3f}_{height}{tag}.png")
 
     @staticmethod
     def _load(path):
@@ -155,6 +180,37 @@ class ProjectThumbWorker(_api.QThread):
             img = _api.QImage()
             if r.stdout and img.loadFromData(r.stdout, "PNG"):
                 return img
+        return None
+
+    @staticmethod
+    def _extract_hdr(src, sec, height, hdr):
+        """Кадр HDR-файла в цветах воспроизведения: ffmpeg отдаёт уменьшенный
+        кадр в YUV (16 бит), а в RGB его переводит формула шейдера Qt."""
+        max_lum, sw, sh = hdr
+        h = max(8, int(height))
+        w = max(2, int(round(h * sw / float(sh) / 2.0)) * 2)
+        flags = _api.CREATE_NO_WINDOW
+        if _api.os.name == 'nt':
+            flags |= _BELOW_NORMAL_PRIORITY_CLASS
+        tail = ["-ss", f"{max(0.0, sec):.3f}", "-i", src, "-map", "0:v:0?",
+                "-frames:v", "1", "-vf", f"scale={w}:{h}:flags=area,format=yuv444p16le",
+                "-f", "rawvideo", "-pix_fmt", "yuv444p16le", "-"]
+        need = w * h * 3 * 2
+        for probe in (["-probesize", "1000000", "-analyzeduration", "0"], []):
+            try:
+                r = _api.subprocess.run(
+                    [_api.FFMPEG, "-v", "error", "-noaccurate_seek"] + probe + tail,
+                    capture_output=True, timeout=20, creationflags=flags)
+            except Exception:
+                return None
+            if r.stdout and len(r.stdout) >= need:
+                try:
+                    import numpy as np
+                    yuv = np.frombuffer(r.stdout[:need], np.uint16).reshape(3, h, w)
+                    img = _api.edit_tab_frames.qt_pq_image(yuv, max_lum)
+                except Exception:
+                    return None
+                return None if img.isNull() else img
         return None
 
 

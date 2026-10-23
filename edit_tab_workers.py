@@ -12,17 +12,28 @@
 import sys as _sys
 _api = _sys.modules[__name__]
 
+import collections
+import json
 import math
 import os
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import wave
-from config import (CREATE_NO_WINDOW, FFMPEG, FFPROBE, QThread, pyqtSignal)
-from edit_tab_base import (_parse_srt, time_to_s)
+import edit_tab_frames
+import montage_project
+from config import (CREATE_NO_WINDOW, FFMPEG, FFPROBE, QThread, Qt, pyqtSignal)
+from edit_tab_base import (QAudioFormat, QAudioSink, QMediaDevices, _parse_srt,
+                           time_to_s)
+try:
+    from PyQt6.QtMultimedia import QAudio
+except ImportError:                 # без QtMultimedia звук просмотра не поднимется
+    QAudio = None
 from utils import csv_first
-from PyQt6.QtCore import (QFile, QFileDevice, QIODevice)
+from PyQt6.QtCore import (QFile, QFileDevice, QIODevice, QObject, QTimer,
+                          pyqtSlot)
 from PyQt6.QtGui import (QImage)
 
 from si_hyx_parts.edit_tab_workers.share_delete_iodevice import (
@@ -56,3 +67,5 @@ from si_hyx_parts.edit_tab_workers.subtitle_extractor import SubtitleExtractor
 from si_hyx_parts.edit_tab_workers.ass_extractor import AssExtractor, _SeekThumbnailer
 
 from si_hyx_parts.edit_tab_workers.project_thumbs import ProjectThumbWorker
+
+from si_hyx_parts.edit_tab_workers.project_sound import ProjectSoundEngine

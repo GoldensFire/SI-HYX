@@ -63,6 +63,15 @@ class InfoWorker(_api.QThread):
             self.error.emit("yt-dlp не найден. Положите yt-dlp.exe в папку bin рядом с программой.")
             return
         try:
+            # Dream Cast не отдаёт метаданные со страницы — yt-dlp видит только
+            # HTML. Спрашиваем прямой HLS у плеера, как это делает загрузчик.
+            work_url = self.url
+            referer = ""
+            if _api.is_dreamerscast_site(self.url):
+                resolved = _api.resolve_dreamerscast(self.url, proxy=self.proxy)
+                if resolved:
+                    work_url = resolved['url']
+                    referer = resolved.get('referer') or ""
             cmd = base + [
                 "--encoding", "utf-8",
                 "--no-playlist", "--no-warnings", "--skip-download",
@@ -84,7 +93,9 @@ class InfoWorker(_api.QThread):
                 cmd += ["--extractor-args", "youtube:player_client=default,web_safari"]
             if _api.host_matches(self.url, 'bilibili.com', 'b23.tv'):
                 cmd += ["--referer", "https://www.bilibili.com/", "--user-agent", _api.USER_AGENT]
-            cmd += [self.url]
+            if referer:
+                cmd += ["--referer", referer]
+            cmd += [work_url]
 
             # TikTok отдаёт challenge-страницу без данных в ~50-80% запусков
             # («rehydration» ЛИБО «Unexpected response»), НЕЗАВИСИМО от UA/cookies;

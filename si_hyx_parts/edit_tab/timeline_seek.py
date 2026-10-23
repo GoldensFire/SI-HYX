@@ -75,12 +75,17 @@ class EditTabTimelineSeekMixin:
 
     # ── Громкость выходов ────────────────────────────────────────────────────
     def _output_volume(self):
-        """Громкость звука видео и внешней озвучки: ползунок × переход."""
+        """Громкость звука видео и внешней озвучки: ползунок × переход ×
+        громкость клипа проекта (просмотр проекта, project_audio)."""
         try:
             v = self.vol_slider.value() / 100.0
         except Exception:
             v = 1.0
-        return max(0.0, min(1.0, v * float(getattr(self, "_seek_gain", 1.0))))
+        v *= float(getattr(self, "_seek_gain", 1.0))
+        gain = getattr(self, "_pmix_gain", None)
+        if gain is not None:
+            v *= float(gain)
+        return max(0.0, min(1.0, v))
 
     def _apply_output_volume(self):
         v = self._output_volume()

@@ -111,6 +111,7 @@ def _bind(lib):
     lib.ass_set_extract_fonts.argtypes = [c_void_p, c_int]
     lib.ass_set_fonts_dir.argtypes = [c_void_p, c_char_p]
     lib.ass_add_font.argtypes = [c_void_p, c_char_p, c_char_p, c_int]
+    lib.ass_set_style_overrides.argtypes = [c_void_p, POINTER(c_char_p)]
 
     lib.ass_renderer_init.restype = c_void_p
     lib.ass_renderer_init.argtypes = [c_void_p]
@@ -127,6 +128,16 @@ def _bind(lib):
     lib.ass_render_frame.restype = POINTER(ASS_Image)
     lib.ass_render_frame.argtypes = [c_void_p, c_void_p, c_longlong, POINTER(c_int)]
 
+    lib.ass_set_message_cb.argtypes = [c_void_p, c_void_p, c_void_p]
+
+
+# Обработчик сообщений libass по умолчанию печатает в stderr всё до уровня INFO
+# («[ass] Added subtitle file…», «fontselect: …») — в консоли приложения это
+# шум на каждую загрузку дорожки. Свой обработчик их глотает; держим его на
+# уровне модуля, чтобы ctypes-обёртку не собрал сборщик мусора.
+_MSG_CB_TYPE = ctypes.CFUNCTYPE(None, c_int, c_char_p, c_void_p, c_void_p)
+_MSG_CB = _MSG_CB_TYPE(lambda level, fmt, args, data: None)
+
 
 _try_load()
 
@@ -137,14 +148,24 @@ class AssRenderer:
     render(now_ms) -> (QImage|None, changed: bool). QImage в формате
     RGBA8888_Premultiplied, размером с кадр; None — если нет видимых субтитров."""
 
-    def __init__(self, default_family="Arial", fonts=()):
+    def __init__(self, default_family="Arial", fonts=(), style_overrides=()):
         if not AVAILABLE:
             raise RuntimeError("libass недоступна: " + LOAD_ERROR)
         self._lib = _LIB
         self._library = self._lib.ass_library_init()
         if not self._library:
             raise RuntimeError("ass_library_init вернул NULL")
+        self._lib.ass_set_message_cb(self._library,
+                                     ctypes.cast(_MSG_CB, c_void_p), None)
         self._lib.ass_set_extract_fonts(self._library, 1)
+        # Переопределения стилей («Поле=значение» или «Стиль.Поле=значение») —
+        # то же, что force_style у ffmpeg-фильтра subtitles: libass применяет
+        # их при чтении дорожки, поэтому задаются ДО load_ass_*. Строки она
+        # копирует себе.
+        if style_overrides:
+            items = [str(s).encode("utf-8") for s in style_overrides]
+            arr = (c_char_p * (len(items) + 1))(*items, None)
+            self._lib.ass_set_style_overrides(self._library, arr)
         # Свои шрифты (например, шрифт караоке — стиль «Создать субтитры» по
         # умолчанию): системный провайдер их не видит. Добавляем из памяти —
         # libass копирует данные, а путь с не-ASCII символами ей не помеха.

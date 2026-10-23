@@ -45,6 +45,7 @@ def _stub(tmp_path, mode=4, **over):
         main=None,
         log_label=SimpleNamespace(setText=lambda *a: None,
                                   setStyleSheet=lambda *a: None),
+        _project_export_route=lambda: False,
     )
     st._execute_cut_and_process = lambda *a, **k: calls['process'].append((a, k))
     st._execute_cut = lambda *a, **k: calls['cut'].append((a, k))

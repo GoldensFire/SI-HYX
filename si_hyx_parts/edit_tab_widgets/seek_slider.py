@@ -66,6 +66,10 @@ class SeekSlider(_api.QSlider):
             self._last_seek_emit = _api.time.monotonic()  # свежее окно троттлинга для нового драга
             v = self._value_at(int(ev.position().x()))
             self.setValue(v)
+            # Штатный QSlider шлёт sliderPressed/sliderReleased сам, а здесь
+            # нажатие перехвачено — шлём их явно (полноэкранная панель по ним
+            # отличает протяжку от клика).
+            self.sliderPressed.emit()
             self.sliderMoved.emit(v)
             ev.accept()
             return
@@ -96,6 +100,7 @@ class SeekSlider(_api.QSlider):
                 v, self._seek_pending_v = self._seek_pending_v, None
                 self._last_seek_emit = _api.time.monotonic()
                 self.sliderMoved.emit(v)
+            self.sliderReleased.emit()
             ev.accept()
             return
         super().mouseReleaseEvent(ev)
@@ -144,9 +149,14 @@ class SeekPreview:
 
     _QUANT = 1.0   # шаг квантования позиции (сек) — ограничивает число кадров
 
-    def __init__(self, get_duration):
+    def __init__(self, get_duration, locate=None):
         self._get_duration = get_duration
-        self._cache = {}
+        # locate(время полосы) -> (файл, время в нём) или None (там пусто): у
+        # «Монтажа» полоса идёт по проекту, а кадр берётся из клипа под этим
+        # временем. Без locate время полосы — время файла set_source.
+        self._locate = locate
+        self._src = None
+        self._cache = {}               # (файл, время) -> QPixmap
         self._cur_q = None
         self._anchor = None   # (slider, local_x)
         self._popup = _api.QWidget(None, _api.Qt.WindowType.ToolTip
@@ -174,6 +184,7 @@ class SeekPreview:
         self._th.start()
 
     def set_source(self, src):
+        self._src = str(src) if src else None
         self._cache.clear()
         self._cur_q = None
         self._img_lbl.clear()
@@ -182,13 +193,26 @@ class SeekPreview:
         # Префетч одного кадра, чтобы первое наведение уже имело картинку.
         try:
             dur = float(self._get_duration() or 0.0)
-            if dur > 0:
-                self._th.request(self._quant(dur / 2.0))
+            key = self._key(dur / 2.0) if dur > 0 else None
+            if key is not None:
+                self._th.request(key[1], key[0])
         except Exception:
             pass
 
     def _quant(self, sec):
         return round(sec / self._QUANT) * self._QUANT
+
+    def _key(self, sec):
+        """(файл, время в нём) кадра для времени полосы sec или None."""
+        if self._locate is None:
+            return (self._src, self._quant(sec)) if self._src else None
+        try:
+            hit = self._locate(sec)
+        except Exception:
+            hit = None
+        if hit is None or not hit[0]:
+            return None
+        return (str(hit[0]), self._quant(max(0.0, float(hit[1]))))
 
     def show_at(self, slider, local_x, value):
         dur = 0.0
@@ -197,18 +221,23 @@ class SeekPreview:
         if dur <= 0:
             self.hide(); return
         sec = max(0.0, min(dur, (value / 1000.0) * dur))
-        q = self._quant(sec)
-        self._cur_q = q
+        key = self._key(sec)
+        self._cur_q = key
         self._anchor = (slider, local_x)
         # Время — всегда мгновенно.
         self._time_lbl.setText(self._fmt(sec))
         # Картинку обновляем только из кэша; если её нет — оставляем предыдущую
-        # (никаких «сначала цифры, потом кадр») и заказываем извлечение.
-        pm = self._cache.get(q)
-        if pm is not None and not pm.isNull():
-            self._set_image(pm)
-        elif q not in self._cache:
-            self._th.request(q)
+        # (никаких «сначала цифры, потом кадр») и заказываем извлечение. Под
+        # курсором пустота проекта — кадра нет, только время.
+        if key is None:
+            self._img_lbl.clear()
+            self._img_lbl.setFixedSize(0, 0)
+        else:
+            pm = self._cache.get(key)
+            if pm is not None and not pm.isNull():
+                self._set_image(pm)
+            elif key not in self._cache:
+                self._th.request(key[1], key[0])
         self._reposition()
         self._popup.show(); self._popup.raise_()
 
@@ -216,13 +245,13 @@ class SeekPreview:
         self._img_lbl.setFixedSize(pm.width(), pm.height())
         self._img_lbl.setPixmap(pm)
 
-    def _on_ready(self, sec, img):
+    def _on_ready(self, key, img):
         try:
             pm = _api.QPixmap.fromImage(img)
             if not pm.isNull():
-                self._cache[sec] = pm
+                self._cache[key] = pm
                 # Если курсор всё ещё на этой позиции — показываем кадр.
-                if self._cur_q == sec and self._popup.isVisible() and self._anchor:
+                if self._cur_q == key and self._popup.isVisible() and self._anchor:
                     self._set_image(pm)
                     self._reposition()
         except Exception:

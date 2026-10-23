@@ -2,6 +2,9 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """TrackOverlayWorker. Public namespace: edit_tab_workers."""
+import hdr_tonemap
+from utils import escape_filter_path
+
 import edit_tab_workers as _api
 
 
@@ -147,24 +150,37 @@ class TrackOverlayWorker(_api.QThread):
             span = (self._trim_out - self._trim_in
                     if self._trim_out != float('inf') else 0.0)
             dur_args = ["-t", f"{span:.6f}"] if span > 0.001 else []
+            # В bgr24 и обратно — одной матрицей, HDR10 сводится в SDR, как в
+            # просмотре (hdr_tonemap): иначе PQ-кадр выходил блёклым, а у
+            # BT.709-видео уезжал цвет (обратно ffmpeg сводил по BT.601).
+            to_rgb = hdr_tonemap.rgb_decode_filter(self._src, escape_filter_path, "bgr24")
             dec_cmd = ([_api.FFMPEG, "-hide_banner", "-nostdin"] + trim_args
                        + ["-i", self._src] + dur_args
+                       + (["-vf", to_rgb] if to_rgb else [])
                        + ["-an", "-sn", "-dn", "-f", "rawvideo",
                           "-pix_fmt", "bgr24", "-"])
             enc_cmd = [_api.FFMPEG, "-hide_banner", "-nostdin", "-y",
                        "-f", "rawvideo", "-pixel_format", "bgr24",
                        "-video_size", f"{self._w}x{self._h}",
                        "-framerate", f"{self._fps:.6f}", "-i", "-"]
+            enc_vf = []
             if self._w % 2 or self._h % 2:
                 # yuv420p требует чётных сторон — редкие нечётные размеры
                 # (кадрированные исходники) иначе роняют кодировщик.
-                enc_cmd += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+                enc_vf.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+            to_yuv = hdr_tonemap.rgb_encode_filter(self._src) if to_rgb else ""
+            if to_yuv:
+                enc_vf.append(to_yuv)
             if self._has_audio:
                 enc_cmd += (trim_args + ["-i", self._src] + dur_args
                             + ["-map", "0:v:0", "-map", "1:a:0?",
                                "-c:a", "aac", "-b:a", "192k"])
             else:
                 enc_cmd += ["-map", "0:v:0"]
+            # -vf — опция вывода: только после всех входов (перед вторым -i
+            # ffmpeg её отвергает, и кодировщик не стартовал).
+            if enc_vf:
+                enc_cmd += ["-vf", ",".join(enc_vf)]
             enc_cmd += self._venc + ["-pix_fmt", "yuv420p",
                                      "-movflags", "+faststart", "-shortest", out_tmp]
 
@@ -221,6 +237,14 @@ class TrackOverlayWorker(_api.QThread):
                 try:
                     enc.stdin.write(frame.tobytes())
                 except (BrokenPipeError, OSError):
+                    # -shortest: звук кончился раньше видео — кодировщик сам
+                    # дописал файл и закрыл трубу. Это конец, а не сбой.
+                    try:
+                        early_rc = enc.wait(timeout=30)
+                    except Exception:
+                        early_rc = None
+                    if early_rc == 0 and idx > 0:
+                        break
                     raise RuntimeError("Кодировщик неожиданно завершился")
 
                 idx += 1

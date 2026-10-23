@@ -490,12 +490,15 @@ def _wrap_ass_text(text, fm, width):
 
 def _ass_text_shape(text, rect_w, rect_h, family, size, bold, italic, underline,
                     spacing, align, margin_l, margin_r, margin_v, outline,
-                    play_res):
+                    play_res, scale=(1.0, 1.0)):
     """Контуры текста (path) и его «тела» с обводкой (body, для тени) в
-    координатах области rect_w×rect_h. Считается один раз на текст и размер."""
+    координатах области rect_w×rect_h. Считается один раз на текст и размер.
+    scale — ScaleX/ScaleY стиля долями (1 — 100 %), как у libass: глифы и шаг
+    строк растягиваются, кегль остаётся."""
+    sx, sy = (max(0.01, float(v)) for v in scale)
     key = (text, rect_w, rect_h, family, round(size, 3), bold, italic, underline,
            round(spacing, 3), align, margin_l, margin_r, margin_v,
-           round(outline, 3), play_res)
+           round(outline, 3), play_res, round(sx, 4), round(sy, 4))
     hit = _ASS_TEXT_CACHE.get(key)
     if hit is not None:
         return hit
@@ -512,14 +515,16 @@ def _ass_text_shape(text, rect_w, rect_h, family, size, bold, italic, underline,
     ref = 200.0
     font.setPixelSize(int(ref))
     k = size_px * ratio / ref
+    kx, ky = k * sx, k * sy
     if spacing:
         font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing,
-                              spacing * scale_y / k)
+                              spacing * scale_y / kx)
     fm = QFontMetricsF(font)
     ml, mr, mv = margin_l * scale_x, margin_r * scale_x, margin_v * scale_y
     avail = max(1.0, rect_w - ml - mr)
-    lines = _wrap_ass_text(text, fm, avail / k)
-    block = size_px * len(lines)
+    lines = _wrap_ass_text(text, fm, avail / kx)
+    line_h = size_px * sy
+    block = line_h * len(lines)
     row, col = (int(align) - 1) // 3, (int(align) - 1) % 3
     top = (rect_h - mv - block if row == 0
            else (rect_h - block) / 2.0 if row == 1 else mv)
@@ -527,11 +532,11 @@ def _ass_text_shape(text, rect_w, rect_h, family, size, bold, italic, underline,
     for i, line in enumerate(lines):
         if not line:
             continue
-        w = fm.horizontalAdvance(line) * k
+        w = fm.horizontalAdvance(line) * kx
         x = ml if col == 0 else (rect_w - mr - w if col == 2 else ml + (avail - w) / 2.0)
-        base = top + i * size_px + size_px * asc_frac
-        ref_path.addText(QPointF(x / k, base / k), font, line)
-    path = QTransform.fromScale(k, k).map(ref_path)
+        base = top + i * line_h + line_h * asc_frac
+        ref_path.addText(QPointF(x / kx, base / ky), font, line)
+    path = QTransform.fromScale(kx, ky).map(ref_path)
     body = path
     if outline > 0:
         stroker = QPainterPathStroker()
@@ -575,7 +580,9 @@ def _paint_ass_text(painter, rect, text, style, margins=None,
         float(style.get('size') or DEFAULT_SUBTITLE_STYLE['size']),
         bool(style.get('bold')), bool(style.get('italic')),
         bool(style.get('underline')), float(style.get('spacing') or 0),
-        int(style.get('align') or 2), ml, mr, mv, outline, play_res)
+        int(style.get('align') or 2), ml, mr, mv, outline, play_res,
+        (_style_num(style, 'scale_x', 100) / 100.0,
+         _style_num(style, 'scale_y', 100) / 100.0))
     painter.save()
     painter.translate(rect.left(), rect.top())
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -599,23 +606,34 @@ def _prog_sub_style():
     return dict(DEFAULT_SUBTITLE_STYLE)
 
 
-def prog_sub_force_style(play_res_y=None):
-    """force_style ffmpeg-фильтра subtitles для программного стиля.
+def prog_sub_force_style(play_res_y=None, play_res_x=None):
+    """force_style ffmpeg-фильтра subtitles для программного стиля. Тот же
+    список (через запятую) превью отдаёт своей libass — ass_set_style_overrides,
+    — поэтому субтитры в плеере и во вшитом файле одни.
 
-    play_res_y — высота холста самой дорожки: у SRT/VTT это 288 (холст, на
-    котором их рендерит ffmpeg), у ASS — её PlayResY. Без пересчёта кегль 21
-    на холсте 1080 вышел бы вчетверо мельче."""
+    play_res_y/play_res_x — холст самой дорожки: у SRT/VTT это 384×288 (холст,
+    на котором их рендерит ffmpeg), у ASS — её PlayResY/PlayResX. Без пересчёта
+    кегль 21 на холсте 1080 вышел бы вчетверо мельче.
+
+    Поля стиля ASS, которых нет у программного, сбрасываются явно: иначе
+    оставались бы от оригинала — ScaleY 60 сплющивал шрифт караоке, а
+    выравнивание вправо уводило реплику к краю. ScaleX/ScaleY у force_style
+    libass — доли (1 = 100 %), не проценты, как в самом файле."""
     st = _prog_sub_style()
     k = float(play_res_y or _ASS_PLAYRES_Y) / _ASS_PLAYRES_Y
+    kx = float(play_res_x or _ASS_PLAYRES_X) / _ASS_PLAYRES_X
 
-    def num(v):
-        return f"{float(v) * k:.2f}".rstrip("0").rstrip(".")
+    def num(v, scale=k):
+        return f"{float(v) * scale:.2f}".rstrip("0").rstrip(".")
 
     return (f"FontName={_karaoke_style.FONT_NAME},Fontsize={num(st['size'])},Bold=1,"
+            f"Italic=0,Underline=0,StrikeOut=0,ScaleX=1,ScaleY=1,Spacing=0,Angle=0,"
             f"PrimaryColour={_hex_to_ass_color(st['color'])},"
             f"OutlineColour={_hex_to_ass_color(st['outline_color'])},"
             f"BackColour={_hex_to_ass_color('#000000', st['shadow_alpha'])},"
             f"BorderStyle=1,Outline={num(st['outline'])},Shadow={num(st['shadow'])},"
+            f"Alignment=2,MarginL={num(_ASS_MARGIN_L, kx)},"
+            f"MarginR={num(_ASS_MARGIN_R, kx)},"
             f"MarginV={num(PROG_SUB_MARGIN_V)},ScaledBorderAndShadow=yes")
 
 
@@ -681,12 +699,15 @@ _ASS_PLAYRES_X, _ASS_PLAYRES_Y = 384, 288
 _ASS_MARGIN_L, _ASS_MARGIN_R, _ASS_MARGIN_V = 10, 10, 20
 
 
-def _animation_override_tags(anim, align, duration_s):
+def _animation_override_tags(anim, align, duration_s, play_res=None, margins=None):
     """Строит override-теги ASS ({\\...}) для простой анимации появления —
     fade/slide/pop. Тайминг анимации — треть длительности реплики (но не больше
-    300мс и не меньше 50мс), чтобы короткие реплики не «залипали» в анимации."""
+    300мс и не меньше 50мс), чтобы короткие реплики не «залипали» в анимации.
+    play_res/margins — холст и отступы файла (по умолчанию свои 384×288)."""
     if anim not in ('fade', 'slide', 'pop'):
         return ''
+    res_x, res_y = play_res or (_ASS_PLAYRES_X, _ASS_PLAYRES_Y)
+    m_l, m_r, m_v = margins or (_ASS_MARGIN_L, _ASS_MARGIN_R, _ASS_MARGIN_V)
     dur_ms = max(10, int(round(duration_s * 1000)))
     t = min(300, max(50, dur_ms // 3))
     if anim == 'fade':
@@ -697,18 +718,17 @@ def _animation_override_tags(anim, align, duration_s):
     # обычные формулы ASS для \pos/\move), старт — со смещением за пределы
     # кадра со стороны, соответствующей горизонтали/вертикали выравнивания.
     row = (align - 1) // 3; col = (align - 1) % 3
-    x = (_ASS_PLAYRES_X / 2 if col == 1
-         else (_ASS_MARGIN_L if col == 0 else _ASS_PLAYRES_X - _ASS_MARGIN_R))
-    y = (_ASS_PLAYRES_Y - _ASS_MARGIN_V if row == 0
-         else (_ASS_PLAYRES_Y / 2 if row == 1 else _ASS_MARGIN_V))
+    x = res_x / 2 if col == 1 else (m_l if col == 0 else res_x - m_r)
+    y = res_y - m_v if row == 0 else (res_y / 2 if row == 1 else m_v)
+    off_x, off_y = 60 * res_x / _ASS_PLAYRES_X, 40 * res_y / _ASS_PLAYRES_Y
     if col == 0:
-        x0, y0 = -60, y
+        x0, y0 = -off_x, y
     elif col == 2:
-        x0, y0 = _ASS_PLAYRES_X + 60, y
+        x0, y0 = res_x + off_x, y
     elif row == 0:
-        x0, y0 = x, _ASS_PLAYRES_Y + 40
+        x0, y0 = x, res_y + off_y
     elif row == 2:
-        x0, y0 = x, -40
+        x0, y0 = x, -off_y
     else:
         x0, y0 = x, y
     return f"{{\\move({x0:.0f},{y0:.0f},{x:.0f},{y:.0f},0,{t})}}"
@@ -727,8 +747,11 @@ def _style_line(name, style):
     # нет — им остаются прежние Outline 1 и Shadow 0.
     border = f"{_style_num(style, 'outline', 1):g},{_style_num(style, 'shadow', 0):g}"
     back = _hex_to_ass_color('#000000', int(_style_num(style, 'shadow_alpha', 0)))
+    # Растяжение — у реплик, взятых из стилей ASS при правке (см.
+    # subtitle_style.editor_style); у своих стилей его нет — 100 %.
+    scale = f"{_style_num(style, 'scale_x', 100):g},{_style_num(style, 'scale_y', 100):g}"
     return (f"Style: {name},{font},{size},{primary},&H000000FF,{outline},{back},"
-            f"{bold},{italic},{underline},0,100,100,{spacing},0,1,{border},{align},"
+            f"{bold},{italic},{underline},0,{scale},{spacing},0,1,{border},{align},"
             f"{_ASS_MARGIN_L},{_ASS_MARGIN_R},{_ASS_MARGIN_V},1")
 
 

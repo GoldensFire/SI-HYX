@@ -2,6 +2,8 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """Обработка: аргументы ffmpeg — кадрирование, фильтры, кодеки и подбор CRF по метрике."""
+import hdr_tonemap
+
 import workers as _api
 
 # Наименьший CRF, который libsvtav1 действительно применяет. «-crf 0» ffmpeg
@@ -850,14 +852,35 @@ class ProcessFiltersMixin:
         (координаты в пикселях ИСХОДНОГО кадра), item['overlay_format'] — формат
         работы overlay, посчитанный Монтажом по pix_fmt исходника. Формата нет —
         считаем сами: `format=auto` оставлять нельзя, иначе RGBA-накладка уводит
-        весь граф в RGB и цвет итогового файла уезжает."""
+        весь граф в RGB и цвет итогового файла уезжает.
+
+        Элемент из Монтажа с HDR10-исходником (item['sdr_tonemap']) сперва
+        сводится в SDR, как в просмотре Монтажа, — до накладок и цепочки."""
+        tone = self._sdr_tonemap_vf(item)
         chain = ",".join(vf_list)
         rendered = [tuple(o) for o in (item.get('overlays') or [])]
         if not rendered:
-            return chain
+            return ",".join(c for c in (tone, chain) if c)
         fmt = item.get('overlay_format') or _api.overlay_chroma_format(
             _api.get_pix_fmt(current_input))
-        return _api.overlay_filter_graph(chain, rendered, pix_fmt=fmt)
+        return _api.overlay_filter_graph(chain, rendered, pix_fmt=fmt, pre_chain=tone)
+
+    @staticmethod
+    def _sdr_tonemap_vf(item):
+        """Сведение HDR10 в SDR (hdr_tonemap) для элемента из Монтажа или "".
+        10 бит на выходе: кодирует SVT-AV1 10 бит, а формат накладки Монтаж
+        считает по 10-битному исходнику."""
+        if not item.get('sdr_tonemap') or item.get('project'):
+            return ""
+        return hdr_tonemap.tonemap_filter(item.get('path') or "", _api.escape_filter_path,
+                                          pix_fmt="yuv420p10le")
+
+    def _color_args(self, item, path):
+        """Цветовые теги кодирования: BT.709 у сведённого в SDR HDR, иначе
+        _bt709_color_args (HDR-исходник без сведения тегов не получает)."""
+        if self._sdr_tonemap_vf(item):
+            return list(hdr_tonemap.SDR_COLOR_ARGS)
+        return self._bt709_color_args(path)
 
     def _metric_vf(self, vf_list, item, sample_input):
         """Цепочка для пробных кодирований подбора CRF и оценки XPSNR: только

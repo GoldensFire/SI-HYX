@@ -531,7 +531,7 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                         _api.FFMPEG, "-y",
                     ] + trim_pre + ["-i", current_input] + trim_post \
                       + self._map_av_args(remove_audio, a_map_sel) + timing_args + ["-map_metadata", "-1", "-map_chapters", "-1"] \
-                      + self._bt709_color_args(current_input) + fps_args \
+                      + self._color_args(item, current_input) + fps_args \
                       + self._av1_encoder_args(crf, preset_val, pix_fmt, video_tune)
                     if vf_arg:
                         cmd_dark += ["-vf", vf_arg]
@@ -567,10 +567,10 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                                       "-pix_fmt", "yuva420p"]
                     elif has_alpha:
                         self.log.emit("⚠ libvpx-vp9 недоступен — альфа будет потеряна (SVT-AV1 alpha не поддерживает)")
-                        cmd_step2 += self._bt709_color_args(current_input)
+                        cmd_step2 += self._color_args(item, current_input)
                         cmd_step2 += self._av1_encoder_args(crf, max(0, min(8, sv.get('pre', 8))), self._choose_pix_fmt(False), video_tune)
                     else:
-                        cmd_step2 += self._bt709_color_args(current_input)
+                        cmd_step2 += self._color_args(item, current_input)
                         cmd_step2 += self._av1_encoder_args(crf, max(0, min(8, sv.get('pre', 8))), pix_fmt, video_tune)
 
                     if vf_arg: cmd_step2 += ["-vf", vf_arg]

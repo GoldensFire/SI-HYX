@@ -269,7 +269,10 @@ class FfmpegWorker(_api.QThread):
         proc = self.proc
         if self.duration is None:
             rc = proc.wait()
-            self.finished.emit(rc == 0 and not self._stopped, f"Код: {rc}")
+            if self._stopped:
+                self.finished.emit(False, "Отменено")
+            else:
+                self.finished.emit(rc == 0, f"Код: {rc}")
             return
 
         # Хвост вывода ffmpeg (без строк прогресса) — в сообщение об ошибке:

@@ -10,6 +10,35 @@ import widgets as _api
 # фото» (photo_tab.py). Держим здесь, чтобы tabs.py и photo_tab.py не зависели
 # друг от друга (иначе получался бы циклический импорт).
 
+class _TabScrollStyle(_api.QProxyStyle):
+    """Геометрия стрелок прокрутки для QTabBar.
+
+    Родной стиль ставит обе кнопки в блок у правого края, и QTabBar обрезает
+    вкладки по левой из них. Левую мы уводим к левому краю (TabScrollArrows),
+    а её пустой слот справа всё равно отрезал вкладки — получалась широкая
+    тёмная полоса перед стрелкой. Здесь слот левой кнопки совпадает с правой,
+    так что справа резервируется ровно одна стрелка, и обе шириной в значок."""
+
+    WIDTH = 14   # значок 11px + по пикселю-полтора с боков
+
+    def pixelMetric(self, metric, option=None, widget=None):
+        if metric == _api.QStyle.PixelMetric.PM_TabBarScrollButtonWidth:
+            return self.WIDTH
+        return super().pixelMetric(metric, option, widget)
+
+    def subElementRect(self, element, option, widget=None):
+        if element in (_api.QStyle.SubElement.SE_TabBarScrollLeftButton,
+                       _api.QStyle.SubElement.SE_TabBarScrollRightButton):
+            r = option.rect
+            if r.width() >= r.height():
+                return _api.QRect(r.right() + 1 - self.WIDTH, r.top(),
+                                  self.WIDTH, r.height())
+        return super().subElementRect(element, option, widget)
+
+_TabScrollStyle.__module__ = _api.__name__
+_api._TabScrollStyle = _TabScrollStyle
+
+
 class TabScrollArrows(_api.QObject):
     """Стрелки прокрутки вкладок «как в браузере».
 
@@ -42,6 +71,11 @@ class TabScrollArrows(_api.QObject):
                 return
             self.left, self.right = btns[0], btns[-1]
         self._busy = False
+        # Стиль не принадлежит виджету (setStyle не забирает владение) —
+        # держим его детищем контроллера, который живёт столько же, сколько бар.
+        self._style = _TabScrollStyle(_api.QApplication.style().name())
+        self._style.setParent(self)
+        bar.setStyle(self._style)
         self._style_buttons()
         for b in (self.left, self.right):
             b.installEventFilter(self)
@@ -56,7 +90,7 @@ class TabScrollArrows(_api.QObject):
         этих двух кнопок. Фон непрозрачный НАРОЧНО: кнопки лежат ПОВЕРХ
         вкладок, и сквозь прозрачную было бы видно вкладку под низом."""
         flat = ("QToolButton{background:#1e1e2e;border:none;border-radius:0px;"
-                "padding:0px;margin:0px;min-width:18px;min-height:0px;}"
+                "padding:0px;margin:0px;min-width:0px;min-height:0px;}"
                 "QToolButton:hover{background:#313244;}"
                 "QToolButton:disabled{background:#1e1e2e;}")
         for b, icon in ((self.left, 'fa5s.chevron-left'),

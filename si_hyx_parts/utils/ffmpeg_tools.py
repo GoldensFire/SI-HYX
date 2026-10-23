@@ -70,14 +70,16 @@ _api.escape_filter_path = escape_filter_path
 
 
 def overlay_filter_graph(base_chain, rendered, escape_path=None,
-                         pix_fmt="yuv420"):
+                         pix_fmt="yuv420", pre_chain=""):
     """Собирает -vf для экспорта с наложенными картинками.
 
     base_chain — уже готовая цепочка видеофильтров одной строкой (кадрирование,
                  субтитры, пикселизация, масштаб/фейды «Обработки»), может быть
                  пустой;
     rendered   — список (png_path, x, y) от ImageOverlay.save_png;
-    pix_fmt    — формат работы overlay (см. overlay_chroma_format).
+    pix_fmt    — формат работы overlay (см. overlay_chroma_format);
+    pre_chain  — цепочка ДО накладок (сведение HDR в SDR — hdr_tonemap:
+                 картинка ложится уже на SDR-кадр), может быть пустой.
 
     Схема графа (без спец-меток вроде [in]/[out], их поддержка у ffmpeg
     исторически плавала): картинки заводятся источниками `movie`, кадр проходит
@@ -87,13 +89,13 @@ def overlay_filter_graph(base_chain, rendered, escape_path=None,
     кадрирование/масштаб обязаны применяться уже к кадру с картинкой — ровно
     так, как это видно в плеере Монтажа."""
     if not rendered:
-        return base_chain or ""
+        return ",".join(c for c in (pre_chain, base_chain) if c)
     esc = escape_path or _api.escape_filter_path
     fmt = (pix_fmt or "yuv420").strip()
     parts = []
     for i, (png, _x, _y) in enumerate(rendered):
         parts.append(f"movie='{esc(png)}',format=rgba[sihyxovl{i}]")
-    parts.append("null[sihyxbase0]")
+    parts.append(f"{pre_chain or 'null'}[sihyxbase0]")
     last = len(rendered) - 1
     for i, (_png, x, y) in enumerate(rendered):
         out = "" if (i == last and not base_chain) else f"[sihyxbase{i + 1}]"

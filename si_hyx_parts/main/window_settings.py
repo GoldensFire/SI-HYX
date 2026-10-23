@@ -711,6 +711,17 @@ class UnifiedWindowSettingsMixin:
         add_row(sec_about, grp_links,
                 "discord github ссылки сообщество поддержка поддержать автора донат donationalerts обновления")
 
+        # ── Опциональная локальная надстройка настроек ───────────────────────
+        # Кнопки, живущие в файле _local_dev.py рядом с main.py (файл добавлен
+        # в .gitignore). В новой выгрузке и в релизной сборке файла нет —
+        # ImportError гасится, секция просто не появляется.
+        try:
+            import _local_dev
+        except ImportError:
+            pass
+        else:
+            _local_dev.extend_settings(self, sections, make_section, add_row, hint)
+
         content_l.addStretch(1)
 
         # ── Навигация ↔ прокрутка (взаимная синхронизация) ───────────────────
@@ -798,7 +809,9 @@ class UnifiedWindowSettingsMixin:
                         'preset_mode': 'dark' if tm.btn_mode_dark.isChecked() else 'std',
                         'metric': tm._video_metric_value(), 'target_metric': float(tm.s_target_metric.value()),
                         'vfade_in': bool(tm.ck_vfade_in.isChecked()), 'vfade_in_d': float(tm.s_vfade_in.value()),
-                        'vfade_out': bool(tm.ck_vfade_out.isChecked()), 'vfade_out_d': float(tm.s_vfade_out.value())
+                        'vfade_out': bool(tm.ck_vfade_out.isChecked()), 'vfade_out_d': float(tm.s_vfade_out.value()),
+                        'tune': tm._video_tune_value(),
+                        'crop_black': bool(tm.ck_crop_black.isChecked())
                     },
                     'export_dir': getattr(tm, 'export_dir', '') or ''
                 },
@@ -921,7 +934,7 @@ class UnifiedWindowSettingsMixin:
                 tm.chk_enable_video, tm.btn_mode_dark,
                 tm.ck_overwrite_src,
                 tm.ck_lim, tm.ck_dim,
-                tm.ck_vfade_in, tm.ck_vfade_out,
+                tm.ck_vfade_in, tm.ck_vfade_out, tm.ck_crop_black,
                 ty.chk_k,
             ]
             # Виджеты с сигналом valueChanged (QSpinBox, QDoubleSpinBox, QSlider)

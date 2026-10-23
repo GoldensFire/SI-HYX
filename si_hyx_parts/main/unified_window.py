@@ -67,6 +67,7 @@ class UnifiedWindow(
         # Прогресс на иконке в панели задач (Windows 11, ITaskbarList3)
         self._taskbar = _api.TaskbarProgress()
         self._taskbar_hwnd = 0
+        _api.QTimer.singleShot(1500, self._warn_taskbar_broken)
         self.log_signal.connect(self.log)
         self.update_available_sig.connect(self._on_update_available)
         self.update_ready_sig.connect(self._apply_update)
@@ -197,6 +198,9 @@ class UnifiedWindow(
         try:
             self.tabs.tabBar().setUsesScrollButtons(True)
             self.tabs.tabBar().setElideMode(_api.Qt.TextElideMode.ElideNone)
+            # Справа на вкладке стоит значок ⓘ со своим отступом от рамки
+            # (см. _add_tab); общий padding-right давал лишнюю пустоту перед ним.
+            self.tabs.tabBar().setStyleSheet("QTabBar::tab{padding-right:0px;}")
             self._style_tab_scroll_buttons()
         except Exception:
             pass
@@ -595,6 +599,7 @@ class UnifiedWindow(
             tm.s_vfade_in.setValue(v.get("vfade_in_d", 1.0))
             tm.ck_vfade_out.setChecked(v.get("vfade_out", False))
             tm.s_vfade_out.setValue(v.get("vfade_out_d", 1.0))
+            tm.ck_crop_black.setChecked(bool(v.get("crop_black", False)))
         except Exception as e:
             self.log(f"_load_settings(video) error: {e}")
 

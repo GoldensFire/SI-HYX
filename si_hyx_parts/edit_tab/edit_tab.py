@@ -3,6 +3,7 @@
 # See LICENSE and the public module for attribution and API.
 """EditTab. Public namespace: edit_tab."""
 import edit_tab as _api
+from sip_notify import prime_disconnect_notify
 from si_hyx_parts.edit_tab.layout import EditTabLayoutMixin
 from si_hyx_parts.edit_tab.tracks import EditTabTracksMixin
 from si_hyx_parts.edit_tab.playback import EditTabPlaybackMixin
@@ -15,6 +16,9 @@ from si_hyx_parts.edit_tab.project import EditTabProjectMixin
 from si_hyx_parts.edit_tab.timeline_seek import EditTabTimelineSeekMixin
 from si_hyx_parts.edit_tab.subtitle_sync import EditTabSubtitleSyncMixin
 from si_hyx_parts.edit_tab.project_audio import EditTabProjectAudioMixin
+from si_hyx_parts.edit_tab.splice_bridge import EditTabSpliceBridgeMixin
+from si_hyx_parts.edit_tab.project_sound import EditTabProjectSoundMixin
+from si_hyx_parts.edit_tab.session_state import EditTabSessionMixin
 
 
 # ─── Edit Tab ─────────────────────────────────────────────────────────────────
@@ -31,11 +35,16 @@ class EditTab(
     EditTabEntranceMixin,
     EditTabProjectMixin,
     EditTabProjectAudioMixin,
+    EditTabSpliceBridgeMixin,
+    EditTabProjectSoundMixin,
+    EditTabSessionMixin,
     _api.QWidget,
 ):
     # Боковая панель монтажа: кнопки масштабируются под ровно столько значков в высоту.
     _MSIDE_COUNT = 8
     _MSIDE_GAP = 6
+    # Шестерёнка настроек экспорта справа от «Экспорт» (её ширина отнята у кнопки).
+    _EXPORT_GEAR_W = 36
 
     def __init__(self, main_window=None):
         super().__init__()
@@ -169,12 +178,13 @@ class EditTab(
         self._scrub_sink_io = None
         self._scrub_sink_asleep = False   # suspend() после тишины, см. _sleep_scrub_sink
         self._scrub_fmt = None
-        self._scrub_wait = None       # (время, когда) — шаг ждёт окно PCM
+        self._scrub_wait = None       # (proj_t, время звука, когда) — шаг ждёт окно PCM
         # Громкость до выключения звука кликом по динамику (см. toggle_mute).
         self._vol_before_mute = 100
         # Режим «только звук» (кнопка наушников): видео снято с плеера, чтобы
-        # тяжёлый файл не лагал. Живёт до перезапуска приложения и НЕ пишется в
-        # настройки — иначе через месяц «пропало видео» было бы загадкой.
+        # тяжёлый файл не лагал. Переживает перезапуск, как и остальное
+        # состояние вкладки (session_state): почему нет картинки и как её
+        # вернуть, на холсте написано (_update_audio_only_placeholder).
         self._audio_only_mode = False
         self._audio_only_prev_track = 0
         # Папка экспорта обрезки ("" = рядом с исходником)
@@ -188,7 +198,9 @@ class EditTab(
         self.trim_end_seq   = "Shift+V"   # обрезать КОНЕЦ (OUT) до плейхеда
 
         self.player = _api.QMediaPlayer()
-        self.audio_output = _api.QAudioOutput()
+        # Первый disconnectNotify выхода — здесь, под нашим GIL: иначе его зовёт
+        # поток ffmpeg-плагина под мьютексом Qt и ждёт GIL (см. sip_notify).
+        self.audio_output = prime_disconnect_notify(_api.QAudioOutput())
         self.player.setAudioOutput(self.audio_output)
         # Отключили наушники / сменилось устройство вывода — переезжаем на
         # живое, иначе сеанс WASAPI аннулируется и звук пропадает до
@@ -239,6 +251,8 @@ class EditTab(
         self._subtitle_fonts_cache = {}   # (path, mtime, size) -> fonts_dir
         # Проект из кусков (как в Filmora) — модель и состояние просмотра.
         self._project_init()
+        # Состояние вкладки между запусками (плейхед, дорожки файлов).
+        self._session_init()
 
         self.init_ui()
         self.apply_theme()
@@ -329,6 +343,16 @@ class EditTab(
         if (event.type() == _api.QEvent.Type.Resize
                 and watched is getattr(self, "audio_meter", None)):
             self._resize_montage_side_btns(watched.height())
+        # Кнопку экспорта сжала теснота в строке плеера → подпись по ширине.
+        if (event.type() == _api.QEvent.Type.Resize
+                and watched is getattr(self, "btn_cut", None)):
+            self._refresh_export_btn()
+        # Место под видео изменилось (рос таймлайн, ресайз окна) → холст заново
+        # вписывается в контейнер, иначе вылезет на кнопки под ним.
+        if (event.type() == _api.QEvent.Type.Resize
+                and watched is getattr(self, "video_container", None)
+                and getattr(self, "_ready", False)):
+            self._adjust_video_height()
         if event.type() == _api.QEvent.Type.Wheel and isinstance(
                 watched, (_api.QSpinBox, _api.QComboBox, _api.QSlider)):
             # Виджеты с пометкой wheelAlways (ползунок громкости) — колесо меняет
@@ -584,6 +608,8 @@ class EditTab(
     _VK_I = 0x49
     _VK_O = 0x4F
     _VK_B = 0x42
+    _VK_C = 0x43
+    _VK_V = 0x56
 
     def keyPressEvent(self, event):
         if event.modifiers() & _api.Qt.KeyboardModifier.ControlModifier:
@@ -608,6 +634,16 @@ class EditTab(
             # Ctrl+B — разрезать клип проекта у плейхеда (как в Filmora).
             if vk == self._VK_B or event.key() == _api.Qt.Key.Key_B:
                 self.project_split()
+                event.accept()
+                return
+            # Ctrl+C / Ctrl+V — копировать клипы и вставить их у плейхеда. Поле
+            # ввода в фокусе забирает их себе раньше (копирует свой текст).
+            if vk == self._VK_C or event.key() == _api.Qt.Key.Key_C:
+                self.project_copy()
+                event.accept()
+                return
+            if vk == self._VK_V or event.key() == _api.Qt.Key.Key_V:
+                self.project_paste()
                 event.accept()
                 return
         elif not (event.modifiers() & (_api.Qt.KeyboardModifier.AltModifier
@@ -674,6 +710,8 @@ class EditTab(
                 'zoom':       float(self.waveform.zoom),
                 'view_offset': float(self.waveform.view_offset),
                 'volume':     int(self.vol_slider.value()),   # громкость теперь сохраняется (пункт B)
+                'volume_before_mute': int(getattr(self, '_vol_before_mute', 100) or 0),
+                'audio_only': bool(getattr(self, '_audio_only_mode', False)),
                 'trim_start_seq': self.trim_start_seq,
                 'trim_end_seq':   self.trim_end_seq,
                 'export_dir':     self.export_dir or "",
@@ -685,6 +723,7 @@ class EditTab(
                     if hasattr(self, 'spin_proxy_min') else 0,
                 'subtitle_style': dict(getattr(self, '_last_subtitle_style', None) or {}) or None,
                 'project_collapsed': bool(getattr(self, '_proj_collapsed', False)),
+                'session': self._session_settings(),
             }
             # Атомарно (временный файл + подмена): прямая запись обрезала файл
             # ДО того, как в него ляжет новое содержимое, и жёсткое завершение
@@ -718,6 +757,14 @@ class EditTab(
             vol = max(0, min(100, int(settings.get('volume', 100))))
             self.vol_slider.setValue(vol)
             self._apply_output_volume()
+            self._vol_before_mute = max(0, min(100, int(settings.get('volume_before_mute', 100))))
+            if settings.get('audio_only') and hasattr(self, 'btn_audio_only'):
+                # Без сигнала: файла ещё нет — плееру режим применится на
+                # LoadedMedia (on_media_status_changed), холсту — при открытии.
+                self._audio_only_mode = True
+                self.btn_audio_only.blockSignals(True)
+                self.btn_audio_only.setChecked(True)
+                self.btn_audio_only.blockSignals(False)
             self.set_trim_shortcuts(
                 settings.get('trim_start_seq', self.trim_start_seq),
                 settings.get('trim_end_seq', self.trim_end_seq),
@@ -731,6 +778,7 @@ class EditTab(
             self._last_subtitle_style = settings.get('subtitle_style') or None
             self._proj_collapsed = bool(settings.get('project_collapsed', False))
             self._project_apply_collapsed()
+            self._session_load(settings.get('session'))
         except Exception:
             pass
 
