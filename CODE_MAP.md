@@ -60,7 +60,8 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
   первому буферу нового места), протяжка плейхеда мышью (пауза на время
   протяжки, одна перемотка в полёте), кадр остановки и прогрев после кадра;
   [subtitle_sync](si_hyx_parts/edit_tab/subtitle_sync.py) — автосинхронизация
-  субтитров по звуку (сдвиг ±5 с, копия `…_sync.srt/.ass`);
+  субтитров по звуку (сдвиг ±5 с, копия `…_sync.srt/.ass`; расчёт без Qt —
+  [speech_sync.py](speech_sync.py), реэкспорт);
   [effects](si_hyx_parts/edit_tab/effects.py) — кадрирование, пикселизация,
   накладки, удаление объекта, трекинг; [export](si_hyx_parts/edit_tab/export.py) —
   кодировщик, обрезка, Smart Cut, шестерёнка у «Экспорт» — окно
@@ -796,6 +797,18 @@ ffmpeg/ffprobe, экранирование путей в фильтрах и в�
 12 fps, до 8 МБ, время проекта в углу) рендерятся через `excerpt` +
 `build_source`, как итог; `ask` отдаёт их в `GeminiClient.generate_json` со
 схемой (ключ — `GEMINI_API_KEY` или `api_keys.gemini` настроек; тратит квоту).
+Анализ → маркеры (`Marker` в схеме v2: время, вид scene/beat/onset/silence/
+speech/word/custom, подпись, сила, `end` у отрезков) —
+[analysis.py](si_hyx_parts/montage_tool/analysis.py): `analyze` во времени
+проекта (`--track` — звук одной дорожки, `--write` — в проект; свои маркеры
+не трогаются), `analyze-file` — во времени файла. Сцены — scdet по картинке
+итога; онсеты и биты — поток в лог-частотных полосах (центрированные кадры
+10 мс, поправка `ONSET_LAG_S`), темп автокорреляцией, биты — ДП Эллиса,
+сильная доля — по басу; тишина — громкость, речь —
+`speech_sync.speech_activity`; слова и стемы — `karaoke/asr_worker.py` в
+Python генератора (`music_effects.runtime_python`), музыка стема — звук
+минус вокал. Таймлайн рисует маркеры у низа линейки и прилипает к видимым
+(`_visible_markers` в project_timeline).
 
 Плеер «Монтажа» читает файл через QFile поверх хэндла с FILE_SHARE_DELETE
 (`open_share_delete_file` в
