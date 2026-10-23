@@ -13,7 +13,7 @@ import re
 
 import montage_project as _api
 
-_TOP_FIELDS = ("version", "tracks", "clips", "settings")
+_TOP_FIELDS = ("version", "tracks", "clips", "settings", "markers")
 _TRACK_FIELDS = {"kind": str, "enabled": bool, "muted": bool}
 _CLIP_FIELDS = {
     "src": str, "in_s": float, "out_s": float, "track": int, "start": float, "id": str,
@@ -24,6 +24,8 @@ _CLIP_FIELDS = {
 _CLIP_REQUIRED = ("src", "in_s", "out_s", "track")
 _SETTINGS_FIELDS = {"width": int, "height": int, "fps": float, "fit": str,
                     "background": str, "loudness": float}
+_MARKER_FIELDS = {"t": float, "kind": str, "label": str, "strength": float, "end": float}
+_MARKER_LABEL_MAX = 500
 _COLOR_RX = re.compile(r"#[0-9A-Fa-f]{6}")
 _MAX_SIDE = 8192
 _MAX_FPS = 240.0
@@ -130,6 +132,54 @@ def parse_settings(raw):
     if _is_num(loud) and _LOUDNESS_RANGE[0] <= loud <= _LOUDNESS_RANGE[1]:
         s.loudness = float(loud)
     return s
+
+
+def parse_markers(raw):
+    """Маркеры из списка словарей (мягкая загрузка: негодные выбрасываются),
+    по времени."""
+    out = []
+    for m in raw if isinstance(raw, list) else []:
+        if not isinstance(m, dict):
+            continue
+        t = _num_or(m.get("t"), None)
+        kind = m.get("kind", "custom")
+        if t is None or t < 0 or kind not in _api.MARKER_KINDS:
+            continue
+        end = _num_or(m.get("end"), None)
+        strength = _num_or(m.get("strength", 1.0), 1.0)
+        out.append(_api.Marker(t=t, kind=kind, label=str(m.get("label") or "")[:_MARKER_LABEL_MAX],
+                               strength=max(0.0, min(1.0, strength)),
+                               end=end if end is not None and end >= t else None))
+    out.sort(key=lambda m: (m.t, m.kind))
+    return out
+
+
+def _check_markers(raw, strict, problems):
+    if not isinstance(raw, list):
+        problems.append({"path": "markers", "message": "должен быть списком"})
+        return
+    for i, m in enumerate(raw):
+        path = f"markers[{i}]"
+        if not isinstance(m, dict):
+            problems.append({"path": path, "message": "должен быть объектом"})
+            continue
+        _check_fields(m, _MARKER_FIELDS, path, strict, problems, required=("t",),
+                      nullable=("end",))
+        t = _num_or(m.get("t"), None)
+        if t is not None and t < 0:
+            problems.append({"path": f"{path}.t", "message": "отрицательное время"})
+        if m.get("kind", "custom") not in _api.MARKER_KINDS:
+            problems.append({"path": f"{path}.kind",
+                             "message": f"одно из {', '.join(_api.MARKER_KINDS)}"})
+        end = _num_or(m.get("end"), None)
+        if end is not None and t is not None and end < t:
+            problems.append({"path": f"{path}.end", "message": "конец раньше начала"})
+        st = _num_or(m.get("strength", 1.0), None)
+        if st is not None and not 0.0 <= st <= 1.0:
+            problems.append({"path": f"{path}.strength", "message": "от 0 до 1"})
+        if len(str(m.get("label") or "")) > _MARKER_LABEL_MAX:
+            problems.append({"path": f"{path}.label",
+                             "message": f"длиннее {_MARKER_LABEL_MAX} символов"})
 
 
 def _check_settings(raw, strict, problems):
@@ -275,6 +325,7 @@ def validate(data, strict=True, check_files=True):
             if name not in _TOP_FIELDS:
                 problems.append({"path": name, "message": "неизвестное поле"})
     _check_settings(data.get("settings", {}), strict, problems)
+    _check_markers(data.get("markers", []), strict, problems)
     kinds = _check_tracks(data.get("tracks"), strict, problems)
     if kinds is None and data.get("tracks") is None:
         kinds = [t.kind for t in _api.Project().tracks]

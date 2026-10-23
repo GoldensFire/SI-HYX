@@ -58,6 +58,9 @@ def describe_project(p, at=None):
         "clips": [_clip_brief(p, c) for c in sorted(p.clips, key=lambda c: (c.track, c.start))],
         "video": video,
         "audio": audio,
+        "markers": [{"t": _r(m.t), "kind": m.kind, "label": m.label,
+                     "strength": _r(m.strength),
+                     "end": None if m.end is None else _r(m.end)} for m in p.markers],
     }
     if at is not None:
         t = float(at)

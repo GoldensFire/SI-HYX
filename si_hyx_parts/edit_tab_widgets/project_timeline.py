@@ -22,6 +22,11 @@ _RULER_MIN_PX = 70
 _CLIP_HUES = ("#4f6fa8", "#7d5fa8", "#a8714f", "#3f8f86", "#a8587a", "#9a8640",
               "#3f7fa0", "#6b70b0")
 
+# Маркеры проекта (montage_project.Marker) на линейке — цвет по виду.
+_MARKER_COLORS = {'scene': 'accent', 'beat': 'yellow', 'onset': 'text3',
+                  'silence': 'border2', 'speech': 'green', 'word': 'accent2',
+                  'custom': 'red'}
+
 
 def _clip_color(src, video):
     """Цвет клипа: у каждого файла свой, куски одного файла — одного цвета;
@@ -331,7 +336,21 @@ class ProjectTimeline(_api.QWidget):
         for c in self.project.clips:
             if c.id != exclude:
                 pts += [c.start, c.end]
+        # Маркеры (сцены, биты, речь…) — только видимые: битов в песне сотни.
+        lo, hi = self.offset, self.t_of(self.width())
+        for m in self._visible_markers(lo, hi):
+            pts.append(m.t)
+            if m.end is not None:
+                pts.append(m.end)
         return pts
+
+    def _visible_markers(self, lo, hi):
+        """Маркеры, задевающие [lo, hi] (список проекта отсортирован по t)."""
+        for m in getattr(self.project, "markers", ()):
+            if m.t > hi:
+                break
+            if (m.end if m.end is not None else m.t) >= lo:
+                yield m
 
     def _snap(self, t, exclude):
         best, dist = t, self.SNAP_PX / self.pps
@@ -579,11 +598,12 @@ class ProjectTimeline(_api.QWidget):
         clips = tuple((c.id, c.track, c.start, c.in_s, c.out_s, c.speed, c.muted, c.volume)
                       for c in proj.clips)
         tracks = tuple((t.kind, t.enabled, t.muted) for t in proj.tracks)
+        markers = getattr(proj, "markers", [])
         d = self._drag or {}
         drag = (d.get('id'), d.get('track'), d.get('start')) if d.get('mode') == 'move' else None
         return (self.width(), self.height(), self.devicePixelRatioF(), self.offset,
                 self.pps, self.selected, frozenset(self._sel_ids), id(proj), clips,
-                tracks, drag, self._version)
+                tracks, (id(markers), len(markers)), drag, self._version)
 
     def paintEvent(self, ev):
         key = self._static_signature()
@@ -873,6 +893,25 @@ class ProjectTimeline(_api.QWidget):
             t += minor
         p.setPen(_api.QPen(_api.QColor(C['border']), 1))
         p.drawLine(0, self.RULER_H - 1, w, self.RULER_H - 1)
+        self._paint_markers(p, w)
+
+    def _paint_markers(self, p, w):
+        """Маркеры проекта у низа линейки: точка — штрих, чем сильнее (бит,
+        уверенность сцены), тем выше; отрезок (тишина, речь, слово) — полоса."""
+        C = _api.C
+        p.save()
+        p.setClipRect(QRectF(self.HEADER_W, 0, w - self.HEADER_W, self.RULER_H))
+        for m in self._visible_markers(self.offset, self.t_of(w)):
+            col = _api.QColor(C[_MARKER_COLORS.get(m.kind, 'text3')])
+            x = self.x_of(m.t)
+            if m.end is not None and m.end > m.t:
+                col.setAlpha(150)
+                p.fillRect(QRectF(x, self.RULER_H - 4, max(1.0, self.x_of(m.end) - x), 3), col)
+                continue
+            h = 3 + 9 * max(0.0, min(1.0, m.strength))
+            p.setPen(_api.QPen(col, 2 if m.kind in ('scene', 'custom') else 1))
+            p.drawLine(_api.QPointF(x, self.RULER_H - 1 - h), _api.QPointF(x, self.RULER_H - 1))
+        p.restore()
 
     def _paint_headers(self, p, rows):
         C = _api.C

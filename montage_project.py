@@ -42,6 +42,9 @@ _AUDIO_RATE = 48000          # частота звука сборки (и про
 # fill — растянуть на весь кадр (пропорции не держатся); crop — заполнить
 # кадр, срезав лишнее по краям (рефрейм 16:9 ↔ 9:16 ↔ 1:1).
 FIT_MODES = ('fit', 'fill', 'crop')
+# Виды маркеров шкалы: сцена (смена плана), бит и начало звука музыки,
+# тишина и речь (отрезки), слово (отрезок с текстом), свой маркер.
+MARKER_KINDS = ('scene', 'beat', 'onset', 'silence', 'speech', 'word', 'custom')
 
 
 class ProjectError(ValueError):
@@ -194,6 +197,17 @@ class ProjectSettings:
 
 
 @dataclass
+class Marker:
+    """Метка на шкале проекта (время проекта, секунды): итог анализа
+    (montage_tool analyze) или своя. Таймлайн её показывает и прилипает к ней."""
+    t: float
+    kind: str = 'custom'          # MARKER_KINDS
+    label: str = ''
+    strength: float = 1.0         # 0…1: сила бита, уверенность сцены
+    end: float = None             # конец отрезка (тишина, речь, слово); None — точка
+
+
+@dataclass
 class Track:
     kind: str                     # 'video' | 'audio'
     enabled: bool = True
@@ -216,6 +230,7 @@ class Project:
         self.tracks = [Track('video'), Track('video'), Track('audio'), Track('audio')]
         self.clips = []
         self.settings = ProjectSettings()
+        self.markers = []             # Marker по времени
 
     # ── Дорожки ──────────────────────────────────────────────────────────────
     @property
@@ -555,7 +570,8 @@ class Project:
         return {'version': PROJECT_VERSION,
                 'settings': asdict(self.settings),
                 'tracks': [asdict(t) for t in self.tracks],
-                'clips': [asdict(c) for c in self.clips]}
+                'clips': [asdict(c) for c in self.clips],
+                'markers': [asdict(m) for m in self.markers]}
 
     @classmethod
     def from_dict(cls, data, strict=False):
@@ -575,6 +591,7 @@ class Project:
                 raise ProjectError(f"проект не прошёл проверку: {len(problems)} проблем",
                                    problems)
         p.settings = parse_settings(data.get('settings'))
+        p.markers = parse_markers(data.get('markers'))
         # Списки — только списками: «"tracks": 5» в файле ронял загрузку
         # TypeError (итерация по числу) вместо пустого проекта.
         raw_tracks = data.get('tracks')
@@ -888,4 +905,4 @@ def load_project(path, strict=False):
 
 
 from si_hyx_parts.montage_project.schema import (  # noqa: E402
-    migrate_project_data, parse_settings, validate)
+    migrate_project_data, parse_markers, parse_settings, validate)

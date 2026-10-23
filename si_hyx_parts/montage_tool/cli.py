@@ -19,7 +19,8 @@ EXIT_FAIL, EXIT_USAGE, EXIT_CANCEL = 1, 2, 130
 _USAGE_CODES = {"usage", "project_not_found", "project_too_large", "project_invalid_json",
                 "project_invalid", "missing_files", "bad_output", "output_exists",
                 "bad_encoder", "nothing_to_render", "probe_failed", "project_version",
-                "bad_range", "bad_media", "bad_schema", "gemini_no_key"}
+                "bad_range", "bad_media", "bad_schema", "gemini_no_key", "bad_track",
+                "ml_unavailable"}
 
 
 class _Parser(argparse.ArgumentParser):
@@ -29,8 +30,15 @@ class _Parser(argparse.ArgumentParser):
         raise _api.ToolError("usage", message)
 
 
+def _json_default(o):
+    """numpy-числа и прочее, чего не знает json, — числом или строкой."""
+    item = getattr(o, "item", None)
+    return item() if callable(item) else str(o)
+
+
 def _emit(obj, stream=None):
-    data = (_api.json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+    data = (_api.json.dumps(obj, ensure_ascii=False, default=_json_default)
+            + "\n").encode("utf-8")
     out = stream or _api.sys.stdout
     buf = getattr(out, "buffer", None)
     if buf is not None:
@@ -132,6 +140,59 @@ def _cmd_ask(args):
     return {"answer": _api.ask_model(args.media, prompt, schema, model=args.model or None)}
 
 
+def _ml_opts(args):
+    return {"python": args.ml_python, "device": args.device,
+            "language": args.language, "model": args.model}
+
+
+def _kinds_arg(args):
+    return [k for k in (args.kinds or "").split(",") if k.strip()] or None
+
+
+def _cmd_analyze(args):
+    p, problems = _api.load_project_file(args.project, strict=not args.lenient)
+    out = _api.analyze_project(p, _kinds_arg(args), args.t0, args.t1, args.track,
+                               args.scene_threshold, args.vocals, _ml_opts(args))
+    if args.write:
+        added = _api.merge_markers(p, out["markers"], out["kinds"], out["t0"], out["t1"])
+        _api.montage_project.save_project(p, args.project)
+        out["written"] = added
+    out["problems"] = problems
+    return out
+
+
+def _cmd_analyze_file(args):
+    return _api.analyze_file(args.media, _kinds_arg(args), args.t0, args.t1, args.stream,
+                             args.scene_threshold, args.vocals, _ml_opts(args))
+
+
+def _cmd_stems(args):
+    rate = 44100
+    audio = _api.file_audio(args.media, args.t0 or 0.0, args.t1, args.stream,
+                            rate=rate, channels=2)
+    if not len(audio):
+        raise _api.ToolError("nothing_to_render", "в файле нет звука")
+    files = _api.stems(audio, rate, args.out_dir, args.ml_python, args.device)
+    return {"stems": files, "t0": args.t0 or 0.0, "t1": args.t1}
+
+
+def _analysis_args(sp):
+    sp.add_argument("--kinds", default="", help="через запятую: " + ",".join(_api.ANALYSIS_KINDS))
+    sp.add_argument("--t0", type=float, default=0.0)
+    sp.add_argument("--t1", type=float, default=None)
+    sp.add_argument("--scene-threshold", type=float, default=_api.SCENE_THRESHOLD)
+    sp.add_argument("--vocals", action="store_true",
+                    help="слова — по вокалу (отделить HTDemucs; только для песен)")
+    _ml_args(sp)
+
+
+def _ml_args(sp):
+    sp.add_argument("--language", default="auto")
+    sp.add_argument("--model", default="medium")
+    sp.add_argument("--device", default="cpu")
+    sp.add_argument("--ml-python", default="", help="Python с faster-whisper и demucs")
+
+
 def _lenient_arg(sp):
     sp.add_argument("--lenient", action="store_true",
                     help="загружать как вкладка: негодные клипы выбрасываются")
@@ -191,6 +252,26 @@ def build_parser():
     sp.add_argument("--no-timecode", action="store_true", help="без времени проекта в углу")
     _lenient_arg(sp)
     sp.set_defaults(fn=_cmd_preview)
+    sp = sub.add_parser("analyze", help="маркеры проекта (время проекта)")
+    sp.add_argument("project")
+    sp.add_argument("--track", type=int, default=None, help="звук только этой дорожки")
+    sp.add_argument("--write", action="store_true", help="записать маркеры в проект")
+    _analysis_args(sp)
+    _lenient_arg(sp)
+    sp.set_defaults(fn=_cmd_analyze)
+    sp = sub.add_parser("analyze-file", help="маркеры файла (время файла)")
+    sp.add_argument("media")
+    sp.add_argument("--stream", type=int, default=-1, help="абсолютный индекс звукового потока")
+    _analysis_args(sp)
+    sp.set_defaults(fn=_cmd_analyze_file)
+    sp = sub.add_parser("stems", help="вокал и музыка звука файла (HTDemucs)")
+    sp.add_argument("media")
+    sp.add_argument("out_dir")
+    sp.add_argument("--t0", type=float, default=0.0)
+    sp.add_argument("--t1", type=float, default=None)
+    sp.add_argument("--stream", type=int, default=-1)
+    _ml_args(sp)
+    sp.set_defaults(fn=_cmd_stems)
     sp = sub.add_parser("ask", help="вопрос модели Gemini по превью или кадрам")
     sp.add_argument("media", nargs="+", help="mp4, png, jpg, webp")
     sp.add_argument("--schema", required=True, help="JSON Schema ответа")
