@@ -917,6 +917,6 @@ def load_project(path, strict=False):
 
 
 from si_hyx_parts.montage_project.schema import (  # noqa: E402
-    migrate_project_data, parse_markers, parse_settings, parse_texts, validate)
+    describe_schema, migrate_project_data, parse_markers, parse_settings, parse_texts, validate)
 from si_hyx_parts.montage_project.graph import (  # noqa: E402,F401
     build_export, build_source, loudnorm_filter, text_cues)

@@ -63,6 +63,59 @@ def _type_name(kind):
     return {float: "число", int: "целое", bool: "true/false", str: "строка"}[kind]
 
 
+def describe_schema():
+    """Схема файла проекта для внешнего агента (только JSON-типы): поля с
+    типами и значениями по умолчанию, допустимые виды и пределы."""
+    from dataclasses import MISSING, fields
+    json_types = {float: "number", int: "integer", bool: "boolean", str: "string",
+                  dict: "object"}
+
+    def spec(cls, types):
+        out = {}
+        for f in fields(cls):
+            if f.name not in types:
+                continue
+            default = None if f.default is MISSING else f.default
+            if f.default is MISSING and f.default_factory is not MISSING:
+                default = "auto" if f.name == "id" else f.default_factory()
+            out[f.name] = {"type": json_types[types[f.name]],
+                           "required": f.default is MISSING and f.default_factory is MISSING,
+                           "default": default}
+        return out
+
+    import subtitle_ass
+    return {
+        "version": _api.PROJECT_VERSION,
+        "top_fields": list(_TOP_FIELDS),
+        "settings": spec(_api.ProjectSettings, _SETTINGS_FIELDS),
+        "track": spec(_api.Track, _TRACK_FIELDS),
+        "clip": spec(_api.Clip, _CLIP_FIELDS),
+        "marker": spec(_api.Marker, _MARKER_FIELDS),
+        "text": spec(_api.TextItem, _TEXT_FIELDS),
+        "text_style": {k: json_types[v] for k, v in _TEXT_STYLE.items()},
+        "text_style_default": dict(subtitle_ass.DEFAULT_SUBTITLE_STYLE),
+        "enums": {"fit": list(_api.FIT_MODES), "transition": list(_api.TRANSITIONS),
+                  "marker_kind": list(_api.MARKER_KINDS), "track_role": list(_api.TRACK_ROLES),
+                  "track_kind": ["video", "audio"], "text_animation": list(_TEXT_ANIMATIONS)},
+        "limits": {"speed": [_api.MIN_SPEED, _api.MAX_SPEED], "min_clip_s": _api.MIN_CLIP_S,
+                   "scale": [_api.MIN_SCALE, _api.MAX_SCALE], "opacity": [0.0, 1.0],
+                   "duck": [0.0, 1.0], "loudness": list(_LOUDNESS_RANGE),
+                   "frame_side": [16, _MAX_SIDE], "fps": [1.0, _MAX_FPS],
+                   "reverse_max_s": _api.MAX_REVERSE_S, "text_max_chars": _TEXT_MAX},
+        "notes": [
+            "Время — секунды. start — место клипа на шкале проекта, in_s/out_s — кусок исходника.",
+            "Дорожка 0-го вида video — основная и магнитная: клипы встают вплотную по порядку "
+            "start, клип с transition встаёт внахлёст на предыдущий на transition_s.",
+            "Верхние видеодорожки — наложения: scale — доля кадра, pos_x/pos_y — центр в долях.",
+            "Звуковой клип: has_video=false, audio_path — файл звука, audio_stream — "
+            "абсолютный индекс потока (-1 — первый). Поля клипа для файла даёт probe (clip).",
+            "Пути — абсолютные (строгая проверка). Track.role voice приглушает music, "
+            "если settings.duck > 0.",
+            "Стоп-кадр: freeze_at — время кадра исходника, длина клипа — out_s - in_s.",
+        ],
+    }
+
+
 def migrate_project_data(data):
     """Словарь проекта в схеме PROJECT_VERSION. v1 (без настроек формата)
     становится v2 с форматом «по первому клипу». ProjectError — версия не

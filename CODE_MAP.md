@@ -791,7 +791,8 @@ fsync и прежний файл в `.bak`; `load_project` бросает `Proje
 `project_export`.
 
 «Монтаж» без интерфейса — [montage_tool.py](montage_tool.py)
-(`python -I montage_tool.py probe|validate|describe|dry-run|render …`, ответ —
+(`python -I montage_tool.py schema|probe|validate|describe|dry-run|render …`;
+`schema` — формат проекта из самой модели, `describe_schema`; ответ —
 JSON в stdout, ошибка — JSON и код ≠ 0): модуль и его части
 ([si_hyx_parts/montage_tool/](si_hyx_parts/montage_tool/)) не поднимают PyQt6.
 ffmpeg/ffprobe, экранирование путей в фильтрах и выбор кодировщика H.264 —

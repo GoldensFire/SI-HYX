@@ -81,9 +81,24 @@ def still(p, t, out_png, width=0):
            + ["-filter_complex", graph, "-map", out_label, "-frames:v", "1",
               "-update", "1", str(out_png)])
     _run(cmd, _STILL_TIMEOUT)
-    seen = next((c for a, b, c in p.video_segments() if a <= t0 < b), None)
     return {"output": _api.os.path.abspath(str(out_png)), "t": round(t0, 6),
-            "clip": seen.id if seen is not None else None}
+            "clip": visible_clip(p, t0)}
+
+
+def visible_clip(p, t):
+    """id верхнего клипа в кадре проекта на t — по сетке кадров, как его
+    режет сборка (round(t·fps)), или None (пустой кадр)."""
+    _w, _h, fps = p.output_format()
+    k = int(round(t * fps))
+    seen = None
+    for ti in p.tracks_of('video'):
+        if not p.tracks[ti].enabled:
+            continue
+        for c in p.clips_on(ti):
+            if (c.has_video and c.opacity > 0
+                    and int(round(c.start * fps)) <= k < int(round(c.end * fps))):
+                seen = c.id
+    return seen
 
 
 def sheet_times(p, t0, t1, n):

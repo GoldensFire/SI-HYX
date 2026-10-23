@@ -49,6 +49,10 @@ def _emit(obj, stream=None):
         out.flush()
 
 
+def _cmd_schema(args):
+    return {"schema": _api.montage_project.describe_schema()}
+
+
 def _cmd_probe(args):
     media = []
     for f in args.files:
@@ -201,6 +205,8 @@ def _lenient_arg(sp):
 def build_parser():
     ap = _Parser(prog="montage_tool", description="«Монтаж» SI-HYX без интерфейса.")
     sub = ap.add_subparsers(dest="command", required=True, parser_class=_Parser)
+    sp = sub.add_parser("schema", help="формат файла проекта")
+    sp.set_defaults(fn=_cmd_schema)
     sp = sub.add_parser("probe", help="свойства медиафайлов")
     sp.add_argument("files", nargs="+")
     sp.set_defaults(fn=_cmd_probe)
