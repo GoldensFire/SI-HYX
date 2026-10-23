@@ -2,6 +2,7 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """Монтаж: аргументы кодировщика, обрезка, Smart Cut и завершение экспорта."""
+import ffmpeg_env
 import hdr_tonemap
 
 import edit_tab as _api
@@ -195,69 +196,26 @@ class EditTabExportMixin:
         cache = getattr(self, "_encoders_str", None)
         if cache is not None:
             return cache
-        encoders = ""
-        try:
-            p = _api.subprocess.run([_api.FFMPEG, "-hide_banner", "-encoders"],
-                               capture_output=True, text=True, encoding="utf-8",
-                               errors="replace", creationflags=_api.CREATE_NO_WINDOW)
-            encoders = p.stdout or ""
-        except Exception:
-            encoders = ""
-        self._encoders_str = encoders
-        return encoders
-
-    def _gpu_encoder_args(self, encoders, hardsub=False):
-        """Первый доступный аппаратный (GPU) H.264-кодировщик, иначе None.
-        При hardsub (вшивание субтитров) поджимаем качество, чтобы края текста
-        не мылились."""
-        q = 18 if hardsub else 20
-        if "h264_nvenc" in encoders:
-            return ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", str(q)]
-        if "h264_qsv" in encoders:
-            return ["-c:v", "h264_qsv", "-global_quality", str(q)]
-        if "h264_amf" in encoders:
-            return ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "cqp",
-                    "-qp_i", str(q), "-qp_p", str(q)]
-        if "h264_mf" in encoders:
-            qual = 80 if hardsub else 70
-            return ["-c:v", "h264_mf", "-rate_control", "quality", "-quality", str(qual)]
-        return None
+        self._encoders_str = ffmpeg_env.available_encoders(_api.FFMPEG)
+        return self._encoders_str
 
     def _video_encoder_args(self, hardsub=False):
         """Подбирает H.264-кодировщик в bundled ffmpeg с учётом выбора
         пользователя (combo «Кодировщик»): «Видеокарта (GPU)» — аппаратный
-        кодек; «Процессор (CPU)» / «Авто» — libx264. Если выбранного варианта в
-        сборке нет — мягкий откат (GPU↔CPU↔mpeg4), чтобы перекодировка всегда
-        состоялась.
+        кодек; «Процессор (CPU)» / «Авто» — libx264, с мягким откатом
+        (ffmpeg_env.h264_encoder_args — общий с headless-сборкой montage_tool).
 
         hardsub=True (вшивание субтитров): берём чуть более качественный профиль —
         у текста резкие края, и на «fast»/высоком CRF они мылятся. CPU: preset
         medium + crf 17; добавляем -pix_fmt yuv420p для чёткого 8-битного вывода и
         совместимости. Аппаратные кодеки тоже поджимаем по качеству."""
-        encoders = self._available_encoders()
         # 0 = Авто, 1 = Процессор (CPU), 2 = Видеокарта (GPU)
         try:
             choice = int(self.cmb_encoder.currentIndex())
         except Exception:
             choice = 0
-
-        cpu_args = (["-c:v", "libx264", "-preset", "medium", "-crf", "17"]
-                    if hardsub else ["-c:v", "libx264", "-preset", "fast", "-crf", "18"])
-        cpu = cpu_args if ("libx264" in encoders or encoders == "") else None
-        gpu = self._gpu_encoder_args(encoders, hardsub=hardsub)
-
-        if choice == 2:                      # GPU — с откатом на CPU
-            args = gpu or cpu
-        elif choice == 1:                    # CPU — с откатом на GPU
-            args = cpu or gpu
-        else:                                # Авто: CPU (качество/совместимость)
-            args = cpu or gpu
-        if args is None:
-            args = ["-c:v", "mpeg4", "-q:v", "3"]
-        args = list(args)
-        if hardsub and "-pix_fmt" not in args:
-            args += ["-pix_fmt", "yuv420p"]
-        return args
+        return ffmpeg_env.h264_encoder_args(self._available_encoders(), choice,
+                                            hardsub=hardsub)
 
     def _subs_present_in_range(self, src, ext_sub, rel_idx, in_s, out_s):
         """True, если хотя бы одно событие субтитров видно в диапазоне [in_s, out_s].

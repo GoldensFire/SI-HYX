@@ -21,7 +21,7 @@ import json
 import os
 import subprocess
 
-from config import CREATE_NO_WINDOW, FFPROBE, TEMP_DIR
+from ffmpeg_env import CREATE_NO_WINDOW, FFPROBE, TEMP_DIR
 
 LUT_SIZE = 65               # узлов на канал: тетраэдрическая интерполяция ±1 уровень
 SDR_NITS = 100.0            # белый SDR, к которому шейдер Qt сводит яркость
@@ -51,7 +51,7 @@ def qt_pq_to_srgb(y, rgb, max_luminance, max_nits=SDR_NITS):
 
     y — яркость Y' в полном диапазоне 0..1, rgb — (R', G', B') в полном
     диапазоне, max_luminance — maxLuminance кадра у Qt
-    (edit_tab_frames.qt_pq_max_luminance: яркость мастеринга × 10000)."""
+    (media_probe.qt_pq_max_luminance: яркость мастеринга × 10000)."""
     import numpy as np
 
     mw = _pq_from_linear(max_luminance / 100.0)
@@ -131,8 +131,8 @@ def _video_color(path):
         st = {}
     pq = None
     if st.get("color_transfer") == "smpte2084":
-        import edit_tab_frames
-        pq = edit_tab_frames.qt_pq_max_luminance(edit_tab_frames.probe_mastering_nits(path))
+        import media_probe
+        pq = media_probe.qt_pq_max_luminance(media_probe.probe_mastering_nits(path))
     found = {"range": "pc" if st.get("color_range") == "pc" else "tv",
              "space": st.get("color_space") or "", "height": int(st.get("height") or 0),
              "pq": pq}

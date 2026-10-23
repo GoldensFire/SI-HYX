@@ -22,7 +22,6 @@
 # Плеер остаётся ровно тем, чем он хорош: непрерывным воспроизведением.
 
 import ctypes
-import json
 import os
 import subprocess
 import threading
@@ -30,6 +29,9 @@ from collections import OrderedDict
 
 import hdr_tonemap
 from config import (CREATE_NO_WINDOW, FFMPEG, FFPROBE, QThread, pyqtSignal)
+# Пробы ffprobe живут в media_probe (без Qt): их берут и headless-инструменты.
+from media_probe import (probe_mastering_nits, probe_video_props,  # noqa: F401
+                         qt_pq_max_luminance)
 from PyQt6.QtCore import (QSize)
 from PyQt6.QtGui import (QImage)
 from PyQt6.QtMultimedia import (QVideoFrame, QVideoFrameFormat)
@@ -133,59 +135,6 @@ class FrameGrid:
 
 
 # ── Предекодирование кадров вокруг плейхеда ──────────────────────────────────
-def probe_video_props(path):
-    """Свойства первого видеопотока через ffprobe: размер В ПОТОКЕ (до
-    поворота), поворот из метаданных (градусы) и цветовые теги. {} — не вышло.
-
-    JSON, а не csv: в csv ffprobe ставит разделитель и в конце строки
-    («960x540x», сборки 2026 года) — прежний разбор давал int("540x") →
-    (0, 0), и предекодер молча не декодировал ни одного кадра."""
-    try:
-        out = subprocess.run(
-            [FFPROBE, "-v", "error", "-select_streams", "v:0",
-             "-show_entries",
-             "stream=width,height,sample_aspect_ratio,pix_fmt,color_transfer,"
-             "color_space,color_range"
-             ":stream_tags=rotate:stream_side_data=rotation",
-             "-of", "json", str(path)],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            creationflags=CREATE_NO_WINDOW, timeout=15)
-        streams = json.loads(out.stdout or "{}").get("streams") or []
-    except Exception:
-        return {}
-    if not streams:
-        return {}
-    st = streams[0]
-    rot = 0
-    for sd in st.get("side_data_list") or []:
-        if "rotation" in sd:
-            try:
-                rot = int(round(float(sd["rotation"])))
-            except (TypeError, ValueError):
-                pass
-    if not rot:
-        try:
-            rot = int(float((st.get("tags") or {}).get("rotate") or 0))
-        except (TypeError, ValueError):
-            rot = 0
-    try:
-        w, h = int(st.get("width") or 0), int(st.get("height") or 0)
-    except (TypeError, ValueError):
-        w = h = 0
-    sar = (1, 1)
-    num, _, den = str(st.get("sample_aspect_ratio") or "").partition(":")
-    try:
-        if int(num) > 0 and int(den) > 0:
-            sar = (int(num), int(den))
-    except ValueError:
-        pass
-    return {"width": w, "height": h, "rotation": rot, "sar": sar,
-            "pix_fmt": st.get("pix_fmt") or "",
-            "transfer": st.get("color_transfer") or "",
-            "space": st.get("color_space") or "",
-            "range": st.get("color_range") or ""}
-
-
 def qt_frame_size(w, h, sar):
     """Размер кадра так, как его отдаёт плеер Qt (ffmpeg-бэкенд) у файла с
     неквадратным пикселем: qCalculateFrameSize растягивает ОДНУ сторону —
@@ -302,32 +251,6 @@ def _max_luminance(fmt):
         return None
 
 
-def probe_mastering_nits(path):
-    """Яркость мастеринга (кд/м²) из первого кадра или None — как её берёт
-    ffmpeg-бэкенд Qt (side data «Mastering display metadata»)."""
-    try:
-        out = subprocess.run(
-            [FFPROBE, "-v", "error", "-select_streams", "v:0",
-             "-read_intervals", "%+#1", "-show_frames",
-             "-show_entries", "frame=side_data_list", "-of", "json", str(path)],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-            creationflags=CREATE_NO_WINDOW, timeout=20)
-        frames = json.loads(out.stdout or "{}").get("frames") or []
-    except Exception:
-        return None
-    for fr in frames[:1]:
-        for sd in fr.get("side_data_list") or []:
-            val = sd.get("max_luminance")
-            if not val:
-                continue
-            try:
-                num, _sep, den = str(val).partition("/")
-                return float(num) / float(den or 1)
-            except (TypeError, ValueError, ZeroDivisionError):
-                return None
-    return None
-
-
 def guess_player_format(props, nits, hw_decode):
     """Формат, в котором плеер отдаст HDR-кадр, пока он не показал ни одного
     (сразу после открытия файла точный кадр приходит раньше кадров плеера):
@@ -358,12 +281,6 @@ def guess_player_format(props, nits, hw_decode):
             except Exception:
                 pass
     return fmt
-
-
-def qt_pq_max_luminance(nits):
-    """maxLuminance кадра у ffmpeg-бэкенда Qt: яркость мастеринга × 10000
-    (QFFmpegVideoBuffer::maxNits), без метаданных — 10000 (предел PQ)."""
-    return float(nits) * 10000.0 if nits and nits > 0 else 10000.0
 
 
 def qt_pq_image(yuv16, max_luminance, max_nits=100.0):

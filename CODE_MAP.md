@@ -32,6 +32,7 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
 | [widgets.py](widgets.py) | общие виджеты, подсказки, лента последних файлов | [si_hyx_parts/widgets/](si_hyx_parts/widgets/) |
 | [utils.py](utils.py) | настройки, медиа-сведения, ffmpeg, Kodik, HTML-маска | [si_hyx_parts/utils/](si_hyx_parts/utils/) |
 | [edit_tab.py](edit_tab.py) | вкладка «Монтаж» | [si_hyx_parts/edit_tab/](si_hyx_parts/edit_tab/) |
+| [montage_tool.py](montage_tool.py) | «Монтаж» без интерфейса: CLI и API для агента | [si_hyx_parts/montage_tool/](si_hyx_parts/montage_tool/) |
 | [edit_tab_widgets.py](edit_tab_widgets.py), [edit_tab_workers.py](edit_tab_workers.py), [edit_tab_dialogs.py](edit_tab_dialogs.py) | виджеты, потоки и диалоги «Монтажа» | `si_hyx_parts/edit_tab_*/` |
 | [photo_tab.py](photo_tab.py) | вкладка «Фото» (LaMa, RMBG, холст) | [si_hyx_parts/photo_tab/](si_hyx_parts/photo_tab/) |
 | [animepack.py](animepack.py) | генератор аниме-пака | [si_hyx_parts/animepack/](si_hyx_parts/animepack/) |
@@ -765,6 +766,21 @@ ffmpeg — [montage_project.py](montage_project.py) (основная дорож
 клипов и держит IN/OUT, по которым одиночный кусок режет прежняя «Обрезка»
 (`_proj_single_clip`, `_project_export_route`); несколько кусков собирает
 `project_export`.
+
+«Монтаж» без интерфейса — [montage_tool.py](montage_tool.py)
+(`python -I montage_tool.py probe|validate|describe|dry-run|render …`, ответ —
+JSON в stdout, ошибка — JSON и код ≠ 0): модуль и его части
+([si_hyx_parts/montage_tool/](si_hyx_parts/montage_tool/)) не поднимают PyQt6.
+ffmpeg/ffprobe, экранирование путей в фильтрах и выбор кодировщика H.264 —
+[ffmpeg_env.py](ffmpeg_env.py) (config берёт `resolve_tool`, FFMPEG/FFPROBE
+отсюда; `EditTab._video_encoder_args` — `h264_encoder_args`); пробы ffprobe —
+[media_probe.py](media_probe.py) (`probe_video_props`, яркость мастеринга —
+реэкспорт в edit_tab_frames; `probe_media` — сводка файла с полями клипа).
+`render` собирает той же `build_export` и тем же сведением HDR, что и
+`project_export`: прогресс — `-progress pipe:1` (строки JSON в stderr с
+`--progress`), отмена — `--cancel-file`/Ctrl+C (ffmpeg убивается, временный
+файл рядом с итогом удаляется), граф длиннее `INLINE_GRAPH_MAX` — файлом
+через `-/filter_complex`, +faststart — `with_faststart`.
 
 Плеер «Монтажа» читает файл через QFile поверх хэндла с FILE_SHARE_DELETE
 (`open_share_delete_file` в

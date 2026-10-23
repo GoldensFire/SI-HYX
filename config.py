@@ -336,29 +336,9 @@ COOKIE_PATHS = {
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
 
-def _resolve_tool(name):
-    """Ищет ffmpeg/ffprobe рядом с программой (для сборки в .exe с bundled-ffmpeg).
-    Порядок: _MEIPASS (PyInstaller) → папка exe/скрипта → подпапка bin → PATH.
-    Если ничего не найдено — возвращает имя для поиска в системном PATH.
-    """
-    exe = name + (".exe" if IS_WIN else "")
-    roots = []
-    base = getattr(sys, "_MEIPASS", None)        # распакованные данные PyInstaller
-    if base:
-        roots.append(base)
-    roots.append(os.path.dirname(os.path.abspath(sys.argv[0] or ".")))  # папка exe
-    roots.append(os.path.dirname(os.path.abspath(__file__)))            # папка скрипта
-    for r in roots:
-        for cand in (os.path.join(r, exe), os.path.join(r, "bin", exe)):
-            if os.path.isfile(cand):
-                return cand
-    return name  # из системного PATH
-
-
-FFMPEG = _resolve_tool("ffmpeg")
-
-
-FFPROBE = _resolve_tool("ffprobe")
+# Поиск ffmpeg/ffprobe (и yt-dlp, deno) — в ffmpeg_env без Qt: его берут и
+# headless-инструменты (montage_tool), не поднимая PyQt6.
+from ffmpeg_env import FFMPEG, FFPROBE, resolve_tool as _resolve_tool  # noqa: E402
 
 
 def _resolve_ffmpeg7_dir():
