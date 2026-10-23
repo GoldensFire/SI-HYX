@@ -69,7 +69,9 @@ def dry_run(p, out_path, encoder="auto", encoders=None, subs=None):
             "missing_files": missing_files(p)}
 
 
-def _check_output(p, out_path, overwrite):
+def check_output(p, out_path, overwrite):
+    """Абсолютный путь итога или ToolError: нет папки, это папка, совпадает
+    с исходником проекта, файл уже есть (без overwrite)."""
     out = _api.os.path.abspath(str(out_path))
     folder = _api.os.path.dirname(out)
     if not _api.os.path.isdir(folder):
@@ -104,7 +106,7 @@ def render(p, out_path, encoder="auto", overwrite=False, on_progress=None,
     if missing:
         raise _api.ToolError("missing_files", "не найдены файлы проекта",
                              problems=[{"path": m, "message": "нет файла"} for m in missing])
-    out = _check_output(p, out_path, overwrite)
+    out = check_output(p, out_path, overwrite)
     stem, ext = _api.os.path.splitext(out)
     tmp = f"{stem}.sihyx_part{ext}"
     cmd, graph, dur = export_command(p, tmp, encoder, encoders, subs)

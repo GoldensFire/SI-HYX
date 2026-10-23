@@ -18,7 +18,14 @@
                              что видно и что слышно;
   dry-run <проект.json> <выход>   команда ffmpeg и граф без запуска;
   render <проект.json> <выход>    сборка: прогресс (-progress), отмена,
-                             длинный граф — файлом, +faststart.
+                             длинный граф — файлом, +faststart;
+  still <проект.json> <t> <кадр.png>        кадр проекта на времени t;
+  contact-sheet <проект.json> <t0> <t1> <n> <лист.png>   n кадров сеткой
+                             с временем проекта и id клипа под каждым;
+  preview <проект.json> <t0> <t1> <ролик.mp4>   до 15 с, 480p, 12 fps,
+                             до 8 МБ — для модели (Gemini);
+  ask <файл>… --schema <схема.json> --prompt …  превью/кадры и вопрос в
+                             GeminiClient.generate_json (тратит квоту).
 
 Модуль не импортирует PyQt6 (config, utils, edit_tab): ffmpeg ищет
 ffmpeg_env, свойства файлов — media_probe, граф — montage_project.build_export,
@@ -37,6 +44,7 @@ if __name__ == "__main__":
     sys.exit(montage_tool.main())
 
 import json
+import shutil
 import subprocess
 import tempfile
 
@@ -76,5 +84,7 @@ from si_hyx_parts.montage_tool.project_io import (  # noqa: E402,F401
     load_project_file, project_from_data, read_project_json)
 from si_hyx_parts.montage_tool.timeline import describe_project  # noqa: E402,F401
 from si_hyx_parts.montage_tool.render import (  # noqa: E402,F401
-    dry_run, export_command, missing_files, render)
+    check_output, dry_run, export_command, missing_files, render)
+from si_hyx_parts.montage_tool.inspection import (  # noqa: E402,F401
+    ask_model, contact_sheet, gemini_key, preview, sheet_times, still)
 from si_hyx_parts.montage_tool.cli import main  # noqa: E402,F401

@@ -789,7 +789,13 @@ ffmpeg/ffprobe, экранирование путей в фильтрах и в�
 `project_export`: прогресс — `-progress pipe:1` (строки JSON в stderr с
 `--progress`), отмена — `--cancel-file`/Ctrl+C (ffmpeg убивается, временный
 файл рядом с итогом удаляется), граф длиннее `INLINE_GRAPH_MAX` — файлом
-через `-/filter_complex`, +faststart — `with_faststart`.
+через `-/filter_complex`, +faststart — `with_faststart`. Инспекция для модели —
+[inspection.py](si_hyx_parts/montage_tool/inspection.py): `still`,
+`contact-sheet` (кадры по одному в 4 потока, под каждым — время проекта и id
+клипа) и `preview` (рецепт `episode_scene_check.video_input`: до 15 с, 480p,
+12 fps, до 8 МБ, время проекта в углу) рендерятся через `excerpt` +
+`build_source`, как итог; `ask` отдаёт их в `GeminiClient.generate_json` со
+схемой (ключ — `GEMINI_API_KEY` или `api_keys.gemini` настроек; тратит квоту).
 
 Плеер «Монтажа» читает файл через QFile поверх хэндла с FILE_SHARE_DELETE
 (`open_share_delete_file` в

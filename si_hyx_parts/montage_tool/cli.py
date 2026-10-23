@@ -18,7 +18,8 @@ EXIT_FAIL, EXIT_USAGE, EXIT_CANCEL = 1, 2, 130
 # Коды ошибок, которые говорят о вызове или данных, а не о сбое сборки.
 _USAGE_CODES = {"usage", "project_not_found", "project_too_large", "project_invalid_json",
                 "project_invalid", "missing_files", "bad_output", "output_exists",
-                "bad_encoder", "nothing_to_render", "probe_failed", "project_version"}
+                "bad_encoder", "nothing_to_render", "probe_failed", "project_version",
+                "bad_range", "bad_media", "bad_schema", "gemini_no_key"}
 
 
 class _Parser(argparse.ArgumentParser):
@@ -93,6 +94,44 @@ def _cmd_render(args):
     return out
 
 
+def _cmd_still(args):
+    p, problems = _api.load_project_file(args.project, strict=not args.lenient)
+    return dict(_api.still(p, args.t, args.output, width=args.width), problems=problems)
+
+
+def _cmd_contact_sheet(args):
+    p, problems = _api.load_project_file(args.project, strict=not args.lenient)
+    out = _api.contact_sheet(p, args.t0, args.t1, args.n, args.output,
+                             tile_width=args.tile_width, columns=args.columns)
+    out["problems"] = problems
+    return out
+
+
+def _cmd_preview(args):
+    p, problems = _api.load_project_file(args.project, strict=not args.lenient)
+    out = _api.preview(p, args.t0, args.t1, args.output, timecode=not args.no_timecode)
+    out["problems"] = problems
+    return out
+
+
+def _cmd_ask(args):
+    if args.prompt_file:
+        with open(args.prompt_file, "r", encoding="utf-8") as f:
+            prompt = f.read()
+    else:
+        prompt = args.prompt or ""
+    if not prompt.strip():
+        raise _api.ToolError("usage", "нужен --prompt или --prompt-file")
+    try:
+        with open(args.schema, "r", encoding="utf-8") as f:
+            schema = _api.json.load(f)
+    except (OSError, ValueError) as e:
+        raise _api.ToolError("bad_schema", f"схема ответа не прочитана: {e}") from e
+    if not isinstance(schema, dict):
+        raise _api.ToolError("bad_schema", "схема ответа — JSON-объект (JSON Schema)")
+    return {"answer": _api.ask_model(args.media, prompt, schema, model=args.model or None)}
+
+
 def _lenient_arg(sp):
     sp.add_argument("--lenient", action="store_true",
                     help="загружать как вкладка: негодные клипы выбрасываются")
@@ -127,6 +166,38 @@ def build_parser():
             sp.add_argument("--cancel-file", default="",
                             help="появился этот файл — сборка отменяется")
         sp.set_defaults(fn=fn)
+    sp = sub.add_parser("still", help="кадр проекта")
+    sp.add_argument("project")
+    sp.add_argument("t", type=float)
+    sp.add_argument("output")
+    sp.add_argument("--width", type=int, default=0, help="уменьшить до ширины")
+    _lenient_arg(sp)
+    sp.set_defaults(fn=_cmd_still)
+    sp = sub.add_parser("contact-sheet", help="кадры отрезка сеткой")
+    sp.add_argument("project")
+    sp.add_argument("t0", type=float)
+    sp.add_argument("t1", type=float)
+    sp.add_argument("n", type=int)
+    sp.add_argument("output")
+    sp.add_argument("--tile-width", type=int, default=320)
+    sp.add_argument("--columns", type=int, default=0)
+    _lenient_arg(sp)
+    sp.set_defaults(fn=_cmd_contact_sheet)
+    sp = sub.add_parser("preview", help="ролик отрезка для модели")
+    sp.add_argument("project")
+    sp.add_argument("t0", type=float)
+    sp.add_argument("t1", type=float)
+    sp.add_argument("output")
+    sp.add_argument("--no-timecode", action="store_true", help="без времени проекта в углу")
+    _lenient_arg(sp)
+    sp.set_defaults(fn=_cmd_preview)
+    sp = sub.add_parser("ask", help="вопрос модели Gemini по превью или кадрам")
+    sp.add_argument("media", nargs="+", help="mp4, png, jpg, webp")
+    sp.add_argument("--schema", required=True, help="JSON Schema ответа")
+    sp.add_argument("--prompt", default="")
+    sp.add_argument("--prompt-file", default="")
+    sp.add_argument("--model", default="")
+    sp.set_defaults(fn=_cmd_ask)
     return ap
 
 
