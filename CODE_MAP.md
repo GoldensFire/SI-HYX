@@ -741,7 +741,16 @@ ffmpeg — [montage_project.py](montage_project.py) (основная дорож
 задержанный первый вход ломал метки звука; размер клипа — как на экране,
 `stream_display_size`: поворот и неквадратный пиксель, а в графе кадр сперва
 сводится к квадратному пикселю; типы и пределы полей клипа приводит
-`Clip.__post_init__`, скорость в расчётах — `Clip.play_speed`). Таймлайн —
+`Clip.__post_init__`, скорость в расчётах — `Clip.play_speed`). Файл проекта —
+схема `PROJECT_VERSION` 2: формат итога — `ProjectSettings` (размер, fps,
+вписывание fit/fill/crop, фон, целевая громкость; нули — «по первому клипу»),
+v1 читается как v2, версия новее программы — `ProjectError`; строгая проверка
+для агентов и мягкая для вкладки — `validate`/`migrate_project_data` в
+[schema.py](si_hyx_parts/montage_project/schema.py). `save_project` — tmp с
+fsync и прежний файл в `.bak`; `load_project` бросает `ProjectError`, и
+вкладка (`_project_load_saved`) откладывает такой файл в
+`…json.unreadable-ДАТА` и берёт `.bak`, а не затирает его первой правкой.
+`excerpt` держит формат всего проекта. Таймлайн —
 [project_timeline.py](si_hyx_parts/edit_tab_widgets/project_timeline.py)
 (неподвижный слой в кэше, шаг плейхеда перерисовывает две полоски: полная
 отрисовка на каждый шаг занимала главный поток во время игры; выделение —

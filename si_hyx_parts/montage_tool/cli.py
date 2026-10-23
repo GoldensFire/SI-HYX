@@ -18,7 +18,7 @@ EXIT_FAIL, EXIT_USAGE, EXIT_CANCEL = 1, 2, 130
 # Коды ошибок, которые говорят о вызове или данных, а не о сбое сборки.
 _USAGE_CODES = {"usage", "project_not_found", "project_too_large", "project_invalid_json",
                 "project_invalid", "missing_files", "bad_output", "output_exists",
-                "bad_encoder", "nothing_to_render", "probe_failed"}
+                "bad_encoder", "nothing_to_render", "probe_failed", "project_version"}
 
 
 class _Parser(argparse.ArgumentParser):
@@ -51,30 +51,33 @@ def _cmd_probe(args):
 
 
 def _cmd_validate(args):
-    p, problems = _api.load_project_file(args.project)
-    missing = _api.missing_files(p)
-    problems += [{"path": m, "message": "нет файла"} for m in missing]
-    return {"valid": not problems, "problems": problems,
+    # Проблемы — ответ команды, а не ошибка: проект грузится мягко, а
+    # проверяется в выбранном режиме и с файлами на диске.
+    data = _api.read_project_json(args.project)
+    p, _soft = _api.project_from_data(data, strict=False)
+    problems = _api.montage_project.validate(data, strict=not args.lenient, check_files=True)
+    return {"valid": not problems, "strict": not args.lenient, "problems": problems,
+            "version": _api.montage_project.PROJECT_VERSION,
             "clips": len(p.clips), "tracks": len(p.tracks),
             "duration": round(p.duration(), 6)}
 
 
 def _cmd_describe(args):
-    p, problems = _api.load_project_file(args.project)
+    p, problems = _api.load_project_file(args.project, strict=not args.lenient)
     out = _api.describe_project(p, at=args.at)
     out["problems"] = problems
     return out
 
 
 def _cmd_dry_run(args):
-    p, problems = _api.load_project_file(args.project)
+    p, problems = _api.load_project_file(args.project, strict=not args.lenient)
     out = _api.dry_run(p, args.output, encoder=args.encoder)
     out["problems"] = problems
     return out
 
 
 def _cmd_render(args):
-    p, problems = _api.load_project_file(args.project)
+    p, problems = _api.load_project_file(args.project, strict=not args.lenient)
     cancel_file = args.cancel_file
 
     def _stop():
@@ -90,6 +93,11 @@ def _cmd_render(args):
     return out
 
 
+def _lenient_arg(sp):
+    sp.add_argument("--lenient", action="store_true",
+                    help="загружать как вкладка: негодные клипы выбрасываются")
+
+
 def build_parser():
     ap = _Parser(prog="montage_tool", description="«Монтаж» SI-HYX без интерфейса.")
     sub = ap.add_subparsers(dest="command", required=True, parser_class=_Parser)
@@ -98,15 +106,18 @@ def build_parser():
     sp.set_defaults(fn=_cmd_probe)
     sp = sub.add_parser("validate", help="проверка проекта")
     sp.add_argument("project")
+    _lenient_arg(sp)
     sp.set_defaults(fn=_cmd_validate)
     sp = sub.add_parser("describe", help="таймлайн проекта")
     sp.add_argument("project")
+    _lenient_arg(sp)
     sp.add_argument("--at", type=float, default=None, help="время проекта, с")
     sp.set_defaults(fn=_cmd_describe)
     for name, fn in (("dry-run", _cmd_dry_run), ("render", _cmd_render)):
         sp = sub.add_parser(name, help="команда сборки" if fn is _cmd_dry_run else "сборка")
         sp.add_argument("project")
         sp.add_argument("output")
+        _lenient_arg(sp)
         sp.add_argument("--encoder", choices=sorted(_api.ENCODERS), default="auto")
         if fn is _cmd_render:
             sp.add_argument("--overwrite", action="store_true",

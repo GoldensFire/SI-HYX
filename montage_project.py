@@ -20,7 +20,11 @@
 
 Время везде в секундах: start — место клипа на шкале проекта, in_s/out_s —
 кусок исходника. Скорость клипа (speed) меняет только длину на шкале: кусок
-исходника тот же, а на проект он идёт быстрее или медленнее."""
+исходника тот же, а на проект он идёт быстрее или медленнее.
+
+Файл проекта — JSON схемы PROJECT_VERSION: v1 (без настроек формата)
+читается как v2, файл новее программы — ProjectError. Строгая проверка для
+внешних агентов — validate (si_hyx_parts/montage_project/schema.py)."""
 import json
 import math
 import os
@@ -28,12 +32,27 @@ import uuid
 from dataclasses import asdict, dataclass, field, fields, replace
 from fractions import Fraction
 
-PROJECT_VERSION = 1
+PROJECT_VERSION = 2
 MIN_CLIP_S = 0.04          # короче клип не бывает (подрезка, разрезание)
 MIN_SPEED = 0.1            # пределы скорости клипа (доли и разы)
 MAX_SPEED = 8.0
 _EPS = 1e-6
 _AUDIO_RATE = 48000          # частота звука сборки (и просмотра проекта)
+# Вписывание кадра клипа в кадр проекта: fit — целиком, с полями цвета фона;
+# fill — растянуть на весь кадр (пропорции не держатся); crop — заполнить
+# кадр, срезав лишнее по краям (рефрейм 16:9 ↔ 9:16 ↔ 1:1).
+FIT_MODES = ('fit', 'fill', 'crop')
+
+
+class ProjectError(ValueError):
+    """Проект не загружается: файл не читается, версия новее программы или
+    (строгая загрузка) проверка нашла проблемы. problems — как у validate,
+    path — файл, который не загрузился."""
+
+    def __init__(self, message, problems=None, path=""):
+        super().__init__(message)
+        self.problems = list(problems or [])
+        self.path = path
 
 
 def _finite(v, default, low=None):
@@ -163,6 +182,18 @@ class Clip:
 
 
 @dataclass
+class ProjectSettings:
+    """Формат итога. Нули — «по первому клипу», как у Filmora: размер и fps
+    берутся у первого видеоклипа основной дорожки."""
+    width: int = 0
+    height: int = 0
+    fps: float = 0.0
+    fit: str = 'fit'              # FIT_MODES
+    background: str = '#000000'   # поля и пустые места кадра, #RRGGBB
+    loudness: float = None        # целевая громкость итога, LUFS; None — как есть
+
+
+@dataclass
 class Track:
     kind: str                     # 'video' | 'audio'
     enabled: bool = True
@@ -184,6 +215,7 @@ class Project:
     def __init__(self):
         self.tracks = [Track('video'), Track('video'), Track('audio'), Track('audio')]
         self.clips = []
+        self.settings = ProjectSettings()
 
     # ── Дорожки ──────────────────────────────────────────────────────────────
     @property
@@ -495,30 +527,54 @@ class Project:
                 and c.audio_path and not c.muted and c.volume > 0 and c.length > _EPS]
 
     def output_format(self):
-        """(ширина, высота, fps) итогового видео — по первому видеоклипу
-        основной дорожки, как «по первому клипу» у Filmora."""
+        """(ширина, высота, fps) итогового видео: из настроек проекта, а что
+        там не задано — по первому видеоклипу основной дорожки, как «по
+        первому клипу» у Filmora."""
         first = next((c for c in self.clips_on(self.main_track)
                       if c.has_video and c.width > 0), None)
         if first is None:
             first = next((c for c in sorted(self.clips, key=lambda c: c.start)
                           if c.has_video and c.width > 0), None)
-        if first is None:
-            return 1280, 720, 30.0
-        w, h = int(first.width) // 2 * 2, int(first.height) // 2 * 2
-        fps = first.fps if (first.fps and first.fps > 0 and not first.is_image) else 30.0
+        st = self.settings
+        if st.width > 0 and st.height > 0:
+            w, h = int(st.width) // 2 * 2, int(st.height) // 2 * 2
+        elif first is not None:
+            w, h = int(first.width) // 2 * 2, int(first.height) // 2 * 2
+        else:
+            w, h = 1280, 720
+        if st.fps and st.fps > 0:
+            fps = st.fps
+        elif first is not None and first.fps and first.fps > 0 and not first.is_image:
+            fps = first.fps
+        else:
+            fps = 30.0
         return max(2, w), max(2, h), float(fps)
 
     # ── Сохранение ───────────────────────────────────────────────────────────
     def to_dict(self):
         return {'version': PROJECT_VERSION,
+                'settings': asdict(self.settings),
                 'tracks': [asdict(t) for t in self.tracks],
                 'clips': [asdict(c) for c in self.clips]}
 
     @classmethod
-    def from_dict(cls, data):
+    def from_dict(cls, data, strict=False):
+        """Проект из словаря. Версия проверяется всегда: v1 переводится в v2,
+        версия новее программы — ProjectError. strict (внешние агенты) —
+        любая проблема validate (без проверки файлов) тоже ProjectError;
+        иначе, как и раньше во вкладке, негодные клипы выбрасываются."""
         p = cls()
         if not isinstance(data, dict):
+            if strict:
+                raise ProjectError("проект должен быть JSON-объектом")
             return p
+        data = migrate_project_data(data)
+        if strict:
+            problems = validate(data, strict=True, check_files=False)
+            if problems:
+                raise ProjectError(f"проект не прошёл проверку: {len(problems)} проблем",
+                                   problems)
+        p.settings = parse_settings(data.get('settings'))
         # Списки — только списками: «"tracks": 5» в файле ронял загрузку
         # TypeError (итерация по числу) вместо пустого проекта.
         raw_tracks = data.get('tracks')
@@ -538,8 +594,11 @@ class Project:
                 c = Clip(**{k: v for k, v in raw.items() if k in names})
             except (TypeError, ValueError):
                 continue                 # нет обязательных полей или они не числа
-            if 0 <= c.track < len(p.tracks) and c.length > _EPS:
-                p.clips.append(c)
+            if not (0 <= c.track < len(p.tracks)) or c.length <= _EPS:
+                continue
+            if p.tracks[c.track].kind != ('video' if c.has_video else 'audio'):
+                continue                 # видеоклип на звуковой дорожке и наоборот
+            p.clips.append(c)
         p.pack()
         return p
 
@@ -551,6 +610,10 @@ class Project:
         нулю. Клипы обрезаются по краям окна, раскладка не пересчитывается."""
         p = Project()
         p.tracks = [Track(t.kind, t.enabled, t.muted) for t in self.tracks]
+        # Формат — всего проекта: у выдержки первый клип может быть другим,
+        # и превью (или сэмпл «Обработки») вышло бы в чужом размере.
+        w, h, fps = self.output_format()
+        p.settings = replace(self.settings, width=w, height=h, fps=fps)
         for c in self.clips:
             a, b = max(c.start, t0), min(c.end, t1)
             if b - a <= _EPS:
@@ -593,6 +656,26 @@ def fps_expr(fps):
 def source_key(path):
     """Ключ файла для сравнения путей (регистр и вид разделителей)."""
     return os.path.normcase(os.path.abspath(str(path)))
+
+
+def ff_color(color):
+    """Цвет #RRGGBB для фильтров ffmpeg; чёрный — словом, как было в графе."""
+    c = str(color or "").lower()
+    if len(c) != 7 or c[0] != "#" or any(ch not in "0123456789abcdef" for ch in c[1:]):
+        return "black"
+    return "black" if c == "#000000" else "0x" + c[1:]
+
+
+def fit_chain(mode, w, h, color="black"):
+    """Цепочка «кадр в квадратных пикселях → ровно w×h» по способу
+    вписывания (FIT_MODES), с запятой в конце."""
+    if mode == 'fill':
+        return f"scale={w}:{h},"
+    if mode == 'crop':
+        return (f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+                f"crop={w}:{h},")
+    return (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={color},")
 
 
 def _seek_s(c, s):
@@ -652,6 +735,8 @@ def build_source(project, video=True, audio=True, subs=None, tonemap=None):
         segments.append((segments[-1][1], project.duration(), None))
     w, h, fps = project.output_format()
     rate = fps_expr(fps)
+    bg = ff_color(project.settings.background)
+    fit = fit_chain(project.settings.fit, w, h, bg)
     inputs, chains = [], []
     total_s = project.duration()
     with_video = bool(segments)
@@ -665,7 +750,7 @@ def build_source(project, video=True, audio=True, subs=None, tonemap=None):
             continue
         lab = f"v{len(labels)}"
         if c is None:
-            chains.append(f"color=c=black:s={w}x{h}:r={rate},trim=end_frame={n},"
+            chains.append(f"color=c={bg}:s={w}x{h}:r={rate},trim=end_frame={n},"
                           f"setsar=1,format=yuv420p[{lab}]")
         else:
             idx = len(inputs)
@@ -693,9 +778,7 @@ def build_source(project, video=True, audio=True, subs=None, tonemap=None):
             # пикселя размер тот же — фильтр кадр не трогает.
             chains.append(
                 f"[{idx}:v:0]{tone}{burn}setpts=PTS-STARTPTS,{speed_vf}"
-                f"scale=iw*sar:ih,setsar=1,"
-                f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,"
+                f"scale=iw*sar:ih,setsar=1,{fit}setsar=1,"
                 f"fps={rate},tpad=stop_mode=clone:stop_duration=1,"
                 f"trim=end_frame={n},setpts=PTS-STARTPTS,format=yuv420p[{lab}]")
         labels.append(lab)
@@ -767,16 +850,42 @@ def build_export(project, out_path, ffmpeg, video_args, audio_args=None, subs=No
 
 
 def save_project(project, path):
-    """Атомарная запись проекта (tmp + replace)."""
+    """Атомарная запись проекта, как у пресетов субтитров
+    (edit_tab_base._save_subtitle_presets): tmp на диск с fsync, прежний
+    файл — в .bak, затем tmp на место. Сбой между двумя переносами оставляет
+    .bak — его подхватит load_project."""
+    path = str(path)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(project.to_dict(), f, ensure_ascii=False, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    if os.path.exists(path):
+        os.replace(path, path + ".bak")
     os.replace(tmp, path)
 
 
-def load_project(path):
+def load_project(path, strict=False):
+    """Проект из файла. Файла нет — его .bak (сбой посреди save_project),
+    нет и его — пустой проект. Файл есть, но не загружается (не JSON,
+    версия новее программы, строгая проверка) — ProjectError с path этого
+    файла: вызывающий решает, что с ним делать, и не затирает его молча."""
+    path = str(path)
+    if not os.path.exists(path) and os.path.exists(path + ".bak"):
+        path += ".bak"
+    if not os.path.exists(path):
+        return Project()
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return Project.from_dict(json.load(f))
-    except (OSError, ValueError):
-        return Project()
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ProjectError(f"проект не прочитан: {e}", path=path) from e
+    try:
+        return Project.from_dict(data, strict=strict)
+    except ProjectError as e:
+        e.path = path
+        raise
+
+
+from si_hyx_parts.montage_project.schema import (  # noqa: E402
+    migrate_project_data, parse_settings, validate)

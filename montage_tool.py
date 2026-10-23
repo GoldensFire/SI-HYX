@@ -72,7 +72,8 @@ class ToolError(Exception):
         return out
 
 
-from si_hyx_parts.montage_tool.project_io import load_project_file, project_from_data  # noqa: E402,F401
+from si_hyx_parts.montage_tool.project_io import (  # noqa: E402,F401
+    load_project_file, project_from_data, read_project_json)
 from si_hyx_parts.montage_tool.timeline import describe_project  # noqa: E402,F401
 from si_hyx_parts.montage_tool.render import (  # noqa: E402,F401
     dry_run, export_command, missing_files, render)

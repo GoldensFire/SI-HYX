@@ -4,9 +4,10 @@
 """Проект для headless-команд: чтение файла без молчаливых подмен.
 Public namespace: montage_tool.
 
-montage_project.load_project на любой ошибке отдаёт пустой проект — вкладке
-так удобнее, а агенту нужна причина: битый JSON, не тот тип, выпавшие
-клипы. Здесь ошибка — ToolError, а потери — в списке проблем."""
+montage_project.load_project у вкладки мягкий: негодные клипы выбрасываются.
+Агенту нужна причина, поэтому по умолчанию проект проверяется строго
+(montage_project.validate) и любая проблема — ToolError со списком; lenient
+загружает как вкладка, а проблемы только перечисляет."""
 import montage_tool as _api
 
 # Больше не читаем: проект — это дорожки и клипы, а не медиа.
@@ -32,29 +33,23 @@ def read_project_json(path):
     return data
 
 
-def project_from_data(data):
-    """(Project, проблемы) из словаря проекта. Проблемы — клипы и дорожки,
-    которые загрузка выбросила (путь поля и причина)."""
-    if not isinstance(data, dict):
-        raise _api.ToolError("project_invalid", "проект должен быть JSON-объектом")
-    p = _api.montage_project.Project.from_dict(data)
-    problems = []
-    raw_clips = data.get("clips")
-    if raw_clips is not None and not isinstance(raw_clips, list):
-        problems.append({"path": "clips", "message": "должен быть списком — клипы не загружены"})
-    elif raw_clips:
-        kept = {c.id for c in p.clips}
-        for i, raw in enumerate(raw_clips):
-            cid = str(raw.get("id")) if isinstance(raw, dict) and raw.get("id") else ""
-            if not cid or cid not in kept:
-                problems.append({"path": f"clips[{i}]", "message": "клип не загружен"})
-    raw_tracks = data.get("tracks")
-    if raw_tracks is not None and (not isinstance(raw_tracks, list)
-                                   or len(p.tracks) != len(raw_tracks)):
-        problems.append({"path": "tracks", "message": "дорожки не загружены — взяты стандартные"})
-    return p, problems
+def project_from_data(data, strict=True, check_files=False):
+    """(Project, проблемы). strict — проблемы проверки (montage_project.validate)
+    — ToolError('project_invalid'); иначе проект грузится как во вкладке.
+    Версия новее программы — ToolError('project_version') в любом режиме."""
+    mp = _api.montage_project
+    try:
+        migrated = mp.migrate_project_data(data)
+    except mp.ProjectError as e:
+        raise _api.ToolError("project_version", str(e), e.problems) from e
+    problems = mp.validate(data, strict=strict, check_files=check_files)
+    if strict and problems:
+        raise _api.ToolError("project_invalid",
+                             f"проект не прошёл проверку: проблем — {len(problems)}", problems)
+    return mp.Project.from_dict(migrated), problems
 
 
-def load_project_file(path):
-    """(Project, проблемы) из файла проекта; ToolError — файл не читается."""
-    return project_from_data(read_project_json(path))
+def load_project_file(path, strict=True, check_files=False):
+    """(Project, проблемы) из файла проекта; ToolError — файл не читается
+    или (strict) проект не прошёл проверку."""
+    return project_from_data(read_project_json(path), strict, check_files)

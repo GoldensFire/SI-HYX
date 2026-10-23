@@ -46,12 +46,8 @@ class EditTabProjectMixin:
     # ── Состояние ────────────────────────────────────────────────────────────
     def _project_init(self):
         """Вызывается из __init__ до сборки интерфейса."""
-        self.project = _mp.Project()
-        try:
-            if _api.os.path.exists(_api.MONTAGE_PROJECT_PATH):
-                self.project = _mp.load_project(_api.MONTAGE_PROJECT_PATH)
-        except Exception:
-            self.project = _mp.Project()
+        self._proj_save_blocked = False   # файл проекта не загрузился и не отложен
+        self.project = self._project_load_saved()
         self._proj_undo = _api.deque(maxlen=100)
         self._proj_redo = _api.deque(maxlen=100)
         self._proj_active = not self.project.is_empty()   # плеер на проекте
@@ -108,6 +104,10 @@ class EditTabProjectMixin:
         self._project_panel = panel
         self._project_sync_scroll()
         self._project_update_ui()
+        note = getattr(self, "_proj_load_note", "")
+        if note:
+            # Подпись строки состояния появится позже панели — после сборки окна.
+            _api.QTimer.singleShot(0, lambda: self._proj_status(note))
         return panel
 
     def _project_apply_collapsed(self):
@@ -161,6 +161,42 @@ class EditTabProjectMixin:
             if n > 0:
                 b.setEnabled(True)
 
+    def _project_load_saved(self):
+        """Проект из MONTAGE_PROJECT_PATH. Файл, который не загрузился (битый
+        JSON, версия новее программы), не затирается первой же правкой: он
+        откладывается рядом (…json.unreadable-ДАТА), и тогда берётся его .bak;
+        не вышло отложить — проект не сохраняется до перезапуска."""
+        path = _api.MONTAGE_PROJECT_PATH
+        for _attempt in range(2):        # сам файл, затем его .bak
+            try:
+                return _mp.load_project(path)
+            except _mp.ProjectError as e:
+                bad = e.path or path
+                aside = f"{bad}.unreadable-{_api.time.strftime('%Y%m%d-%H%M%S')}"
+                try:
+                    _api.os.replace(bad, aside)
+                except OSError:
+                    self._proj_save_blocked = True
+                    self._proj_load_note = f"проект не загружен ({e}) и не сохраняется: {bad}"
+                    return _mp.Project()
+                self._proj_load_note = f"проект не загружен ({e}), файл отложен: {aside}"
+            except Exception as e:
+                self._proj_save_blocked = True
+                self._proj_load_note = f"проект не загружен и не сохраняется: {e}"
+                return _mp.Project()
+        return _mp.Project()
+
+    def _project_save(self):
+        """Сохраняет проект в MONTAGE_PROJECT_PATH (не затирая файл, который
+        не загрузился, — см. _project_load_saved)."""
+        if getattr(self, "_proj_save_blocked", False):
+            return
+        try:
+            _api.os.makedirs(_api.os.path.dirname(_api.MONTAGE_PROJECT_PATH), exist_ok=True)
+            _mp.save_project(self.project, _api.MONTAGE_PROJECT_PATH)
+        except Exception:
+            pass
+
     def _proj_status(self, text):
         try:
             self.log_label.setText(text)
@@ -181,11 +217,7 @@ class EditTabProjectMixin:
         if self._proj_play is not None:
             self.project_stop()
         self._proj_active = not self.project.is_empty()
-        try:
-            _api.os.makedirs(_api.os.path.dirname(_api.MONTAGE_PROJECT_PATH), exist_ok=True)
-            _mp.save_project(self.project, _api.MONTAGE_PROJECT_PATH)
-        except Exception:
-            pass
+        self._project_save()
         self.project_timeline.refresh()
         self._project_sync_source()
         self._project_update_ui()
@@ -355,11 +387,7 @@ class EditTabProjectMixin:
                 changed.append(c.id)
         if not changed:
             return
-        try:
-            _api.os.makedirs(_api.os.path.dirname(_api.MONTAGE_PROJECT_PATH), exist_ok=True)
-            _mp.save_project(self.project, _api.MONTAGE_PROJECT_PATH)
-        except Exception:
-            pass
+        self._project_save()
         if self._proj_play is not None and self._snd_active:
             # Звук тракта сведён со старой дорожкой — просмотр заново с того
             # же места: звук и картинка стартуют вместе уже с новой.
