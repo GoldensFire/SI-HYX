@@ -82,6 +82,14 @@ class EditTabProjectMixin:
         lay.setContentsMargins(8, 2, 8, 4)
         lay.setSpacing(2)
 
+        # Чего живой плеер не покажет (он играет клипы по одному и без
+        # эффектов): видно только в собранном файле и в превью montage_tool.
+        self.lbl_proj_preview_gap = _api.QLabel()
+        self.lbl_proj_preview_gap.setWordWrap(True)
+        self.lbl_proj_preview_gap.setStyleSheet(f"color: {_api.C['text3']}; font-size: 11px;")
+        self.lbl_proj_preview_gap.hide()
+        lay.addWidget(self.lbl_proj_preview_gap)
+
         tl = _api.ProjectTimeline(self.project)
         tl.thumb_provider = self._project_thumb
         tl.wave_provider = self._project_wave
@@ -147,6 +155,13 @@ class EditTabProjectMixin:
         self.btn_proj_redo.setEnabled(bool(self._proj_redo))
         self._update_total_time()
         self.update_selection_label()
+        gap_lbl = getattr(self, "lbl_proj_preview_gap", None)
+        if gap_lbl is not None:
+            gaps = self.project.live_preview_gaps()
+            gap_lbl.setText("Просмотр во вкладке играет клипы без эффектов. "
+                            f"Только в собранном файле и в превью montage_tool: {', '.join(gaps)}."
+                            if gaps else "")
+            gap_lbl.setVisible(bool(gaps))
         if n > 0:
             # Плеер на проекте: играть есть что, даже если на экране картинка.
             self.btn_play.setEnabled(True)

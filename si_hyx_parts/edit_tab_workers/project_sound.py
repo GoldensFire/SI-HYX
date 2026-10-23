@@ -175,8 +175,10 @@ class _Renderer(_api.threading.Thread):
         лишнее отрезаем (часы и стык следующего окна держатся на счёте)."""
         want = b - a
         rate = float(self.rate)
+        # Окно по полному проекту (window), а не по excerpt: затухание и
+        # переход на краю окна звучат с той же фазой, что и в сборке.
         src = _api.montage_project.build_source(
-            self.project.excerpt(a / rate, b / rate), video=False, audio=True)
+            self.project, video=False, audio=True, window=(a / rate, b / rate))
         if src is None or not src.audio:
             return self._silence(want)
         graph_file = None

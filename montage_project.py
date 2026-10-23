@@ -45,6 +45,19 @@ FIT_MODES = ('fit', 'fill', 'crop')
 # Виды маркеров шкалы: сцена (смена плана), бит и начало звука музыки,
 # тишина и речь (отрезки), слово (отрезок с текстом), свой маркер.
 MARKER_KINDS = ('scene', 'beat', 'onset', 'silence', 'speech', 'word', 'custom')
+# Переходы между клипами основной дорожки — виды ffmpeg xfade (без custom и
+# новых, которых нет в сборках ffmpeg 6).
+TRANSITIONS = (
+    'fade', 'fadeblack', 'fadewhite', 'fadegrays', 'fadefast', 'fadeslow', 'dissolve',
+    'pixelize', 'radial', 'distance', 'hblur', 'wipeleft', 'wiperight', 'wipeup',
+    'wipedown', 'wipetl', 'wipetr', 'wipebl', 'wipebr', 'slideleft', 'slideright',
+    'slideup', 'slidedown', 'smoothleft', 'smoothright', 'smoothup', 'smoothdown',
+    'circlecrop', 'rectcrop', 'circleopen', 'circleclose', 'vertopen', 'vertclose',
+    'horzopen', 'horzclose', 'diagtl', 'diagtr', 'diagbl', 'diagbr', 'hlslice',
+    'hrslice', 'vuslice', 'vdslice', 'squeezeh', 'squeezev', 'zoomin')
+# Роль дорожки: голос приглушает музыку (ProjectSettings.duck).
+TRACK_ROLES = ('', 'voice', 'music')
+MIN_SCALE, MAX_SCALE = 0.02, 4.0
 
 
 class ProjectError(ValueError):
@@ -131,6 +144,16 @@ class Clip:
     height: int = 0
     fps: float = 0.0
     src_duration: float = 0.0     # длина исходника — предел подрезки
+    # v2 — вид и звук клипа; по умолчанию всё как в v1.
+    fit: str = ''                 # вписывание (FIT_MODES); '' — как у проекта
+    pos_x: float = 0.5            # клип верхней дорожки: центр, доли кадра
+    pos_y: float = 0.5
+    scale: float = 1.0            # клип верхней дорожки: размер, доля кадра
+    opacity: float = 1.0          # клип верхней дорожки: непрозрачность 0…1
+    transition: str = ''          # переход В этот клип основной дорожки (TRANSITIONS)
+    transition_s: float = 0.0     # его длина: клип встаёт внахлёст на предыдущий
+    fade_in: float = 0.0          # нарастание и затухание звука клипа, с
+    fade_out: float = 0.0
 
     def __post_init__(self):
         """Типы и пределы полей — при любом создании клипа: из файла проекта,
@@ -157,6 +180,15 @@ class Clip:
         self.src_duration = _finite(self.src_duration, 0.0, low=0.0)
         speed = _finite(self.speed, 1.0)
         self.speed = 1.0 if self.is_image else max(MIN_SPEED, min(MAX_SPEED, speed))
+        self.fit = self.fit if self.fit in FIT_MODES else ''
+        self.pos_x = _finite(self.pos_x, 0.5)
+        self.pos_y = _finite(self.pos_y, 0.5)
+        self.scale = max(MIN_SCALE, min(MAX_SCALE, _finite(self.scale, 1.0)))
+        self.opacity = max(0.0, min(1.0, _finite(self.opacity, 1.0)))
+        self.transition = self.transition if self.transition in TRANSITIONS else ''
+        self.transition_s = _finite(self.transition_s, 0.0, low=0.0)
+        self.fade_in = _finite(self.fade_in, 0.0, low=0.0)
+        self.fade_out = _finite(self.fade_out, 0.0, low=0.0)
 
     @property
     def play_speed(self):
@@ -185,6 +217,23 @@ class Clip:
 
 
 @dataclass
+class TextItem:
+    """Текст проекта во времени проекта (титр, подпись): вшивается ASS-ом
+    после склейки и наложений. style — поверх стиля программы
+    (subtitle_ass.DEFAULT_SUBTITLE_STYLE: font, size, bold, italic,
+    underline, align 1…9, spacing, color, outline_color, outline, shadow,
+    shadow_alpha, animation none/fade/slide/pop); pos_x/pos_y — точка
+    привязки, доли кадра (None — по выравниванию align)."""
+    start: float
+    end: float
+    text: str
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    style: dict = field(default_factory=dict)
+    pos_x: float = None
+    pos_y: float = None
+
+
+@dataclass
 class ProjectSettings:
     """Формат итога. Нули — «по первому клипу», как у Filmora: размер и fps
     берутся у первого видеоклипа основной дорожки."""
@@ -194,6 +243,7 @@ class ProjectSettings:
     fit: str = 'fit'              # FIT_MODES
     background: str = '#000000'   # поля и пустые места кадра, #RRGGBB
     loudness: float = None        # целевая громкость итога, LUFS; None — как есть
+    duck: float = 0.0             # 0…1: насколько голос (Track.role) приглушает музыку
 
 
 @dataclass
@@ -212,6 +262,7 @@ class Track:
     kind: str                     # 'video' | 'audio'
     enabled: bool = True
     muted: bool = False           # звук клипов дорожки выключен (картинка остаётся)
+    role: str = ''                # TRACK_ROLES: голос приглушает музыку
 
 
 def snap_to_frame(t, fps):
@@ -231,6 +282,7 @@ class Project:
         self.clips = []
         self.settings = ProjectSettings()
         self.markers = []             # Marker по времени
+        self.texts = []               # TextItem по времени
 
     # ── Дорожки ──────────────────────────────────────────────────────────────
     @property
@@ -283,12 +335,22 @@ class Project:
     def clip_at(self, ti, t):
         return next((c for c in self.clips_on(ti) if c.start <= t < c.end), None)
 
+    @staticmethod
+    def transition_overlap(prev, c):
+        """Нахлёст клипа c на предыдущий prev основной дорожки — длина
+        перехода, не больше половины каждого из двух клипов (иначе два
+        перехода одного клипа налезли бы друг на друга)."""
+        if prev is None or not c.transition or c.transition_s <= 0:
+            return 0.0
+        return max(0.0, min(c.transition_s, prev.length / 2.0, c.length / 2.0))
+
     def pack(self):
-        """Основная дорожка — вплотную, в порядке start (магнитная)."""
-        t = 0.0
+        """Основная дорожка — вплотную, в порядке start (магнитная); клип с
+        переходом встаёт внахлёст на предыдущий (transition_overlap)."""
+        t, prev = 0.0, None
         for c in self.clips_on(self.main_track):
-            c.start = t
-            t = c.end
+            c.start = max(0.0, t - self.transition_overlap(prev, c))
+            t, prev = c.end, c
 
     def _free_spot(self, clip):
         """Ставит клип свободной дорожки туда, где он ни на кого не налезает:
@@ -344,6 +406,9 @@ class Project:
             return None
         right = Clip(**{f.name: getattr(c, f.name) for f in fields(Clip)})
         right.id = uuid.uuid4().hex[:12]
+        # Переход и нарастание звука — у начала клипа, затухание — у конца.
+        right.transition, right.transition_s, right.fade_in = '', 0.0, 0.0
+        c.fade_out = 0.0
         right.in_s = cut
         right.start = c.start + (cut - c.in_s) / speed
         c.out_s = cut
@@ -541,6 +606,31 @@ class Project:
                 if self.tracks[c.track].enabled and not self.tracks[c.track].muted
                 and c.audio_path and not c.muted and c.volume > 0 and c.length > _EPS]
 
+    def live_preview_gaps(self):
+        """Что из проекта живой плеер вкладки не покажет (он играет один
+        клип за раз и без эффектов) — видно только в превью montage_tool и
+        в собранном файле. Пустой список — просмотр совпадает с итогом."""
+        gaps = []
+        main = self.main_track
+        upper = [c for c in self.clips if c.track != main and c.has_video
+                 and self.tracks[c.track].enabled]
+        if any(abs(c.scale - 1.0) > _EPS or abs(c.pos_x - 0.5) > _EPS
+               or abs(c.pos_y - 0.5) > _EPS or c.opacity < 1.0 for c in upper):
+            gaps.append("наложения (размер, место, прозрачность)")
+        if any(c.transition and c.transition_s > 0 for c in self.clips_on(main)):
+            gaps.append("переходы")
+        if self.texts:
+            gaps.append("текст")
+        if any(c.fit for c in self.clips) or self.settings.fit != 'fit':
+            gaps.append("вписывание кадра")
+        if any(c.fade_in > 0 or c.fade_out > 0 for c in self.clips):
+            gaps.append("нарастание и затухание звука")
+        if self.settings.duck > 0 and any(t.role for t in self.tracks):
+            gaps.append("приглушение музыки под голос")
+        if self.settings.loudness is not None:
+            gaps.append("выравнивание громкости")
+        return gaps
+
     def output_format(self):
         """(ширина, высота, fps) итогового видео: из настроек проекта, а что
         там не задано — по первому видеоклипу основной дорожки, как «по
@@ -571,7 +661,8 @@ class Project:
                 'settings': asdict(self.settings),
                 'tracks': [asdict(t) for t in self.tracks],
                 'clips': [asdict(c) for c in self.clips],
-                'markers': [asdict(m) for m in self.markers]}
+                'markers': [asdict(m) for m in self.markers],
+                'texts': [asdict(t) for t in self.texts]}
 
     @classmethod
     def from_dict(cls, data, strict=False):
@@ -592,12 +683,14 @@ class Project:
                                    problems)
         p.settings = parse_settings(data.get('settings'))
         p.markers = parse_markers(data.get('markers'))
+        p.texts = parse_texts(data.get('texts'))
         # Списки — только списками: «"tracks": 5» в файле ронял загрузку
         # TypeError (итерация по числу) вместо пустого проекта.
         raw_tracks = data.get('tracks')
         raw_clips = data.get('clips')
         tracks = [Track(kind=t.get('kind', 'video'), enabled=bool(t.get('enabled', True)),
-                        muted=bool(t.get('muted', False)))
+                        muted=bool(t.get('muted', False)),
+                        role=t.get('role') if t.get('role') in TRACK_ROLES else '')
                   for t in (raw_tracks if isinstance(raw_tracks, list) else [])
                   if isinstance(t, dict) and t.get('kind') in ('video', 'audio')]
         if any(t.kind == 'video' for t in tracks):
@@ -626,7 +719,7 @@ class Project:
         """Копия проекта, где осталось только время [t0, t1) — сдвинутое к
         нулю. Клипы обрезаются по краям окна, раскладка не пересчитывается."""
         p = Project()
-        p.tracks = [Track(t.kind, t.enabled, t.muted) for t in self.tracks]
+        p.tracks = [replace(t) for t in self.tracks]
         # Формат — всего проекта: у выдержки первый клип может быть другим,
         # и превью (или сэмпл «Обработки») вышло бы в чужом размере.
         w, h, fps = self.output_format()
@@ -722,150 +815,6 @@ class SourceGraph:
         return [a for args in self.inputs for a in args]
 
 
-def build_source(project, video=True, audio=True, subs=None, tonemap=None):
-    """Граф проекта без кодирования: SourceGraph или None, если собирать
-    нечего. video/audio=False выбрасывают соответствующую часть.
-
-    tonemap — HDR-куски в SDR: {source_key(файл): цепочка фильтров}
-    (hdr_tonemap.tonemap_filters). Цепочка встаёт первой, на кадр исходника:
-    субтитры потом рисуются уже в SDR, а куски HDR и SDR файлов склеиваются
-    в одном цветовом пространстве.
-
-    subs — вшивание субтитров: {source_key(файл): фильтр subtitles=…}. Куски
-    этих файлов получают фильтр на кадре исходника (до масштаба под проект)
-    и во времени исходника: входной -ss обнуляет метки, а реплики фильтр
-    ищет по времени самого файла субтитров.
-
-    Как устроено: каждый видимый кусок видео — свой вход с входным -ss/-t
-    (кадрово точно и без декодирования файла с начала), приводится к размеру и
-    fps проекта и обрезается РОВНО до своего числа кадров; куски склеивает
-    concat. Границы кусков округляются к сетке кадров проекта независимо, так
-    что ошибка не копится: звук, расставленный по точному времени (adelay),
-    не уезжает дальше полукадра на любом числе кусков. Звук всех клипов —
-    отдельные входы, смешивание amix без приглушения."""
-    segments = project.video_segments() if video else []
-    parts = project.audio_parts() if audio else []
-    if not segments and not parts:
-        return None
-    if segments and project.duration() > segments[-1][1] + _EPS:
-        # Звук длиннее картинки — хвост видео добиваем чёрным кадром.
-        segments.append((segments[-1][1], project.duration(), None))
-    w, h, fps = project.output_format()
-    rate = fps_expr(fps)
-    bg = ff_color(project.settings.background)
-    fit = fit_chain(project.settings.fit, w, h, bg)
-    inputs, chains = [], []
-    total_s = project.duration()
-    with_video = bool(segments)
-    if with_video:
-        frames_total = int(round(total_s * fps))
-        total_s = frames_total / fps
-    labels = []
-    for t0, t1, c in segments:
-        n = int(round(t1 * fps)) - int(round(t0 * fps))
-        if n <= 0:
-            continue
-        lab = f"v{len(labels)}"
-        if c is None:
-            chains.append(f"color=c={bg}:s={w}x{h}:r={rate},trim=end_frame={n},"
-                          f"setsar=1,format=yuv420p[{lab}]")
-        else:
-            idx = len(inputs)
-            speed = c.play_speed
-            s = c.source_time(t0)
-            span = t1 - t0
-            if c.is_image:
-                inputs.append(["-loop", "1", "-framerate", rate,
-                               "-t", _num(span + 1.0), "-i", c.src])
-            else:
-                inputs.append(["-ss", _num(_seek_s(c, s)),
-                               "-t", _num(span * speed + 0.5), "-i", c.src])
-            sub_vf = (subs or {}).get(source_key(c.src)) if not c.is_image else None
-            tone_vf = (tonemap or {}).get(source_key(c.src)) if not c.is_image else None
-            tone = f"{tone_vf}," if tone_vf else ""
-            burn = ""
-            if sub_vf:
-                # Первый кадр после входного seek — кадр, на котором стоит s.
-                first = snap_to_frame(s, c.fps)
-                burn = (f"setpts=PTS-STARTPTS+{_num(first)}/TB,{sub_vf},")
-            speed_vf = "" if abs(speed - 1.0) <= 1e-6 else f"setpts=(PTS-STARTPTS)/{_num(speed)},"
-            # scale=iw*sar:ih — неквадратный пиксель (анаморфный DVD) в
-            # квадратный до вписывания: вписывание шло по размеру в пикселях,
-            # а setsar=1 потом показывал кадр 16:9 как 3:2. У квадратного
-            # пикселя размер тот же — фильтр кадр не трогает.
-            chains.append(
-                f"[{idx}:v:0]{tone}{burn}setpts=PTS-STARTPTS,{speed_vf}"
-                f"scale=iw*sar:ih,setsar=1,{fit}setsar=1,"
-                f"fps={rate},tpad=stop_mode=clone:stop_duration=1,"
-                f"trim=end_frame={n},setpts=PTS-STARTPTS,format=yuv420p[{lab}]")
-        labels.append(lab)
-    amix = []
-    for c in parts:
-        idx = len(inputs)
-        speed = c.play_speed
-        inputs.append(["-ss", _num(c.in_s), "-t", _num(c.length * speed + 0.25),
-                       "-i", c.audio_path])
-        spec = f"{idx}:{c.audio_stream}" if c.audio_stream >= 0 else f"{idx}:a:0"
-        lab = f"a{len(amix)}"
-        tempo = atempo_chain(speed)
-        tempo_vf = (",".join(tempo) + ",") if tempo else ""
-        # Место и длина — в сэмплах, от общей сетки шкалы: конец клипа и
-        # начало следующего попадают в один и тот же сэмпл. С миллисекундами
-        # (adelay округлял начало) на стыке оставалась дыра до 0.5 мс — щелчок.
-        a0 = int(round(c.start * _AUDIO_RATE))
-        n = max(1, int(round((c.start + c.length) * _AUDIO_RATE)) - a0)
-        chains.append(
-            f"[{spec}]aresample={_AUDIO_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            f"{tempo_vf}atrim=end_sample={n},asetpts=PTS-STARTPTS,"
-            f"volume={_num(c.volume)},adelay={a0}S:all=1[{lab}]")
-        amix.append(lab)
-    if labels:
-        if len(labels) == 1:
-            chains.append(f"[{labels[0]}]null[vout]")
-        else:
-            chains.append("".join(f"[{x}]" for x in labels)
-                          + f"concat=n={len(labels)}:v=1:a=0[vout]")
-    if amix:
-        # Первым входом amix — тишина на всю длину проекта: amix берёт метки
-        # времени у первого входа, и если им оказывался задержанный adelay
-        # кусок (клип не с начала шкалы), ffmpeg выдавал битые метки — звук
-        # обрывался на первых 20 мс («Error submitting a packet to the muxer»).
-        # Тишина с нуля даёт ровную шкалу, а duration=first — точную длину.
-        chains.append(f"anullsrc=r={_AUDIO_RATE}:cl=stereo,"
-                      f"atrim=end_sample={max(1, int(round(total_s * _AUDIO_RATE)))}[asil]")
-        chains.append("[asil]" + "".join(f"[{x}]" for x in amix)
-                      + f"amix=inputs={len(amix) + 1}:normalize=0:"
-                        f"dropout_transition=0:duration=first[aout]")
-    return SourceGraph(inputs, ";".join(chains), bool(labels), bool(amix),
-                       total_s, w, h, fps)
-
-
-def build_export(project, out_path, ffmpeg, video_args, audio_args=None, subs=None,
-                 tonemap=None):
-    """Команда ffmpeg для сборки проекта.
-
-    Возвращает (cmd, graph, duration): graph — граф фильтров (его кладут в
-    файл и передают через -/filter_complex, если команда длинная), duration —
-    длина итога для прогресса. None, если собирать нечего. subs и tonemap —
-    как у build_source."""
-    audio_args = audio_args or ["-c:a", "aac", "-b:a", "192k"]
-    src = build_source(project, subs=subs, tonemap=tonemap)
-    if src is None:
-        return None
-    cmd = [ffmpeg, "-y", "-hide_banner"] + src.input_args()
-    cmd += ["-filter_complex", src.graph]
-    if src.video:
-        cmd += ["-map", "[vout]"] + list(video_args)
-        if "-pix_fmt" not in video_args:
-            cmd += ["-pix_fmt", "yuv420p"]
-    if src.audio:
-        cmd += ["-map", "[aout]"] + list(audio_args)
-    else:
-        cmd += ["-an"]
-    cmd += ["-t", _num(src.duration), str(out_path)]
-    return cmd, src.graph, src.duration
-
-
 def save_project(project, path):
     """Атомарная запись проекта, как у пресетов субтитров
     (edit_tab_base._save_subtitle_presets): tmp на диск с fsync, прежний
@@ -905,4 +854,6 @@ def load_project(path, strict=False):
 
 
 from si_hyx_parts.montage_project.schema import (  # noqa: E402
-    migrate_project_data, parse_markers, parse_settings, validate)
+    migrate_project_data, parse_markers, parse_settings, parse_texts, validate)
+from si_hyx_parts.montage_project.graph import (  # noqa: E402,F401
+    build_export, build_source, loudnorm_filter, text_cues)

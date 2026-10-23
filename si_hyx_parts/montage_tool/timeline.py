@@ -18,9 +18,13 @@ def _clip_brief(p, c):
             "speed": _r(c.play_speed), "has_video": c.has_video, "is_image": c.is_image,
             "width": c.width, "height": c.height, "fps": _r(c.fps),
             "src_duration": _r(c.src_duration),
+            "fit": c.fit, "transition": c.transition, "transition_s": _r(c.transition_s),
+            "overlay": ({"pos_x": _r(c.pos_x), "pos_y": _r(c.pos_y), "scale": _r(c.scale),
+                         "opacity": _r(c.opacity)} if c.track != p.main_track else None),
             "audio": ({"path": c.audio_path, "stream": c.audio_stream,
                        "volume": _r(c.volume), "muted": c.muted,
-                       "detached": c.audio_detached} if c.audio_path else None)}
+                       "detached": c.audio_detached, "fade_in": _r(c.fade_in),
+                       "fade_out": _r(c.fade_out)} if c.audio_path else None)}
 
 
 def _span(c, t0, t1):
@@ -32,10 +36,12 @@ def _span(c, t0, t1):
 
 
 def describe_project(p, at=None):
-    """Словарь (только JSON-типы): формат итога, дорожки, клипы, что видно
-    (video — куски кадра, как их склеит сборка; clip None — чёрный кадр) и
-    что слышно (audio — все клипы, чей звук смешивается). at — время
-    проекта: ещё и что видно и слышно в этот момент, со временем исходника."""
+    """Словарь (только JSON-типы): формат итога и настройки, дорожки, клипы,
+    что видно (video — верхний клип в каждый момент, как у живого плеера;
+    наложения и переходы — поля клипов; clip None — пустой кадр), что
+    слышно (audio — все клипы, чей звук смешивается), маркеры и текст. at —
+    время проекта: ещё и что видно и слышно в этот момент, со временем
+    исходника. live_preview_gaps — чего не покажет живой плеер вкладки."""
     w, h, fps = p.output_format()
     video = []
     for t0, t1, c in p.video_segments():
@@ -50,9 +56,11 @@ def describe_project(p, at=None):
         "duration": _r(p.duration()),
         "format": {"width": w, "height": h, "fps": _r(fps),
                    "fps_expr": _api.montage_project.fps_expr(fps)},
+        "settings": _api.dataclasses.asdict(p.settings),
         "main_track": p.main_track,
         "tracks": [{"index": i, "kind": t.kind, "name": p.track_name(i),
                     "main": i == p.main_track, "enabled": t.enabled, "muted": t.muted,
+                    "role": t.role,
                     "clips": [c.id for c in p.clips_on(i)]}
                    for i, t in enumerate(p.tracks)],
         "clips": [_clip_brief(p, c) for c in sorted(p.clips, key=lambda c: (c.track, c.start))],
@@ -61,6 +69,10 @@ def describe_project(p, at=None):
         "markers": [{"t": _r(m.t), "kind": m.kind, "label": m.label,
                      "strength": _r(m.strength),
                      "end": None if m.end is None else _r(m.end)} for m in p.markers],
+        "texts": [{"id": x.id, "start": _r(x.start), "end": _r(x.end), "text": x.text,
+                   "style": dict(x.style), "pos_x": x.pos_x, "pos_y": x.pos_y}
+                  for x in p.texts],
+        "live_preview_gaps": p.live_preview_gaps(),
     }
     if at is not None:
         t = float(at)
@@ -75,5 +87,20 @@ def describe_project(p, at=None):
             c = p.clip(seen["clip"])
             vis = {"clip": c.id, "src": c.src, "src_time": _r(c.source_time(t)),
                    "track": c.track}
-        out["at"] = {"t": _r(t), "video": vis, "audio": heard}
+        # Слои кадра снизу вверх: основная дорожка (на переходе — оба клипа),
+        # затем наложения верхних дорожек.
+        layers = []
+        for ti in p.tracks_of('video'):
+            if not p.tracks[ti].enabled:
+                continue
+            for c in p.clips_on(ti):
+                if c.has_video and c.start <= t < c.end:
+                    layers.append({"clip": c.id, "track": ti, "src": c.src,
+                                   "src_time": _r(c.source_time(t)),
+                                   "main": ti == p.main_track})
+        main_layers = [x for x in layers if x["main"]]
+        layers = main_layers + [x for x in layers if not x["main"]]
+        texts = [x.id for x in p.texts if x.start <= t < x.end]
+        out["at"] = {"t": _r(t), "video": vis, "layers": layers, "texts": texts,
+                     "audio": heard}
     return out

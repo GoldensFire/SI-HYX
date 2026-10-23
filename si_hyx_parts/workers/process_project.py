@@ -197,7 +197,7 @@ class ProcessProjectMixin:
         dur = proj.duration()
         take = min(_SAMPLE_MAX_S, dur)
         t0 = max(0.0, (dur - take) / 2.0)
-        part = _mp.build_source(proj.excerpt(t0, t0 + take), audio=False, tonemap=tonemap)
+        part = _mp.build_source(proj, audio=False, tonemap=tonemap, window=(t0, t0 + take))
         if part is None or not part.video:
             return None
         tmp = _api.os.path.join(_api.TEMP_DIR, f"projsample_{_api.uuid.uuid4().hex}.mkv")

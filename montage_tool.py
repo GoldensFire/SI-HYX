@@ -47,6 +47,7 @@ if __name__ == "__main__":
     import montage_tool
     sys.exit(montage_tool.main())
 
+import dataclasses
 import json
 import shutil
 import subprocess

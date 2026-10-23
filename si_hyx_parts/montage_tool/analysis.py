@@ -4,8 +4,8 @@
 """Анализ проекта или файла → маркеры (montage_project.Marker).
 Public namespace: montage_tool.
 
-Сцены — ffmpeg scdet по картинке, собранной как итог (excerpt +
-build_source) или по самому файлу. Звук сводится в моно 16 кГц
+Сцены — ffmpeg scdet по картинке, собранной как итог (build_source с
+окном) или по самому файлу. Звук сводится в моно 16 кГц
 (speech_sync.SYNC_RATE), и на сетке 10 мс считаются: начала звуков и биты
 (спектральный поток, темп автокорреляцией, биты — динамическим
 программированием, как у Эллиса; сильная доля — фаза из четырёх с самым
@@ -57,13 +57,14 @@ def _run_bytes(cmd, timeout=600):
 
 
 def _part(p, t0, t1, track):
-    """Выдержка проекта [t0, t1); track — только клипы этой дорожки."""
-    part = p.excerpt(t0, t1)
+    """Проект для окна [t0, t1); track — только клипы этой дорожки (копия)."""
+    part = p
     if track is not None:
         if not 0 <= track < len(p.tracks):
             raise _api.ToolError("bad_track", f"нет дорожки {track}")
+        part = p.copy()
         part.clips = [c for c in part.clips if c.track == track]
-    missing = _api.missing_files(part)
+    missing = _api.missing_files(part, t0, t1)
     if missing:
         raise _api.ToolError("missing_files", "не найдены файлы проекта",
                              problems=[{"path": m, "message": "нет файла"} for m in missing])
@@ -74,7 +75,7 @@ def project_audio(p, t0, t1, track=None, rate=SR, channels=1):
     """Звук выдержки проекта (как в итоге: громкости, скорость, смешивание)
     float32 [сэмплы] (моно) или [сэмплы, каналы]; пустой — звука нет."""
     part = _part(p, t0, t1, track)
-    src = _api.montage_project.build_source(part, video=False)
+    src = _api.montage_project.build_source(part, video=False, window=(t0, t1))
     if src is None or not src.audio:
         return np.zeros(0, np.float32)
     raw = _run_bytes([_api.FFMPEG, "-v", "error", "-nostdin"] + src.input_args()
@@ -121,7 +122,7 @@ def _scene_chain(threshold):
 def project_scenes(p, t0, t1, threshold=SCENE_THRESHOLD):
     part = _part(p, t0, t1, None)
     src = _api.montage_project.build_source(
-        part, audio=False, tonemap=_api.hdr_tonemap.tonemap_filters(
+        part, audio=False, window=(t0, t1), tonemap=_api.hdr_tonemap.tonemap_filters(
             (c.src for c in part.clips if c.has_video and not c.is_image),
             _api.escape_filter_path))
     if src is None or not src.video:

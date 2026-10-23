@@ -13,17 +13,30 @@ import re
 
 import montage_project as _api
 
-_TOP_FIELDS = ("version", "tracks", "clips", "settings", "markers")
-_TRACK_FIELDS = {"kind": str, "enabled": bool, "muted": bool}
+_TOP_FIELDS = ("version", "tracks", "clips", "settings", "markers", "texts")
+_TRACK_FIELDS = {"kind": str, "enabled": bool, "muted": bool, "role": str}
 _CLIP_FIELDS = {
     "src": str, "in_s": float, "out_s": float, "track": int, "start": float, "id": str,
     "has_video": bool, "is_image": bool, "audio_path": str, "audio_stream": int,
     "volume": float, "muted": bool, "speed": float, "audio_detached": bool,
     "width": int, "height": int, "fps": float, "src_duration": float,
+    "fit": str, "pos_x": float, "pos_y": float, "scale": float, "opacity": float,
+    "transition": str, "transition_s": float, "fade_in": float, "fade_out": float,
 }
 _CLIP_REQUIRED = ("src", "in_s", "out_s", "track")
 _SETTINGS_FIELDS = {"width": int, "height": int, "fps": float, "fit": str,
-                    "background": str, "loudness": float}
+                    "background": str, "loudness": float, "duck": float}
+_TEXT_FIELDS = {"start": float, "end": float, "text": str, "id": str, "style": dict,
+                "pos_x": float, "pos_y": float}
+# Стиль текста проекта: ключи стиля программы (subtitle_ass.DEFAULT_SUBTITLE_STYLE).
+_TEXT_STYLE = {"font": str, "size": float, "bold": bool, "italic": bool, "underline": bool,
+               "align": int, "spacing": float, "color": str, "outline_color": str,
+               "outline": float, "shadow": float, "shadow_alpha": int, "animation": str}
+_TEXT_ANIMATIONS = ("none", "fade", "slide", "pop")
+_TEXT_MAX = 2000
+# Имя шрифта уходит в строку стиля ASS через запятые — только буквы, цифры,
+# пробел, точка, дефис и подчёркивание.
+_FONT_RX = re.compile(r"[\w .\-]{1,80}")
 _MARKER_FIELDS = {"t": float, "kind": str, "label": str, "strength": float, "end": float}
 _MARKER_LABEL_MAX = 500
 _COLOR_RX = re.compile(r"#[0-9A-Fa-f]{6}")
@@ -131,6 +144,9 @@ def parse_settings(raw):
     loud = raw.get("loudness")
     if _is_num(loud) and _LOUDNESS_RANGE[0] <= loud <= _LOUDNESS_RANGE[1]:
         s.loudness = float(loud)
+    duck = raw.get("duck")
+    if _is_num(duck):
+        s.duck = max(0.0, min(1.0, float(duck)))
     return s
 
 
@@ -182,6 +198,85 @@ def _check_markers(raw, strict, problems):
                              "message": f"длиннее {_MARKER_LABEL_MAX} символов"})
 
 
+def _style_value_ok(key, v):
+    """Значение ключа стиля текста в допустимых пределах."""
+    kind = _TEXT_STYLE[key]
+    if not _type_ok(v, kind) and not (kind is float and _type_ok(v, int)):
+        return False
+    if key == "font":
+        return bool(_FONT_RX.fullmatch(v))
+    if key in ("color", "outline_color"):
+        return bool(_COLOR_RX.fullmatch(v))
+    if key == "size":
+        return 1 <= v <= 400
+    if key == "align":
+        return 1 <= v <= 9
+    if key in ("outline", "shadow"):
+        return 0 <= v <= 50
+    if key == "spacing":
+        return -50 <= v <= 100
+    if key == "shadow_alpha":
+        return 0 <= v <= 255
+    if key == "animation":
+        return v in _TEXT_ANIMATIONS
+    return True
+
+
+def parse_texts(raw):
+    """Тексты проекта из списка словарей (мягкая загрузка: негодные тексты
+    и ключи стиля выбрасываются), по времени начала."""
+    out = []
+    for t in raw if isinstance(raw, list) else []:
+        if not isinstance(t, dict):
+            continue
+        a, b = _num_or(t.get("start"), None), _num_or(t.get("end"), None)
+        text = t.get("text")
+        if a is None or b is None or a < 0 or b <= a or not isinstance(text, str) or not text:
+            continue
+        raw_style = t.get("style")
+        style = ({k: v for k, v in raw_style.items() if k in _TEXT_STYLE and _style_value_ok(k, v)}
+                 if isinstance(raw_style, dict) else {})
+        item = _api.TextItem(start=a, end=b, text=text[:_TEXT_MAX], style=style,
+                             pos_x=_num_or(t.get("pos_x"), None),
+                             pos_y=_num_or(t.get("pos_y"), None))
+        if isinstance(t.get("id"), str) and t["id"]:
+            item.id = t["id"]
+        out.append(item)
+    out.sort(key=lambda x: (x.start, x.end))
+    return out
+
+
+def _check_texts(raw, strict, problems):
+    if not isinstance(raw, list):
+        problems.append({"path": "texts", "message": "должен быть списком"})
+        return
+    for i, t in enumerate(raw):
+        path = f"texts[{i}]"
+        if not isinstance(t, dict):
+            problems.append({"path": path, "message": "должен быть объектом"})
+            continue
+        _check_fields(t, _TEXT_FIELDS, path, strict, problems,
+                      required=("start", "end", "text"), nullable=("pos_x", "pos_y"))
+        a, b = _num_or(t.get("start"), None), _num_or(t.get("end"), None)
+        if a is not None and a < 0:
+            problems.append({"path": f"{path}.start", "message": "отрицательное время"})
+        if a is not None and b is not None and b <= a:
+            problems.append({"path": f"{path}.end", "message": "конец не позже начала"})
+        text = t.get("text")
+        if isinstance(text, str) and (not text.strip() or len(text) > _TEXT_MAX):
+            problems.append({"path": f"{path}.text",
+                             "message": f"пустой или длиннее {_TEXT_MAX} символов"})
+        style = t.get("style", {})
+        if isinstance(style, dict):
+            for k, v in style.items():
+                if k not in _TEXT_STYLE:
+                    if strict:
+                        problems.append({"path": f"{path}.style.{k}",
+                                         "message": "неизвестный ключ стиля"})
+                elif not _style_value_ok(k, v):
+                    problems.append({"path": f"{path}.style.{k}", "message": "неверное значение"})
+
+
 def _check_settings(raw, strict, problems):
     if not isinstance(raw, dict):
         problems.append({"path": "settings", "message": "должен быть объектом"})
@@ -205,6 +300,9 @@ def _check_settings(raw, strict, problems):
     bg = raw.get("background", "#000000")
     if isinstance(bg, str) and not _COLOR_RX.fullmatch(bg):
         problems.append({"path": "settings.background", "message": "цвет вида #RRGGBB"})
+    duck = raw.get("duck", 0.0)
+    if _is_num(duck) and not 0.0 <= duck <= 1.0:
+        problems.append({"path": "settings.duck", "message": "от 0 до 1"})
     loud = raw.get("loudness")
     if loud is not None and _is_num(loud) and not _LOUDNESS_RANGE[0] <= loud <= _LOUDNESS_RANGE[1]:
         problems.append({"path": "settings.loudness",
@@ -230,6 +328,8 @@ def _check_tracks(raw, strict, problems):
         if kind not in ("video", "audio"):
             problems.append({"path": f"{path}.kind", "message": "video или audio"})
             kind = None
+        if t.get("role", "") not in _api.TRACK_ROLES:
+            problems.append({"path": f"{path}.role", "message": "voice, music или пусто"})
         kinds.append(kind)
     if "video" not in kinds:
         problems.append({"path": "tracks", "message": "нужна хотя бы одна видеодорожка"})
@@ -275,6 +375,22 @@ def _check_clip(raw, i, kinds, main, strict, check_files, problems):
         problems.append({"path": f"{path}.audio_stream", "message": "-1 или индекс потока"})
     if image and not has_video:
         problems.append({"path": f"{path}.is_image", "message": "картинка без видео"})
+    if raw.get("fit", "") not in _api.FIT_MODES + ("",):
+        problems.append({"path": f"{path}.fit", "message": f"одно из {', '.join(_api.FIT_MODES)} или пусто"})
+    if raw.get("transition", "") not in _api.TRANSITIONS + ("",):
+        problems.append({"path": f"{path}.transition", "message": "неизвестный переход (виды xfade)"})
+    scale = _num_or(raw.get("scale", 1.0), 1.0)
+    if not _api.MIN_SCALE <= scale <= _api.MAX_SCALE:
+        problems.append({"path": f"{path}.scale",
+                         "message": f"от {_api.MIN_SCALE:g} до {_api.MAX_SCALE:g}"})
+    if not 0.0 <= _num_or(raw.get("opacity", 1.0), 1.0) <= 1.0:
+        problems.append({"path": f"{path}.opacity", "message": "от 0 до 1"})
+    for name in ("transition_s", "fade_in", "fade_out"):
+        if _num_or(raw.get(name, 0.0), 0.0) < 0:
+            problems.append({"path": f"{path}.{name}", "message": "отрицательная длина"})
+    if strict and (_num_or(raw.get("fade_in", 0.0), 0.0)
+                   + _num_or(raw.get("fade_out", 0.0), 0.0) > length + 1e-6 > 0):
+        problems.append({"path": f"{path}.fade_out", "message": "нарастание и затухание длиннее клипа"})
     audio_path = raw.get("audio_path") or ""
     if not has_video and not audio_path:
         problems.append({"path": f"{path}.audio_path", "message": "звуковой клип без звука"})
@@ -301,6 +417,9 @@ def _check_clip(raw, i, kinds, main, strict, check_files, problems):
             problems.append({"path": f"{path}.{name}", "message": "нет файла"})
     if track == main:
         return None                      # основная дорожка магнитная — место задаёт порядок
+    if strict and raw.get("transition"):
+        problems.append({"path": f"{path}.transition",
+                         "message": "переход — только у клипов основной дорожки"})
     start = _num_or(raw.get("start", 0.0), 0.0)
     if start < 0:
         problems.append({"path": f"{path}.start", "message": "отрицательное место на шкале"})
@@ -326,6 +445,7 @@ def validate(data, strict=True, check_files=True):
                 problems.append({"path": name, "message": "неизвестное поле"})
     _check_settings(data.get("settings", {}), strict, problems)
     _check_markers(data.get("markers", []), strict, problems)
+    _check_texts(data.get("texts", []), strict, problems)
     kinds = _check_tracks(data.get("tracks"), strict, problems)
     if kinds is None and data.get("tracks") is None:
         kinds = [t.kind for t in _api.Project().tracks]

@@ -4,10 +4,11 @@
 """Инспекция проекта для модели: кадр, контактный лист и короткое превью
 по времени проекта. Public namespace: montage_tool.
 
-Всё рендерится как сборка: Project.excerpt + build_source (тот же путь, что
-у звука просмотра и сэмпла «Обработки»), поэтому модель видит ровно то, что
-выйдет в итоге, — с HDR-сведением, вписыванием и (позже) эффектами,
-которых живой плеер вкладки не покажет. Превью — по рецепту проверки сцен
+Всё рендерится как сборка: build_source с окном (window) по полному
+проекту — тот же путь, что у звука просмотра и сэмпла «Обработки», —
+поэтому модель видит ровно то, что выйдет в итоге: HDR-сведение,
+вписывание, наложения, переходы и текст, которых живой плеер вкладки не
+покажет. Превью — по рецепту проверки сцен
 генератора (episode_scene_check.video_input): до 15 с, 480p, 12 fps, до 8 МБ."""
 import base64
 import concurrent.futures
@@ -53,8 +54,7 @@ def _run(cmd, timeout):
 
 
 def _check_media(p, t0=None, t1=None):
-    part = p if t0 is None else p.excerpt(t0, t1)
-    missing = _api.missing_files(part)
+    missing = _api.missing_files(p, t0, t1)
     if missing:
         raise _api.ToolError("missing_files", "не найдены файлы проекта",
                              problems=[{"path": m, "message": "нет файла"} for m in missing])
@@ -68,8 +68,8 @@ def still(p, t, out_png, width=0):
     out_png = _api.check_output(p, out_png, overwrite=True)
     t0, step = _frame_start(p, t)
     _check_media(p, t0, t0 + step)
-    src = _api.montage_project.build_source(p.excerpt(t0, t0 + step), audio=False,
-                                            tonemap=_tonemap(p))
+    src = _api.montage_project.build_source(p, audio=False, tonemap=_tonemap(p),
+                                            window=(t0, t0 + step))
     if src is None or not src.video:
         raise _api.ToolError("nothing_to_render", f"на {t0:.3f} с нет кадра")
     graph = src.graph
@@ -99,7 +99,7 @@ def sheet_times(p, t0, t1, n):
 def contact_sheet(p, t0, t1, n, out_png, tile_width=320, columns=0):
     """Контактный лист: n кадров отрезка [t0, t1) сеткой, под каждым — время
     проекта и id видимого клипа (по ним модель называет место правки).
-    Кадры рендерятся по одному (excerpt + build_source) в 4 потока."""
+    Кадры рендерятся по одному (build_source с окном в кадр) в 4 потока."""
     from PIL import Image, ImageDraw, ImageFont
 
     out_png = _api.check_output(p, out_png, overwrite=True)
@@ -155,7 +155,7 @@ def preview(p, t0, t1, out_mp4, timecode=True):
         raise _api.ToolError("bad_range", "пустой отрезок времени")
     out_mp4 = _api.check_output(p, out_mp4, overwrite=True)
     _check_media(p, t0, t1)
-    src = _api.montage_project.build_source(p.excerpt(t0, t1), tonemap=_tonemap(p))
+    src = _api.montage_project.build_source(p, tonemap=_tonemap(p), window=(t0, t1))
     if src is None:
         raise _api.ToolError("nothing_to_render", "на отрезке нечего показывать")
     graph = src.graph
