@@ -37,6 +37,7 @@ import hashlib
 import os
 
 import montage_project as _api
+from si_hyx_parts.montage_project import effects as _fx
 
 _LIMIT = 0.95                     # потолок alimiter (≈ −0.45 dBFS)
 _DUCK_THRESHOLD = 0.02            # голос громче ≈ −34 dBFS прижимает музыку
@@ -104,6 +105,8 @@ def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap):
         first = _api.snap_to_frame(s, c.fps)
         burn = f"setpts=PTS-STARTPTS+{_api._num(first)}/TB,{sub_vf},"
     speed_vf = "" if abs(speed - 1.0) <= 1e-6 else f"setpts=(PTS-STARTPTS)/{_api._num(speed)},"
+    if c.speed_curve and not (c.frozen or c.reverse or c.is_image):
+        speed_vf = _fx.curve_setpts(c) + ","
     # scale=iw*sar:ih — неквадратный пиксель (анаморфный DVD) в квадратный до
     # вписывания: вписывание шло по размеру в пикселях, а setsar=1 потом
     # показывал кадр 16:9 как 3:2. У квадратного пикселя фильтр кадр не трогает.
@@ -119,6 +122,34 @@ def _span_times(c, a, b, F0, F1, fps):
     t_a = c.start if a == F0 else c.start + (a - F0) / fps
     t_b = c.end if b == F1 else c.start + (b - F0) / fps
     return t_a, t_b
+
+
+def _fx_main(g, project, c, f0, f1, a, b, rate, fit, fps, w, h, subs, tonemap):
+    """Клип основной дорожки с ключевыми кадрами, эффектами или кривой
+    скорости: собирается целиком с первого кадра (как в полной сборке), затем
+    эффекты во времени клипа и только потом — кусок [a, b) окна. Так кадр
+    выдержки равен кадру полной сборки побайтно."""
+    n = f1 - f0
+    chain = _source_chain(g, c, c.start, c.end, n, rate, fit, "yuv420p", subs, tonemap)
+    fx = _fx.main_fx_chain(project, c, n, fps, w, h, True, g.label)
+    if fx:
+        chain += "," + fx + ",format=yuv420p"
+    if (a, b) != (f0, f1):
+        chain += f",trim=start_frame={a - f0}:end_frame={b - f0},setpts=PTS-STARTPTS"
+    return chain
+
+
+def _fx_overlay(g, project, c, f0, f1, a, b, rate, fit, fps, w, h, subs, tonemap):
+    """То же для наложения: размер, поворот и прозрачность по ключевым
+    кадрам и эффекты — во времени клипа, затем кусок окна."""
+    n = f1 - f0
+    chain = _source_chain(g, c, c.start, c.end, n, rate, fit, "yuva420p", subs, tonemap)
+    fx = _fx.main_fx_chain(project, c, n, fps, w, h, False, g.label)
+    if fx:
+        chain += "," + fx + ",format=yuva420p"
+    if (a, b) != (f0, f1):
+        chain += f",trim=start_frame={a - f0}:end_frame={b - f0},setpts=PTS-STARTPTS"
+    return chain
 
 
 def _box_fit(mode, bw, bh):
@@ -238,11 +269,15 @@ def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items):
                 continue
             if a > cursor:
                 filler(cursor, a)
-        t_a, t_b = _span_times(c, a, b, f0, f1, fps)
         fit = _api.fit_chain(c.fit or settings.fit, w, h, bg)
         lab = g.label("v")
-        g.chains.append(_source_chain(g, c, t_a, t_b, b - a, rate, fit, "yuv420p",
-                                      subs, tonemap) + f"[{lab}]")
+        if _api.has_fx(c):
+            g.chains.append(_fx_main(g, project, c, f0, f1, a, b, rate, fit, fps, w, h,
+                                     subs, tonemap) + f"[{lab}]")
+        else:
+            t_a, t_b = _span_times(c, a, b, f0, f1, fps)
+            g.chains.append(_source_chain(g, c, t_a, t_b, b - a, rate, fit, "yuv420p",
+                                          subs, tonemap) + f"[{lab}]")
         seq.append({"label": lab, "a": a, "b": b, "trans": trans, "d": d if trans else 0})
         cursor = b
     if cursor < r1:
@@ -260,20 +295,27 @@ def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items):
             a, b = max(f0, r0), min(f1, r1)
             if b <= a:
                 continue
-            t_a, t_b = _span_times(c, a, b, f0, f1, fps)
             bw = max(2, int(round(w * c.scale / 2.0)) * 2)
             bh = max(2, int(round(h * c.scale / 2.0)) * 2)
             fit = _box_fit(c.fit or settings.fit, bw, bh)
             alpha = f",lut=a=val*{_api._num(c.opacity)}" if c.opacity < 1.0 else ""
             lab = g.label("o")
+            if _api.has_fx(c):
+                body = _fx_overlay(g, project, c, f0, f1, a, b, rate, fit, fps, w, h,
+                                   subs, tonemap)
+            else:
+                t_a, t_b = _span_times(c, a, b, f0, f1, fps)
+                body = _source_chain(g, c, t_a, t_b, b - a, rate, fit, "yuva420p", subs, tonemap)
             # Метки кадров — в долях 1/fps (их ставит fps=): сдвиг на целое
             # число кадров, без округления секунд.
-            g.chains.append(_source_chain(g, c, t_a, t_b, b - a, rate, fit, "yuva420p",
-                                          subs, tonemap)
-                            + f"{alpha},setpts=PTS+{a - r0}[{lab}]")
+            g.chains.append(body + f"{alpha},setpts=PTS+{a - r0}[{lab}]")
             out = g.label("c")
-            g.chains.append(f"[{cur}][{lab}]overlay=x=main_w*{_api._num(c.pos_x)}-overlay_w/2:"
-                            f"y=main_h*{_api._num(c.pos_y)}-overlay_h/2:"
+            if c.keyframes and ("pos_x" in c.keyframes or "pos_y" in c.keyframes):
+                ox, oy = _fx.overlay_xy(c, r0, f0, fps)
+            else:
+                ox = f"main_w*{_api._num(c.pos_x)}-overlay_w/2"
+                oy = f"main_h*{_api._num(c.pos_y)}-overlay_h/2"
+            g.chains.append(f"[{cur}][{lab}]overlay=x={ox}:y={oy}:"
                             f"eof_action=pass:format=yuv420[{out}]")
             cur = out
     return cur
@@ -388,12 +430,23 @@ def _audio(g, project, parts, w0, w1, total_s, pre=0.0):
         # Реверс: читается кусок [время на a_end, время на a_start), его
         # первые n сэмплов разворачиваются (areverse после atrim).
         seek = c.source_time(a_end if c.reverse else a_start)
+        curve = bool(c.speed_curve)
+        if curve:
+            # Кривая скорости: rubberband помнит прошлое — звук клипа
+            # считается с его начала, кусок окна вырезается сэмплами.
+            seek, src_span = c.in_s, c.out_s - c.in_s
         g.inputs.append(["-ss", _api._num(seek),
                          "-t", _api._num(src_span + 0.25), "-i", c.audio_path])
         spec = f"{idx}:{c.audio_stream}" if c.audio_stream >= 0 else f"{idx}:a:0"
         lab = g.label("a")
         tempo = _api.atempo_chain(speed)
         tempo_vf = (",".join(tempo) + ",") if tempo else ""
+        skip = ""
+        if curve:
+            tempo_vf = _fx.curve_rubberband(c) + ","
+            cut0 = int(round((a_start - c.start) * rate))
+            if cut0 > 0:
+                skip = f"atrim=start_sample={cut0},asetpts=PTS-STARTPTS,"
         # Место и длина — в сэмплах, от общей сетки шкалы: конец клипа и
         # начало следующего попадают в один и тот же сэмпл. С миллисекундами
         # (adelay округлял начало) на стыке оставалась дыра до 0.5 мс — щелчок.
@@ -415,7 +468,7 @@ def _audio(g, project, parts, w0, w1, total_s, pre=0.0):
             fade_vf += "asetpts=PTS-STARTPTS,"
         g.chains.append(
             f"[{spec}]aresample={rate},aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            f"{tempo_vf}atrim=end_sample={n},{'areverse,' if c.reverse else ''}"
+            f"{tempo_vf}{skip}atrim=end_sample={n},{'areverse,' if c.reverse else ''}"
             f"asetpts=PTS-STARTPTS,{fade_vf}"
             f"volume={_api._num(c.volume)},adelay={a0}S:all=1[{lab}]")
         role = project.tracks[c.track].role

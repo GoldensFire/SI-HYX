@@ -23,7 +23,9 @@
 исходника тот же, а на проект он идёт быстрее или медленнее.
 
 Файл проекта — JSON схемы PROJECT_VERSION: v1 (без настроек формата)
-читается как v2, файл новее программы — ProjectError. Строгая проверка для
+читается как v2, v2 — как v3 (v3 — ключевые кадры, эффекты и кривая
+скорости клипа; проект без них пишется как v2), файл новее программы —
+ProjectError. Строгая проверка для
 внешних агентов — validate (si_hyx_parts/montage_project/schema.py)."""
 import json
 import math
@@ -32,7 +34,10 @@ import uuid
 from dataclasses import asdict, dataclass, field, fields, replace
 from fractions import Fraction
 
-PROJECT_VERSION = 2
+PROJECT_VERSION = 3
+# Поля v3 у клипа: пустые в файл не пишутся, и проект без них остаётся v2 —
+# его читают и прежние версии программы.
+_V3_CLIP_FIELDS = ('keyframes', 'effects', 'speed_curve', 'curve_audio')
 MIN_CLIP_S = 0.04          # короче клип не бывает (подрезка, разрезание)
 MIN_SPEED = 0.1            # пределы скорости клипа (доли и разы)
 MAX_SPEED = 8.0
@@ -163,6 +168,11 @@ class Clip:
     reverse: bool = False         # кусок исходника идёт задом наперёд (до MAX_REVERSE_S)
     freeze_at: float = -1.0       # стоп-кадр: кадр исходника на этом времени всю длину
                                   # клипа (in_s/out_s задают только длину, как у картинки)
+    # v3 — эффекты (si_hyx_parts/montage_project/effects.py); пустые — как v2.
+    keyframes: dict = field(default_factory=dict)   # {свойство: [{t, v, ease}]}
+    effects: list = field(default_factory=list)     # [{type, on, section, amount, …}]
+    speed_curve: list = field(default_factory=list)  # [{at: доля куска, speed}]
+    curve_audio: bool = False     # звук клипа с кривой скорости (rubberband); иначе тишина
 
     def __post_init__(self):
         """Типы и пределы полей — при любом создании клипа: из файла проекта,
@@ -203,6 +213,13 @@ class Clip:
         self.freeze_at = freeze if freeze >= 0 and not self.is_image and self.has_video else -1.0
         if self.frozen:
             self.reverse, self.speed = False, 1.0
+        # v3: мягкая чистка (негодное выбрасывается, как у полей v2).
+        self.keyframes = sanitize_keyframes(self.keyframes)
+        self.effects = sanitize_effects(self.effects)
+        self.speed_curve = sanitize_curve(self.speed_curve)
+        self.curve_audio = bool(self.curve_audio)
+        if self.speed_curve and (self.is_image or self.frozen or self.reverse):
+            self.speed_curve = []        # кривая — только у обычного видео/звука
 
     @property
     def frozen(self):
@@ -216,6 +233,10 @@ class Clip:
         speed, присвоенный в обход set_speed, не разводит их."""
         if self.is_image or self.frozen:
             return 1.0
+        if self.speed_curve:
+            # Средняя скорость кривой: длина клипа — время τ всего куска.
+            tau = curve_length(self)
+            return (self.out_s - self.in_s) / tau if tau > 0 else 1.0
         return max(MIN_SPEED, min(MAX_SPEED, self.speed))
 
     @property
@@ -235,6 +256,8 @@ class Clip:
         от конца куска к началу."""
         if self.reverse:
             return self.out_s - max(0.0, t - self.start) * self.play_speed
+        if self.speed_curve:
+            return self.in_s + curve_source_offset(self, max(0.0, t - self.start))
         return self.in_s + max(0.0, t - self.start) * self.play_speed
 
 
@@ -432,6 +455,7 @@ class Project:
         # Переход и нарастание звука — у начала клипа, затухание — у конца.
         right.transition, right.transition_s, right.fade_in = '', 0.0, 0.0
         c.fade_out = 0.0
+        t_local = t - c.start
         if c.reverse:
             # Реверс: слева на шкале — конец куска исходника [cut, out_s).
             right.out_s = cut
@@ -440,6 +464,10 @@ class Project:
         else:
             right.in_s = cut
             right.start = c.start + (cut - c.in_s) / speed
+            if c.speed_curve:
+                split_fx(c, right, t_local, cut)    # своя кривая у каждой половины
+            elif c.keyframes:
+                split_fx(c, right, t_local, cut)
             c.out_s = cut
         self.clips.insert(self.clips.index(c) + 1, right)
         self.pack()
@@ -667,7 +695,7 @@ class Project:
         return [c for c in self.clips
                 if self.tracks[c.track].enabled and not self.tracks[c.track].muted
                 and c.audio_path and not c.muted and c.volume > 0 and c.length > _EPS
-                and not c.frozen]
+                and not c.frozen and (not c.speed_curve or c.curve_audio)]
 
     def live_preview_gaps(self):
         """Что из проекта живой плеер вкладки не покажет (он играет один
@@ -694,6 +722,13 @@ class Project:
             gaps.append("выравнивание громкости")
         if any(c.reverse or c.frozen for c in self.clips):
             gaps.append("реверс и стоп-кадр")
+        if any(c.keyframes for c in self.clips):
+            gaps.append("ключевые кадры (зум, панорама, поворот, прозрачность)")
+        if any(c.effects for c in self.clips):
+            gaps.append("эффекты: " + ", ".join(sorted({e["type"] for c in self.clips
+                                                        for e in c.effects})))
+        if any(c.speed_curve for c in self.clips):
+            gaps.append("плавная смена скорости")
         return gaps
 
     def output_format(self):
@@ -722,10 +757,19 @@ class Project:
 
     # ── Сохранение ───────────────────────────────────────────────────────────
     def to_dict(self):
-        return {'version': PROJECT_VERSION,
+        clips, v3 = [], False
+        for c in self.clips:
+            d = asdict(c)
+            for k in _V3_CLIP_FIELDS:
+                if d.get(k):
+                    v3 = True
+                else:
+                    d.pop(k, None)
+            clips.append(d)
+        return {'version': PROJECT_VERSION if v3 else 2,
                 'settings': asdict(self.settings),
                 'tracks': [asdict(t) for t in self.tracks],
-                'clips': [asdict(c) for c in self.clips],
+                'clips': clips,
                 'markers': [asdict(m) for m in self.markers],
                 'texts': [asdict(t) for t in self.texts]}
 
@@ -922,5 +966,9 @@ def load_project(path, strict=False):
 
 from si_hyx_parts.montage_project.schema import (  # noqa: E402
     describe_schema, migrate_project_data, parse_markers, parse_settings, parse_texts, validate)
+from si_hyx_parts.montage_project.effects import (  # noqa: E402,F401
+    EASES, EFFECT_KEYS, EFFECT_LIMITS, EFFECT_TYPES, CURVES_PRESETS, KEYFRAME_PROPS,
+    curve_length, curve_source_offset, has_fx, keyframe_value, sanitize_curve, sanitize_effect,
+    sanitize_effects, sanitize_keyframes, split_fx)
 from si_hyx_parts.montage_project.graph import (  # noqa: E402,F401
     build_export, build_source, loudnorm_filter, text_cues)

@@ -23,7 +23,12 @@ _CLIP_FIELDS = {
     "fit": str, "pos_x": float, "pos_y": float, "scale": float, "opacity": float,
     "transition": str, "transition_s": float, "fade_in": float, "fade_out": float,
     "reverse": bool, "freeze_at": float,
+    # v3
+    "keyframes": dict, "effects": list, "speed_curve": list, "curve_audio": bool,
 }
+# Пределы значений ключевых кадров (strict).
+_KEYFRAME_RANGE = {"pos_x": (-1.0, 2.0), "pos_y": (-1.0, 2.0), "scale": (0.02, 8.0),
+                   "rotation": (-3600.0, 3600.0), "opacity": (0.0, 1.0)}
 _CLIP_REQUIRED = ("src", "in_s", "out_s", "track")
 _SETTINGS_FIELDS = {"width": int, "height": int, "fps": float, "fit": str,
                     "background": str, "loudness": float, "duck": float}
@@ -60,7 +65,8 @@ def _type_ok(v, kind):
 
 
 def _type_name(kind):
-    return {float: "число", int: "целое", bool: "true/false", str: "строка"}[kind]
+    return {float: "число", int: "целое", bool: "true/false", str: "строка",
+            dict: "объект", list: "список"}[kind]
 
 
 def describe_schema():
@@ -68,7 +74,7 @@ def describe_schema():
     типами и значениями по умолчанию, допустимые виды и пределы."""
     from dataclasses import MISSING, fields
     json_types = {float: "number", int: "integer", bool: "boolean", str: "string",
-                  dict: "object"}
+                  dict: "object", list: "array"}
 
     def spec(cls, types):
         out = {}
@@ -96,7 +102,17 @@ def describe_schema():
         "text_style_default": dict(subtitle_ass.DEFAULT_SUBTITLE_STYLE),
         "enums": {"fit": list(_api.FIT_MODES), "transition": list(_api.TRANSITIONS),
                   "marker_kind": list(_api.MARKER_KINDS), "track_role": list(_api.TRACK_ROLES),
-                  "track_kind": ["video", "audio"], "text_animation": list(_TEXT_ANIMATIONS)},
+                  "track_kind": ["video", "audio"], "text_animation": list(_TEXT_ANIMATIONS),
+                  "keyframe_prop": list(_api.KEYFRAME_PROPS), "ease": list(_api.EASES),
+                  "effect_type": list(_api.EFFECT_TYPES),
+                  "curves_preset": list(_api.CURVES_PRESETS)},
+        "keyframe": {"t": "number (с от начала клипа)", "v": "number", "ease": "string"},
+        "keyframe_range": {k: list(v) for k, v in _KEYFRAME_RANGE.items()},
+        "effect": {"keys": list(_api.EFFECT_KEYS),
+                   "limits": {k: list(v) for k, v in _api.EFFECT_LIMITS.items()},
+                   "on": "вид маркера проекта или список времён проекта; без on — на весь "
+                         "клип (glow, motion_blur, vignette, color) или в начале клипа"},
+        "speed_curve_point": {"at": "number 0…1 (доля куска исходника)", "speed": "number"},
         "limits": {"speed": [_api.MIN_SPEED, _api.MAX_SPEED], "min_clip_s": _api.MIN_CLIP_S,
                    "scale": [_api.MIN_SCALE, _api.MAX_SCALE], "opacity": [0.0, 1.0],
                    "duck": [0.0, 1.0], "loudness": list(_LOUDNESS_RANGE),
@@ -112,6 +128,13 @@ def describe_schema():
             "Пути — абсолютные (строгая проверка). Track.role voice приглушает music, "
             "если settings.duck > 0.",
             "Стоп-кадр: freeze_at — время кадра исходника, длина клипа — out_s - in_s.",
+            "v3: keyframes {свойство: [{t, v, ease}]} — на основной дорожке scale ≥ 1 — зум "
+            "внутрь кадра, pos_x/pos_y — центр видимой части, rotation — градусы; у "
+            "наложения — его место, размер, поворот, opacity.",
+            "v3: effects — zoom_punch, shake, flash, rgb_shift, glow, motion_blur, vignette, "
+            "color; on: kick/snare/beat/downbeat… — по маркерам проекта (section — часть).",
+            "v3: speed_curve [{at, speed}] — плавная скорость: длина клипа — интеграл ds/v(s); "
+            "звук такого клипа выключен, curve_audio — rubberband.",
         ],
     }
 
@@ -455,6 +478,7 @@ def _check_clip(raw, i, kinds, main, strict, check_files, problems):
     if strict and (_num_or(raw.get("fade_in", 0.0), 0.0)
                    + _num_or(raw.get("fade_out", 0.0), 0.0) > length + 1e-6 > 0):
         problems.append({"path": f"{path}.fade_out", "message": "нарастание и затухание длиннее клипа"})
+    _check_v3(raw, path, image, frozen, check_files, problems)
     audio_path = raw.get("audio_path") or ""
     if not has_video and not audio_path:
         problems.append({"path": f"{path}.audio_path", "message": "звуковой клип без звука"})
@@ -488,6 +512,90 @@ def _check_clip(raw, i, kinds, main, strict, check_files, problems):
     if start < 0:
         problems.append({"path": f"{path}.start", "message": "отрицательное место на шкале"})
     return track, start, start + max(0.0, length)
+
+
+def _check_v3(raw, path, image, frozen, check_files, problems):
+    """Ключевые кадры, эффекты и кривая скорости клипа (v3)."""
+    kf = raw.get("keyframes")
+    if isinstance(kf, dict):
+        for prop, pts in kf.items():
+            kp = f"{path}.keyframes.{prop}"
+            if prop not in _api.KEYFRAME_PROPS:
+                problems.append({"path": kp, "message": f"одно из {', '.join(_api.KEYFRAME_PROPS)}"})
+                continue
+            if not isinstance(pts, list) or not pts:
+                problems.append({"path": kp, "message": "непустой список точек"})
+                continue
+            lo, hi = _KEYFRAME_RANGE[prop]
+            for i, pt in enumerate(pts):
+                pp = f"{kp}[{i}]"
+                if not isinstance(pt, dict):
+                    problems.append({"path": pp, "message": "должен быть объектом"})
+                    continue
+                for k in pt:
+                    if k not in ("t", "v", "ease"):
+                        problems.append({"path": f"{pp}.{k}", "message": "неизвестное поле"})
+                t, v = pt.get("t"), pt.get("v")
+                if not _is_num(t) or t < 0:
+                    problems.append({"path": f"{pp}.t", "message": "число ≥ 0"})
+                if not _is_num(v) or not lo <= v <= hi:
+                    problems.append({"path": f"{pp}.v", "message": f"число от {lo:g} до {hi:g}"})
+                if pt.get("ease", "linear") not in _api.EASES:
+                    problems.append({"path": f"{pp}.ease",
+                                     "message": f"одно из {', '.join(_api.EASES)}"})
+    eff = raw.get("effects")
+    if isinstance(eff, list):
+        for i, e in enumerate(eff):
+            ep = f"{path}.effects[{i}]"
+            if not isinstance(e, dict):
+                problems.append({"path": ep, "message": "должен быть объектом"})
+                continue
+            if e.get("type") not in _api.EFFECT_TYPES:
+                problems.append({"path": f"{ep}.type",
+                                 "message": f"одно из {', '.join(_api.EFFECT_TYPES)}"})
+            for k, v in e.items():
+                if k not in _api.EFFECT_KEYS:
+                    problems.append({"path": f"{ep}.{k}", "message": "неизвестное поле"})
+                elif k in _api.EFFECT_LIMITS:
+                    lo, hi = _api.EFFECT_LIMITS[k]
+                    if not _is_num(v) or not lo <= v <= hi:
+                        problems.append({"path": f"{ep}.{k}",
+                                         "message": f"число от {lo:g} до {hi:g}"})
+                elif k == "on":
+                    ok = (isinstance(v, str) and v in _api.MARKER_KINDS) or (
+                        isinstance(v, list) and v and all(_is_num(x) and x >= 0 for x in v))
+                    if not ok:
+                        problems.append({"path": f"{ep}.on",
+                                         "message": "вид маркера или список времён проекта"})
+                elif k == "color" and not (isinstance(v, str) and _COLOR_RX.fullmatch(v)):
+                    problems.append({"path": f"{ep}.color", "message": "цвет вида #RRGGBB"})
+                elif k == "curves" and v not in _api.CURVES_PRESETS:
+                    problems.append({"path": f"{ep}.curves",
+                                     "message": f"одно из {', '.join(_api.CURVES_PRESETS)}"})
+                elif k == "lut":
+                    if not isinstance(v, str) or not v.lower().endswith(".cube"):
+                        problems.append({"path": f"{ep}.lut", "message": "путь к файлу .cube"})
+                    elif check_files and not os.path.isfile(v):
+                        problems.append({"path": f"{ep}.lut", "message": "нет файла"})
+                elif k == "section" and not isinstance(v, str):
+                    problems.append({"path": f"{ep}.section", "message": "строка"})
+    curve = raw.get("speed_curve")
+    if isinstance(curve, list) and curve:
+        if image or frozen or raw.get("reverse"):
+            problems.append({"path": f"{path}.speed_curve",
+                             "message": "кривая скорости — не у картинки, стоп-кадра и реверса"})
+        if len(curve) < 2:
+            problems.append({"path": f"{path}.speed_curve", "message": "хотя бы две точки"})
+        for i, pt in enumerate(curve):
+            pp = f"{path}.speed_curve[{i}]"
+            if not isinstance(pt, dict) or set(pt) - {"at", "speed"}:
+                problems.append({"path": pp, "message": "объект {at, speed}"})
+                continue
+            if not _is_num(pt.get("at")) or not 0.0 <= pt["at"] <= 1.0:
+                problems.append({"path": f"{pp}.at", "message": "доля от 0 до 1"})
+            if not _is_num(pt.get("speed")) or not _api.MIN_SPEED <= pt["speed"] <= _api.MAX_SPEED:
+                problems.append({"path": f"{pp}.speed",
+                                 "message": f"от {_api.MIN_SPEED:g} до {_api.MAX_SPEED:g}"})
 
 
 def validate(data, strict=True, check_files=True):

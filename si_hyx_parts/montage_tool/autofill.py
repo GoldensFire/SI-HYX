@@ -25,6 +25,14 @@ import numpy as np
 import montage_tool as _api
 
 DEFAULT_MIN_SHOT = 0.35
+# --fx amv: удары — зум-удар по бочке, тряска по малому в припеве, вспышка на
+# начале части; эффекты разворачиваются по маркерам проекта при сборке.
+FX_PRESETS = {
+    "amv": [{"type": "zoom_punch", "on": "kick", "amount": 0.05, "decay": 0.15},
+            {"type": "shake", "on": "snare", "section": "chorus", "amount": 0.012,
+             "decay": 0.2},
+            {"type": "flash", "on": "section", "amount": 0.6, "decay": 0.2}],
+    "soft": [{"type": "zoom_punch", "on": "downbeat", "amount": 0.03, "decay": 0.25}]}
 TOP_K = 40                         # кандидатов на отрезок в ДП
 
 
@@ -128,8 +136,8 @@ def _align_raw(shot, seg_len, hits_rel):
     best_in, best = None, 0.0
     for acc in shot["accents"]:
         for tau, hs in hits_rel:
-            if tau < 0.08 or tau > seg_len - 0.05:
-                continue                 # удар на самом резе — акцент не виден
+            if tau < 0.12 or tau > seg_len - 0.05:
+                continue                 # удар на самом резе — акцент не виден (и вспышка на резе)
             in_s = acc["t"] - tau
             if t0 <= in_s and in_s + seg_len <= t1:
                 sc = acc["strength"] * hs
@@ -161,7 +169,7 @@ def _match_section(shot, rule):
 
 def autofill(project_path, song, db=None, plan=None, t0=None, t1=None, duration=None,
              min_shot=DEFAULT_MIN_SHOT, width=0, height=0, ctl=None, beat_model=None,
-             overwrite=False):
+             overwrite=False, fx=""):
     """Черновик: проект с песней и планами каталога под места резов."""
     ctl = ctl or _api.NO_CONTROL
     plan = _plan(plan) if isinstance(plan, (str, type(None))) else dict(plan)
@@ -181,7 +189,9 @@ def autofill(project_path, song, db=None, plan=None, t0=None, t1=None, duration=
     if files:
         found = [s for s in found if any(str(f).lower() in s["file"].lower() for f in files)]
     avoid = {int(x) for x in plan.get("avoid", [])}
-    found = [s for s in found if s["id"] not in avoid and not s["hardsub"]]
+    # Почти чёрные планы — не в черновик (check-sync их отметил бы как dark).
+    found = [s for s in found if s["id"] not in avoid and not s["hardsub"]
+             and s["brightness"] >= 0.06]
     if not found:
         raise _api.ToolError("nothing_to_render", "в каталоге нет подходящих планов (index?)")
     fps = float(plan.get("fps") or found[0]["fps"] or 24.0)
@@ -209,6 +219,8 @@ def autofill(project_path, song, db=None, plan=None, t0=None, t1=None, duration=
             sc = 1.0 - abs(target - mot_rank[k])
             in_s, acc = _align(s, L, hits)
             sc += 0.6 * acc + _match_section(s, rule) + (0.5 if s["id"] in prefer else 0.0)
+            if any(a["kind"] == "flash" and abs(a["t"] - in_s) < 0.1 for a in s["accents"]):
+                sc -= 1.0                # клип начинался бы со вспышки
             sc -= 0.3 * float(s["static"] and e > 0.5)
             rows.append((sc, k, in_s, acc))
         rows.sort(key=lambda r: -r[0])
@@ -269,12 +281,19 @@ def autofill(project_path, song, db=None, plan=None, t0=None, t1=None, duration=
     p.settings.height = int(height or probe0.get("height") or 1080)
     p.settings.fps = fps
     ops, report = [], []
+    effects = list(plan.get("effects") or [])
+    if fx:
+        if fx not in FX_PRESETS:
+            raise _api.ToolError("usage", f"--fx: {', '.join(FX_PRESETS)}")
+        effects += FX_PRESETS[fx]
     for i, ((a, b), k) in enumerate(zip(segs, chosen)):
         s = found[k]
         L = (b - a) / fps
         in_s, acc = aligned[i][k]
         ops.append({"op": "add", "shot": s["id"], "in_offset": round(in_s - s["t0"], 6),
                     "length": round(L, 6)})
+        for e in effects:
+            ops.append({"op": "effect", "clip": "last", "effect": dict(e)})
         sec = _section_at(m, t0 + (a + b) / 2 / fps)
         report.append({"segment": i + 1, "start": round(a / fps, 6), "end": round(b / fps, 6),
                        "shot": s["id"], "file": s["file"], "in_s": round(in_s, 3),

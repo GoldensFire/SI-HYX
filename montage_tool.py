@@ -123,7 +123,7 @@ from si_hyx_parts.montage_tool.library import (  # noqa: E402,F401
     INDEX_VERSION, connect, default_db, detect_oped, index_library, library_stats, match_runs,
     recluster_characters, rename_character, search, shot_sheet)
 from si_hyx_parts.montage_tool.edit import (  # noqa: E402,F401
-    OPS, apply_ops, edit_project, resolve_time)
+    OPS, add_clip_effect, apply_ops, edit_project, resolve_time)
 from si_hyx_parts.montage_tool.autofill import autofill, pick_window, segments  # noqa: E402,F401
 from si_hyx_parts.montage_tool.critique import check_sync  # noqa: E402,F401
 from si_hyx_parts.montage_tool.beat_strip import beat_strip  # noqa: E402,F401

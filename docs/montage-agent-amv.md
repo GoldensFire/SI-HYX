@@ -74,6 +74,31 @@
 сдвинутые клипы и проблемы строгой проверки; ошибка в любой операции —
 проект не меняется.
 
+## Эффекты, ключевые кадры, плавная скорость
+
+```json
+{"op": "effect", "clip": "main#4", "effect": {"type": "shake", "on": "snare", "section": "chorus", "amount": 0.015, "decay": 0.2}}
+{"op": "effect", "clip": "main#5", "effect": {"type": "flash", "on": [12.51], "amount": 0.8, "color": "#ffffff"}}
+{"op": "set", "clip": "main#6", "fields": {"keyframes": {"scale": [{"t": 0, "v": 1.0}, {"t": 1.2, "v": 1.3, "ease": "ease_in_out"}]}}}
+{"op": "set", "clip": "main#7", "fields": {"speed_curve": [{"at": 0, "speed": 1.0}, {"at": 1, "speed": 0.35}]}}
+```
+
+- Типы: `zoom_punch` (amount — доля зума), `shake` (доля кадра), `flash`
+  (непрозрачность, color), `rgb_shift` (пиксели), `glow` (amount, sigma),
+  `motion_blur` (frames), `vignette` (angle), `color` (lut .cube, contrast,
+  brightness, saturation, gamma, curves). Пределы — `schema` → `effect.limits`.
+- `on` — вид маркера проекта (kick, snare, beat, downbeat, section, slot…)
+  или список времён проекта; `section` — только в этих частях. Без `on` —
+  на весь клип или один раз в начале (punch, shake, flash, rgb_shift).
+- Ключевые кадры: `t` — секунды от начала клипа; на основной дорожке
+  `scale` ≥ 1 (зум внутрь кадра), `pos_x/pos_y` — центр видимой части,
+  `rotation` — градусы (поверните с зумом, иначе видны края).
+- `speed_curve`: `at` — доля куска исходника; длина клипа меняется
+  (∫ ds/v) — поправьте следующий рез `trim`. Звук такого клипа выключен
+  (`curve_audio: true` — растяжение rubberband).
+- `autofill … --fx amv`: зум-удар по бочке, тряска по малому в припеве,
+  вспышка на начале частей.
+
 ## plan.json для autofill
 
 ```json

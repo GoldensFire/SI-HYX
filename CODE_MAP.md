@@ -911,6 +911,31 @@ Project на копии, ошибка — `bad_op` с номером, проек
 резы. Памятка — [docs/montage-agent-amv.md](docs/montage-agent-amv.md)
 (`guide`).
 
+Эффекты AMV (схема v3: v2 читается как v3, проект без новых полей пишется
+как v2, пустые поля в файл не идут — `_V3_CLIP_FIELDS`) —
+[effects.py](si_hyx_parts/montage_project/effects.py): `Clip.keyframes`
+(pos_x/pos_y/scale/rotation/opacity с плавностью; на основной дорожке —
+зум, панорама и поворот одним `perspective` eval=frame по номеру кадра, у
+наложения — overlay x/y, `scale` eval=frame, `rotate`, `geq` альфы),
+`Clip.effects` (zoom_punch, shake, flash, rgb_shift, glow, motion_blur,
+vignette, color; `on` — вид маркера проекта и `section` — огибающая по
+маркерам внутри клипа, детерминированно; вспышка и RGB — ступеньками с
+`enable` по номеру кадра), `Clip.speed_curve` (скорость линейна по куску
+исходника, время клипа τ(s) = Σ ln(1 + b·s/a)/b — `curve_setpts`, длина и
+`source_time` — через тот же интеграл; звук выключен, `curve_audio` —
+rubberband с командами tempo через asendcmd). Инвариант окон держится так:
+клип с v3-полями в `graph._fx_main/_fx_overlay` собирается всегда с первого
+своего кадра (эффекты видят время клипа и те же соседние кадры у tmix), а
+кусок окна вырезается после эффектов; звук кривой — с начала клипа, потом
+atrim сэмплами. Проверка: кадры still каждого эффекта = кадры полной сборки
+(разница 0), звук окна кривой = полный (0; громкую смесь сдвигает только
+alimiter — так и раньше), графы старых проектов — побайтно прежние.
+`Project.split` делит кривую и сдвигает ключевые кадры (`split_fx`);
+`live_preview_gaps` перечисляет v3-поля. Агенту: `edit` op `effect`
+(`add_clip_effect`, чистка как при загрузке, отброшенное — ошибка), `set`
+keyframes/effects/speed_curve; `autofill --fx amv|soft` или `effects` плана
+— эффекты по ударам на каждый клип.
+
 Плеер «Монтажа» читает файл через QFile поверх хэндла с FILE_SHARE_DELETE
 (`open_share_delete_file` в
 [share_delete_iodevice.py](si_hyx_parts/edit_tab_workers/share_delete_iodevice.py)):

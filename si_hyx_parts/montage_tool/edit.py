@@ -23,7 +23,8 @@ _CLIP_REF_RX = re.compile(r"(main|track([0-9]+))#([0-9]+)")
 # Поля клипа, которые задаёт set (дорожка и место — move, длина — trim).
 _SETTABLE = ("volume", "muted", "speed", "fit", "pos_x", "pos_y", "scale", "opacity",
              "transition", "transition_s", "fade_in", "fade_out", "reverse", "freeze_at",
-             "in_s", "out_s", "audio_path", "audio_stream", "has_video")
+             "in_s", "out_s", "audio_path", "audio_stream", "has_video",
+             "keyframes", "effects", "speed_curve", "curve_audio")
 
 
 class _OpError(Exception):
@@ -178,6 +179,20 @@ def _op_add(p, op, fps, db):
     return clip
 
 
+def add_clip_effect(p, c, effect):
+    """Эффект клипу (effect — словарь эффекта v3): чистка как при загрузке;
+    отброшенный ключ или значение за пределами — ошибка с подсказкой."""
+    clean = _api.montage_project.sanitize_effect(effect)
+    if clean is None:
+        raise _OpError(f"effect.type — одно из {', '.join(_api.montage_project.EFFECT_TYPES)}")
+    lost = sorted(k for k in effect if k not in clean)
+    changed = sorted(k for k in clean if k in effect and clean[k] != effect[k])
+    if lost or changed:
+        raise _OpError(f"effect: неизвестные или неверные поля {lost + changed} "
+                       f"(пределы — schema: effect.limits)")
+    c.effects = list(c.effects) + [clean]
+
+
 def _set_fields(p, c, fields):
     if not isinstance(fields, dict):
         raise _OpError("fields — объект")
@@ -278,7 +293,7 @@ def _apply(p, op, fps, db, state):
         p.markers = sorted(p.markers + new, key=lambda m: (m.t, m.kind))
     elif kind == "effect":
         c = _clip(p, op.get("clip"), state["last"])
-        _api.add_clip_effect(p, c, op.get("effect") or {})
+        add_clip_effect(p, c, op.get("effect") or {})
         out["clip"] = c.id
     return out
 
