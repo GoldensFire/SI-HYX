@@ -169,13 +169,16 @@ def _match_section(shot, rule):
 
 def autofill(project_path, song, db=None, plan=None, t0=None, t1=None, duration=None,
              min_shot=DEFAULT_MIN_SHOT, width=0, height=0, ctl=None, beat_model=None,
-             overwrite=False, fx=""):
-    """Черновик: проект с песней и планами каталога под места резов."""
+             overwrite=False, fx="", gemini=False):
+    """Черновик: проект с песней и планами каталога под места резов. Части
+    песни — карта с подписями Gemini, если она уже в кэше (music --gemini)
+    или gemini=True (один запрос), иначе локальные."""
     ctl = ctl or _api.NO_CONTROL
     plan = _plan(plan) if isinstance(plan, (str, type(None))) else dict(plan)
     if _api.os.path.exists(str(project_path)) and not overwrite:
         raise _api.ToolError("output_exists", f"проект уже есть: {project_path} (--overwrite)")
-    m = _api.music_file(song, model=beat_model or _api.DEFAULT_BEAT_MODEL, ctl=ctl)
+    m = _api.music_file(song, model=beat_model or _api.DEFAULT_BEAT_MODEL, ctl=ctl,
+                        gemini=gemini, reuse_gemini=True)
     if t0 is None:
         t0, t1 = pick_window(m, float(duration or 45.0))
     t1 = m["duration"] if t1 is None else min(float(t1), m["duration"])

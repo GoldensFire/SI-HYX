@@ -309,7 +309,7 @@ def _cmd_autofill(args):
     return _api.autofill(args.project, args.song, args.library or None, args.plan or None,
                          t0=args.t0, t1=args.t1, duration=args.duration, min_shot=args.min_shot,
                          ctl=_control(args), beat_model=args.beat_model, overwrite=args.overwrite,
-                         fx=args.fx)
+                         fx=args.fx, gemini=args.gemini)
 
 
 def _cmd_check_sync(args):
@@ -543,6 +543,8 @@ def build_parser():
                     help="длина окна, с (без t0 — окно выбирается по частям)")
     sp.add_argument("--min-shot", type=float, default=0.35)
     sp.add_argument("--fx", default="", help="эффекты по ударам: amv или soft")
+    sp.add_argument("--gemini", action="store_true",
+                    help="части песни — запрос Gemini (готовая карта music --gemini берётся из кэша и так)")
     sp.add_argument("--beat-model", choices=_api.BEAT_MODELS, default=_api.DEFAULT_BEAT_MODEL)
     sp.add_argument("--overwrite", action="store_true")
     sp.add_argument("--progress", action="store_true")

@@ -24,7 +24,7 @@ _CLIP_REF_RX = re.compile(r"(main|track([0-9]+))#([0-9]+)")
 _SETTABLE = ("volume", "muted", "speed", "fit", "pos_x", "pos_y", "scale", "opacity",
              "transition", "transition_s", "fade_in", "fade_out", "reverse", "freeze_at",
              "in_s", "out_s", "audio_path", "audio_stream", "has_video",
-             "keyframes", "effects", "speed_curve", "curve_audio")
+             "keyframes", "effects", "speed_curve", "curve_audio", "interpolate", "upscale")
 
 
 class _OpError(Exception):

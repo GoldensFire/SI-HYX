@@ -765,9 +765,11 @@ def snap_frame(t, fps, lead=0):
 
 # ── Карта целиком ────────────────────────────────────────────────────────────
 def song_map(stereo, mono, *, model=DEFAULT_BEAT_MODEL, python="", drums=True,
-             sections=True, gemini=False, gemini_client=None, ctl=None):
+             sections=True, gemini=False, gemini_client=None, ctl=None, reuse_gemini=False):
     """Карта песни по звуку: stereo — float32 [сэмплы, 2] 44,1 кГц, mono —
-    float32 16 кГц. Время — от начала звука (shift_map, snap_slots)."""
+    float32 16 кГц. Время — от начала звука (shift_map, snap_slots).
+    reuse_gemini — без gemini взять готовую карту с частями Gemini из кэша,
+    если она есть (autofill: подписи частей точнее, нового запроса нет)."""
     ctl = ctl or _api.NO_CONTROL
     if model not in BEAT_MODELS:
         raise _api.ToolError("usage", f"модель долей: {', '.join(BEAT_MODELS)}")
@@ -785,6 +787,8 @@ def song_map(stereo, mono, *, model=DEFAULT_BEAT_MODEL, python="", drums=True,
     cached = _api.os.path.join(song.dir, f"map-v{MUSIC_VERSION}-{model}-"
                                          f"{int(bool(drums))}{int(bool(sections))}"
                                          f"{'g' if gemini else ''}.json")
+    if not gemini and reuse_gemini and sections and _api.os.path.isfile(cached[:-5] + "g.json"):
+        cached = cached[:-5] + "g.json"
     try:
         if _api.os.path.isfile(cached):
             out = _load_json(cached)

@@ -341,14 +341,16 @@ async def montage_autofill(
         t0: float | None = None, t1: float | None = None,
         plan: Annotated[dict[str, Any] | None, Field(description="план: files, min_shot, exclude_tags, sections{chorus/verse/…: motion, scale, tags_any, characters}, prefer, avoid")] = None,
         fx: Annotated[str, Field(description="эффекты по ударам: amv, soft или пусто")] = "",
-        library: str = "", min_shot: float = 0.35, overwrite: bool = False) -> str:
+        library: str = "", min_shot: float = 0.35, overwrite: bool = False,
+        gemini: Annotated[bool, Field(description="части песни — запрос Gemini (карта после montage_music gemini=true берётся из кэша и так)")] = False) -> str:
     """Черновик AMV: окно песни, резы на местах резов, планы каталога по энергии частей,
     акцент плана — на удар. Маркеры песни пишутся в проект."""
     plan_file = _json_file(plan, "plan") if plan else ""
     try:
         args = [project, "--song", song, *_opt("--duration", duration), *_opt("--t0", t0),
                 *_opt("--t1", t1), *_opt("--plan", plan_file), *_opt("--fx", fx),
-                *_opt("--library", library), "--min-shot", min_shot, *_opt("--overwrite", overwrite)]
+                *_opt("--library", library), "--min-shot", min_shot, *_opt("--overwrite", overwrite),
+                *_opt("--gemini", gemini)]
         return _text(await _run(ctx, "autofill", *args, progress=True))
     finally:
         if plan_file:
