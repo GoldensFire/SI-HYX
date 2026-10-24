@@ -23,6 +23,7 @@ def _clip_brief(p, c):
             "keyframes": c.keyframes or None, "effects": c.effects or None,
             "speed_curve": c.speed_curve or None,
             "curve_audio": c.curve_audio if c.speed_curve else None,
+            "interpolate": c.interpolate or None, "upscale": c.upscale or None,
             "overlay": ({"pos_x": _r(c.pos_x), "pos_y": _r(c.pos_y), "scale": _r(c.scale),
                          "opacity": _r(c.opacity)} if c.track != p.main_track else None),
             "audio": ({"path": c.audio_path, "stream": c.audio_stream,

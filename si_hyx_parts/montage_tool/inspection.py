@@ -68,6 +68,7 @@ def still(p, t, out_png, width=0):
     out_png = _api.check_output(p, out_png, overwrite=True)
     t0, step = _frame_start(p, t)
     _check_media(p, t0, t0 + step)
+    _api.prepare_project(p)
     src = _api.montage_project.build_source(p, audio=False, tonemap=_tonemap(p),
                                             window=(t0, t0 + step))
     if src is None or not src.video:
@@ -118,6 +119,7 @@ def contact_sheet(p, t0, t1, n, out_png, tile_width=320, columns=0):
     out_png = _api.check_output(p, out_png, overwrite=True)
     times = sheet_times(p, t0, t1, n)
     tile_width = max(64, min(1280, int(tile_width)))
+    _api.prepare_project(p)              # кэш RIFE — один раз, до потоков still
     tmpdir = _api.tempfile.mkdtemp(prefix="sihyx_sheet_")
     try:
         paths = [_api.os.path.join(tmpdir, f"{i:03d}.png") for i in range(len(times))]
@@ -188,6 +190,7 @@ def preview(p, t0, t1, out_mp4, timecode=True):
         raise _api.ToolError("bad_range", "пустой отрезок времени")
     out_mp4 = _api.check_output(p, out_mp4, overwrite=True)
     _check_media(p, t0, t1)
+    _api.prepare_project(p)
     src = _api.montage_project.build_source(p, tonemap=_tonemap(p), window=(t0, t1))
     if src is None:
         raise _api.ToolError("nothing_to_render", "на отрезке нечего показывать")

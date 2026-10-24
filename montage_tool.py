@@ -48,6 +48,8 @@
 Долгие команды (music, analyze с видами карты песни) пишут этапы строками
 JSON в stderr (--progress) и отменяются файлом (--cancel-file). Кэш, модели
 по требованию с SHA-256 и обработчики — si_hyx_parts/montage_tool/jobs.py.
+render, still, preview и contact-sheet перед графом готовят шейдеры Anime4K
+и кэш замедления RIFE (enhance.py; dry-run — только отчёт enhance).
 
 Модуль не импортирует PyQt6 (config, utils, edit_tab): ffmpeg ищет
 ffmpeg_env, свойства файлов — media_probe, граф — montage_project.build_export,
@@ -127,4 +129,5 @@ from si_hyx_parts.montage_tool.edit import (  # noqa: E402,F401
 from si_hyx_parts.montage_tool.autofill import autofill, pick_window, segments  # noqa: E402,F401
 from si_hyx_parts.montage_tool.critique import check_sync  # noqa: E402,F401
 from si_hyx_parts.montage_tool.beat_strip import beat_strip  # noqa: E402,F401
+from si_hyx_parts.montage_tool.enhance import build_interp, prepare_project  # noqa: E402,F401
 from si_hyx_parts.montage_tool.cli import main  # noqa: E402,F401

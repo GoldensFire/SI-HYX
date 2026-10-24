@@ -98,6 +98,11 @@
   (`curve_audio: true` — растяжение rubberband).
 - `autofill … --fx amv`: зум-удар по бочке, тряска по малому в припеве,
   вспышка на начале частей.
+- Плавное замедление: `{"op": "set", "clip": "main#3", "fields": {"speed":
+  0.5, "interpolate": "rife-v4.22-lite"}}` — промежуточные кадры RIFE на
+  iGPU (1 с исходника 1080p ≈ 35 с, потом из кэша). Апскейл аниме меньше
+  кадра проекта: `settings.upscale` = anime4k_m (или у клипа). Без Vulkan
+  — как раньше; `dry-run` показывает в `enhance`, что готово.
 
 ## plan.json для autofill
 

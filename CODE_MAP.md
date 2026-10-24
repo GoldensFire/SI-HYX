@@ -936,6 +936,24 @@ alimiter — так и раньше), графы старых проектов �
 keyframes/effects/speed_curve; `autofill --fx amv|soft` или `effects` плана
 — эффекты по ударам на каждый клип.
 
+Качество на Vulkan — [vulkan_fx.py](si_hyx_parts/montage_project/vulkan_fx.py)
+(граф ссылается на готовые файлы) и [enhance.py](si_hyx_parts/montage_tool/enhance.py)
+(`prepare_project` перед render/still/preview/contact-sheet; dry-run —
+только отчёт `enhance`; сбой — клип без улучшения, причина в `errors`).
+Anime4K (`settings.upscale`/`Clip.upscale`: anime4k_s/m/l, у клипа `none`;
+`settings.deband`) — libplacebo `custom_shader_path` для кадров меньше кадра
+проекта; на Radeon (драйвер AMD) фрагментные пользовательские проходы
+libplacebo дают чёрный кадр, compute — верный, поэтому `to_compute` переводит
+проходы (код — в `hook_frag`, `hook` пишет `out_image`); 540p→1080p ~25 кадр/с.
+RIFE (`Clip.interpolate`: rife-v4.22-lite, rife-v4.25; только speed < 1) —
+`build_interp`: кусок → mpdecimate → PNG (HDR в SDR) → rife-ncnn-vulkan -n
+(fps проекта / speed) на iGPU → mkv все кадры ключевые; ключ кэша — файл,
+кусок, скорость, модель, fps (`interp_key`); `_source_chain` подменяет
+исходник кэшем (`interp_source`). Бинарник и модели — файлы из windows.zip
+релиза 20250112 запросами Range (`jobs._RangeFile`, 25 МБ вместо 827), SHA-256
+— у файлов. Замер (Vega 7): RIFE 720p ~5,8, 1080p ~2,9 выходных кадра/с
+(v4.25 ≈ v4.22-lite). `minterpolate` не используется.
+
 Плеер «Монтажа» читает файл через QFile поверх хэндла с FILE_SHARE_DELETE
 (`open_share_delete_file` в
 [share_delete_iodevice.py](si_hyx_parts/edit_tab_workers/share_delete_iodevice.py)):

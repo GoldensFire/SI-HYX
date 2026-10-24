@@ -37,7 +37,9 @@ from fractions import Fraction
 PROJECT_VERSION = 3
 # Поля v3 у клипа: пустые в файл не пишутся, и проект без них остаётся v2 —
 # его читают и прежние версии программы.
-_V3_CLIP_FIELDS = ('keyframes', 'effects', 'speed_curve', 'curve_audio')
+_V3_CLIP_FIELDS = ('keyframes', 'effects', 'speed_curve', 'curve_audio', 'interpolate',
+                   'upscale')
+_V3_SETTINGS = {'upscale': '', 'deband': False}
 MIN_CLIP_S = 0.04          # короче клип не бывает (подрезка, разрезание)
 MIN_SPEED = 0.1            # пределы скорости клипа (доли и разы)
 MAX_SPEED = 8.0
@@ -173,6 +175,8 @@ class Clip:
     effects: list = field(default_factory=list)     # [{type, on, section, amount, …}]
     speed_curve: list = field(default_factory=list)  # [{at: доля куска, speed}]
     curve_audio: bool = False     # звук клипа с кривой скорости (rubberband); иначе тишина
+    interpolate: str = ''         # RIFE для замедления (vulkan_fx.RIFE_MODELS); '' — нет
+    upscale: str = ''             # Anime4K (vulkan_fx.UPSCALE_PRESETS); '' — как проект, none — нет
 
     def __post_init__(self):
         """Типы и пределы полей — при любом создании клипа: из файла проекта,
@@ -218,6 +222,9 @@ class Clip:
         self.effects = sanitize_effects(self.effects)
         self.speed_curve = sanitize_curve(self.speed_curve)
         self.curve_audio = bool(self.curve_audio)
+        self.interpolate = self.interpolate if self.interpolate in RIFE_MODELS else ''
+        self.upscale = (self.upscale if self.upscale in UPSCALE_PRESETS or self.upscale == 'none'
+                        else '')
         if self.speed_curve and (self.is_image or self.frozen or self.reverse):
             self.speed_curve = []        # кривая — только у обычного видео/звука
 
@@ -289,6 +296,8 @@ class ProjectSettings:
     background: str = '#000000'   # поля и пустые места кадра, #RRGGBB
     loudness: float = None        # целевая громкость итога, LUFS; None — как есть
     duck: float = 0.0             # 0…1: насколько голос (Track.role) приглушает музыку
+    upscale: str = ''             # v3: Anime4K для кадров меньше кадра проекта; '' — нет
+    deband: bool = False          # v3: deband libplacebo вместе с апскейлом
 
 
 @dataclass
@@ -729,6 +738,10 @@ class Project:
                                                         for e in c.effects})))
         if any(c.speed_curve for c in self.clips):
             gaps.append("плавная смена скорости")
+        if any(c.interpolate for c in self.clips):
+            gaps.append("интерполяция RIFE")
+        if self.settings.upscale or any(c.upscale not in ('', 'none') for c in self.clips):
+            gaps.append("апскейл Anime4K")
         return gaps
 
     def output_format(self):
@@ -766,8 +779,14 @@ class Project:
                 else:
                     d.pop(k, None)
             clips.append(d)
+        settings = asdict(self.settings)
+        for k, default in _V3_SETTINGS.items():
+            if settings.get(k) != default:
+                v3 = True
+            else:
+                settings.pop(k, None)
         return {'version': PROJECT_VERSION if v3 else 2,
-                'settings': asdict(self.settings),
+                'settings': settings,
                 'tracks': [asdict(t) for t in self.tracks],
                 'clips': clips,
                 'markers': [asdict(m) for m in self.markers],
@@ -970,5 +989,8 @@ from si_hyx_parts.montage_project.effects import (  # noqa: E402,F401
     EASES, EFFECT_KEYS, EFFECT_LIMITS, EFFECT_TYPES, CURVES_PRESETS, KEYFRAME_PROPS,
     curve_length, curve_source_offset, has_fx, keyframe_value, sanitize_curve, sanitize_effect,
     sanitize_effects, sanitize_keyframes, split_fx)
+from si_hyx_parts.montage_project.vulkan_fx import (  # noqa: E402,F401
+    RIFE_MODELS, UPSCALE_PRESETS, interp_path, interp_rate, interp_wanted, shader_path,
+    to_compute, upscale_of, vulkan_ok)
 from si_hyx_parts.montage_project.graph import (  # noqa: E402,F401
     build_export, build_source, loudnorm_filter, text_cues)

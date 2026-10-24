@@ -112,11 +112,12 @@ def measure_loudness(p, timeout=1800):
 def dry_run(p, out_path, encoder="auto", encoders=None, subs=None):
     """Что запустит render, без запуска: команда (итог — сразу out_path,
     без временного файла), граф, уйдёт ли граф в файл, длина итога."""
+    enhance = _api.prepare_project(p, run=False)
     cmd, graph, dur = export_command(p, out_path, encoder, encoders, subs)
     cmd = with_faststart(cmd)
     cmd[1:1] = ["-nostdin", "-nostats", "-progress", "pipe:1"]
     w, h, fps = p.output_format()
-    return {"command": cmd, "graph": graph,
+    return {"command": cmd, "graph": graph, "enhance": enhance,
             "graph_in_file": len(" ".join(cmd)) > _api.INLINE_GRAPH_MAX,
             "duration": round(dur, 6), "width": w, "height": h, "fps": round(fps, 6),
             "missing_files": missing_files(p)}
@@ -162,6 +163,8 @@ def render(p, out_path, encoder="auto", overwrite=False, on_progress=None,
         raise _api.ToolError("missing_files", "не найдены файлы проекта",
                              problems=[{"path": m, "message": "нет файла"} for m in missing])
     out = check_output(p, out_path, overwrite)
+    # Шейдеры Anime4K и кэш RIFE — до графа (граф только ссылается на файлы).
+    enhance = _api.prepare_project(p, _api.Control.from_stop(should_stop))
     stem, ext = _api.os.path.splitext(out)
     tmp = f"{stem}.sihyx_part{ext}"
     measured = measure_loudness(p) if p.settings.loudness is not None else None
@@ -227,4 +230,4 @@ def render(p, out_path, encoder="auto", overwrite=False, on_progress=None,
     return {"output": out, "duration": round(dur, 6),
             "size": _api.os.path.getsize(out), "loudness_measured": measured,
             "elapsed": round(time.monotonic() - t_start, 3),
-            "graph_in_file": graph_file is not None}
+            "graph_in_file": graph_file is not None, "enhance": enhance}

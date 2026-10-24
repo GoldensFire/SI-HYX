@@ -25,13 +25,15 @@ _CLIP_FIELDS = {
     "reverse": bool, "freeze_at": float,
     # v3
     "keyframes": dict, "effects": list, "speed_curve": list, "curve_audio": bool,
+    "interpolate": str, "upscale": str,
 }
 # Пределы значений ключевых кадров (strict).
 _KEYFRAME_RANGE = {"pos_x": (-1.0, 2.0), "pos_y": (-1.0, 2.0), "scale": (0.02, 8.0),
                    "rotation": (-3600.0, 3600.0), "opacity": (0.0, 1.0)}
 _CLIP_REQUIRED = ("src", "in_s", "out_s", "track")
 _SETTINGS_FIELDS = {"width": int, "height": int, "fps": float, "fit": str,
-                    "background": str, "loudness": float, "duck": float}
+                    "background": str, "loudness": float, "duck": float,
+                    "upscale": str, "deband": bool}
 _TEXT_FIELDS = {"start": float, "end": float, "text": str, "id": str, "style": dict,
                 "pos_x": float, "pos_y": float}
 # Стиль текста проекта: ключи стиля программы (subtitle_ass.DEFAULT_SUBTITLE_STYLE).
@@ -105,7 +107,8 @@ def describe_schema():
                   "track_kind": ["video", "audio"], "text_animation": list(_TEXT_ANIMATIONS),
                   "keyframe_prop": list(_api.KEYFRAME_PROPS), "ease": list(_api.EASES),
                   "effect_type": list(_api.EFFECT_TYPES),
-                  "curves_preset": list(_api.CURVES_PRESETS)},
+                  "curves_preset": list(_api.CURVES_PRESETS),
+                  "interpolate": list(_api.RIFE_MODELS), "upscale": list(_api.UPSCALE_PRESETS)},
         "keyframe": {"t": "number (с от начала клипа)", "v": "number", "ease": "string"},
         "keyframe_range": {k: list(v) for k, v in _KEYFRAME_RANGE.items()},
         "effect": {"keys": list(_api.EFFECT_KEYS),
@@ -135,6 +138,10 @@ def describe_schema():
             "color; on: kick/snare/beat/downbeat… — по маркерам проекта (section — часть).",
             "v3: speed_curve [{at, speed}] — плавная скорость: длина клипа — интеграл ds/v(s); "
             "звук такого клипа выключен, curve_audio — rubberband.",
+            "v3: interpolate (rife-v4.22-lite, rife-v4.25) — плавное замедление RIFE у клипа "
+            "со speed < 1 (кэш готовит render/still/preview); upscale (anime4k_s/m/l, у клипа "
+            "ещё none) и settings.deband — Anime4K через libplacebo для кадров меньше кадра "
+            "проекта; без Vulkan — обычное масштабирование.",
         ],
     }
 
@@ -224,6 +231,9 @@ def parse_settings(raw):
     duck = raw.get("duck")
     if _is_num(duck):
         s.duck = max(0.0, min(1.0, float(duck)))
+    if raw.get("upscale") in _api.UPSCALE_PRESETS:
+        s.upscale = raw["upscale"]
+    s.deband = bool(raw.get("deband", False))
     return s
 
 
@@ -380,6 +390,10 @@ def _check_settings(raw, strict, problems):
     duck = raw.get("duck", 0.0)
     if _is_num(duck) and not 0.0 <= duck <= 1.0:
         problems.append({"path": "settings.duck", "message": "от 0 до 1"})
+    up = raw.get("upscale", "")
+    if isinstance(up, str) and up and up not in _api.UPSCALE_PRESETS:
+        problems.append({"path": "settings.upscale",
+                         "message": f"одно из {', '.join(_api.UPSCALE_PRESETS)} или пусто"})
     loud = raw.get("loudness")
     if loud is not None and _is_num(loud) and not _LOUDNESS_RANGE[0] <= loud <= _LOUDNESS_RANGE[1]:
         problems.append({"path": "settings.loudness",
@@ -479,6 +493,12 @@ def _check_clip(raw, i, kinds, main, strict, check_files, problems):
                    + _num_or(raw.get("fade_out", 0.0), 0.0) > length + 1e-6 > 0):
         problems.append({"path": f"{path}.fade_out", "message": "нарастание и затухание длиннее клипа"})
     _check_v3(raw, path, image, frozen, check_files, problems)
+    if raw.get("interpolate", "") not in _api.RIFE_MODELS + ("",):
+        problems.append({"path": f"{path}.interpolate",
+                         "message": f"одно из {', '.join(_api.RIFE_MODELS)} или пусто"})
+    if raw.get("upscale", "") not in tuple(_api.UPSCALE_PRESETS) + ("", "none"):
+        problems.append({"path": f"{path}.upscale",
+                         "message": f"одно из {', '.join(_api.UPSCALE_PRESETS)}, none или пусто"})
     audio_path = raw.get("audio_path") or ""
     if not has_video and not audio_path:
         problems.append({"path": f"{path}.audio_path", "message": "звуковой клип без звука"})

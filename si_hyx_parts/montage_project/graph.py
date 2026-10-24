@@ -38,6 +38,7 @@ import os
 
 import montage_project as _api
 from si_hyx_parts.montage_project import effects as _fx
+from si_hyx_parts.montage_project import vulkan_fx as _vfx
 
 _LIMIT = 0.95                     # потолок alimiter (≈ −0.45 dBFS)
 _DUCK_THRESHOLD = 0.02            # голос громче ≈ −34 dBFS прижимает музыку
@@ -65,7 +66,8 @@ class _Graph:
         return f"{prefix}{k}"
 
 
-def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap):
+def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap, project=None,
+                  fps=0.0, out_h=0):
     """Вход клипа c с времени проекта t_a по t_b и цепочка его кадров: ровно
     n кадров в размере вписывания fit, метки с нуля (без метки выхода).
 
@@ -73,6 +75,15 @@ def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap):
     длину. Реверс — кусок исходника [время на t_b, время на t_a) читается
     ровно (-t без запаса: лишние кадры после reverse оказались бы первыми)
     и разворачивается уже в размере проекта: reverse держит все кадры."""
+    up = ""
+    if project is not None:
+        up = _vfx.upscale_filter(project, c, out_h)
+        # Замедление RIFE: исходник — готовый кэш промежуточных кадров
+        # (vulkan_fx.interp_source), время — от начала куска.
+        px = _vfx.interp_source(c, fps)
+        if px is not None:
+            c = px
+            tonemap = subs = None        # кэш уже в SDR и без субтитров
     speed = c.play_speed
     span = t_b - t_a
     idx = len(g.inputs)
@@ -110,7 +121,7 @@ def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap):
     # scale=iw*sar:ih — неквадратный пиксель (анаморфный DVD) в квадратный до
     # вписывания: вписывание шло по размеру в пикселях, а setsar=1 потом
     # показывал кадр 16:9 как 3:2. У квадратного пикселя фильтр кадр не трогает.
-    return (f"[{idx}:v:0]{tone}{burn}{pick}setpts=PTS-STARTPTS,{speed_vf}"
+    return (f"[{idx}:v:0]{tone}{burn}{pick}{up}setpts=PTS-STARTPTS,{speed_vf}"
             f"scale=iw*sar:ih,setsar=1,{fit}setsar=1,{reverse}"
             f"fps={rate},tpad=stop_mode=clone:stop_duration={hold},"
             f"trim=end_frame={n},setpts=PTS-STARTPTS,format={pix_fmt}")
@@ -130,7 +141,8 @@ def _fx_main(g, project, c, f0, f1, a, b, rate, fit, fps, w, h, subs, tonemap):
     эффекты во времени клипа и только потом — кусок [a, b) окна. Так кадр
     выдержки равен кадру полной сборки побайтно."""
     n = f1 - f0
-    chain = _source_chain(g, c, c.start, c.end, n, rate, fit, "yuv420p", subs, tonemap)
+    chain = _source_chain(g, c, c.start, c.end, n, rate, fit, "yuv420p", subs, tonemap,
+                          project, fps, h)
     fx = _fx.main_fx_chain(project, c, n, fps, w, h, True, g.label)
     if fx:
         chain += "," + fx + ",format=yuv420p"
@@ -143,7 +155,8 @@ def _fx_overlay(g, project, c, f0, f1, a, b, rate, fit, fps, w, h, subs, tonemap
     """То же для наложения: размер, поворот и прозрачность по ключевым
     кадрам и эффекты — во времени клипа, затем кусок окна."""
     n = f1 - f0
-    chain = _source_chain(g, c, c.start, c.end, n, rate, fit, "yuva420p", subs, tonemap)
+    chain = _source_chain(g, c, c.start, c.end, n, rate, fit, "yuva420p", subs, tonemap,
+                          project, fps, h)
     fx = _fx.main_fx_chain(project, c, n, fps, w, h, False, g.label)
     if fx:
         chain += "," + fx + ",format=yuva420p"
@@ -277,7 +290,7 @@ def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items):
         else:
             t_a, t_b = _span_times(c, a, b, f0, f1, fps)
             g.chains.append(_source_chain(g, c, t_a, t_b, b - a, rate, fit, "yuv420p",
-                                          subs, tonemap) + f"[{lab}]")
+                                          subs, tonemap, project, fps, h) + f"[{lab}]")
         seq.append({"label": lab, "a": a, "b": b, "trans": trans, "d": d if trans else 0})
         cursor = b
     if cursor < r1:
@@ -305,7 +318,8 @@ def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items):
                                    subs, tonemap)
             else:
                 t_a, t_b = _span_times(c, a, b, f0, f1, fps)
-                body = _source_chain(g, c, t_a, t_b, b - a, rate, fit, "yuva420p", subs, tonemap)
+                body = _source_chain(g, c, t_a, t_b, b - a, rate, fit, "yuva420p", subs, tonemap,
+                                     project, fps, h)
             # Метки кадров — в долях 1/fps (их ставит fps=): сдвиг на целое
             # число кадров, без округления секунд.
             g.chains.append(body + f"{alpha},setpts=PTS+{a - r0}[{lab}]")

@@ -11,6 +11,7 @@ Public namespace: montage_tool.
 с пониженным приоритетом: память общая с видеокартой. Отмена — файлом
 (--cancel-file), прогресс — строками JSON в stderr (Control)."""
 import hashlib
+import io as _io
 import time
 from urllib.parse import urlsplit
 from urllib.request import urlopen
@@ -92,6 +93,46 @@ ASSETS = {
         "url": "https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3/resolve/b25b82a03f7282e41aa2f257a52c7583b710bd1c/selected_tags.csv",
         "sha256": "298633d94d0031d2081c0893f29c82eab7f0df00b08483ba8f29d1e979441217",
         "size": 308468, "license": "Apache-2.0 (SmilingWolf WD tagger v3)"},
+    # Фаза 5: RIFE — файлы из windows.zip релиза 20250112 (запросами Range), Anime4K.
+    "rife/rife-ncnn-vulkan.exe": {
+        "zip_url": "https://github.com/TNTwise/rife-ncnn-vulkan/releases/download/20250112/windows.zip",
+        "member": "rife-ncnn-vulkan-refs/heads/master-windows/rife-ncnn-vulkan.exe",
+        "sha256": "ddee627a5342e6ac4456625921b8d5ff52c2b459102c1c220106623ae358725a",
+        "size": 7242752, "license": "MIT (TNTwise rife-ncnn-vulkan; веса hzwer Practical-RIFE)"},
+    "rife/vcomp140.dll": {
+        "zip_url": "https://github.com/TNTwise/rife-ncnn-vulkan/releases/download/20250112/windows.zip",
+        "member": "rife-ncnn-vulkan-refs/heads/master-windows/vcomp140.dll",
+        "sha256": "036b9b3f7ece8dfd48aeccd77113721c5305043aaa9c64d1e72812252727aa7c",
+        "size": 192104, "license": "MIT (TNTwise rife-ncnn-vulkan; веса hzwer Practical-RIFE)"},
+    "rife/LICENSE": {
+        "zip_url": "https://github.com/TNTwise/rife-ncnn-vulkan/releases/download/20250112/windows.zip",
+        "member": "rife-ncnn-vulkan-refs/heads/master-windows/LICENSE",
+        "sha256": "de18cbedb0c3b0d1eeb9ccac3988cdf69c21fa89039cd97dd8846cb68f661f81",
+        "size": 1093, "license": "MIT (TNTwise rife-ncnn-vulkan; веса hzwer Practical-RIFE)"},
+    "rife/rife-v4.22-lite/flownet.bin": {
+        "zip_url": "https://github.com/TNTwise/rife-ncnn-vulkan/releases/download/20250112/windows.zip",
+        "member": "rife-ncnn-vulkan-refs/heads/master-windows/rife-v4.22-lite/flownet.bin",
+        "sha256": "792da5d62937199886bf8bb781ab8e0eddf663854d57e4a43cd7b32e4e81b29b",
+        "size": 9759728, "license": "MIT (TNTwise rife-ncnn-vulkan; веса hzwer Practical-RIFE)"},
+    "rife/rife-v4.22-lite/flownet.param": {
+        "zip_url": "https://github.com/TNTwise/rife-ncnn-vulkan/releases/download/20250112/windows.zip",
+        "member": "rife-ncnn-vulkan-refs/heads/master-windows/rife-v4.22-lite/flownet.param",
+        "sha256": "f52fd053ed743123831a611c80900cafdce55680a7953d3de52ac2d9d8be8ca2",
+        "size": 29282, "license": "MIT (TNTwise rife-ncnn-vulkan; веса hzwer Practical-RIFE)"},
+    "rife/rife-v4.25/flownet.bin": {
+        "zip_url": "https://github.com/TNTwise/rife-ncnn-vulkan/releases/download/20250112/windows.zip",
+        "member": "rife-ncnn-vulkan-refs/heads/master-windows/rife-v4.25/flownet.bin",
+        "sha256": "10de487a095e61cb2971c39e3b5e17005a70fba6201c77fb96e063f4423b583f",
+        "size": 11360684, "license": "MIT (TNTwise rife-ncnn-vulkan; веса hzwer Practical-RIFE)"},
+    "rife/rife-v4.25/flownet.param": {
+        "zip_url": "https://github.com/TNTwise/rife-ncnn-vulkan/releases/download/20250112/windows.zip",
+        "member": "rife-ncnn-vulkan-refs/heads/master-windows/rife-v4.25/flownet.param",
+        "sha256": "99d0f49866ff06f170c08e570e3e1b67b89019e3d11a87c8f0e7908fa50ab4c1",
+        "size": 31669, "license": "MIT (TNTwise rife-ncnn-vulkan; веса hzwer Practical-RIFE)"},
+    "anime4k/Anime4K_v4.0.zip": {
+        "url": "https://github.com/bloc97/Anime4K/releases/download/v4.0.1/Anime4K_v4.0.zip",
+        "sha256": "139cd282086457c5adc79caf7b75b8b825091d71c9b54958c18745fea62d7ed7",
+        "size": 776303, "license": "MIT (bloc97 Anime4K)"},
 }
 
 
@@ -106,7 +147,16 @@ class Control:
         self.started = time.monotonic()
 
     def stop(self):
+        if getattr(self, "_stop_fn", None) is not None and self._stop_fn():
+            return True
         return bool(self.cancel_file) and _api.os.path.exists(self.cancel_file)
+
+    @classmethod
+    def from_stop(cls, should_stop):
+        """Control поверх функции отмены (render: should_stop)."""
+        c = cls()
+        c._stop_fn = should_stop
+        return c
 
     def check(self):
         if self.stop():
@@ -140,6 +190,52 @@ def file_sha256(path):
     return h.hexdigest()
 
 
+def _check_host(url):
+    """Адрес модели — только https на известных хостах (и после редиректа)."""
+    parts = urlsplit(url)
+    if parts.scheme != "https" or (parts.hostname or "") not in _ASSET_HOSTS:
+        raise _api.ToolError("asset_failed", f"недопустимый адрес модели: {parts.hostname}")
+
+
+class _RangeFile(_io.RawIOBase):
+    """Файл по HTTP с произвольным доступом (Range) — для zipfile."""
+
+    def __init__(self, url, ctl):
+        from urllib.request import Request
+        self._req = Request
+        self.ctl = ctl
+        with urlopen(Request(url, method="HEAD"), timeout=60) as r:
+            self.url = r.geturl()
+            self.size = int(r.headers["Content-Length"])
+        _check_host(self.url)
+        self.pos = 0
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.pos
+
+    def seek(self, off, whence=0):
+        self.pos = off if whence == 0 else (self.pos + off if whence == 1 else self.size + off)
+        return self.pos
+
+    def readinto(self, b):
+        n = min(len(b), self.size - self.pos)
+        if n <= 0:
+            return 0
+        self.ctl.check()
+        req = self._req(self.url, headers={"Range": f"bytes={self.pos}-{self.pos + n - 1}"})
+        with urlopen(req, timeout=60) as r:
+            data = r.read()
+        b[:len(data)] = data
+        self.pos += len(data)
+        return len(data)
+
+
 def asset(name, ctl=NO_CONTROL):
     """Путь модели из ASSETS; нет в кэше — скачивается с проверкой SHA-256
     (проверенный файл помечается .ok, чтобы не считать хэш каждый раз)."""
@@ -154,26 +250,36 @@ def asset(name, ctl=NO_CONTROL):
         with open(ok, "w", encoding="utf-8") as f:
             f.write(f"{spec['sha256']} {_api.os.path.getsize(target)}")
         return target
-    host = urlsplit(spec["url"]).hostname or ""
-    if urlsplit(spec["url"]).scheme != "https" or host not in _ASSET_HOSTS:
-        raise _api.ToolError("asset_failed", f"недопустимый адрес модели: {host}")
+    url = spec.get("zip_url") or spec["url"]
+    _check_host(url)
     _api.os.makedirs(_api.os.path.dirname(target), exist_ok=True)
     tmp = target + ".download"
     ctl.stage("download", file=name, size=spec["size"])
     h = hashlib.sha256()
     try:
-        with urlopen(spec["url"], timeout=60) as r, open(tmp, "wb") as f:
-            while True:
-                ctl.check()
-                chunk = r.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-                h.update(chunk)
+        if "member" in spec:
+            # Файл из большого zip (RIFE: 827 МБ со всеми моделями) — только
+            # его байты, запросами Range по оглавлению архива.
+            import zipfile
+            with zipfile.ZipFile(_io.BufferedReader(_RangeFile(url, ctl), 1 << 20)) as z, \
+                    open(tmp, "wb") as f:
+                data = z.read(spec["member"])
+                f.write(data)
+                h.update(data)
+        else:
+            with urlopen(url, timeout=60) as r, open(tmp, "wb") as f:
+                _check_host(r.geturl())
+                while True:
+                    ctl.check()
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
         if h.hexdigest() != spec["sha256"]:
             raise _api.ToolError("asset_failed", f"контрольная сумма не совпала: {name}")
         _api.os.replace(tmp, target)
-    except OSError as e:
+    except (OSError, KeyError) as e:
         raise _api.ToolError("asset_failed", f"модель {name} не скачана: {e}") from e
     finally:
         if _api.os.path.exists(tmp):
