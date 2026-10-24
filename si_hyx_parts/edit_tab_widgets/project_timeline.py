@@ -25,7 +25,14 @@ _CLIP_HUES = ("#4f6fa8", "#7d5fa8", "#a8714f", "#3f8f86", "#a8587a", "#9a8640",
 # Маркеры проекта (montage_project.Marker) на линейке — цвет по виду.
 _MARKER_COLORS = {'scene': 'accent', 'beat': 'yellow', 'onset': 'text3',
                   'silence': 'border2', 'speech': 'green', 'word': 'accent2',
-                  'custom': 'red'}
+                  'custom': 'red', 'downbeat': 'yellow', 'phrase': 'accent2',
+                  'kick': 'red2', 'snare': 'green2', 'hat': 'text3', 'slot': 'green'}
+# Части песни (маркер section, label «chorus A») — полоса у верха линейки.
+_SECTION_COLORS = {'intro': 'text3', 'verse': 'accent', 'build': 'yellow',
+                   'chorus': 'red2', 'drop': 'red', 'bridge': 'green2', 'outro': 'text3'}
+# Удары барабанов видны только при крупном масштабе (пикселей на секунду):
+# в песне их тысячи, мельче они сливаются в серую полосу.
+_HIT_MIN_PPS = {'kick': 30.0, 'snare': 30.0, 'hat': 80.0}
 
 
 def _clip_color(src, video):
@@ -339,6 +346,8 @@ class ProjectTimeline(_api.QWidget):
         # Маркеры (сцены, биты, речь…) — только видимые: битов в песне сотни.
         lo, hi = self.offset, self.t_of(self.width())
         for m in self._visible_markers(lo, hi):
+            if self.pps < _HIT_MIN_PPS.get(m.kind, 0.0):
+                continue                 # невидимые при этом масштабе удары
             pts.append(m.t)
             if m.end is not None:
                 pts.append(m.end)
@@ -902,14 +911,42 @@ class ProjectTimeline(_api.QWidget):
         p.save()
         p.setClipRect(QRectF(self.HEADER_W, 0, w - self.HEADER_W, self.RULER_H))
         for m in self._visible_markers(self.offset, self.t_of(w)):
+            if self.pps < _HIT_MIN_PPS.get(m.kind, 0.0):
+                continue
             col = _api.QColor(C[_MARKER_COLORS.get(m.kind, 'text3')])
             x = self.x_of(m.t)
+            if m.kind == 'section':
+                # Часть песни — полоса у верха линейки цветом подписи, с
+                # просветом в 1 px на границе частей.
+                col = _api.QColor(C[_SECTION_COLORS.get(m.label.split(' ')[0], 'border2')])
+                col.setAlpha(170)
+                end = m.end if m.end is not None else m.t
+                p.fillRect(QRectF(x + 1, 0, max(1.0, self.x_of(end) - x - 1), 3), col)
+                continue
+            if m.kind == 'phrase':
+                # Фраза — штрих у начала (длиннее у восьмитактовой), не полоса:
+                # фразы идут встык и слились бы в одну.
+                h = 8 if m.label == '8' else 5
+                p.setPen(_api.QPen(col, 1))
+                p.drawLine(_api.QPointF(x, 3), _api.QPointF(x, 3 + h))
+                continue
             if m.end is not None and m.end > m.t:
                 col.setAlpha(150)
                 p.fillRect(QRectF(x, self.RULER_H - 4, max(1.0, self.x_of(m.end) - x), 3), col)
                 continue
-            h = 3 + 9 * max(0.0, min(1.0, m.strength))
-            p.setPen(_api.QPen(col, 2 if m.kind in ('scene', 'custom') else 1))
+            if m.kind == 'slot':
+                # Место для реза — треугольник у верха линейки.
+                p.setPen(_api.Qt.PenStyle.NoPen)
+                p.setBrush(col)
+                p.drawPolygon(QPolygonF([_api.QPointF(x - 3, 3), _api.QPointF(x + 3, 3),
+                                         _api.QPointF(x, 8)]))
+                continue
+            if m.kind in _HIT_MIN_PPS:
+                h = 2 + 4 * max(0.0, min(1.0, m.strength))
+            else:
+                h = 3 + 9 * max(0.0, min(1.0, m.strength))
+            wide = m.kind in ('scene', 'custom', 'downbeat')
+            p.setPen(_api.QPen(col, 2 if wide else 1))
             p.drawLine(_api.QPointF(x, self.RULER_H - 1 - h), _api.QPointF(x, self.RULER_H - 1))
         p.restore()
 

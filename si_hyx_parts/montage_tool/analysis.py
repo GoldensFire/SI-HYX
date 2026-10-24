@@ -12,7 +12,10 @@ Public namespace: montage_tool.
 громким потоком), тишина (громкость кадра) и речь (speech_sync.
 speech_activity — та же оценка, что у синхронизации субтитров; пение она
 тоже считает речью). Слова и стемы — karaoke/asr_worker.py в отдельном
-Python генератора (faster-whisper, HTDemucs)."""
+Python генератора (faster-whisper, HTDemucs).
+
+Бит и виды карты песни (сильная доля, фраза, часть, удары, места резов) —
+music.py: Beat This! и HTDemucs в Python генератора, без него — DSP выше."""
 import re
 
 import numpy as np
@@ -21,7 +24,10 @@ import speech_sync
 
 import montage_tool as _api
 
-ANALYSIS_KINDS = ("scene", "beat", "onset", "silence", "speech", "word")
+# Карта песни (music.py): бит, сильная доля, фраза, часть, удары, места резов.
+_MUSIC_ONLY = ("downbeat", "phrase", "section", "kick", "snare", "hat", "slot")
+_DEFAULT_KINDS = ("scene", "beat", "onset", "silence", "speech", "word")
+ANALYSIS_KINDS = _DEFAULT_KINDS + _MUSIC_ONLY
 SR = speech_sync.SYNC_RATE           # 16 кГц, моно
 HOP = SR // 100                      # кадр анализа — 10 мс
 HOP_S = HOP / SR
@@ -487,8 +493,28 @@ def _word_markers(x, offset, vocals, opts):
     return [_marker(offset + a, "word", w, 1.0, offset + b) for a, b, w in words]
 
 
+def _music_markers(kinds, ml, get_map, fps=0.0):
+    """Маркеры карты песни для видов kinds (бит — тоже отсюда) и темп."""
+    want = [k for k in kinds if k == "beat" or k in _MUSIC_ONLY]
+    if not want:
+        return [], None
+    ml = ml or {}
+    try:
+        m = get_map(model=ml.get("beat_model") or _api.DEFAULT_BEAT_MODEL,
+                    python=ml.get("python", ""),
+                    drums=any(k in want for k in ("kick", "snare", "hat", "slot")),
+                    sections=any(k in want for k in ("section", "phrase", "slot")),
+                    ctl=ml.get("ctl"))
+    except _api.ToolError as e:
+        if e.code in ("nothing_to_render", "bad_range"):
+            return [], None              # нет звука или он короче секунды — нет и битов
+        raise
+    _api.snap_slots(m, fps)
+    return _api.map_markers(m, want), m.get("tempo")
+
+
 def _kinds(kinds):
-    kinds = [k.strip() for k in (kinds or ANALYSIS_KINDS) if k and k.strip()]
+    kinds = [k.strip() for k in (kinds or _DEFAULT_KINDS) if k and k.strip()]
     bad = [k for k in kinds if k not in ANALYSIS_KINDS]
     if bad:
         raise _api.ToolError("usage", f"неизвестный вид анализа: {', '.join(bad)} "
@@ -510,10 +536,13 @@ def analyze_project(p, kinds=None, t0=0.0, t1=None, track=None, scene_threshold=
     if "scene" in kinds:
         markers += [_marker(t0 + t, "scene", "", s)
                     for t, s in project_scenes(p, t0, t1, scene_threshold)]
-    audio_kinds = [k for k in kinds if k != "scene"]
+    found, tempo = _music_markers(
+        kinds, ml, lambda **kw: _api.music_project(p, t0, t1, track, **kw), p.output_format()[2])
+    markers += found
+    audio_kinds = [k for k in kinds if k not in ("scene", "beat") + _MUSIC_ONLY]
     if audio_kinds:
         x = project_audio(p, t0, t1, track)
-        found, tempo = audio_markers(x, audio_kinds, t0)
+        found, _t = audio_markers(x, audio_kinds, t0)
         markers += found
         if "word" in kinds and len(x):
             markers += _word_markers(x, t0, vocals, ml or {})
@@ -533,10 +562,13 @@ def analyze_file(path, kinds=None, t0=0.0, t1=None, stream=-1,
     if "scene" in kinds:
         markers += [_marker(t0 + t, "scene", "", s)
                     for t, s in file_scenes(path, t0, t1, scene_threshold)]
-    audio_kinds = [k for k in kinds if k != "scene"]
+    found, tempo = _music_markers(
+        kinds, ml, lambda **kw: _api.music_file(path, t0, t1, stream, **kw))
+    markers += found
+    audio_kinds = [k for k in kinds if k not in ("scene", "beat") + _MUSIC_ONLY]
     if audio_kinds:
         x = file_audio(path, t0, t1, stream)
-        found, tempo = audio_markers(x, audio_kinds, t0)
+        found, _t = audio_markers(x, audio_kinds, t0)
         markers += found
         if "word" in kinds and len(x):
             markers += _word_markers(x, t0, vocals, ml or {})

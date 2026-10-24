@@ -30,7 +30,15 @@
   analyze <проект.json> [--kinds scene,beat,…] [--track N] [--write]
                              маркеры во времени проекта (--write — в проект);
   analyze-file <файл> [--kinds …]   маркеры во времени файла;
-  stems <файл> <папка>       вокал и музыка (HTDemucs, Python генератора).
+  stems <файл> <папка>       вокал и музыка (HTDemucs, Python генератора);
+  music <звук|видео> [--write <проект> --track N] [--gemini] [--brief]
+                             карта песни: темп, размер, доли с номером в такте,
+                             такты, фразы, части, энергия, удары барабанов,
+                             места для резов (Beat This!, HTDemucs, librosa).
+
+Долгие команды (music, analyze с видами карты песни) пишут этапы строками
+JSON в stderr (--progress) и отменяются файлом (--cancel-file). Кэш, модели
+по требованию с SHA-256 и обработчики — si_hyx_parts/montage_tool/jobs.py.
 
 Модуль не импортирует PyQt6 (config, utils, edit_tab): ffmpeg ищет
 ffmpeg_env, свойства файлов — media_probe, граф — montage_project.build_export,
@@ -93,7 +101,13 @@ from si_hyx_parts.montage_tool.render import (  # noqa: E402,F401
     check_output, dry_run, export_command, missing_files, render)
 from si_hyx_parts.montage_tool.inspection import (  # noqa: E402,F401
     ask_model, contact_sheet, gemini_key, preview, sheet_times, still)
+from si_hyx_parts.montage_tool.jobs import (  # noqa: E402,F401
+    ASSETS, NO_CONTROL, Control, asset, cache_dir, ensure_packages, run_worker)
 from si_hyx_parts.montage_tool.analysis import (  # noqa: E402,F401
     ANALYSIS_KINDS, SCENE_THRESHOLD, analyze_file, analyze_project, file_audio,
     merge_markers, project_audio, stems)
+from si_hyx_parts.montage_tool.music import (  # noqa: E402,F401
+    BEAT_MODELS, DEFAULT_BEAT_MODEL, MUSIC_KINDS, MUSIC_WRITE_KINDS, SECTION_LABELS,
+    clip_mapper, drum_hits, map_markers, music_file, music_project, shift_map, snap_frame,
+    snap_slots, song_map)
 from si_hyx_parts.montage_tool.cli import main  # noqa: E402,F401

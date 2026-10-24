@@ -20,7 +20,7 @@ _USAGE_CODES = {"usage", "project_not_found", "project_too_large", "project_inva
                 "project_invalid", "missing_files", "bad_output", "output_exists",
                 "bad_encoder", "nothing_to_render", "probe_failed", "project_version",
                 "bad_range", "bad_media", "bad_schema", "gemini_no_key", "bad_track",
-                "ml_unavailable"}
+                "ml_unavailable", "no_clip"}
 
 
 class _Parser(argparse.ArgumentParser):
@@ -146,7 +146,8 @@ def _cmd_ask(args):
 
 def _ml_opts(args):
     return {"python": args.ml_python, "device": args.device,
-            "language": args.language, "model": args.model}
+            "language": args.language, "model": args.model,
+            "beat_model": getattr(args, "beat_model", ""), "ctl": _control(args)}
 
 
 def _kinds_arg(args):
@@ -180,13 +181,73 @@ def _cmd_stems(args):
     return {"stems": files, "t0": args.t0 or 0.0, "t1": args.t1}
 
 
+def _control(args):
+    return _api.Control(cancel_file=getattr(args, "cancel_file", ""),
+                        progress=getattr(args, "progress", False))
+
+
+def _brief_map(m):
+    """Карта песни без длинных списков: доли, удары и кандидаты резов —
+    числом, места для резов — только рекомендованные."""
+    out = {k: v for k, v in m.items() if k not in ("beats", "hits", "slots")}
+    out["beats"] = len(m.get("beats", []))
+    out["hits"] = {k: len(v) for k, v in m.get("hits", {}).items()}
+    out["slots"] = [s for s in m.get("slots", []) if s.get("recommended")]
+    out["bars"] = [{k: b[k] for k in ("index", "t", "bpm", "energy", "section")}
+                   for b in m.get("bars", [])]
+    return out
+
+
+def _cmd_music(args):
+    ctl = _control(args)
+    opts = {"model": args.beat_model, "python": args.ml_python, "drums": not args.no_drums,
+            "sections": not args.no_sections, "gemini": args.gemini, "ctl": ctl}
+    m = _api.music_file(args.media, args.t0, args.t1, args.stream, **opts)
+    fps = args.fps
+    if args.write:
+        p, problems = _api.load_project_file(args.write, strict=not args.lenient)
+        if args.track is None or not 0 <= args.track < len(p.tracks):
+            raise _api.ToolError("bad_track", "--write: нужен --track N (дорожка с песней)")
+        media = _api.os.path.normcase(_api.os.path.abspath(args.media))
+        clips = [c for c in p.clips_on(args.track)
+                 if media in (_api.os.path.normcase(_api.os.path.abspath(c.src)),
+                              _api.os.path.normcase(_api.os.path.abspath(c.audio_path or c.src)))]
+        if not clips:
+            raise _api.ToolError("no_clip", f"на дорожке {args.track} нет клипа с этим файлом")
+        fps = fps or p.output_format()[2]
+        kinds = _kinds_arg(args) or list(_api.MUSIC_WRITE_KINDS)
+        bad = [k for k in kinds if k not in _api.MUSIC_KINDS]
+        if bad:
+            raise _api.ToolError("usage", f"неизвестный вид: {', '.join(bad)} "
+                                          f"(есть {', '.join(_api.MUSIC_KINDS)})")
+        # Резы — на сетке кадров проекта: время места пересчитывается в
+        # проект, затем прилипает к кадру.
+        found = _api.map_markers(m, kinds, _api.clip_mapper(clips))
+        for mk in found:
+            if mk["kind"] == "slot":
+                mk["t"] = round(_api.snap_frame(mk["t"], fps, args.lead)[0], 6)
+        _api.snap_slots(m, fps, args.lead)
+        added = _api.merge_markers(p, found, kinds, 0.0, float("inf"))
+        _api.montage_project.save_project(p, args.write)
+        m["written"] = {"project": _api.os.path.abspath(args.write), "markers": added,
+                        "kinds": kinds, "problems": problems}
+    else:
+        _api.snap_slots(m, fps, args.lead)
+    return _brief_map(m) if args.brief else m
+
+
 def _analysis_args(sp):
-    sp.add_argument("--kinds", default="", help="через запятую: " + ",".join(_api.ANALYSIS_KINDS))
+    sp.add_argument("--kinds", default="", help="через запятую: " + ",".join(_api.ANALYSIS_KINDS)
+                    + " (без --kinds — scene,beat,onset,silence,speech,word)")
     sp.add_argument("--t0", type=float, default=0.0)
     sp.add_argument("--t1", type=float, default=None)
     sp.add_argument("--scene-threshold", type=float, default=_api.SCENE_THRESHOLD)
     sp.add_argument("--vocals", action="store_true",
                     help="слова — по вокалу (отделить HTDemucs; только для песен)")
+    sp.add_argument("--beat-model", choices=_api.BEAT_MODELS, default=_api.DEFAULT_BEAT_MODEL,
+                    help="Beat This! для бита и карты песни")
+    sp.add_argument("--progress", action="store_true", help="этапы строками JSON в stderr")
+    sp.add_argument("--cancel-file", default="", help="появился этот файл — отмена")
     _ml_args(sp)
 
 
@@ -278,6 +339,29 @@ def build_parser():
     sp.add_argument("--stream", type=int, default=-1)
     _ml_args(sp)
     sp.set_defaults(fn=_cmd_stems)
+    sp = sub.add_parser("music", help="карта песни: доли, такты, части, удары, места резов")
+    sp.add_argument("media", help="звук или видео с песней")
+    sp.add_argument("--t0", type=float, default=0.0)
+    sp.add_argument("--t1", type=float, default=None)
+    sp.add_argument("--stream", type=int, default=-1, help="абсолютный индекс звукового потока")
+    sp.add_argument("--beat-model", choices=_api.BEAT_MODELS, default=_api.DEFAULT_BEAT_MODEL)
+    sp.add_argument("--no-drums", action="store_true", help="без ударов (HTDemucs)")
+    sp.add_argument("--no-sections", action="store_true", help="без частей песни")
+    sp.add_argument("--fps", type=float, default=0.0,
+                    help="места резов на сетке кадров (с --write — fps проекта)")
+    sp.add_argument("--lead", type=int, default=0, help="рез раньше доли на N кадров")
+    sp.add_argument("--write", default="", help="проект: записать маркеры во время проекта")
+    sp.add_argument("--track", type=int, default=None, help="дорожка клипа с этой песней")
+    sp.add_argument("--kinds", default="", help="виды маркеров для --write: "
+                    + ",".join(_api.MUSIC_KINDS))
+    sp.add_argument("--gemini", action="store_true",
+                    help="подписи частей — один запрос Gemini по звуку (квота пользователя)")
+    sp.add_argument("--brief", action="store_true", help="без длинных списков долей и ударов")
+    sp.add_argument("--ml-python", default="", help="Python генератора (torch, demucs)")
+    sp.add_argument("--progress", action="store_true", help="этапы строками JSON в stderr")
+    sp.add_argument("--cancel-file", default="", help="появился этот файл — отмена")
+    _lenient_arg(sp)
+    sp.set_defaults(fn=_cmd_music)
     sp = sub.add_parser("ask", help="вопрос модели Gemini по превью или кадрам")
     sp.add_argument("media", nargs="+", help="mp4, png, jpg, webp")
     sp.add_argument("--schema", required=True, help="JSON Schema ответа")

@@ -53,8 +53,9 @@ def generate_json(self, prompt, schema: dict, *,
                 "thinking_level": thinking,
             },
         }
+        # Звук идёт тем же путём, что и видео: inlineData в GenerateContent.
         video_input = isinstance(prompt, list) and any(
-            isinstance(part, dict) and part.get("type") == "video" for part in prompt)
+            isinstance(part, dict) and part.get("type") in ("video", "audio") for part in prompt)
         image_input = isinstance(prompt, list) and any(
             isinstance(part, dict) and part.get("type") == "image" for part in prompt)
         if (not getattr(self, "prefer_interactions", False)
