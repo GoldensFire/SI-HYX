@@ -33,6 +33,7 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
 | [utils.py](utils.py) | настройки, медиа-сведения, ffmpeg, Kodik, HTML-маска | [si_hyx_parts/utils/](si_hyx_parts/utils/) |
 | [edit_tab.py](edit_tab.py) | вкладка «Монтаж» | [si_hyx_parts/edit_tab/](si_hyx_parts/edit_tab/) |
 | [montage_tool.py](montage_tool.py) | «Монтаж» без интерфейса: CLI и API для агента | [si_hyx_parts/montage_tool/](si_hyx_parts/montage_tool/) |
+| [montage_mcp.py](montage_mcp.py) | MCP-сервер (stdio) с командами montage_tool; отдельный venv, не в сборке | — |
 | [edit_tab_widgets.py](edit_tab_widgets.py), [edit_tab_workers.py](edit_tab_workers.py), [edit_tab_dialogs.py](edit_tab_dialogs.py) | виджеты, потоки и диалоги «Монтажа» | `si_hyx_parts/edit_tab_*/` |
 | [photo_tab.py](photo_tab.py) | вкладка «Фото» (LaMa, RMBG, холст) | [si_hyx_parts/photo_tab/](si_hyx_parts/photo_tab/) |
 | [animepack.py](animepack.py) | генератор аниме-пака | [si_hyx_parts/animepack/](si_hyx_parts/animepack/) |
@@ -953,6 +954,19 @@ RIFE (`Clip.interpolate`: rife-v4.22-lite, rife-v4.25; только speed < 1) �
 релиза 20250112 запросами Range (`jobs._RangeFile`, 25 МБ вместо 827), SHA-256
 — у файлов. Замер (Vega 7): RIFE 720p ~5,8, 1080p ~2,9 выходных кадра/с
 (v4.25 ≈ v4.22-lite). `minterpolate` не используется.
+
+Локальное зрение — `look` ([vision_local.py](si_hyx_parts/montage_tool/vision_local.py)):
+llama-server llama.cpp b11838 (Vulkan, zip ASSETS распакован в кэш с проверкой
+имён) с Qwen3.5-2B Q4_K_M + mmproj F16 на 127.0.0.1 со случайным портом, один
+вызов — один запуск (model_slot), `--reasoning off`, JSON-схема —
+`response_format`. Текст по умолчанию на процессоре (`--gpu-layers 0`): на
+Vega 7 генерация ~10 т/с против ~7 на iGPU; кадр 960 px ≈ 550 токенов, вызов
+~27–30 с. MCP — [montage_mcp.py](montage_mcp.py) в корне: SDK `mcp` 2.x
+(`MCPServer`, stdio) в отдельном venv `~/.cache/si-hyx-montage/mcp-venv`, не в
+сборке; инструменты зовут `montage_tool.py` Python'ом приложения, PNG —
+`Image`, прогресс `--progress` — `report_progress`, отмена вызова — файл
+отмены под `anyio.CancelScope(shield=True)`, потом taskkill дерева.
+Хост закачек: известные имена и поддомены `hf.co` (CDN LFS Hugging Face).
 
 Плеер «Монтажа» читает файл через QFile поверх хэндла с FILE_SHARE_DELETE
 (`open_share_delete_file` в

@@ -326,6 +326,16 @@ def _cmd_beat_strip(args):
     return out
 
 
+def _cmd_look(args):
+    prompt = args.prompt
+    if args.prompt_file:
+        with open(args.prompt_file, "r", encoding="utf-8") as f:
+            prompt = f.read()
+    schema = _read_json_arg(args.schema, "файл схемы") if args.schema else None
+    return _api.look(args.images, prompt, schema=schema, model=args.model,
+                     max_tokens=args.max_tokens, gpu_layers=args.gpu_layers, ctl=_control(args))
+
+
 def _cmd_guide(args):
     path = _api.os.path.join(_api.os.path.dirname(_api.os.path.abspath(_api.__file__)),
                              "docs", "montage-agent-amv.md")
@@ -552,6 +562,18 @@ def build_parser():
     sp.add_argument("--db", default="")
     _lenient_arg(sp)
     sp.set_defaults(fn=_cmd_beat_strip)
+    sp = sub.add_parser("look", help="вопрос локальной модели зрения по картинкам (llama.cpp)")
+    sp.add_argument("images", nargs="+", help="png, jpg (webp и прочее — перекодируется)")
+    sp.add_argument("--prompt", default="")
+    sp.add_argument("--prompt-file", default="")
+    sp.add_argument("--schema", default="", help="JSON Schema ответа (файл)")
+    sp.add_argument("--model", choices=sorted(_api.LOOK_MODELS), default=_api.DEFAULT_LOOK_MODEL)
+    sp.add_argument("--max-tokens", type=int, default=512)
+    sp.add_argument("--gpu-layers", type=int, default=0,
+                    help="слоёв текста на видеокарте (0 — процессор; iGPU с общей памятью так быстрее)")
+    sp.add_argument("--progress", action="store_true")
+    sp.add_argument("--cancel-file", default="")
+    sp.set_defaults(fn=_cmd_look)
     sp = sub.add_parser("guide", help="памятка агента по монтажу AMV")
     sp.set_defaults(fn=_cmd_guide)
     sp = sub.add_parser("ask", help="вопрос модели Gemini по превью или кадрам")

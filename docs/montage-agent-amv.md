@@ -44,6 +44,7 @@
        beat-strip amv.json 0 20 strip.png   # волна, доли, части, резы, клипы — смотреть глазами
        contact-sheet amv.json 0 20 16 s.png # кадры проекта с id клипов
        preview amv.json 10 22 p.mp4         # до 15 с — для Gemini (ask)
+       look s.png --prompt "…" --schema a.json  # локальная модель, без квоты (~30 с)
 
 5. **Правки** — `edit amv.json --ops ops.json`, затем снова check-sync.
 6. **Поиск замены** — `search --tags … --character … --motion-min 0.3 --brief`,
@@ -135,3 +136,27 @@
 - Короче 0,3–0,4 с план не читается; длинный план — в тихой части.
 - Смотреть результат: `beat-strip` (ритм), `contact-sheet` (картинка),
   `preview` + `ask` (Gemini смотрит ролик и отвечает по JSON-схеме).
+
+## MCP и локальное зрение
+
+`montage_mcp.py` — те же команды инструментами MCP (`montage_guide`,
+`montage_music`, `montage_autofill`, `montage_edit`, `montage_check_sync`,
+`montage_beat_strip`, `montage_still`, `montage_shot_sheet`, `montage_look`,
+`montage_render`…; `montage_cli` — любая команда как есть). PNG приходят
+картинкой, прогресс долгих команд — уведомлениями, отмена вызова —
+отмена команды. Окружение — отдельное, в приложение не ставится:
+
+    uv venv --python 3.11 %USERPROFILE%\.cache\si-hyx-montage\mcp-venv
+    uv pip install --python %USERPROFILE%\.cache\si-hyx-montage\mcp-venv\Scripts\python.exe mcp==2.3.0
+
+Claude Code (`--python` — Python, которым запускается SI-HYX из исходников):
+
+    claude mcp add si-hyx-montage -- %USERPROFILE%\.cache\si-hyx-montage\mcp-venv\Scripts\python.exe -I C:\путь\SI-HYX\montage_mcp.py --python C:\путь\python.exe
+
+Другие клиенты (Claude Desktop, Cursor и т.п.) — тот же `command`/`args` в их
+JSON-настройке `mcpServers`, транспорт stdio.
+
+`look` — локальная модель зрения (llama.cpp Vulkan, Qwen3.5-2B, ~2 ГБ —
+скачивается при первом вызове): вопрос по кадрам, листам, лентам, ответ
+по JSON-схеме. Без сети и квоты, ~30 с на картинку; заметно слабее Gemini
+(крупность, тёмный кадр, текст, «что в кадре» — да; тонкие оценки — нет).

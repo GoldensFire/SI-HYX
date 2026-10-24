@@ -43,7 +43,12 @@
   autofill <проект> --song … [--plan …]   черновик AMV из каталога под песню;
   check-sync <проект>        резы против долей и ударов, плотность, повторы;
   beat-strip <проект> <t0> <t1> <out.png>   ритм-лента: волна, доли, части, резы;
+  look <картинка>… --prompt … [--schema …]   локальная модель зрения
+                             (llama.cpp Vulkan, Qwen3.5-2B): без сети и квот;
   guide                      памятка агента (docs/montage-agent-amv.md).
+
+MCP-сервер с этими командами как инструментами — montage_mcp.py (отдельное
+окружение с SDK mcp, в сборку не входит).
 
 Долгие команды (music, analyze с видами карты песни) пишут этапы строками
 JSON в stderr (--progress) и отменяются файлом (--cancel-file). Кэш, модели
@@ -130,4 +135,6 @@ from si_hyx_parts.montage_tool.autofill import autofill, pick_window, segments  
 from si_hyx_parts.montage_tool.critique import check_sync  # noqa: E402,F401
 from si_hyx_parts.montage_tool.beat_strip import beat_strip  # noqa: E402,F401
 from si_hyx_parts.montage_tool.enhance import build_interp, prepare_project  # noqa: E402,F401
+from si_hyx_parts.montage_tool.vision_local import (  # noqa: E402,F401
+    DEFAULT_LOOK_MODEL, LOOK_MODELS, llama_dir, look)
 from si_hyx_parts.montage_tool.cli import main  # noqa: E402,F401

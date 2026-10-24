@@ -22,6 +22,9 @@ CACHE_ENV = "SI_HYX_MONTAGE_CACHE"
 _BELOW_NORMAL = 0x00004000           # BELOW_NORMAL_PRIORITY_CLASS (наследуют дочерние)
 _ASSET_HOSTS = ("cloud.cp.jku.at", "huggingface.co", "github.com",
                 "objects.githubusercontent.com", "release-assets.githubusercontent.com")
+# Файлы LFS Hugging Face отдаются редиректом на CDN: us.aws.cdn.hf.co,
+# cas-bridge.xethub.hf.co и т.п. — поддомены hf.co.
+_ASSET_DOMAINS = ("hf.co",)
 # Закреплённые модели: путь в кэше, адрес, SHA-256, размер, лицензия.
 ASSETS = {
     "beat_this/small0.ckpt": {
@@ -129,6 +132,19 @@ ASSETS = {
         "member": "rife-ncnn-vulkan-refs/heads/master-windows/rife-v4.25/flownet.param",
         "sha256": "99d0f49866ff06f170c08e570e3e1b67b89019e3d11a87c8f0e7908fa50ab4c1",
         "size": 31669, "license": "MIT (TNTwise rife-ncnn-vulkan; веса hzwer Practical-RIFE)"},
+    # Локальное зрение (look): llama.cpp с Vulkan и Qwen3.5-2B (GGUF unsloth).
+    "llama/llama-b11838-bin-win-vulkan-x64.zip": {
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11838/llama-b11838-bin-win-vulkan-x64.zip",
+        "sha256": "d5c28fd61d2d6947d6cae9fe4576c7b9beddda31ab4cee6abd9417561e63b5f9",
+        "size": 36882552, "license": "MIT (ggml-org llama.cpp)"},
+    "vlm/qwen3.5-2b/Qwen3.5-2B-Q4_K_M.gguf": {
+        "url": "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/f6d5376be1edb4d416d56da11e5397a961aca8ae/Qwen3.5-2B-Q4_K_M.gguf",
+        "sha256": "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223",
+        "size": 1280835840, "license": "Apache-2.0 (Qwen3.5; GGUF unsloth)"},
+    "vlm/qwen3.5-2b/mmproj-F16.gguf": {
+        "url": "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/f6d5376be1edb4d416d56da11e5397a961aca8ae/mmproj-F16.gguf",
+        "sha256": "7035e9cb8d7c6a9681d07eef9a364783e86ea4cd73faab2eabb4f43a101830c7",
+        "size": 668227264, "license": "Apache-2.0 (Qwen3.5; GGUF unsloth)"},
     "anime4k/Anime4K_v4.0.zip": {
         "url": "https://github.com/bloc97/Anime4K/releases/download/v4.0.1/Anime4K_v4.0.zip",
         "sha256": "139cd282086457c5adc79caf7b75b8b825091d71c9b54958c18745fea62d7ed7",
@@ -193,7 +209,9 @@ def file_sha256(path):
 def _check_host(url):
     """Адрес модели — только https на известных хостах (и после редиректа)."""
     parts = urlsplit(url)
-    if parts.scheme != "https" or (parts.hostname or "") not in _ASSET_HOSTS:
+    host = (parts.hostname or "").lower()
+    known = host in _ASSET_HOSTS or any(host.endswith("." + d) for d in _ASSET_DOMAINS)
+    if parts.scheme != "https" or not known:
         raise _api.ToolError("asset_failed", f"недопустимый адрес модели: {parts.hostname}")
 
 
