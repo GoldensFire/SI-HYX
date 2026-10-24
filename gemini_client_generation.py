@@ -54,8 +54,11 @@ def generate_json(self, prompt, schema: dict, *,
             },
         }
         # Звук идёт тем же путём, что и видео: inlineData в GenerateContent.
+        # Видео из File API (uri, processing: fps/offsets, resolution) —
+        # частью Interactions как есть (gemini_files).
         video_input = isinstance(prompt, list) and any(
-            isinstance(part, dict) and part.get("type") in ("video", "audio") for part in prompt)
+            isinstance(part, dict) and part.get("type") in ("video", "audio") and "data" in part
+            for part in prompt)
         image_input = isinstance(prompt, list) and any(
             isinstance(part, dict) and part.get("type") == "image" for part in prompt)
         if (not getattr(self, "prefer_interactions", False)

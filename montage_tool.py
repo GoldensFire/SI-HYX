@@ -34,7 +34,12 @@
   music <звук|видео> [--write <проект> --track N] [--gemini] [--brief]
                              карта песни: темп, размер, доли с номером в такте,
                              такты, фразы, части, энергия, удары барабанов,
-                             места для резов (Beat This!, HTDemucs, librosa).
+                             места для резов (Beat This!, HTDemucs, librosa);
+  index <файл|папка> [--db …] [--gemini]   каталог планов: границы, движение,
+                             акценты, крупность, персонажи, теги, текст, OP/ED;
+  search [фильтры] [--query …]   планы каталога JSON; shot-sheet <out.png> —
+                             лист найденных с id; characters [--rename ID имя];
+
 
 Долгие команды (music, analyze с видами карты песни) пишут этапы строками
 JSON в stderr (--progress) и отменяются файлом (--cancel-file). Кэш, модели
@@ -100,7 +105,7 @@ from si_hyx_parts.montage_tool.timeline import describe_project  # noqa: E402,F4
 from si_hyx_parts.montage_tool.render import (  # noqa: E402,F401
     check_output, dry_run, export_command, missing_files, render)
 from si_hyx_parts.montage_tool.inspection import (  # noqa: E402,F401
-    ask_model, contact_sheet, gemini_key, preview, sheet_times, still)
+    SHEET_MAX, ask_model, contact_sheet, draw_sheet, gemini_key, preview, sheet_times, still)
 from si_hyx_parts.montage_tool.jobs import (  # noqa: E402,F401
     ASSETS, NO_CONTROL, Control, asset, cache_dir, ensure_packages, run_worker)
 from si_hyx_parts.montage_tool.analysis import (  # noqa: E402,F401
@@ -110,4 +115,7 @@ from si_hyx_parts.montage_tool.music import (  # noqa: E402,F401
     BEAT_MODELS, DEFAULT_BEAT_MODEL, MUSIC_KINDS, MUSIC_WRITE_KINDS, SECTION_LABELS,
     clip_mapper, drum_hits, map_markers, music_file, music_project, shift_map, snap_frame,
     snap_slots, song_map)
+from si_hyx_parts.montage_tool.library import (  # noqa: E402,F401
+    INDEX_VERSION, connect, default_db, detect_oped, index_library, library_stats, match_runs,
+    recluster_characters, rename_character, search, shot_sheet)
 from si_hyx_parts.montage_tool.cli import main  # noqa: E402,F401

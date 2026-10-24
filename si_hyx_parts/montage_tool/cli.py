@@ -236,6 +236,84 @@ def _cmd_music(args):
     return _brief_map(m) if args.brief else m
 
 
+def _cmd_index(args):
+    return _api.index_library(args.target, args.db or None, _control(args), force=args.force,
+                              tagger=args.tagger, gemini=args.gemini,
+                              gemini_model=args.gemini_model)
+
+
+def _list_arg(v):
+    return [x.strip() for x in (v or "").split(",") if x.strip()]
+
+
+def _search_found(args, limit=None):
+    return _api.search(
+        args.db or None, tags_all=_list_arg(args.tags), tags_any=_list_arg(args.any_tags),
+        tags_none=_list_arg(args.no_tags), character=args.character,
+        motion_min=args.motion_min, motion_max=args.motion_max, min_len=args.min_len,
+        max_len=args.max_len, bright_min=args.bright_min, bright_max=args.bright_max,
+        scale=_list_arg(args.scale), no_text=args.no_text, include_oped=args.with_oped,
+        include_transitions=args.with_transitions, file=args.file, query=args.query,
+        static=True if args.static else (False if args.moving else None),
+        limit=limit or args.limit, ids=[int(x) for x in _list_arg(args.ids)])
+
+
+def _cmd_search(args):
+    out = _search_found(args)
+    if args.brief:
+        keep = ("id", "file", "t0", "t1", "length", "scale", "motion", "characters", "tags",
+                "character_tags", "accents", "oped", "score")
+        out["shots"] = [{k: s[k] for k in keep if k in s} for s in out["shots"]]
+    return out
+
+
+def _cmd_shot_sheet(args):
+    found = _search_found(args, limit=min(args.limit, _api.SHEET_MAX))
+    out = _api.shot_sheet(found["shots"], args.output, args.tile_width, args.columns)
+    out["total"] = found["total"]
+    return out
+
+
+def _cmd_characters(args):
+    con = _api.connect(args.db or None)
+    try:
+        if args.rename:
+            _api.rename_character(con, args.rename[0], args.rename[1])
+        if args.recluster:
+            _api.recluster_characters(con, _control(args))
+        rows = con.execute(
+            "SELECT h.id, h.name, h.size, (SELECT MIN(k.shot_id) FROM crops k WHERE k.char_id=h.id) "
+            "AS example FROM characters h ORDER BY h.size DESC").fetchall()
+        return {"characters": [dict(r) for r in rows]}
+    finally:
+        con.close()
+
+
+def _search_args(sp):
+    sp.add_argument("--db", default="", help="база каталога (по умолчанию — в кэше)")
+    sp.add_argument("--query", default="", help="текст: теги, надписи, описания (rapidfuzz)")
+    sp.add_argument("--tags", default="", help="все эти теги WD (через запятую)")
+    sp.add_argument("--any-tags", default="", help="хотя бы один из тегов")
+    sp.add_argument("--no-tags", default="", help="ни одного из тегов")
+    sp.add_argument("--character", default="", help="id или имя персонажа, или тег персонажа WD")
+    sp.add_argument("--motion-min", type=float, default=None,
+                    help="движение, доля ширины кадра в секунду")
+    sp.add_argument("--motion-max", type=float, default=None)
+    sp.add_argument("--min-len", type=float, default=None, help="длина плана, с")
+    sp.add_argument("--max-len", type=float, default=None)
+    sp.add_argument("--bright-min", type=float, default=None, help="яркость 0…1")
+    sp.add_argument("--bright-max", type=float, default=None)
+    sp.add_argument("--scale", default="", help="крупность: closeup,medium,wide,none")
+    sp.add_argument("--static", action="store_true", help="только статичные планы")
+    sp.add_argument("--moving", action="store_true", help="только не статичные")
+    sp.add_argument("--no-text", action="store_true", help="без надписей и хардсаба")
+    sp.add_argument("--with-oped", action="store_true", help="включая опенинг и эндинг")
+    sp.add_argument("--with-transitions", action="store_true", help="включая растворения")
+    sp.add_argument("--file", default="", help="часть пути файла")
+    sp.add_argument("--ids", default="", help="id планов через запятую")
+    sp.add_argument("--limit", type=int, default=50)
+
+
 def _analysis_args(sp):
     sp.add_argument("--kinds", default="", help="через запятую: " + ",".join(_api.ANALYSIS_KINDS)
                     + " (без --kinds — scene,beat,onset,silence,speech,word)")
@@ -362,6 +440,33 @@ def build_parser():
     sp.add_argument("--cancel-file", default="", help="появился этот файл — отмена")
     _lenient_arg(sp)
     sp.set_defaults(fn=_cmd_music)
+    sp = sub.add_parser("index", help="каталог планов файла или папки (SQLite + миниатюры)")
+    sp.add_argument("target", help="видеофайл или папка")
+    sp.add_argument("--db", default="", help="база каталога (по умолчанию — в кэше)")
+    sp.add_argument("--force", action="store_true", help="заново, даже если файл не менялся")
+    sp.add_argument("--tagger", choices=("vit", "eva02"), default="vit",
+                    help="WD tagger v3: vit (0,7 с/кадр) или eva02 (2,9 с/кадр)")
+    sp.add_argument("--gemini", action="store_true",
+                    help="описания сцен: серия в File API, один запрос Gemini (квота пользователя)")
+    sp.add_argument("--gemini-model", default="", help="модель Gemini (по умолчанию — Flash-Lite)")
+    sp.add_argument("--progress", action="store_true", help="этапы строками JSON в stderr")
+    sp.add_argument("--cancel-file", default="", help="появился этот файл — отмена")
+    sp.set_defaults(fn=_cmd_index)
+    sp = sub.add_parser("search", help="поиск планов каталога")
+    _search_args(sp)
+    sp.add_argument("--brief", action="store_true", help="только главные поля")
+    sp.set_defaults(fn=_cmd_search)
+    sp = sub.add_parser("shot-sheet", help="лист найденных планов с id (PNG)")
+    sp.add_argument("output")
+    _search_args(sp)
+    sp.add_argument("--tile-width", type=int, default=320)
+    sp.add_argument("--columns", type=int, default=0)
+    sp.set_defaults(fn=_cmd_shot_sheet, limit=24)
+    sp = sub.add_parser("characters", help="персонажи каталога (кластеры CCIP)")
+    sp.add_argument("--db", default="")
+    sp.add_argument("--rename", nargs=2, metavar=("ID", "ИМЯ"), help="дать кластеру имя")
+    sp.add_argument("--recluster", action="store_true", help="пересобрать кластеры")
+    sp.set_defaults(fn=_cmd_characters)
     sp = sub.add_parser("ask", help="вопрос модели Gemini по превью или кадрам")
     sp.add_argument("media", nargs="+", help="mp4, png, jpg, webp")
     sp.add_argument("--schema", required=True, help="JSON Schema ответа")

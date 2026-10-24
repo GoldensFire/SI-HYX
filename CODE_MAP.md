@@ -863,6 +863,36 @@ Python генератора (`music_effects.runtime_python`), музыка ст�
 Замер (Ryzen 5 5600H, CPU): песня 3:56 — доли 20 с, HTDemucs ~150 с
 (~0,65× длины, 6 потоков быстрее 12), признаки 8 с; повтор из кэша ~2 с.
 
+Каталог планов — `index`/`search`/`shot-sheet`/`characters`
+([library.py](si_hyx_parts/montage_tool/library.py), SQLite в кэше, `--db`):
+инкрементально (размер+mtime, перенос — по хэшу краёв файла, `INDEX_VERSION`),
+процесс — BELOW_NORMAL и под `model_slot`. Один проход ffmpeg
+([shots.py](si_hyx_parts/montage_tool/shots.py) `FramePass`): кадры 320 px в
+трубу (scdet без `sc_pass` — с `sc_pass=1` дальше шли только смены сцены, и
+CFR дублировал их), JPEG 640 px 4 раза в секунду (ключевые кадры), HDR
+сводится после уменьшения. `FrameStats`: миниатюры 48×27, разность соседних
+кадров (повтор рисунка — < 0,3), DIS-поток (общий сдвиг — камера, остаток —
+движение в кадре). `TransNetStream` — TransNetV2 в своём потоке во время
+декода; тихие окна (`_quiet`: малая разность, похожие края) не считаются —
+резы Majo 01 совпали с полным прогоном. `find_shots`: вспышка (края похожи,
+скачок яркости) — не рез, многокадровый выход — растворение (`transition`).
+Зрение ([vision.py](si_hyx_parts/montage_tool/vision.py), onnxruntime
+приложения, только CPU): детекторы deepghs n-версии (лица/головы/фигуры →
+`scale`), CCIP (OpenRAIL) по фигуре → `recluster_characters` (DBSCAN на
+модели-метрике, имена переходят по большинству), WD tagger v3 ViT (EVA02 —
+4× медленнее при тех же тегах), rapidocr приложения (сначала поиск строк;
+флаги вызова — явно, RapidOCR их запоминает). Средний кадр, почти равный
+кадру прошлого плана (`twin`, диалог A-B-A-B), — теги, текст и персонажи
+копируются. OP/ED — `match_runs`: отпечатки chromaprint (`-f chromaprint
+-fp_format raw`, шаг 0,124 с), сдвиги голосованием точных совпадений, куски
+≥ 60 с с разницей < 10 бит из 32. `--gemini` —
+[gemini_files.py](gemini_files.py) (File API: resumable-загрузка, ACTIVE,
+удаление) + часть `video` с `processing` (static, fps, offsets) и
+`resolution: low` в Interactions (GeminiClient отдаёт части с `uri` как есть).
+Замер Majo 01 (24 мин 1080p H.264): ~15 мин — декод 105 с, TransNetV2 ещё
+~195 с после декода, детекторы 55 с, CCIP 133 с, теги 307 с, OCR 141 с;
+узкое место — теги и TransNetV2 на CPU.
+
 Плеер «Монтажа» читает файл через QFile поверх хэндла с FILE_SHARE_DELETE
 (`open_share_delete_file` в
 [share_delete_iodevice.py](si_hyx_parts/edit_tab_workers/share_delete_iodevice.py)):

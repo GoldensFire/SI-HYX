@@ -115,8 +115,6 @@ def contact_sheet(p, t0, t1, n, out_png, tile_width=320, columns=0):
     """Контактный лист: n кадров отрезка [t0, t1) сеткой, под каждым — время
     проекта и id видимого клипа (по ним модель называет место правки).
     Кадры рендерятся по одному (build_source с окном в кадр) в 4 потока."""
-    from PIL import Image, ImageDraw, ImageFont
-
     out_png = _api.check_output(p, out_png, overwrite=True)
     times = sheet_times(p, t0, t1, n)
     tile_width = max(64, min(1280, int(tile_width)))
@@ -126,29 +124,49 @@ def contact_sheet(p, t0, t1, n, out_png, tile_width=320, columns=0):
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             infos = list(pool.map(lambda a: still(p, a[0], a[1], tile_width),
                                   zip(times, paths)))
-        tiles = [Image.open(x).convert("RGB") for x in paths]
-        th = max(t.height for t in tiles)
-        cols = int(columns) if columns and columns > 0 else min(len(tiles), 4)
-        rows = -(-len(tiles) // cols)
-        label_h = 22
-        sheet = Image.new("RGB", (cols * tile_width, rows * (th + label_h)), "#111827")
-        draw = ImageDraw.Draw(sheet)
-        try:
-            font = ImageFont.truetype(_TIMECODE_FONT, 14)
-        except OSError:
-            font = ImageFont.load_default()
-        for i, (tile, info) in enumerate(zip(tiles, infos)):
-            x, y = (i % cols) * tile_width, (i // cols) * (th + label_h)
-            sheet.paste(tile, (x, y))
-            draw.text((x + 6, y + th + 3), f"{i + 1}. {info['t']:.3f} с · {info['clip'] or '—'}",
-                      font=font, fill="white")
-            tile.close()
-        sheet.save(str(out_png))
+        cols, rows = draw_sheet(
+            paths, [f"{i + 1}. {info['t']:.3f} с · {info['clip'] or '—'}"
+                    for i, info in enumerate(infos)], out_png, tile_width, columns)
     finally:
         _api.shutil.rmtree(tmpdir, ignore_errors=True)
     return {"output": _api.os.path.abspath(str(out_png)), "columns": cols, "rows": rows,
             "frames": [{"index": i + 1, "t": info["t"], "clip": info["clip"]}
                        for i, info in enumerate(infos)]}
+
+
+def draw_sheet(images, labels, out_png, tile_width=320, columns=0):
+    """Лист: картинки (пути) сеткой по tile_width, под каждой — подпись
+    (строки — через перевод строки). (колонки, строки)."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    tiles = []
+    for path in images:
+        with Image.open(path) as im:
+            tile = im.convert("RGB")
+        if tile.width != tile_width:
+            tile = tile.resize((tile_width, max(1, round(tile.height * tile_width / tile.width))))
+        tiles.append(tile)
+    if not tiles:
+        raise _api.ToolError("nothing_to_render", "нет кадров для листа")
+    th = max(t.height for t in tiles)
+    cols = int(columns) if columns and columns > 0 else min(len(tiles), 4)
+    rows = -(-len(tiles) // cols)
+    lines = max(str(t).count("\n") + 1 for t in labels) if labels else 1
+    label_h = 4 + 18 * lines
+    sheet = Image.new("RGB", (cols * tile_width, rows * (th + label_h)), "#111827")
+    draw = ImageDraw.Draw(sheet)
+    try:
+        font = ImageFont.truetype(_TIMECODE_FONT, 14)
+    except OSError:
+        font = ImageFont.load_default()
+    for i, tile in enumerate(tiles):
+        x, y = (i % cols) * tile_width, (i // cols) * (th + label_h)
+        sheet.paste(tile, (x, y))
+        if i < len(labels):
+            draw.multiline_text((x + 6, y + th + 3), str(labels[i]), font=font, fill="white",
+                                spacing=2)
+    sheet.save(str(out_png))
+    return cols, rows
 
 
 def _timecode_filter(t0):
