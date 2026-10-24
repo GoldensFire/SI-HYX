@@ -67,6 +67,13 @@ def describe_project(p, at=None):
         "clips": [_clip_brief(p, c) for c in sorted(p.clips, key=lambda c: (c.track, c.start))],
         "video": video,
         "audio": audio,
+        # Сводка маркеров (карта песни даёт их сотни): число по видам и части.
+        "marker_counts": {k: sum(1 for m in p.markers if m.kind == k)
+                          for k in _api.montage_project.MARKER_KINDS
+                          if any(m.kind == k for m in p.markers)},
+        "sections": [{"t": _r(m.t), "end": None if m.end is None else _r(m.end),
+                      "label": m.label, "energy": _r(m.strength)}
+                     for m in p.markers if m.kind == "section"],
         "markers": [{"t": _r(m.t), "kind": m.kind, "label": m.label,
                      "strength": _r(m.strength),
                      "end": None if m.end is None else _r(m.end)} for m in p.markers],

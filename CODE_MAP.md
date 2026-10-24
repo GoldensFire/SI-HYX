@@ -893,6 +893,24 @@ CFR дублировал их), JPEG 640 px 4 раза в секунду (клю
 ~195 с после декода, детекторы 55 с, CCIP 133 с, теги 307 с, OCR 141 с;
 узкое место — теги и TransNetV2 на CPU.
 
+Команды агента: `edit` ([edit.py](si_hyx_parts/montage_tool/edit.py)) —
+операции add/move/trim/split/swap/delete/set/text/marker/effect через методы
+Project на копии, ошибка — `bad_op` с номером, проект не меняется; время —
+число или «вид[:подпись]#N[.end][±с]» (`resolve_time`, прилипает к кадру).
+`autofill` ([autofill.py](si_hyx_parts/montage_tool/autofill.py)) —
+рекомендованные места резов окна песни → отрезки на кадрах проекта →
+Витерби по кандидатам каталога (движение ↔ энергия, правила частей плана,
+подгон акцента к удару — `_align`, `in_s` на кадрах исходника; цена
+перехода — соседние планы одной сцены, та же крупность), повторы — на
+следующий по оценке. `check-sync` ([critique.py](si_hyx_parts/montage_tool/critique.py))
+— резы против маркеров beat/downbeat/kick/snare (±1 кадр), плотность по
+частям против `_spacing_s`, длины, повторы, скачки внутри плана, по каталогу
+— хардсаб, OP/ED, темнота, вспышка на резе. `beat-strip`
+([beat_strip.py](si_hyx_parts/montage_tool/beat_strip.py)) — PNG ~2000 px:
+шкала, части, волна с громкостью, такты, удары, места резов, кадры клипов,
+резы. Памятка — [docs/montage-agent-amv.md](docs/montage-agent-amv.md)
+(`guide`).
+
 Плеер «Монтажа» читает файл через QFile поверх хэндла с FILE_SHARE_DELETE
 (`open_share_delete_file` в
 [share_delete_iodevice.py](si_hyx_parts/edit_tab_workers/share_delete_iodevice.py)):

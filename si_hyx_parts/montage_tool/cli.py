@@ -20,7 +20,7 @@ _USAGE_CODES = {"usage", "project_not_found", "project_too_large", "project_inva
                 "project_invalid", "missing_files", "bad_output", "output_exists",
                 "bad_encoder", "nothing_to_render", "probe_failed", "project_version",
                 "bad_range", "bad_media", "bad_schema", "gemini_no_key", "bad_track",
-                "ml_unavailable", "no_clip"}
+                "ml_unavailable", "no_clip", "bad_op", "bad_plan", "no_markers"}
 
 
 class _Parser(argparse.ArgumentParser):
@@ -289,6 +289,53 @@ def _cmd_characters(args):
         con.close()
 
 
+def _read_json_arg(path, what):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return _api.json.load(f)
+    except (OSError, ValueError) as e:
+        raise _api.ToolError("usage", f"{what} не прочитан: {e}") from e
+
+
+def _cmd_edit(args):
+    ops = _read_json_arg(args.ops, "файл операций")
+    if isinstance(ops, dict) and isinstance(ops.get("ops"), list):
+        ops = ops["ops"]
+    return _api.edit_project(args.project, ops, args.db or None, strict=not args.lenient,
+                             dry_run=args.dry_run)
+
+
+def _cmd_autofill(args):
+    return _api.autofill(args.project, args.song, args.library or None, args.plan or None,
+                         t0=args.t0, t1=args.t1, duration=args.duration, min_shot=args.min_shot,
+                         ctl=_control(args), beat_model=args.beat_model, overwrite=args.overwrite)
+
+
+def _cmd_check_sync(args):
+    p, problems = _api.load_project_file(args.project, strict=not args.lenient)
+    out = _api.check_sync(p, args.db or None)
+    out["load_problems"] = problems
+    return out
+
+
+def _cmd_beat_strip(args):
+    p, problems = _api.load_project_file(args.project, strict=not args.lenient)
+    out = _api.beat_strip(p, args.t0, args.t1, args.output, args.width, args.db or None)
+    out["problems"] = problems
+    return out
+
+
+def _cmd_guide(args):
+    path = _api.os.path.join(_api.os.path.dirname(_api.os.path.abspath(_api.__file__)),
+                             "docs", "montage-agent-amv.md")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        raise _api.ToolError("usage", f"памятка не прочитана: {e}") from e
+    return {"path": path, "guide": text}
+
+
 def _search_args(sp):
     sp.add_argument("--db", default="", help="база каталога (по умолчанию — в кэше)")
     sp.add_argument("--query", default="", help="текст: теги, надписи, описания (rapidfuzz)")
@@ -467,6 +514,44 @@ def build_parser():
     sp.add_argument("--rename", nargs=2, metavar=("ID", "ИМЯ"), help="дать кластеру имя")
     sp.add_argument("--recluster", action="store_true", help="пересобрать кластеры")
     sp.set_defaults(fn=_cmd_characters)
+    sp = sub.add_parser("edit", help="точечные правки проекта списком операций")
+    sp.add_argument("project")
+    sp.add_argument("--ops", required=True, help="JSON: список операций (или {\"ops\": […]})")
+    sp.add_argument("--db", default="", help="каталог планов для add по shot")
+    sp.add_argument("--dry-run", action="store_true", help="не сохранять, только отчёт")
+    _lenient_arg(sp)
+    sp.set_defaults(fn=_cmd_edit)
+    sp = sub.add_parser("autofill", help="черновик AMV: песня + каталог планов")
+    sp.add_argument("project", help="новый проект (.json)")
+    sp.add_argument("--song", required=True)
+    sp.add_argument("--library", default="", help="каталог планов (по умолчанию — в кэше)")
+    sp.add_argument("--plan", default="", help="JSON плана: файлы, теги частей, prefer/avoid")
+    sp.add_argument("--t0", type=float, default=None, help="начало окна песни, с")
+    sp.add_argument("--t1", type=float, default=None)
+    sp.add_argument("--duration", type=float, default=None,
+                    help="длина окна, с (без t0 — окно выбирается по частям)")
+    sp.add_argument("--min-shot", type=float, default=0.35)
+    sp.add_argument("--beat-model", choices=_api.BEAT_MODELS, default=_api.DEFAULT_BEAT_MODEL)
+    sp.add_argument("--overwrite", action="store_true")
+    sp.add_argument("--progress", action="store_true")
+    sp.add_argument("--cancel-file", default="")
+    sp.set_defaults(fn=_cmd_autofill)
+    sp = sub.add_parser("check-sync", help="отчёт: резы против долей и ударов, плотность, повторы")
+    sp.add_argument("project")
+    sp.add_argument("--db", default="", help="каталог планов (тёмные кадры, хардсаб, OP/ED)")
+    _lenient_arg(sp)
+    sp.set_defaults(fn=_cmd_check_sync)
+    sp = sub.add_parser("beat-strip", help="ритм-лента PNG: волна, доли, части, резы, клипы")
+    sp.add_argument("project")
+    sp.add_argument("t0", type=float)
+    sp.add_argument("t1", type=float)
+    sp.add_argument("output")
+    sp.add_argument("--width", type=int, default=2000)
+    sp.add_argument("--db", default="")
+    _lenient_arg(sp)
+    sp.set_defaults(fn=_cmd_beat_strip)
+    sp = sub.add_parser("guide", help="памятка агента по монтажу AMV")
+    sp.set_defaults(fn=_cmd_guide)
     sp = sub.add_parser("ask", help="вопрос модели Gemini по превью или кадрам")
     sp.add_argument("media", nargs="+", help="mp4, png, jpg, webp")
     sp.add_argument("--schema", required=True, help="JSON Schema ответа")

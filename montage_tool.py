@@ -39,7 +39,11 @@
                              акценты, крупность, персонажи, теги, текст, OP/ED;
   search [фильтры] [--query …]   планы каталога JSON; shot-sheet <out.png> —
                              лист найденных с id; characters [--rename ID имя];
-
+  edit <проект> --ops ops.json   правки списком операций (время — маркеры);
+  autofill <проект> --song … [--plan …]   черновик AMV из каталога под песню;
+  check-sync <проект>        резы против долей и ударов, плотность, повторы;
+  beat-strip <проект> <t0> <t1> <out.png>   ритм-лента: волна, доли, части, резы;
+  guide                      памятка агента (docs/montage-agent-amv.md).
 
 Долгие команды (music, analyze с видами карты песни) пишут этапы строками
 JSON в stderr (--progress) и отменяются файлом (--cancel-file). Кэш, модели
@@ -118,4 +122,9 @@ from si_hyx_parts.montage_tool.music import (  # noqa: E402,F401
 from si_hyx_parts.montage_tool.library import (  # noqa: E402,F401
     INDEX_VERSION, connect, default_db, detect_oped, index_library, library_stats, match_runs,
     recluster_characters, rename_character, search, shot_sheet)
+from si_hyx_parts.montage_tool.edit import (  # noqa: E402,F401
+    OPS, apply_ops, edit_project, resolve_time)
+from si_hyx_parts.montage_tool.autofill import autofill, pick_window, segments  # noqa: E402,F401
+from si_hyx_parts.montage_tool.critique import check_sync  # noqa: E402,F401
+from si_hyx_parts.montage_tool.beat_strip import beat_strip  # noqa: E402,F401
 from si_hyx_parts.montage_tool.cli import main  # noqa: E402,F401
