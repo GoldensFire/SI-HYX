@@ -26,6 +26,7 @@ class EditTabExportMixin:
     def _start_cut_phase(self, phase):
         """Начало экспорта: подпись этапа и отсчёт времени для _report_cut."""
         self._cut_cancelled = False
+        self._cut_queued = False
         self._cut_phase = phase
         self._cut_t0 = _api.time.time()
         self._cut_lastp = 0.0
@@ -51,7 +52,9 @@ class EditTabExportMixin:
                 # перематывает декодер до точки реза (выходной seek) и ещё не даёт
                 # ни одного out_time — реального процента нет. Включаем пульсирующий
                 # («busy») режим полосы, чтобы она не выглядела зависшей на 0%.
-                txt = f"{phase} подготовка {self._fmt_mmss(elapsed)}"
+                txt = (f"{phase} {self._fmt_mmss(elapsed)}"
+                       if getattr(self, "_cut_queued", False) else
+                       f"{phase} подготовка {self._fmt_mmss(elapsed)}")
                 self._report_progress(-1, txt)
         except Exception:
             pass
@@ -180,9 +183,20 @@ class EditTabExportMixin:
             self.btn_cut.setEnabled(False)
             th.stop()
 
-    def _cancel_cut_and_process(self, tab_media):
-        """Отменяет «Обрезать и обработать» (worker вкладки «Обработка»)."""
-        w = getattr(tab_media, 'worker', None)
+    def _cancel_cut_and_process(self, tab_media, run=None):
+        """Отменяет «Обрезать и обработать» (worker вкладки «Обработка»).
+        run — состояние запуска из _execute_cut_and_process: пока обрезка ждёт
+        в очереди «Обработки», её просто снимаем, чужой воркер не трогаем."""
+        if run is not None and run.get('worker') is None:
+            if run.get('entry') is not None and tab_media.cancel_queued_run(run['entry']):
+                self._cut_cancelled = True
+                self._cut_queued = False
+                if getattr(self, "_cut_ticker", None) is not None:
+                    self._cut_ticker.stop()
+                self._set_cut_btn_cancel(False)
+                self.on_ffmpeg_finished(False, "Отменено")
+            return
+        w = run['worker'] if run is not None else getattr(tab_media, 'worker', None)
         if w is not None and w.isRunning():
             self._cut_cancelled = True
             self._report_progress(-1, "Отмена…")
@@ -1011,7 +1025,10 @@ class EditTabExportMixin:
             return
         dlg = getattr(self, "_export_settings_dlg", None)
         if dlg is None:
-            dlg = _api._ExportSettingsDialog(tm, mode_combo=self.cmb_mode, parent=self)
+            # Родитель — главное окно, не вкладка: стиль вкладки
+            # (QWidget { background } для всех потомков) перебил бы общий стиль
+            # приложения, и окно выглядело бы не так, как «Обработка».
+            dlg = _api._ExportSettingsDialog(tm, mode_combo=self.cmb_mode, parent=self.main)
             self._export_settings_dlg = dlg
         dlg.show()
         dlg.raise_()
@@ -1081,16 +1098,12 @@ class EditTabExportMixin:
         if tm is None:
             _api.msgbox_warning(self, "Внимание", "Вкладка «Обработка» недоступна.")
             return
+        # «Обработка» занята — обрезка встаёт в её очередь (enqueue_run) и
+        # стартует сама, как только текущий прогон закончится.
         try:
             busy = bool(getattr(tm, 'worker', None) is not None and tm.worker.isRunning())
         except Exception:
             busy = False
-        if busy:
-            _api.msgbox_information(
-                self, "«Обработка» занята",
-                "Во вкладке «Обработка» уже идёт очередь — дождитесь её "
-                "завершения и повторите обрезку.")
-            return
 
         stem = name_stem or src.stem
         out_dir = (_api.Path(self.export_dir)
@@ -1103,11 +1116,16 @@ class EditTabExportMixin:
         # факту — см. ниже. Флаг разрешает перезапись, и только её.
         force_overwrite = bool(out_path)
 
+        phase = "Обработка звука…" if audio_only else "Обработка…"
+        # run['worker'] — воркер этой обрезки, пока она не дождалась очереди — None;
+        # run['entry'] — её место в очереди «Обработки» (для отмены).
+        run = {'worker': None, 'entry': None}
         self._report_progress(0, "Обработка…")
-        self.log_label.setText("Отправлено в «Обработку»…"
+        self.log_label.setText(("В очереди «Обработки»…" if busy else "Отправлено в «Обработку»…")
                                + (" (только звук)" if audio_only else ""))
-        self._set_cut_btn_cancel(True, cancel_handler=lambda: self._cancel_cut_and_process(tm))
-        self._start_cut_phase("Обработка звука…" if audio_only else "Обработка…")
+        self._set_cut_btn_cancel(True, cancel_handler=lambda: self._cancel_cut_and_process(tm, run))
+        self._start_cut_phase("В очереди «Обработки»" if busy else phase)
+        self._cut_queued = busy
         if getattr(self, "_cut_ticker", None) is None:
             self._cut_ticker = _api.QTimer(self); self._cut_ticker.setInterval(500)
             self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
@@ -1163,16 +1181,6 @@ class EditTabExportMixin:
                 spec = self._burn_subs_spec(src, in_s)
                 if spec:
                     item['burn_subs'] = spec
-        # _run_items сама собирает настройки со всех виджетов «Обработки» и
-        # запускает ProcessWorker (тот же путь, что кнопка «НАЧАТЬ»); в очереди —
-        # только наш синтетический элемент, чужие файлы не затрагиваются.
-        tm._run_items([item])
-        proc_worker = getattr(tm, 'worker', None)
-        if proc_worker is None:
-            self._set_cut_btn_cancel(False)
-            self.on_ffmpeg_finished(False, "Не удалось запустить «Обработку»")
-            return
-
         def _on_progress(p_iid, pct, _iid=iid):
             if p_iid == _iid:
                 self._on_cut_progress(pct)
@@ -1187,6 +1195,7 @@ class EditTabExportMixin:
                 self._smartcut_status(phase)
 
         def _on_finished_all(_item=item):
+            proc_worker = run['worker']
             for sig, slot in ((proc_worker.progress, _on_progress),
                               (proc_worker.status, _on_status),
                               (proc_worker.finished_all, _on_finished_all)):
@@ -1250,17 +1259,38 @@ class EditTabExportMixin:
             except Exception as e:
                 self.on_ffmpeg_finished(False, f"Ошибка при сохранении: {e}")
 
-        # Общую полосу и значок на панели задач ведёт сам Монтаж (_report_cut).
-        # Воркер «Обработки» шлёт туда же свой текст и в начале 0 % — 0 снимает
-        # значок, а тикер Монтажа тут же ставит «бегущий»: значок мигал и не
-        # показывал прогресса, а полоса скакала между двумя подписями.
-        try:
-            proc_worker.global_progress.disconnect(self.main.update_global_progress)
-        except Exception:
-            pass
-        proc_worker.progress.connect(_on_progress)
-        proc_worker.status.connect(_on_status)
-        proc_worker.finished_all.connect(_on_finished_all)
+        def _attach(proc_worker):
+            run['worker'] = proc_worker
+            if self._cut_queued:
+                self._cut_queued = False
+                self.log_label.setText("Отправлено в «Обработку»…"
+                                       + (" (только звук)" if audio_only else ""))
+                self._start_cut_phase(phase)
+            # Общую полосу и значок на панели задач ведёт сам Монтаж (_report_cut).
+            # Воркер «Обработки» шлёт туда же свой текст и в начале 0 % — 0 снимает
+            # значок, а тикер Монтажа тут же ставит «бегущий»: значок мигал и не
+            # показывал прогресса, а полоса скакала между двумя подписями.
+            try:
+                proc_worker.global_progress.disconnect(self.main.update_global_progress)
+            except Exception:
+                pass
+            proc_worker.progress.connect(_on_progress)
+            proc_worker.status.connect(_on_status)
+            proc_worker.finished_all.connect(_on_finished_all)
+
+        if busy:
+            run['entry'] = tm.enqueue_run([item], on_start=_attach)
+            return
+        # _run_items сама собирает настройки со всех виджетов «Обработки» и
+        # запускает ProcessWorker (тот же путь, что кнопка «НАЧАТЬ»); в очереди —
+        # только наш синтетический элемент, чужие файлы не затрагиваются.
+        tm._run_items([item])
+        proc_worker = getattr(tm, 'worker', None)
+        if proc_worker is None:
+            self._set_cut_btn_cancel(False)
+            self.on_ffmpeg_finished(False, "Не удалось запустить «Обработку»")
+            return
+        _attach(proc_worker)
 
     def on_ffmpeg_finished(self, success, message):
         if success:
@@ -1306,10 +1336,10 @@ class EditTabExportMixin:
 
     @staticmethod
     def _escape_filter_path(p):
-        """Экранирует путь для libavfilter (subtitles/fontsdir): прямые слэши +
-        экранированное двоеточие диска (`C\\:`) + экранированная кавычка. Без
-        экранирования двоеточия на Windows фильтр не инициализируется."""
-        return str(p).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+        """Путь для libavfilter без кавычек (двухуровневое экранирование,
+        см. ffmpeg_env.escape_filter_path): `'`, `:`, `[`/`]` в имени файла
+        больше не ломают фильтр."""
+        return ffmpeg_env.escape_filter_path(p)
 
     def _extract_subtitle_fonts(self, src):
         """Извлекает вложенные шрифты (font attachments) контейнера во временную

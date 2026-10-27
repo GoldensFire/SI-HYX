@@ -292,9 +292,16 @@ class ProjectTimeline(_api.QWidget):
         self.viewChanged.emit()
         self.update()
 
+    def _fit_pps(self):
+        return self.lane_width() * 0.92 / max(1.0, self.project.duration())
+
+    def min_pps(self):
+        """Предел отдаления: 0.5 px/с, но длинный проект (серия, фильм в узком
+        окне) всё равно должен целиком помещаться — тогда предел ниже."""
+        return min(0.5, self._fit_pps())
+
     def zoom_to_fit(self):
-        dur = max(1.0, self.project.duration())
-        self.pps = max(0.5, min(400.0, self.lane_width() * 0.92 / dur))
+        self.pps = max(self.min_pps(), min(400.0, self._fit_pps()))
         self.offset = 0.0
         self.viewChanged.emit()
         self.update()
@@ -331,7 +338,7 @@ class ProjectTimeline(_api.QWidget):
             x = ev.position().x()
             t_at = self.t_of(max(self.HEADER_W, x))
             factor = 1.2 if delta > 0 else 1 / 1.2
-            self.pps = max(0.5, min(400.0, self.pps * factor))
+            self.pps = max(self.min_pps(), min(400.0, self.pps * factor))
             self.set_offset(t_at - (max(self.HEADER_W, x) - self.HEADER_W) / self.pps)
         else:
             self.set_offset(self.offset - delta / 120.0 * self.visible_span() * 0.15)
@@ -339,9 +346,12 @@ class ProjectTimeline(_api.QWidget):
 
     # ── Прилипание ───────────────────────────────────────────────────────────
     def _snap_points(self, exclude):
+        """exclude — id клипа или набор id (переносимая группа)."""
+        if isinstance(exclude, str):
+            exclude = {exclude}
         pts = [0.0, self.playhead]
         for c in self.project.clips:
-            if c.id != exclude:
+            if c.id not in exclude:
                 pts += [c.start, c.end]
         # Маркеры (сцены, биты, речь…) — только видимые: битов в песне сотни.
         lo, hi = self.offset, self.t_of(self.width())
@@ -467,6 +477,9 @@ class ProjectTimeline(_api.QWidget):
             if abs(pos.x() - d['x0']) < self.DRAG_PX and abs(pos.y() - d['y0']) < self.DRAG_PX:
                 return
             d['mode'] = 'move'
+            # Тянут клип из нескольких выделенных — едет вся группа.
+            sel = self._sel_ids
+            d['group'] = frozenset(sel) if len(sel) > 1 and d['id'] in sel else None
             self.setCursor(_api.Qt.CursorShape.ClosedHandCursor)
         if d['mode'] == 'trim':
             if not d['started']:
@@ -484,13 +497,22 @@ class ProjectTimeline(_api.QWidget):
         if row is not None and self.project.tracks[row[0]].kind == kind:
             track = row[0]
         start = max(0.0, self.t_of(pos.x()) - d['grab'])
+        group = d.get('group')
+        exclude = group or clip.id
         if track != self.project.main_track:
             # Прилипает начало клипа, а если ему не к чему — конец.
-            snapped = self._snap(start, clip.id)
+            snapped = self._snap(start, exclude)
             if abs(snapped - start) > 1e-9:
                 start = snapped
             else:
-                start = max(0.0, self._snap(start + clip.length, clip.id) - clip.length)
+                start = max(0.0, self._snap(start + clip.length, exclude) - clip.length)
+        if group:
+            # Группа не уходит левее нуля: упор по самому левому свободному клипу.
+            free = [c.start for c in self.project.clips
+                    if c.id in group and c.id != clip.id
+                    and c.track != self.project.main_track]
+            if free:
+                start = max(start, clip.start - min(free))
         d['track'], d['start'] = track, start
         self.update()
 
@@ -512,7 +534,10 @@ class ProjectTimeline(_api.QWidget):
             clip = self.project.clip(d['id'])
             if clip is not None:
                 self.editStarted.emit()
-                self.project.move(clip.id, d['track'], d['start'])
+                if d.get('group'):
+                    self.project.move_group(d['group'], clip.id, d['track'], d['start'])
+                else:
+                    self.project.move(clip.id, d['track'], d['start'])
                 self.edited.emit()
         self.viewChanged.emit()
         self.update()
@@ -675,18 +700,25 @@ class ProjectTimeline(_api.QWidget):
         p.setClipRect(QRectF(self.HEADER_W, self.RULER_H, w - self.HEADER_W, h - self.RULER_H))
         d = self._drag or {}
         moving = d.get('id') if d.get('mode') == 'move' else None
+        group = (d.get('group') or {moving}) if moving else set()
         for c in self.project.clips:
             r = self.clip_rect(c)
             if r.right() < self.HEADER_W or r.left() > w:
                 continue
-            self._paint_clip(p, c, r, faded=(c.id == moving))
-        if moving and 'track' in d:
-            c = self.project.clip(moving)
-            if c is not None:
-                r = self.clip_rect(c, start=d['start'], track=d['track'])
-                if d['track'] == self.project.main_track:
-                    self._paint_insert_mark(p, c, d)
-                self._paint_clip(p, c, r, ghost=True)
+            self._paint_clip(p, c, r, faded=(c.id in group))
+        lead = self.project.clip(moving) if moving and 'track' in d else None
+        if lead is not None:
+            # Призраки: ведущий — под мышью, остальные — с тем же сдвигом.
+            delta = d['start'] - lead.start
+            ghosts = [(c, c.start + delta, c.track) for c in self.project.clips
+                      if c.id in group and c is not lead]
+            ghosts.append((lead, d['start'], d['track']))
+            main = self.project.main_track
+            on_main = [s for c, s, ti in ghosts if ti == main]
+            if on_main:
+                self._paint_insert_mark(p, group, min(on_main))
+            for c, start, ti in ghosts:
+                self._paint_clip(p, c, self.clip_rect(c, start=start, track=ti), ghost=True)
         if self.project.is_empty():
             p.setPen(_api.QColor(C['text3']))
             p.drawText(QRectF(self.HEADER_W + 12, self.RULER_H, w - self.HEADER_W - 24,
@@ -701,11 +733,13 @@ class ProjectTimeline(_api.QWidget):
         p.end()
         return pm
 
-    def _paint_insert_mark(self, p, clip, d):
-        """Куда встанет клип на основной дорожке — вертикальная метка на стыке."""
-        others = [o for o in self.project.clips_on(self.project.main_track) if o is not clip]
+    def _paint_insert_mark(self, p, moving_ids, start):
+        """Куда встанут переносимые клипы на основной дорожке — вертикальная
+        метка на стыке."""
+        others = [o for o in self.project.clips_on(self.project.main_track)
+                  if o.id not in moving_ids]
         at = sum(o.length for o in others
-                 if d['start'] >= o.start + o.length / 2.0)
+                 if start >= o.start + o.length / 2.0)
         x = self.x_of(at)
         row = next(r for r in self.rows() if r[0] == self.project.main_track)
         p.setPen(_api.QPen(_api.QColor(_api.C['accent']), 3))

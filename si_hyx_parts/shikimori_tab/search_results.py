@@ -65,17 +65,24 @@ class ShikimoriSearchMixin:
         self._anime_by_id.clear()
         self._raw_results = []
         self._results = []
+        self._page = 0
+        self._update_pager()
         self._seen_franchises = set()
         self._set_actions_enabled(False)
         self._set_busy(True)
-        self.lbl_status.setText(
-            "Поиск по кэшу… (нажмите «Стоп», чтобы остановить)" if cache_only
-            else "Поиск… (нажмите «Стоп», чтобы остановить)")
-        task = _api._SearchTask(criteria)
-        task.signals.batch.connect(self._on_search_batch)
-        task.signals.finished.connect(self._on_search_finished)
-        task.signals.failed.connect(self._on_search_failed)
-        task.signals.progress.connect(self._on_search_progress)
+        if cache_only:
+            # По базе генератора — без сети, вся выдача одним сигналом.
+            self.lbl_status.setText("Поиск по базе Shikimori генератора… (можно «Стоп»)")
+            task = _api._CacheSearchTask(criteria)
+            task.signals.finished.connect(self._on_cache_search_finished)
+            task.signals.failed.connect(self._on_search_failed)
+        else:
+            self.lbl_status.setText("Поиск… (нажмите «Стоп», чтобы остановить)")
+            task = _api._SearchTask(criteria)
+            task.signals.batch.connect(self._on_search_batch)
+            task.signals.finished.connect(self._on_search_finished)
+            task.signals.failed.connect(self._on_search_failed)
+            task.signals.progress.connect(self._on_search_progress)
         self._task = task
         self._pool.start(task)
 
@@ -124,6 +131,8 @@ class ShikimoriSearchMixin:
         self._anime_by_id.clear()
         self._raw_results = []
         self._results = []
+        self._page = 0
+        self._update_pager()
         self._set_actions_enabled(False)
         self.lbl_status.setText("Список очищен.")
 
@@ -144,6 +153,7 @@ class ShikimoriSearchMixin:
         """Потоково добавляет новые тайтлы страницы (с учётом исключения паков)."""
         if self._task is None:
             return
+        page_end = (self._page + 1) * _api._PAGE_SIZE
         for a in items:
             self._raw_results.append(a)
             if self._is_excluded(a):
@@ -151,7 +161,11 @@ class ShikimoriSearchMixin:
             if self._collapse_franchise and self._franchise_seen(a):
                 continue
             self._results.append(a)
-            self._append_anime(a)
+            if len(self._results) <= page_end:
+                self._append_anime(a)
+            else:
+                self._anime_by_id[a.id] = a
+        self._update_pager()
         self._load_visible_thumbs()
         self._set_actions_enabled(bool(self._results))
         # Автостоп: набрали достаточно тайтлов ПОСЛЕ фильтрации — дальше искать
@@ -182,6 +196,20 @@ class ShikimoriSearchMixin:
         if self._results and self._views_sort_active():
             # Просмотры и индекс — из базы генератора; «По кэшу» не ходит в сеть
             # за недостающими карточками (см. _begin_views_sort).
+            self._begin_views_sort()
+
+    def _on_cache_search_finished(self, results: list, info: dict):
+        """«По кэшу»: вся выдача из базы генератора сразу, просмотры — из её
+        карточек. Индекс досчитывается следом (_begin_views_sort)."""
+        self._task = None
+        self._set_busy(False)
+        for aid, (views, franchise) in info.items():
+            self._views_cache[aid] = views
+            if franchise:
+                self._franchise_of[aid] = franchise
+        self._raw_results = results
+        self._apply_exclusions()
+        if self._results and self._views_sort_active():
             self._begin_views_sort()
 
     def _on_search_failed(self, message: str):
@@ -216,29 +244,70 @@ class ShikimoriSearchMixin:
                 return True
         # Франшиза целиком: пак с «Наруто» прячет «Наруто: Ураганные хроники».
         if self._collapse_franchise and self._excluded_franchises:
-            keys = [k for k in (_api._franchise_key(a.title),
-                                _api._franchise_key(a.name)) if k]
+            keys = self._fkeys.get(a.id)
+            if keys is None:
+                keys = frozenset(k for k in (_api._franchise_key(a.title),
+                                             _api._franchise_key(a.name)) if k)
+                self._fkeys[a.id] = keys
             for k in keys:
                 if k in self._excluded_franchises:
                     return True
             # Длинные тайтлы одной франшизы, отличающиеся лишь последним словом
             # («…мечту девочки зайки» vs «…девочки-мечтательницы»).
             for k in keys:
-                if any(_api._same_franchise_prefix(k, ex)
-                       for ex in self._excluded_franchises):
+                if _api._matches_franchise_prefix(k, self._excluded_prefixes):
                     return True
         return False
 
+    def _franchise_keys(self, a) -> set:
+        """Ключи франшизы тайтла: по русскому названию, по ромадзи и, если тайтл
+        есть в базе генератора, — ключ франшизы самого Shikimori. Последний
+        ловит части, у которых название другое («Атака! Титаны средней школы»
+        у «Атаки титанов»)."""
+        keys = self._fkeys.get(a.id)
+        if keys is None:
+            keys = frozenset(k for k in (_api._franchise_key(a.title),
+                                         _api._franchise_key(a.name)) if k)
+            self._fkeys[a.id] = keys
+        franchise = self._franchise_of.get(a.id)
+        return keys | {"#" + franchise} if franchise else set(keys)
+
     def _franchise_seen(self, a) -> bool:
         """True (и запоминает), если франшиза этого тайтла уже показана в выдаче —
-        для схлопывания сезонов/частей. Ключи берём и по русскому, и по ромадзи."""
-        keys = {k for k in (_api._franchise_key(a.title), _api._franchise_key(a.name)) if k}
+        для схлопывания сезонов/частей по ходу потоковой выдачи."""
+        keys = self._franchise_keys(a)
         if not keys:
             return False
         if keys & self._seen_franchises:
             return True
         self._seen_franchises |= keys
         return False
+
+    def _filtered(self):
+        """(оставшиеся тайтлы в порядке выдачи, сколько скрыто): исключение
+        паков и схлопывание франшиз. От франшизы остаётся самый просматриваемый
+        тайтл, а не первый попавшийся в выдаче — иначе вместо «Атаки титанов»
+        мог остаться её спин-офф. Тайтлы без известных просмотров уступают
+        тем, у кого они есть, а между собой идут в порядке выдачи."""
+        raw = self._raw_results
+        kept = [a for a in raw if not self._is_excluded(a)]
+        hidden = len(raw) - len(kept)
+        seen = set()
+        if self._collapse_franchise:
+            views = self._views_cache
+            order = sorted(kept, key=lambda a: (views.get(a.id, -1) < 0,
+                                                -views.get(a.id, -1)))
+            keep_ids = set()
+            for a in order:
+                keys = self._franchise_keys(a)
+                if keys & seen:
+                    continue
+                seen |= keys
+                keep_ids.add(a.id)
+            hidden += len(kept) - len(keep_ids)
+            kept = [a for a in kept if a.id in keep_ids]
+        self._seen_franchises = seen
+        return kept, hidden
 
     def _on_collapse_toggled(self, on: bool):
         self._collapse_franchise = bool(on)
@@ -250,20 +319,12 @@ class ShikimoriSearchMixin:
         """Пересобирает «базовые» формы и «ключи франшиз» исключённых названий."""
         self._excluded_bases = {b for b in (_api._base_title(x) for x in self._excluded) if b}
         self._excluded_franchises = {f for f in (_api._franchise_key(x) for x in self._excluded) if f}
+        self._excluded_prefixes = _api._franchise_prefix_index(self._excluded_franchises)
 
     def _apply_exclusions(self):
         """Фильтрует «сырые» результаты по выбранным пакам и схлопывает франшизы."""
         raw = self._raw_results
-        self._seen_franchises = set()   # пересобираем «показанные франшизы» с нуля
-        kept, excluded_n = [], 0
-        for a in raw:
-            if self._is_excluded(a):
-                excluded_n += 1
-            elif self._collapse_franchise and self._franchise_seen(a):
-                excluded_n += 1
-            else:
-                kept.append(a)
-        self._results = kept
+        self._results, excluded_n = self._filtered()
         self._display_results()
         n = len(self._results)
         self._set_actions_enabled(n > 0)
@@ -347,11 +408,20 @@ class ShikimoriSearchMixin:
         пересортировывает список. Уже известные берём из кеша (не перезапрашиваем)."""
         self._stop_views_task()
         limit = self._views_sort_limit()
-        # Что уже лежит в базе генератора, считается для всех найденных; по сети
-        # дозапрашиваются только верхние limit (и не в режиме «По кэшу»).
-        ids = [a.id for a in self._results if a.id not in self._views_cache]
-        fetch_ids = [a.id for a in self._results[:limit]
-                     if a.id not in self._views_cache]
+        # Что уже лежит в базе генератора, считается для всех найденных — и для
+        # скрытых схлопыванием частей: по их просмотрам и ключу франшизы
+        # выбирается, какая часть останется. По сети дозапрашиваются только
+        # верхние limit (и не в режиме «По кэшу»).
+        if self._cache_only and not self._index_sort_active():
+            # «По кэшу» просмотры уже есть у всех; индекс всей базы считается
+            # секундами — огонёк нужен лишь строкам открытой страницы.
+            off = self._page * _api._PAGE_SIZE
+            pool = self._results[off:off + _api._PAGE_SIZE]
+        else:
+            pool = self._raw_results
+        ids = [a.id for a in pool if a.id not in self._index_cache]
+        fetch_ids = ([] if self._cache_only else
+                     [a.id for a in self._results[:limit] if a.id not in self._index_cache])
         if not ids:
             self._resort_by_views(done=True)
             return
@@ -375,6 +445,9 @@ class ShikimoriSearchMixin:
         self._index_cache[anime_id] = index
         if row is not None:
             self._index_rows[anime_id] = row
+            franchise = str((row.get("card") or {}).get("franchise") or "")
+            if franchise:
+                self._franchise_of[anime_id] = franchise
         # Подсказка с разбивкой индекса показывается делегатом по наведению на
         # значок индекса (см. _ViewsBadgeDelegate.helpEvent) — здесь только кешируем.
         # Расставляем тайтлы ПАРАЛЛЕЛЬНО, по мере поступления просмотров: как только
@@ -418,6 +491,8 @@ class ShikimoriSearchMixin:
         pos = sb.value()
         cur = self.list.currentItem()
         cur_id = cur.data(_api.Qt.ItemDataRole.UserRole + 1) if cur else None
+        # Узнали просмотры и франшизы — от франшизы остаётся самая популярная часть.
+        self._results = self._filtered()[0]
         self._results.sort(key=self._sort_key, reverse=True)
         self._fill_list(self._results)
         if cur_id is not None:
@@ -437,11 +512,41 @@ class ShikimoriSearchMixin:
                 f"({self._sort_phrase()}{tail})" if n else "Ничего не найдено.")
 
     def _fill_list(self, results: list):
+        """Показывает открытую страницу выдачи (_PAGE_SIZE строк)."""
         self.list.clear()
         self._anime_by_id = {a.id: a for a in results}
-        for a in results:
+        pages = max(1, -(-len(results) // _api._PAGE_SIZE))
+        self._page = max(0, min(self._page, pages - 1))
+        off = self._page * _api._PAGE_SIZE
+        for a in results[off:off + _api._PAGE_SIZE]:
             self._append_anime(a)
+        self._update_pager()
         self._load_visible_thumbs()
+
+    def _update_pager(self):
+        """Кнопки страниц и «Стр. N из M» — только когда страниц больше одной."""
+        pages = max(1, -(-len(self._results) // _api._PAGE_SIZE))
+        multi = pages > 1
+        for w in (self.btn_page_prev, self.lbl_page, self.btn_page_next):
+            w.setVisible(multi)
+        if not multi:
+            return
+        self.lbl_page.setText(f"Стр. {self._page + 1} из {pages}")
+        self.btn_page_prev.setEnabled(self._page > 0)
+        self.btn_page_next.setEnabled(self._page < pages - 1)
+
+    def _go_page(self, delta: int):
+        pages = max(1, -(-len(self._results) // _api._PAGE_SIZE))
+        page = max(0, min(self._page + delta, pages - 1))
+        if page == self._page:
+            return
+        self._page = page
+        self._fill_list(self._results)
+        self.list.scrollToTop()
+        # «По кэшу» огонёк индекса считается постранично (см. _begin_views_sort).
+        if (self._cache_only and self._views_sort_active() and self._task is None
+                and self._views_task is None):
+            self._begin_views_sort()
 
     def _row_text(self, a: '_api.Anime') -> str:
         """Текст строки тайтла: название + краткая инфа. Просмотры (значок «глаз»

@@ -35,7 +35,7 @@ class _SubtitleTimeline(_api.QWidget):
         self.setMinimumHeight(self.RULER_H + self._ROW_H + 2 * self._ROW_GAP)
         self.setMouseTracking(True)
         self.setFocusPolicy(_api.Qt.FocusPolicy.ClickFocus)
-        self.dragging = None       # None | 'start' | 'end' | 'move' | 'maybe_move'
+        self.dragging = None       # None | 'start' | 'end' | 'move' | 'maybe_move' | 'seek'
         self.drag_index = -1
         self.drag_start_x = None
         self.orig_start = 0.0
@@ -101,14 +101,19 @@ class _SubtitleTimeline(_api.QWidget):
         visible = self._visible()
         step = self._nice_tick_step(w / visible)
         p.setPen(_api.QPen(_api.QColor(_api.C['text3'])))
-        t = _api.math.floor(self.view_offset / step) * step
+        # Засечки и подписи — от начала отрезка, а не от начала исходника:
+        # у трёхсекундного отрезка с 49-й секунды линейка идёт 00:00…00:02.
+        rs = self.range_start
+        k = _api.math.floor((self.view_offset - rs) / step)
         end_t = self.view_offset + visible + step
+        t = rs + k * step
         while t <= end_t:
             x = self.time_to_x(t)
             if 0 <= x <= w:
                 p.drawLine(int(x), self.RULER_H - 6, int(x), self.RULER_H)
-                p.drawText(int(x) + 3, self.RULER_H - 7, _api.s_to_time(max(0.0, t))[:8])
-            t += step
+                p.drawText(int(x) + 3, self.RULER_H - 7, _api.s_to_clock(t - rs))
+            k += 1
+            t = rs + k * step
 
     def _draw_cues(self, p):
         y = self.RULER_H + self._ROW_GAP
@@ -150,14 +155,24 @@ class _SubtitleTimeline(_api.QWidget):
             row_top, row_bottom = self._row_bounds()
             if y < row_top or y > row_bottom:
                 return -1, None
+        # Середина блока — перенос, края — растяжение. У узкого блока края
+        # уже (четверть ширины), иначе 8-пиксельные края съедали его целиком и
+        # короткую реплику нельзя было сдвинуть. Из краёв берётся ближайший, а
+        # при общем крае соседей — тот блок, на чьей стороне курсор.
+        edge = None
         for i, (s, e) in enumerate(self.cues):
             x0 = self.time_to_x(s); x1 = self.time_to_x(e)
-            if abs(x - x0) <= self._EDGE_TOL:
-                return i, 'start'
-            if abs(x - x1) <= self._EDGE_TOL:
-                return i, 'end'
-            if x0 + self._EDGE_TOL < x < x1 - self._EDGE_TOL:
+            tol = min(self._EDGE_TOL, max(2.0, (x1 - x0) / 4.0))
+            if x0 + tol < x < x1 - tol:
                 return i, 'move'
+            for ex, mode, inside in ((x0, 'start', x >= x0), (x1, 'end', x <= x1)):
+                d = abs(x - ex)
+                if d <= tol:
+                    key = (d, 0 if inside else 1)
+                    if edge is None or key < edge[0]:
+                        edge = (key, i, mode)
+        if edge is not None:
+            return edge[1], edge[2]
         return -1, None
 
     def _neighbor_bounds(self, i):
@@ -186,11 +201,21 @@ class _SubtitleTimeline(_api.QWidget):
             self.interactionStarted.emit()
             self.update()
             return
+        # Мимо блоков — перемотка, а протяжка дальше тащит плейхед.
+        self.dragging = 'seek'
+        self._seek_to_x(x)
+
+    def _seek_to_x(self, x):
         t = max(self.range_start, min(self.range_start + self.duration, self.x_to_time(x)))
+        self.playhead_s = t
         self.seekRequested.emit(t)
+        self.update()
 
     def mouseMoveEvent(self, ev):
         x = ev.position().x(); y = ev.position().y()
+        if self.dragging == 'seek':
+            self._seek_to_x(x)
+            return
         if self.dragging and self.drag_index >= 0:
             if self.dragging == 'maybe_move':
                 if abs(x - (self.drag_start_x or x)) < 6:
@@ -231,10 +256,16 @@ class _SubtitleTimeline(_api.QWidget):
     def leaveEvent(self, ev):
         self.unsetCursor()
 
-    # ── Зум (Ctrl+колесо, как в WaveformWidget) ──────────────────────────────
+    # ── Зум (Ctrl+колесо, как в WaveformWidget), колесо — прокрутка ─────────
     def wheelEvent(self, event):
         if not (_api.QApplication.keyboardModifiers() & _api.Qt.KeyboardModifier.ControlModifier):
-            event.ignore(); return
+            # Без Ctrl колесо листает увеличенный таймлайн вбок, как скроллбар.
+            ad = event.angleDelta()
+            delta = ad.x() if abs(ad.x()) > abs(ad.y()) else ad.y()
+            if self.zoom <= 1.0 or delta == 0:
+                event.ignore(); return
+            self.set_view_offset(self.view_offset - delta / 120.0 * 0.15 * self._visible())
+            event.accept(); return
         delta = event.angleDelta().y()
         if delta == 0:
             return
@@ -246,7 +277,9 @@ class _SubtitleTimeline(_api.QWidget):
         event.accept()
 
     def set_zoom(self, zoom, anchor_t=None, anchor_frac=0.5):
-        self.zoom = max(0.25, min(zoom, 200.0))
+        # Отдалять дальше отрезка некуда: таймлайн показывает только его, и
+        # при зуме < 1 реплики сжимались в левую часть полосы.
+        self.zoom = max(1.0, min(zoom, 200.0))
         visible_after = self._visible()
         if anchor_t is not None:
             new_view = anchor_t - anchor_frac * visible_after

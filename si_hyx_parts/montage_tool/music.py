@@ -1001,6 +1001,82 @@ def snap_slots(m, fps, lead=0):
     return m
 
 
+# Сплошной кусок песни (music --segment): разные места песни не склеиваются,
+# кусок начинается с начала части и кончается концом части; конец песни —
+# естественный финал, иначе — затухание. Песня не длиннее цели × WHOLE_RATIO
+# берётся целиком.
+SEGMENT_FADE_S = 3.0
+SEGMENT_SPAN = (0.75, 1.15)          # допустимая длина куска — доля цели
+WHOLE_RATIO = 1.25
+
+
+def _segment_row(t0, t1, labels, natural, whole, score=None):
+    return {"t0": round(t0, 3), "t1": round(t1, 3), "duration": round(t1 - t0, 3),
+            "fade": 0.0 if natural else SEGMENT_FADE_S, "sections": labels,
+            "natural_end": natural, "whole": whole,
+            "score": None if score is None else round(score, 3)}
+
+
+def song_segment(m, target):
+    """Кусок карты m длиной ~target с: {t0, t1, duration, fade, sections
+    (подписи частей), natural_end, whole, score}; время — как в карте."""
+    target = float(target)
+    if target <= 0:
+        raise _api.ToolError("usage", "--segment — длина куска, с")
+    secs = m.get("sections") or []
+    start0 = float(m.get("t0", 0.0))
+    end0 = start0 + float(m["duration"])
+    labels = [s["label"] for s in secs]
+    if end0 - start0 <= target * WHOLE_RATIO:
+        return _segment_row(start0, end0, labels, True, True)
+    if not secs:                          # без частей — с начала, затуханием
+        return _segment_row(start0, start0 + target, [], False, False)
+    lo, hi = target * SEGMENT_SPAN[0], target * SEGMENT_SPAN[1]
+    best = None
+    for i, a in enumerate(secs):
+        for j in range(i, len(secs)):
+            t0, t1 = float(a["t"]), float(secs[j]["end"])
+            d = t1 - t0
+            if d > hi:
+                break
+            if d < lo:
+                continue
+            natural = j == len(secs) - 1
+            # Ближе к цели; лучше с начала песни, с естественным финалом или
+            # с концом припева/дропа; припевы внутри — плюс.
+            score = (-abs(d - target) / target + 0.3 * (i == 0) + 0.3 * natural
+                     + 0.25 * (labels[j] in ("chorus", "drop") and not natural)
+                     + 0.05 * sum(x in ("chorus", "drop") for x in labels[i:j + 1]))
+            if best is None or score > best[0]:
+                best = (score, i, j)
+    if best is None:
+        # Частей нужной длины нет: с начала песни до конца части, ближайшего к цели.
+        j = min(range(len(secs)), key=lambda k: abs(float(secs[k]["end"]) - start0 - target))
+        best = (None, 0, j)
+    score, i, j = best
+    natural = j == len(secs) - 1
+    return _segment_row(float(secs[i]["t"]), float(secs[j]["end"]), labels[i:j + 1],
+                        natural, i == 0 and natural, score)
+
+
+def cut_segment(path, seg, out_wav, stream=-1, overwrite=False):
+    """Кусок seg файла path → WAV 44,1 кГц стерео с затуханием seg['fade']."""
+    out = _api.os.path.abspath(str(out_wav))
+    if not out.lower().endswith(".wav"):
+        raise _api.ToolError("bad_output", "--segment-out — файл .wav")
+    if _api.os.path.normcase(out) == _api.os.path.normcase(_api.os.path.abspath(str(path))):
+        raise _api.ToolError("bad_output", "кусок совпадает с исходником")
+    if _api.os.path.exists(out) and not overwrite:
+        raise _api.ToolError("output_exists", f"файл уже есть (нужен --overwrite): {out}")
+    d, fade = seg["duration"], seg["fade"]
+    af = f"afade=t=out:st={max(0.0, d - fade):.3f}:d={fade:.3f}" if fade else "anull"
+    amap = ["-map", f"0:{stream}"] if stream >= 0 else ["-map", "0:a:0"]
+    _an._run_bytes([_api.FFMPEG, "-v", "error", "-nostdin", "-y", "-ss", f"{seg['t0']:.3f}",
+                    "-t", f"{d:.3f}", "-i", str(path)] + amap +
+                   ["-af", af, "-ar", str(SONG_RATE), "-ac", "2", "-c:a", "pcm_s16le", out])
+    return out
+
+
 def music_file(path, t0=0.0, t1=None, stream=-1, **kw):
     """Карта песни файла path (звук [t0, t1)) во времени файла."""
     if not _api.os.path.isfile(str(path)):

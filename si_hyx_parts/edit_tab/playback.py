@@ -764,8 +764,7 @@ class EditTabPlaybackMixin:
         self.start_waveform_loading()
         # Звук — по кускам проекта, если они из этого файла; субтитры и звук
         # без кусков — как выбирали в прошлый раз (session_state).
-        governed = self._project_restore_audio()
-        self._session_restore_tracks(audio=not governed)
+        self._session_restore_tracks()
         _api.QTimer.singleShot(50, self._adjust_video_aspect_once)
         self.update_selection_label(); self.update_pan_slider_values()
         # После загрузки файла (в т.ч. через drag&drop) забираем фокус клавиатуры
@@ -888,6 +887,10 @@ class EditTabPlaybackMixin:
         if getattr(self, "_proj_play", None) is not None:
             lim = self._proj_play_limit()
             if lim is not None:
+                if self._grid.valid:
+                    # Кусок до конца файла — встаём на его последнем кадре:
+                    # запас «длина − 0.05 с» останавливал просмотр кадром раньше.
+                    return max(0.0, min(lim, self._grid.start_of(self._grid.last)))
                 frame_s = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.04
                 return max(0.0, min(lim, self.duration - max(frame_s, 0.05)))
         if getattr(self, "_play_past_out", False):
@@ -1369,12 +1372,21 @@ class EditTabPlaybackMixin:
         # раньше), возвращаемся на последний реальный кадр и держим паузу.
         try:
             if status == _api.QMediaPlayer.MediaStatus.EndOfMedia and self.duration > 0:
-                frame_s = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.04
-                last = max(self.current_in, self.duration - max(frame_s, 0.05))
+                grid = self._grid
+                if grid.valid:
+                    self._frame_idx = grid.last
+                    last, ms = grid.start_of(grid.last), grid.ms_of(grid.last)
+                else:
+                    frame_s = (1.0 / self.fps) if (self.fps and self.fps > 0) else 0.04
+                    last = max(self.current_in, self.duration - max(frame_s, 0.05))
+                    ms = int(last * 1000)
+                # Позиция — ДО паузы: pause() после EndOfMedia Qt начинает с
+                # перемотки в 0, и кадр остановки считался от начала файла —
+                # на экране первый кадр, метка 0, шаг влево с конца не шёл.
+                self.player.setPosition(ms)
                 self.player.pause()
-                self.player.setPosition(int(last * 1000))
                 self.waveform.set_playhead(last)
-                self.lbl_current_time.setText(_api.s_to_time(last))
+                self._paint_playhead(last)
         except Exception:
             pass
 

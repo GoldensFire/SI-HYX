@@ -78,7 +78,7 @@ class FramePass:
                  # scdet без sc_pass: дальше идут все кадры (sc_pass=1 пропускал
                  # только смены сцены, и вывод CFR дублировал их до полной частоты).
                  f"[a]scale={self.lo_w}:{self.lo_h}:flags=area,scdet=threshold=8,"
-                 f"metadata=mode=print:file='{meta}',"
+                 f"metadata=mode=print:file={meta},"
                  f"{_chain(self.path, self.lo_w, self.lo_h).split(',', 1)[1]}[lo];"
                  f"[b]fps={SAMPLE_FPS},{_chain(self.path, sw, sh)}[hi]")
         win = ((["-ss", f"{float(start):.3f}"] if start else [])

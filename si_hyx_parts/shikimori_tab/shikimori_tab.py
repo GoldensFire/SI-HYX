@@ -30,9 +30,13 @@ class ShikimoriTab(ShikimoriSearchMixin, _api.QWidget):
         self._excluded: set = set()    # нормализованные названия из паков
         self._excluded_bases: set = set()  # их «базовые» формы (без сезонов)
         self._excluded_franchises: set = set()  # их «ключи франшиз» (без подзаголовков)
+        self._excluded_prefixes: set = set()  # индекс _franchise_prefix_index по ним
         self._excluded_packs: list = []  # имена выбранных паков
         self._collapse_franchise = True   # схлопывать сезоны/части одной франшизы
         self._seen_franchises: set = set()  # уже показанные франшизы (для схлопывания)
+        self._franchise_of: dict = {}  # anime_id -> ключ франшизы Shikimori (из базы)
+        self._fkeys: dict = {}         # anime_id -> ключи франшизы по названиям
+        self._page = 0                 # открытая страница списка (_PAGE_SIZE строк)
         # Просмотры и индекс берутся из базы генератора аниме-паков (pack_index):
         # здесь только то, что уже узнали в этом сеансе.
         self._views_cache: dict = {}   # anime_id -> просмотры (для сортировки)
@@ -101,10 +105,8 @@ class ShikimoriTab(ShikimoriSearchMixin, _api.QWidget):
         self.btn_search_cache = _api.QPushButton("По кэшу")
         self.btn_search_cache.setIcon(_api.get_icon('fa5s.database'))
         self.btn_search_cache.setToolTip(
-            "Тот же поиск, но БЕЗ дозагрузки просмотров по сети для сортировки —\n"
-            "используются только уже закешированные ранее числа (за один день "
-            "просмотры почти не меняются).\nБыстрее, но новые/незнакомые тайтлы "
-            "могут остаться внизу списка (без данных).")
+            "Тот же поиск, но по базе Shikimori генерации аниме-паков, без сети:\n"
+            "вся выдача сразу, с просмотрами. Тайтлов, которых в базе нет, не будет.")
         self.btn_search_cache.clicked.connect(lambda: self.start_search(True))
         self.btn_cancel = _api.QPushButton("Стоп")
         self.btn_cancel.setIcon(_api.get_icon('fa5s.stop'))
@@ -150,9 +152,27 @@ class ShikimoriTab(ShikimoriSearchMixin, _api.QWidget):
         self.list.verticalScrollBar().valueChanged.connect(
             lambda *_: self._load_visible_thumbs())
         left.addWidget(self.list, 1)
+        bottom = _api.QHBoxLayout(); bottom.setSpacing(6)
         self.lbl_status = _api.QLabel("Готово к поиску.")
         self.lbl_status.setStyleSheet(f"color:{_api.C['text2']}; font-size:12px;")
-        left.addWidget(self.lbl_status)
+        bottom.addWidget(self.lbl_status, 1)
+        # Страницы выдачи (по _PAGE_SIZE тайтлов) — видны, когда страниц больше одной.
+        self.btn_page_prev = _api.QPushButton()
+        self.btn_page_prev.setIcon(_api.get_icon('fa5s.chevron-left'))
+        self.btn_page_prev.setToolTip("Предыдущие 100 тайтлов")
+        self.btn_page_prev.clicked.connect(lambda: self._go_page(-1))
+        self.lbl_page = _api.QLabel()
+        self.lbl_page.setStyleSheet(f"color:{_api.C['text2']}; font-size:12px;")
+        self.btn_page_next = _api.QPushButton()
+        self.btn_page_next.setIcon(_api.get_icon('fa5s.chevron-right'))
+        self.btn_page_next.setToolTip("Следующие 100 тайтлов")
+        self.btn_page_next.clicked.connect(lambda: self._go_page(1))
+        for w in (self.btn_page_prev, self.lbl_page, self.btn_page_next):
+            if isinstance(w, _api.QPushButton):
+                w.setCursor(_api.Qt.CursorShape.PointingHandCursor)
+            w.setVisible(False)
+            bottom.addWidget(w)
+        left.addLayout(bottom)
         body.addLayout(left, 1)
 
         # Правая колонка — прокручиваемая панель настроек.
@@ -456,6 +476,8 @@ class ShikimoriTab(ShikimoriSearchMixin, _api.QWidget):
         # Старые результаты больше не релевантны.
         self.list.clear()
         self._raw_results = []; self._results = []
+        self._page = 0
+        self._update_pager()
         self._set_actions_enabled(False)
         self.lbl_status.setText("Готово к поиску.")
 
@@ -813,6 +835,7 @@ class ShikimoriTab(ShikimoriSearchMixin, _api.QWidget):
         self._excluded = set()
         self._excluded_bases = set()
         self._excluded_franchises = set()
+        self._excluded_prefixes = set()
         self._excluded_packs = []
         self._collapse_franchise = True
         self.chk_collapse_fr.blockSignals(True)

@@ -34,15 +34,22 @@ _CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], np.float32)[:, None, 
 _CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], np.float32)[:, None, None]
 
 
-def session(path, threads=6):
-    """InferenceSession: DirectML (iGPU) → CPU; DirectML не поднялся — CPU."""
+def session(path, threads=6, dml=True):
+    """InferenceSession: DirectML (iGPU) → CPU; DirectML не поднялся — CPU.
+    dml=False — только CPU. Замер Vega 7 (tools/montage_dml_bench.py,
+    onnxruntime-directml 1.24.4 против CPU 6 потоков): TransNetV2 ×1,4,
+    детекторы ×1,5–1,75, WD ViT ×1,7 (пачка 1), CCIP ×0,74 — медленнее,
+    EVA02 на DirectML не встаёт (уходит на CPU)."""
     import onnxruntime as ort
     so = ort.SessionOptions()
     so.intra_op_num_threads = threads
     so.inter_op_num_threads = 1
     so.log_severity_level = 3
     avail = set(ort.get_available_providers())
-    if "DmlExecutionProvider" in avail:
+    if dml and "DmlExecutionProvider" in avail:
+        # DirectML требует последовательного исполнения и без шаблонов памяти.
+        so.enable_mem_pattern = False
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         try:
             return ort.InferenceSession(path, sess_options=so,
                                         providers=["DmlExecutionProvider", "CPUExecutionProvider"])
@@ -108,7 +115,7 @@ class CCIP:
 
     def __init__(self, ctl=None):
         ctl = ctl or _api.NO_CONTROL
-        self.feat = session(_api.asset("anime/ccip_feat.onnx", ctl))
+        self.feat = session(_api.asset("anime/ccip_feat.onnx", ctl), dml=False)   # на DirectML медленнее
         self.metric = session(_api.asset("anime/ccip_metrics.onnx", ctl), threads=1)
         with open(_api.asset("anime/ccip_metrics.json", ctl), "r", encoding="utf-8") as f:
             self.threshold = float(json.load(f)["threshold"])

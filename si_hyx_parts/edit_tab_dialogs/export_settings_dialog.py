@@ -56,17 +56,10 @@ class _ExportSettingsDialog(_api.QDialog):
         # в «Обработку» их не пускаем; значения подтянет pull_all в конце.
         self._syncing = True
         self.setWindowTitle("Настройки экспорта")
-        self.setStyleSheet(f"""
-            QDialog {{ background: {_api.C['bg']}; }}
-            QLabel {{ color: {_api.C['text2']}; font-size: 12px; background: transparent; }}
-            QGroupBox {{
-                color: {_api.C['text']}; font-weight: 700;
-                border: 1px solid {_api.C['border2']}; border-radius: 8px;
-                margin-top: 10px; padding: 10px 8px 6px 8px;
-            }}
-            QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; }}
-            QCheckBox {{ color: {_api.C['text2']}; font-size: 12px; background: transparent; }}
-        """)
+        # Своего стиля у окна нет: расцветка — общий стиль приложения, ровно
+        # как у самой «Обработки» (синие заголовки групп, светлые подписи,
+        # залитая выбранная кнопка профиля). Поэтому и родитель — главное
+        # окно, а не вкладка «Монтаж» (см. EditTab._open_export_settings).
         lay = _api.QVBoxLayout(self)
         lay.setContentsMargins(16, 14, 16, 12); lay.setSpacing(10)
 
@@ -102,9 +95,18 @@ class _ExportSettingsDialog(_api.QDialog):
         cols.addWidget(self._build_video(), 1)
         lay.addLayout(cols, 1)
 
-        bb = _api.QDialogButtonBox(_api.QDialogButtonBox.StandardButton.Close)
-        bb.button(_api.QDialogButtonBox.StandardButton.Close).setText("Закрыть")
-        bb.rejected.connect(self.hide)
+        # Правка применяется сразу (зеркало виджетов «Обработки»), кнопка лишь
+        # закрывает окно — но подпись и цвет как у сохранения в других окнах.
+        bb = _api.QDialogButtonBox(_api.QDialogButtonBox.StandardButton.Save)
+        btn_save = bb.button(_api.QDialogButtonBox.StandardButton.Save)
+        btn_save.setText("Сохранить")
+        btn_save.setCursor(_api.Qt.CursorShape.PointingHandCursor)
+        btn_save.setStyleSheet(f"""
+            QPushButton {{ background: {_api.C['green']}; color: #11111b; border: none;
+                border-radius: 6px; padding: 6px 16px; font-weight: 600; }}
+            QPushButton:hover {{ background: {_api.C['green2']}; }}
+        """)
+        bb.accepted.connect(self.hide)
         lay.addWidget(bb)
         self._syncing = False
         self.pull_all()

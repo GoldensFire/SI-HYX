@@ -12,10 +12,12 @@ Public namespace: montage_tool.
 громким потоком), тишина (громкость кадра) и речь (speech_sync.
 speech_activity — та же оценка, что у синхронизации субтитров; пение она
 тоже считает речью). Слова и стемы — karaoke/asr_worker.py в отдельном
-Python генератора (faster-whisper, HTDemucs).
+Python генератора (faster-whisper, HTDemucs); начала слов по вокалу
+уточняются атаками стема (refine_word_starts: Whisper ставит их позже).
 
 Бит и виды карты песни (сильная доля, фраза, часть, удары, места резов) —
 music.py: Beat This! и HTDemucs в Python генератора, без него — DSP выше."""
+import hashlib
 import re
 
 import numpy as np
@@ -355,11 +357,13 @@ def ml_python(path=""):
     return str(music_effects.runtime_python())
 
 
-def _run_worker(python, args, timeout=_ML_TIMEOUT):
+def _run_worker(python, args, timeout=_ML_TIMEOUT, head=None):
+    """Обработчик asr_worker.py (head — другой запуск, например
+    ["-m", "lyric_align.cli"]) в Python генератора."""
     if not _api.os.path.isfile(python):
         raise _api.ToolError("ml_unavailable", f"нет Python обработчика: {python}")
     try:
-        r = _api.subprocess.run([python, "-I", "-X", "utf8", _WORKER] + args,
+        r = _api.subprocess.run([python, "-I", "-X", "utf8"] + (head or [_WORKER]) + args,
                                 stdin=_api.subprocess.DEVNULL, capture_output=True,
                                 text=True, encoding="utf-8", errors="replace",
                                 creationflags=_api.CREATE_NO_WINDOW, timeout=timeout)
@@ -394,9 +398,10 @@ def separate_vocals(wav_in, vocals_out, python="", device="cpu"):
         raise _api.ToolError("ml_failed", "обработчик не записал вокал")
 
 
-def transcribe_words(wav, python="", language="auto", model="medium", device="cpu",
-                     compute="int8"):
-    """[(начало, конец, слово)] — asr_worker transcribe (faster-whisper)."""
+def transcribe_segments(wav, python="", language="auto", model="medium", device="cpu",
+                        compute="int8"):
+    """Отрезки Whisper [{start, end, text, words: [{start, end, word}]}] —
+    asr_worker transcribe (faster-whisper)."""
     tmpdir = _api.tempfile.mkdtemp(prefix="sihyx_asr_")
     try:
         target = _api.os.path.join(tmpdir, "words.json")
@@ -407,8 +412,19 @@ def transcribe_words(wav, python="", language="auto", model="medium", device="cp
             rows = _api.json.load(f)
     finally:
         _api.shutil.rmtree(tmpdir, ignore_errors=True)
+    return rows if isinstance(rows, list) else []
+
+
+def transcribe_words(wav, python="", language="auto", model="medium", device="cpu",
+                     compute="int8"):
+    """[(начало, конец, слово)] — asr_worker transcribe (faster-whisper)."""
+    return segment_words(transcribe_segments(wav, python, language, model, device, compute))
+
+
+def segment_words(rows):
+    """Слова отрезков Whisper: [(начало, конец, слово)]."""
     out = []
-    for row in rows if isinstance(rows, list) else []:
+    for row in rows:
         for w in row.get("words") or []:
             try:
                 a, b = float(w["start"]), float(w["end"])
@@ -418,6 +434,180 @@ def transcribe_words(wav, python="", language="auto", model="medium", device="cp
             if text and b >= a:
                 out.append((a, b, text))
     return out
+
+
+# Whisper (DTW по вниманию) ставит начало слова позже атаки вокала. Замер по
+# стему песни (AMV Gate × Rorke's Drift, 193 слова): все слова — на ~0,08 с,
+# первое слово после паузы — на 0,2–0,3 с. Общий сдвиг ищется по огибающей
+# атак (не дальше WORD_LAG_MAX и только если он заметно лучше нуля), начало
+# фразы — по подъёму громкости после паузы.
+WORD_LAG_MAX = 0.3
+PHRASE_GAP_S = 0.25         # пауза перед словом — с него начинается фраза
+PHRASE_RISE_DB = 12.0       # подъём над тишиной паузы…
+PHRASE_PEAK_DB = 15.0       # …и не тише пика слова больше чем на столько (вдох тише)
+
+
+def _phrase_rise(db, lo, a, b):
+    """Время подъёма громкости вокала к слову [a, b) после паузы с lo
+    (кадры _frame_db); None — паузы нет или подъём неясен."""
+    i_lo, i_a = max(0, int(lo / HOP_S)), int(a / HOP_S)
+    if i_a - i_lo < 10 or i_a + 6 > len(db):
+        return None
+    floor = float(np.percentile(db[i_lo:i_a], 20))
+    peak = float(db[i_a:int(min(b, a + 0.3) / HOP_S) + 1].max())
+    thr = max(floor + PHRASE_RISE_DB, peak - PHRASE_PEAK_DB)
+    j0 = max(i_lo, int((a - WORD_LAG_MAX - 0.1) / HOP_S))
+    hit = np.nonzero(db[j0:i_a + 6] > thr)[0]
+    if not len(hit) or hit[0] == 0:
+        return None                 # громко с самого края окна — не подъём
+    return (j0 + int(hit[0])) * HOP_S + 0.015      # центр окна 30 мс
+
+
+def refine_word_starts(words, v):
+    """[(начало, конец, слово)] Whisper → те же слова с началами по атакам
+    вокала v (моно SR). Порядок слов сохраняется."""
+    env, db = onset_envelope(v), _frame_db(v)
+    if not words or len(env) < 10 or len(db) < 10:
+        return list(words)
+    starts = np.array([a for a, _b, _w in words], np.float64)
+    lags = np.arange(0.0, WORD_LAG_MAX + 1e-9, 0.005)
+    score = [float(env[np.clip(np.round((starts - g - ONSET_LAG_S) / HOP_S).astype(int),
+                               0, len(env) - 1)].mean()) for g in lags]
+    k = int(np.argmax(score))
+    lag = float(lags[k]) if score[k] > 1.03 * score[0] else 0.0
+    out, prev_b = [], -1e9
+    for a, b, w in words:
+        s = a - lag
+        if a - prev_b >= PHRASE_GAP_S:
+            rise = _phrase_rise(db, max(prev_b, a - 1.0), a, b)
+            if rise is not None:
+                s = min(rise, a)
+        if out:
+            pa, pb, pw = out[-1]
+            s = max(s, pa + 0.04)
+            out[-1] = (pa, min(pb, s), pw)
+        out.append((s, max(b - lag, s + 0.05), w))
+        prev_b = b
+    return out
+
+
+# Известный текст песни. Японский и китайский (без пробелов, Whisper делит
+# их на кусочки и склеивает строки в отрезок) — lyric-align: строки файла на
+# отрезки Whisper посимвольным сходством, время символов — по словам Whisper,
+# неуверенная строка не выдумывается. Алфавитный текст — пословное ДП
+# align_lyrics по тем же отрезкам: на AMV Gate × Rorke's Drift (английский
+# метал, отрезок Whisper — строка) lyric-align поставил 24 строки из 44 и при
+# pairing 2 делил отрезок одной строки на две строки файла (строка уезжала на
+# 3 с), ДП — все 44 на своих словах.
+LYRIC_ALIGN = (["lyric_align"], ["lyric-align==0.4.1"])
+_CJK_RX = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f]")
+
+
+def cjk_text(lines):
+    """Текст строк (read_lyrics) — японский/китайский (≥ 20 % знаков)."""
+    text = "".join(k for line in lines for _s, k in line)
+    return bool(text) and len(_CJK_RX.findall(text)) >= 0.2 * len(text)
+
+
+def parse_lines(spec):
+    """Номера строк «9-24,30» → множество (пусто — все)."""
+    out = set()
+    for part in str(spec or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        a, _sep, b = part.partition("-")
+        try:
+            lo, hi = int(a), int(b or a)
+        except ValueError as e:
+            raise _api.ToolError("usage", f"строки текста: «{part}» — нужно 9-24,30") from e
+        if not 1 <= lo <= hi:
+            raise _api.ToolError("usage", f"строки текста: «{part}» — счёт с 1")
+        out.update(range(lo, hi + 1))
+    return out
+
+
+def _line_words(shows, row, heard):
+    """Слова строки [(начало, конец, показ)] по ответу lyric-align. Слов
+    Whisper heard внутри строки столько же — их время один к одному (символы
+    lyric-align делят строку по номеру символа и сдвигают границы длинных и
+    коротких слов); иначе — символы без пробелов по порядку; без
+    посимвольного времени — время строки делится по длине слов."""
+    a, b = float(row["start"]), float(row["end"])
+    inside = [w for w in heard if a - 0.05 <= 0.5 * (w[0] + w[1]) <= b + 0.05]
+    if len(inside) == len(shows):
+        return [(wa, wb, show) for (wa, wb, _w), show in zip(inside, shows)]
+    chars = row.get("chars") or []
+    sizes = [len(s.replace(" ", "")) for s in shows]
+    if len(chars) >= sum(sizes):
+        out, k = [], 0
+        for show, n in zip(shows, sizes):
+            out.append((float(chars[k]["start"]), float(chars[k + n - 1]["end"]), show))
+            k += n
+        return out
+    total, acc, out = max(1, sum(sizes)), 0, []
+    for show, n in zip(shows, sizes):
+        out.append((a + (b - a) * acc / total, a + (b - a) * (acc + n) / total, show))
+        acc += n
+    return out
+
+
+def align_known_lyrics(rows, path, want=(), python="", ctl=None):
+    """Отрезки Whisper rows + файл текста path (want — номера строк) →
+    ([(начало, конец, слово файла)], {engine, matched, missed, outside,
+    match?}): алфавитный текст — align_lyrics, японский/китайский —
+    lyric-align в Python генератора (пакет ставится по требованию)."""
+    lines = _api.read_lyrics(path)
+    chosen = {n for n, line in enumerate(lines, 1) if line and (not want or n in want)}
+    if not chosen:
+        raise _api.ToolError("usage", "в файле текста нет нужных строк")
+    lines = [line if n in chosen else [] for n, line in enumerate(lines, 1)]
+    # Отрезки-шум — одно слово короче секунды (вдох, удар).
+    rows = [r for r in rows if len(r.get("words") or []) > 1
+            or (r.get("words") and float(r["end"]) - float(r["start"]) >= 1.0)]
+    if not rows:
+        return [], {"engine": "none", "matched": [], "missed": sorted(chosen), "outside": []}
+    if not cjk_text(lines):
+        # Кусок песни — строки файла с первой по последнюю найденную, слова
+        # без пары делят время соседей (align_lyrics).
+        span, match = _api.align_lyrics(lines, segment_words(rows))
+        got = [n for n, _ws in span]
+        lo, hi = (got[0], got[-1]) if got else (0, -1)
+        return ([w for _n, ws in span for w in ws],
+                {"engine": "words", "match": round(match, 3), "matched": got,
+                 "missed": [n for n in sorted(chosen) if lo <= n <= hi and n not in got],
+                 "outside": [n for n in sorted(chosen) if not lo <= n <= hi]})
+    picked = [(n, [show for show, _k in line]) for n, line in enumerate(lines, 1) if line]
+    python = ml_python(python)
+    _api.ensure_packages(python, *LYRIC_ALIGN, ctl=ctl or _api.NO_CONTROL)
+    tmpdir = _api.tempfile.mkdtemp(prefix="sihyx_lyr_")
+    try:
+        segs = _api.os.path.join(tmpdir, "segments.json")
+        txt = _api.os.path.join(tmpdir, "lyrics.txt")
+        out = _api.os.path.join(tmpdir, "aligned.json")
+        with open(segs, "w", encoding="utf-8") as f:
+            _api.json.dump(rows, f, ensure_ascii=False)
+        with open(txt, "w", encoding="utf-8") as f:
+            f.write("\n".join(" ".join(shows) for _n, shows in picked))
+        _run_worker(python, ["--segments", segs, txt, "-f", "json", "--karaoke", "-q",
+                             "-o", out], head=["-m", "lyric_align.cli"])
+        with open(out, "r", encoding="utf-8") as f:
+            aligned = _api.json.load(f)
+    finally:
+        _api.shutil.rmtree(tmpdir, ignore_errors=True)
+    if not isinstance(aligned, list) or len(aligned) != len(picked):
+        # lyric-align сам пропускает строки с «#» в начале — номера бы съехали.
+        raise _api.ToolError("ml_failed", "lyric-align вернул не столько строк, сколько дано")
+    heard = segment_words(rows)
+    words, matched, missed = [], [], []
+    for (n, shows), row in zip(picked, aligned):
+        if not row.get("matched") or row.get("start") is None:
+            missed.append(n)
+            continue
+        matched.append(n)
+        words += _line_words(shows, row, heard)
+    words.sort(key=lambda w: w[0])
+    return words, {"engine": "lyric-align", "matched": matched, "missed": missed,
+                   "outside": []}
 
 
 def stems(audio, rate, out_dir, python="", device="cpu"):
@@ -440,6 +630,27 @@ def stems(audio, rate, out_dir, python="", device="cpu"):
                 "volume=-1[v];[m][v]amix=inputs=2:normalize=0:duration=first[out]",
                 "-map", "[out]", "-c:a", "pcm_s16le", music])
     return {"mix": mix, "vocals": vocals, "music": music}
+
+
+def clean_voice(path, t0, t1, python="", device="cpu"):
+    """Голос куска [t0, t1) файла без музыки и шумов (вокал HTDemucs): WAV в
+    кэше по файлу и куску (повторно — сразу). Путь файла."""
+    st = _api.os.stat(path)
+    key = hashlib.sha256(f"{_api.os.path.abspath(path)}|{st.st_size}|{st.st_mtime_ns}|"
+                              f"{t0:.4f}|{t1:.4f}".encode("utf-8")).hexdigest()[:24]
+    out = _api.os.path.join(_api.cache_dir("voice"), f"{key}.wav")
+    if _api.os.path.isfile(out):
+        return out
+    audio = file_audio(path, t0, t1, rate=44100, channels=2)
+    if not len(audio):
+        raise _api.ToolError("nothing_to_render", "в куске нет звука")
+    tmp = _api.tempfile.mkdtemp(prefix="v", dir=_api.cache_dir("voice"))
+    try:
+        files = stems(audio, 44100, tmp, python, device)
+        _api.os.replace(files["vocals"], out)
+    finally:
+        _api.shutil.rmtree(tmp, ignore_errors=True)
+    return out
 
 
 # ── Сборка маркеров ──────────────────────────────────────────────────────────
@@ -478,7 +689,10 @@ def audio_markers(x, kinds, offset=0.0):
 
 
 def _word_markers(x, offset, vocals, opts):
+    """Метки word и отчёт по известному тексту (opts lyrics — файл, тогда
+    слова — из него через lyric-align; lyric_lines — номера строк)."""
     tmpdir = _api.tempfile.mkdtemp(prefix="sihyx_words_")
+    known = None
     try:
         wav = _api.os.path.join(tmpdir, "audio.wav")
         _write_wav(x, wav, SR)
@@ -486,11 +700,18 @@ def _word_markers(x, offset, vocals, opts):
             voc = _api.os.path.join(tmpdir, "vocals.wav")
             separate_vocals(wav, voc, opts.get("python", ""), opts.get("device", "cpu"))
             wav = voc
-        words = transcribe_words(wav, opts.get("python", ""), opts.get("language", "auto"),
-                                 opts.get("model", "medium"), opts.get("device", "cpu"))
+        rows = transcribe_segments(wav, opts.get("python", ""), opts.get("language", "auto"),
+                                   opts.get("model", "medium"), opts.get("device", "cpu"))
+        if opts.get("lyrics"):
+            words, known = align_known_lyrics(rows, opts["lyrics"], opts.get("lyric_lines"),
+                                              opts.get("python", ""), opts.get("ctl"))
+        else:
+            words = segment_words(rows)
+        if vocals:
+            words = refine_word_starts(words, file_audio(wav))
     finally:
         _api.shutil.rmtree(tmpdir, ignore_errors=True)
-    return [_marker(offset + a, "word", w, 1.0, offset + b) for a, b, w in words]
+    return [_marker(offset + a, "word", w, 1.0, offset + b) for a, b, w in words], known
 
 
 def _music_markers(kinds, ml, get_map, fps=0.0):
@@ -526,13 +747,15 @@ def analyze_project(p, kinds=None, t0=0.0, t1=None, track=None, scene_threshold=
                     vocals=False, ml=None):
     """Маркеры проекта во времени проекта на [t0, t1): картинка — как итог
     (сцены), звук — смесь или дорожка track (музыка для битов). ml —
-    {'python', 'device', 'language', 'model'} для слов."""
+    {'python', 'device', 'language', 'model'} для слов; 'lyrics' — файл
+    текста песни (слова — его, время — lyric-align), 'lyric_lines' — номера
+    строк."""
     kinds = _kinds(kinds)
     t0 = max(0.0, float(t0 or 0.0))
     t1 = p.duration() if t1 is None else min(float(t1), p.duration())
     if t1 - t0 <= 0.05:
         raise _api.ToolError("bad_range", "пустой отрезок времени")
-    markers, tempo = [], None
+    markers, tempo, known = [], None, None
     if "scene" in kinds:
         markers += [_marker(t0 + t, "scene", "", s)
                     for t, s in project_scenes(p, t0, t1, scene_threshold)]
@@ -545,10 +768,12 @@ def analyze_project(p, kinds=None, t0=0.0, t1=None, track=None, scene_threshold=
         found, _t = audio_markers(x, audio_kinds, t0)
         markers += found
         if "word" in kinds and len(x):
-            markers += _word_markers(x, t0, vocals, ml or {})
+            found, known = _word_markers(x, t0, vocals, ml or {})
+            markers += found
     markers.sort(key=lambda m: (m["t"], m["kind"]))
     return {"time_base": "project", "t0": round(t0, 6), "t1": round(t1, 6),
-            "kinds": kinds, "tempo": tempo, "markers": markers}
+            "kinds": kinds, "tempo": tempo, "markers": markers,
+            **({"lyrics": known} if known is not None else {})}
 
 
 def analyze_file(path, kinds=None, t0=0.0, t1=None, stream=-1,
@@ -558,7 +783,7 @@ def analyze_file(path, kinds=None, t0=0.0, t1=None, stream=-1,
     if not _api.os.path.isfile(str(path)):
         raise _api.ToolError("missing_files", f"нет файла: {path}")
     t0 = max(0.0, float(t0 or 0.0))
-    markers, tempo = [], None
+    markers, tempo, known = [], None, None
     if "scene" in kinds:
         markers += [_marker(t0 + t, "scene", "", s)
                     for t, s in file_scenes(path, t0, t1, scene_threshold)]
@@ -571,11 +796,13 @@ def analyze_file(path, kinds=None, t0=0.0, t1=None, stream=-1,
         found, _t = audio_markers(x, audio_kinds, t0)
         markers += found
         if "word" in kinds and len(x):
-            markers += _word_markers(x, t0, vocals, ml or {})
+            found, known = _word_markers(x, t0, vocals, ml or {})
+            markers += found
     markers.sort(key=lambda m: (m["t"], m["kind"]))
     return {"time_base": "source", "source": _api.os.path.abspath(str(path)),
             "t0": round(t0, 6), "t1": None if t1 is None else round(float(t1), 6),
-            "kinds": kinds, "tempo": tempo, "markers": markers}
+            "kinds": kinds, "tempo": tempo, "markers": markers,
+            **({"lyrics": known} if known is not None else {})}
 
 
 def merge_markers(p, found, kinds, t0, t1):

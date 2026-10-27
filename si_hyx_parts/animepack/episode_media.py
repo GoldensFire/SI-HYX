@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import animepack as api
+from ffmpeg_env import escape_filter_path
 from si_hyx_parts.kuhi._http import UA
 from .episode_sources import CUT_SECONDS, choose_start
 from .episode_quality_policy import floor, output_height
@@ -174,13 +175,13 @@ def encode_args(generator, subtitles=None, height=720, subtitle_start=None):
         args[at] = f"scale=-2:{height}:flags=lanczos,setsar=1"
     if subtitles:
         # -vf is already provided by the common scaler. Append the burn filter.
-        path = Path(subtitles).as_posix().replace(":", "\\:").replace("'", "\\'")
+        path = escape_filter_path(subtitles)
         at = args.index("-vf") + 1
         clock = "setpts=PTS-STARTPTS"
         native_ass = subtitle_start is not None and Path(subtitles).suffix.lower() in (".ass", ".ssa")
         if native_ass:
             clock += f"+{float(subtitle_start):.3f}/TB"
-        args[at] = clock + "," + args[at] + f",subtitles=filename='{path}':charenc=UTF-8"
+        args[at] = clock + "," + args[at] + f",subtitles=filename={path}:charenc=UTF-8"
         if native_ass:
             args[at] += ",setpts=PTS-STARTPTS"
     return args

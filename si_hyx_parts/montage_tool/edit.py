@@ -11,12 +11,21 @@ Public namespace: montage_tool.
 времени, с 1), «вид:подпись#N» (подпись — слово метки: section:chorus#2,
 section:A#1), «.end» — конец отрезка, «+0.25»/«-0.1» — сдвиг; итог
 прилипает к сетке кадров проекта. Клип — id, «main#N» (N-й клип основной
-дорожки), «track2#N» или «last» (последний добавленный в этом пакете)."""
+дорожки), «track2#N» или «last» (последний добавленный в этом пакете).
+
+Кроме правок клипов: words — пословный текст по меткам word (typography.py),
+lyrics — то же со словами и строками из файла текста песни, voice — реплика
+из серии на дорожку голоса (clean — без музыки, HTDemucs), settings — поля
+настроек проекта (finish — эффекты всего кадра), card — карточка (фон
+cards.py наложением и текст поверх), strobe — мерцание: кусок наложением,
+видимый через каждые N кадров. text/words/lyrics/card берут роль стиля
+ключом preset («стиль.роль», styles.py)."""
 import re
 
 import montage_tool as _api
 
-OPS = ("add", "move", "trim", "split", "swap", "delete", "set", "text", "marker", "effect")
+OPS = ("add", "move", "trim", "split", "swap", "delete", "set", "text", "marker", "effect",
+       "words", "lyrics", "voice", "settings", "card", "strobe")
 # вид[:подпись]#номер[.end][±сдвиг] — ветки без пересечений (CodeQL).
 _REF_RX = re.compile(r"([a-z]+)(?::([A-Za-z0-9_\-]+))?#([0-9]+)(\.end)?([+-][0-9]+(?:\.[0-9]+)?)?")
 _CLIP_REF_RX = re.compile(r"(main|track([0-9]+))#([0-9]+)")
@@ -24,7 +33,11 @@ _CLIP_REF_RX = re.compile(r"(main|track([0-9]+))#([0-9]+)")
 _SETTABLE = ("volume", "muted", "speed", "fit", "pos_x", "pos_y", "scale", "opacity",
              "transition", "transition_s", "fade_in", "fade_out", "reverse", "freeze_at",
              "in_s", "out_s", "audio_path", "audio_stream", "has_video",
-             "keyframes", "effects", "speed_curve", "curve_audio", "interpolate", "upscale")
+             "keyframes", "effects", "speed_curve", "curve_audio", "interpolate", "upscale",
+             "crop", "box", "mask", "stroke", "blend", "matte")
+# Поля настроек, которые задаёт settings.
+_SETTINGS = ("width", "height", "fps", "fit", "background", "loudness", "duck", "upscale",
+             "deband", "finish")
 
 
 class _OpError(Exception):
@@ -153,6 +166,8 @@ def _op_add(p, op, fps, db):
     if b - a < mp.MIN_CLIP_S * speed:
         raise _OpError("add: клип короче минимума (in_offset/length за пределами плана?)")
     want = "video" if fields.get("has_video", True) else "audio"
+    if want == "video" and p.tracks[track].kind == "audio" and fields.get("audio_stream", -1) >= 0:
+        fields["has_video"], want = False, "audio"    # звук видеофайла — на звуковую дорожку
     if p.tracks[track].kind != want:
         raise _OpError(f"add: {want}-клип на дорожке {p.tracks[track].kind}")
     fields.update(in_s=a, out_s=b, track=track, speed=speed)
@@ -209,13 +224,144 @@ def _set_fields(p, c, fields):
         c.__post_init__()                # типы и пределы — как при загрузке
     except (TypeError, ValueError) as e:
         raise _OpError(f"fields: {e}") from e
+    # Слои: значение, которое чистка выбросила, — ошибка (иначе поле молча
+    # не сработало бы).
+    for k in ("crop", "box", "mask", "stroke", "blend", "matte"):
+        if k in fields and fields[k] not in ([], {}, "", "normal", None) and not getattr(c, k):
+            raise _OpError(f"{k}: неверное значение (schema: notes, enums)")
+    if c.track == p.main_track and (c.mask or c.stroke or c.blend or c.matte):
+        raise _OpError("mask, stroke, blend и matte — только у наложения (верхняя дорожка)")
     p._settle(c)
+
+
+def _free_video_track(p, a, b, top=False):
+    """Видеодорожка наложений, свободная на [a, b) (top — сначала верхние);
+    нет такой — новая (она выше всех)."""
+    tracks = [ti for ti in p.tracks_of("video") if ti != p.main_track]
+    for ti in reversed(tracks) if top else tracks:
+        if all(c.end <= a + 1e-6 or c.start >= b - 1e-6 for c in p.clips_on(ti)):
+            return ti
+    return p.add_track("video")
+
+
+def _span(p, op, fps, default=None):
+    """(начало, длина) операции: at и length или until."""
+    at = resolve_time(p, op.get("at", 0.0), fps)
+    if "until" in op:
+        length = resolve_time(p, op["until"], fps) - at
+    else:
+        try:
+            length = float(op.get("length", default))
+        except (TypeError, ValueError):
+            raise _OpError("нужна length (с) или until") from None
+    if length < _api.montage_project.MIN_CLIP_S:
+        raise _OpError("длина короче минимума клипа")
+    return at, length
+
+
+def _op_card(p, op, fps, db, state):
+    """Карточка: фон (cards.card_background, PNG рядом с проектом) наложением
+    на свободной верхней видеодорожке [at, at + length) и текст поверх всего;
+    preset — вид карточки стиля: фон, роль текста, длина, сбой, вспышка."""
+    spec = {}
+    if "preset" in op:
+        try:
+            spec = _api.style_role(op["preset"], "cards")
+        except (ValueError, _api.ToolError) as e:
+            raise _OpError(f"card: {getattr(e, 'message', e)}") from e
+    folder = state.get("cards")
+    if not folder:
+        raise _OpError("card: фон пишется рядом с проектом — edit по файлу проекта")
+    at, length = _span(p, op, fps, spec.get("length", 1.0))
+    w, h, _fps = p.output_format()
+    if not isinstance(op.get("background") or {}, dict):
+        raise _OpError("card: background — объект")
+    try:
+        png = _api.card_background(dict(spec.get("background") or {}, **(op.get("background") or {})),
+                                   w, h, folder)
+    except (ValueError, TypeError, OSError) as e:
+        raise _OpError(f"card: {e}") from e
+    track = int(op["track"]) if "track" in op else _free_video_track(p, at, at + length, top=True)
+    c = _op_add(p, {"op": "add", "src": png, "in": 0.0, "length": length, "track": track,
+                    "at": at}, fps, db)
+    try:
+        glitch = float(op.get("glitch", spec.get("glitch", 0.0)) or 0.0)
+        flash = float(op.get("flash", spec.get("flash", 0.0)) or 0.0)
+    except (TypeError, ValueError):
+        raise _OpError("card: glitch и flash — числа") from None
+    if glitch > 0:
+        add_clip_effect(p, c, {"type": "glitch", "amount": glitch, "decay": 0.08})
+        add_clip_effect(p, c, {"type": "glitch", "on": [round(c.end - 3.0 / fps, 6)],
+                               "amount": glitch, "decay": 0.06})
+    if flash > 0:
+        add_clip_effect(p, c, {"type": "flash", "amount": flash, "decay": 0.12})
+    out = {"clip": c.id, "background": png}
+    if op.get("text"):
+        t_op = {"op": "text", "start": c.start, "end": c.end, "text": op["text"],
+                "style": op.get("style") or {}}
+        for k in ("pos_x", "pos_y", "layer", "id"):
+            if k in op:
+                t_op[k] = op[k]
+        ref = op.get("text_preset") or (f"{spec['_style']}.{spec['text']}" if spec.get("text")
+                                        else None)
+        if ref:
+            t_op["preset"] = ref
+        out["text"] = _apply(p, t_op, fps, db, state)["text"]
+    return out
+
+
+def _op_strobe(p, op, fps, db):
+    """Мерцание: кусок (shot или src, как у add) наложением на [at, at + length),
+    видим через каждые frames кадров — ключевые кадры opacity с hold."""
+    at, length = _span(p, op, fps)
+    k = op.get("frames", 2)
+    if isinstance(k, bool) or not isinstance(k, int) or not 1 <= k <= 24:
+        raise _OpError("strobe: frames — целое от 1 до 24 кадров")
+    track = int(op["track"]) if "track" in op else _free_video_track(p, at, at + length)
+    add = {"op": "add", "track": track, "at": at, "length": length}
+    for key in ("shot", "src", "in", "in_offset", "db"):
+        if key in op:
+            add[key] = op[key]
+    c = _op_add(p, add, fps, db)
+    on, pts = not op.get("start_hidden"), []
+    for f in range(0, max(1, int(round(c.length * fps))), k):
+        # Точка — за полкадра до кадра f: время кадра у самой границы
+        # округлением ушло бы в прошлый отрезок.
+        pts.append({"t": round(max(0.0, (f - 0.5) / fps), 6), "v": 1.0 if on else 0.0,
+                    "ease": "hold"})
+        on = not on
+    _set_fields(p, c, dict({"keyframes": {"opacity": pts}}, **(op.get("fields") or {})))
+    return c
+
+
+def _preset_sample(p, op, fps):
+    """Текст операции — по нему роль выбирает шрифт из списка: у text — сама
+    строка, у lyrics — строки файла (lines), у words — метки word отрезка."""
+    kind = op.get("op")
+    if kind == "text":
+        return str(op.get("text") or "")
+    try:
+        if kind == "lyrics":
+            lines = _api.read_lyrics(_api.os.path.abspath(str(op.get("file") or "")))
+            want = {int(n) for n in op.get("lines") or []}
+            return " ".join(show for n, line in enumerate(lines, 1) if not want or n in want
+                            for show, _k in line)
+        t0 = resolve_time(p, op.get("from", 0.0), fps, snap=False)
+        t1 = resolve_time(p, op["to"], fps, snap=False) if "to" in op else float("inf")
+        return " ".join(w[2] for w in _api.project_words(p, t0, t1 + 1e-6))
+    except (OSError, ValueError, TypeError, _OpError):
+        return ""
 
 
 def _apply(p, op, fps, db, state):
     kind = op.get("op")
     if kind not in OPS:
         raise _OpError(f"неизвестная операция {kind!r} (есть {', '.join(OPS)})")
+    if kind in ("text", "words", "lyrics") and "preset" in op:
+        try:
+            op = _api.apply_preset(op, _preset_sample(p, op, fps))
+        except (ValueError, _api.ToolError) as e:
+            raise _OpError(f"{kind}: {getattr(e, 'message', e)}") from e
     out = {"op": kind}
     if kind == "add":
         c = _op_add(p, op, fps, db)
@@ -274,12 +420,27 @@ def _apply(p, op, fps, db, state):
             raw = {"start": resolve_time(p, op.get("start"), fps),
                    "end": resolve_time(p, op.get("end"), fps), "text": op.get("text"),
                    "style": op.get("style") or {}}
-            for k in ("pos_x", "pos_y", "id"):
+            for k in ("pos_x", "pos_y", "id", "layer"):
                 if k in op:
                     raw[k] = op[k]
+            if "width" in op and isinstance(raw["text"], str):
+                # Блок width (доля кадра; у роли стиля) — кегль под него и
+                # под край кадра от точки текста.
+                import subtitle_ass
+                res_x, res_y = _api.text_canvas(p)
+                full = dict(subtitle_ass.DEFAULT_SUBTITLE_STYLE, **raw["style"])
+                px = 0.5 if raw.get("pos_x") is None else float(raw["pos_x"])
+                py = 0.5 if raw.get("pos_y") is None else float(raw["pos_y"])
+                size = _api.fit_size(raw["text"], full, float(op["width"]), px, py, res_x, res_y)
+                if size < float(full["size"]):
+                    raw["style"] = dict(raw["style"], size=size)
             items = mp.parse_texts([raw])
             if not items:
                 raise _OpError("text: нужен text и конец позже начала")
+            lost = sorted(k for k in raw["style"] if k not in items[0].style)
+            if lost:
+                raise _OpError(f"text: неверные ключи или значения стиля {lost} "
+                               f"(schema: text_style, text_style_kinetic)")
             p.texts = sorted([t for t in p.texts if t.id != items[0].id] + items,
                              key=lambda t: (t.start, t.end))
             out["text"] = items[0].id
@@ -295,7 +456,87 @@ def _apply(p, op, fps, db, state):
         c = _clip(p, op.get("clip"), state["last"])
         add_clip_effect(p, c, op.get("effect") or {})
         out["clip"] = c.id
+    elif kind == "words":
+        try:
+            out["texts"] = _api.add_words(p, op, lambda v: resolve_time(p, v, fps, snap=False))
+        except ValueError as e:
+            raise _OpError(f"words: {e}") from e
+    elif kind == "lyrics":
+        try:
+            out.update(_api.add_lyrics(p, op, lambda v: resolve_time(p, v, fps, snap=False)))
+        except (OSError, ValueError) as e:
+            raise _OpError(f"lyrics: {e}") from e
+    elif kind == "voice":
+        c = _op_voice(p, op, fps, db)
+        state["last"] = c.id
+        out["clip"] = c.id
+    elif kind == "settings":
+        _op_settings(p, op.get("fields") or {})
+    elif kind == "card":
+        out.update(_op_card(p, op, fps, db, state))
+        state["last"] = out["clip"]
+    elif kind == "strobe":
+        c = _op_strobe(p, op, fps, db)
+        state["last"] = c.id
+        out["clip"] = c.id
     return out
+
+
+def _op_settings(p, fields):
+    mp = _api.montage_project
+    if not isinstance(fields, dict):
+        raise _OpError("settings: fields — объект")
+    bad = [k for k in fields if k not in _SETTINGS]
+    if bad:
+        raise _OpError(f"settings: нельзя задать {', '.join(bad)} (можно: {', '.join(_SETTINGS)})")
+    raw = dict(_api.dataclasses.asdict(p.settings), **fields)
+    problems = [x for x in mp.validate({"version": mp.PROJECT_VERSION, "settings": raw},
+                                       strict=True, check_files=False)
+                if x["path"].startswith("settings")]
+    if problems:
+        raise _OpError("settings: " + "; ".join(f"{x['path']}: {x['message']}" for x in problems))
+    p.settings = mp.parse_settings(raw)
+
+
+def _voice_track(p):
+    """Звуковая дорожка с ролью voice (нет — новая); приглушение музыки — 0.6,
+    если не задано."""
+    for i, t in enumerate(p.tracks):
+        if t.kind == "audio" and t.role == "voice":
+            ti = i
+            break
+    else:
+        ti = p.add_track("audio")
+        p.tracks[ti].role = "voice"
+    if p.settings.duck <= 0:
+        p.settings.duck = 0.6
+    return ti
+
+
+def _op_voice(p, op, fps, db):
+    """Реплика: кусок [in, out] файла на дорожку голоса у времени at; clean —
+    вокал HTDemucs без музыки (кэш по файлу и куску)."""
+    src = _api.os.path.abspath(str(op.get("src") or ""))
+    if not _api.os.path.isfile(src):
+        raise _OpError(f"voice: нет файла {src}")
+    try:
+        a, b = float(op["in"]), float(op["out"])
+    except (KeyError, TypeError, ValueError):
+        raise _OpError("voice: нужны in и out (секунды файла)") from None
+    if b - a < _api.montage_project.MIN_CLIP_S:
+        raise _OpError("voice: out не позже in")
+    if op.get("clean"):
+        try:
+            src = _api.clean_voice(src, a, b, op.get("ml_python", ""))
+        except _api.ToolError as e:
+            raise _OpError(f"voice: {e.message}") from e
+        a, b = 0.0, b - a
+    add = {"op": "add", "src": src, "in": a, "out": b, "track": _voice_track(p),
+           "at": op.get("at", 0.0)}
+    c = _op_add(p, add, fps, db)
+    if "volume" in op:
+        _set_fields(p, c, {"volume": op["volume"]})
+    return c
 
 
 def _snapshot(p):
@@ -303,14 +544,15 @@ def _snapshot(p):
                    round(c.out_s, 6)) for c in p.clips}
 
 
-def apply_ops(p, ops, db=None):
+def apply_ops(p, ops, db=None, cards=None):
     """Применяет операции к копии проекта: (новый проект, отчёт по
-    операциям). Ошибка — ToolError('bad_op') с номером операции."""
+    операциям). Ошибка — ToolError('bad_op') с номером операции. cards —
+    папка фонов карточек (op card)."""
     if not isinstance(ops, list):
         raise _api.ToolError("bad_op", "ops — JSON-список операций")
     q = p.copy()
     fps = q.output_format()[2]
-    state = {"last": None}
+    state = {"last": None, "cards": cards}
     done = []
     for i, op in enumerate(ops):
         if not isinstance(op, dict):
@@ -327,7 +569,7 @@ def edit_project(path, ops, db=None, strict=True, dry_run=False):
     добавленные/удалённые/сдвинутые клипы, проблемы строгой проверки."""
     p, _problems = _api.load_project_file(path, strict=strict)
     before = _snapshot(p)
-    q, done = apply_ops(p, ops, db)
+    q, done = apply_ops(p, ops, db, _api.cards_dir(path))
     after = _snapshot(q)
     changed = [{"clip": cid, "before": list(before[cid]), "after": list(after[cid])}
                for cid in after if cid in before and before[cid] != after[cid]]

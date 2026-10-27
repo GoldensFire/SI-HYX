@@ -168,7 +168,7 @@ def tonemap_filter(path, escape_path, pix_fmt="yuv420p"):
     else:
         out = f"scale=out_color_matrix=bt709:out_range=tv,format={pix_fmt},setparams=range=tv:"
     return (f"scale=in_color_matrix=bt2020:in_range={rng}:flags=accurate_rnd+full_chroma_int,"
-            f"format=gbrp16le,lut3d=file='{lut}':interp=tetrahedral,{out}"
+            f"format=gbrp16le,lut3d=file={lut}:interp=tetrahedral,{out}"
             "color_primaries=bt709:color_trc=bt709:colorspace=bt709,"
             "sidedata=mode=delete:type=MASTERING_DISPLAY_METADATA,"
             "sidedata=mode=delete:type=CONTENT_LIGHT_LEVEL")

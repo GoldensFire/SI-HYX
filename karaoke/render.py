@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 
 import animepack as ap
+from ffmpeg_env import escape_filter_path
 from si_hyx_parts.animepack.generation_runtime import encoding_operation
 from .ass import write_ass
 from .style import FONT_DIR
@@ -34,10 +35,8 @@ def audio_effect(settings):
 
 
 def ass_filter(path):
-    escaped = str(path).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
-    escaped = escaped.replace(",", r"\,").replace("[", r"\[").replace("]", r"\]")
-    fonts = str(FONT_DIR).replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
-    return f"ass=filename='{escaped}':fontsdir='{fonts}'"
+    return (f"ass=filename={escape_filter_path(path)}:"
+            f"fontsdir={escape_filter_path(FONT_DIR)}")
 
 
 @encoding_operation

@@ -205,6 +205,32 @@ _RAW_LAYOUTS = {
 }
 
 
+def qt_rgb_scale(props, size=None):
+    """Фильтр ffmpeg, переводящий SDR-кадр в rgb24 так, как его рисует плеер.
+
+    У файла без цветовых тегов Qt берёт матрицу по высоте кадра (выше 576
+    строк — BT.709, ниже — BT.601), а swscale — всегда BT.601: стоп-кадр
+    паузы выходил другого оттенка, чем кадры воспроизведения. Цветность Qt
+    тянет билинейно в шейдере — с этими флагами разница с его кадром не
+    больше 1 уровня (сверено на кадре плеера, без них — до 60).
+    size — (w, h), если кадр надо растянуть (неквадратный пиксель)."""
+    space = props.get("space") or ""
+    if space == "bt709":
+        matrix = "bt709"
+    elif space in ("smpte170m", "bt470bg"):
+        matrix = "bt601"
+    elif space.startswith("bt2020"):
+        matrix = "bt2020"
+    else:
+        matrix = "bt709" if int(props.get("height") or 0) > 576 else "bt601"
+    flags = "accurate_rnd+full_chroma_int+full_chroma_inp"
+    if size is None:
+        return f"scale=in_color_matrix={matrix}:flags=bilinear+{flags},format=rgb24"
+    w, h = size
+    return (f"scale={w}:{h}:in_color_matrix={matrix}:flags=bicubic+{flags},"
+            "setsar=1,format=rgb24")
+
+
 def _raw_planes(layout, w, h):
     """[(байт в строке, строк)] плоскостей сырого кадра ffmpeg."""
     return [(-(-w // wd) * bpp, -(-h // hd)) for wd, hd, bpp in layout]
@@ -709,10 +735,14 @@ class FramePrefetcher(QThread):
         cmd += ["-ss", f"{ss:.4f}", "-i", str(src),
                 "-frames:v", str(int(run_cap)), "-an", "-sn"]
         props = self._props or {}
-        if (props.get("width"), props.get("height")) not in ((w, h), (h, w)):
-            # Неквадратный пиксель: растягиваем, как плеер (см. qt_frame_size).
-            # Автоповорот ffmpeg стоит в графе раньше -vf, так что w/h здесь
+        resize = (props.get("width"), props.get("height")) not in ((w, h), (h, w))
+        if fmt is None:
+            # rgb24 — YUV в RGB так же, как шейдер плеера (см. qt_rgb_scale).
+            # Неквадратный пиксель растягиваем, как плеер (см. qt_frame_size);
+            # автоповорот ffmpeg стоит в графе раньше -vf, так что w/h здесь
             # уже в осях повёрнутого кадра.
+            cmd += ["-vf", qt_rgb_scale(props, (w, h) if resize else None)]
+        elif resize:
             cmd += ["-vf", f"scale={w}:{h}:flags=bicubic,setsar=1"]
         cmd += ["-f", "rawvideo", "-pix_fmt", pix_fmt, "-"]
         try:

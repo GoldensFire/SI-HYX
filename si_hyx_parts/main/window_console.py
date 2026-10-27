@@ -62,30 +62,37 @@ class UnifiedWindowConsoleMixin:
                      f"перезапуск Проводника: Диспетчер задач → «Проводник» → "
                      f"«Перезапустить»; SI-HYX перезапускать не нужно.")
 
+    def _console_shown_on(self, cur):
+        """(консоль, прогрессбар) — видны ли они на вкладке cur. Консоль скрыта
+        на «Монтаж», «SiQuesterHYX» и прочих, где она лишь занимает место.
+        Прогрессбар скрыт везде там же, кроме «Монтаж» (там он нужен для
+        прогресса экспорта)."""
+        def is_tab(name):
+            tab = getattr(self, name, None)
+            return tab is not None and cur is tab
+        own_ui = any(is_tab(n) for n in ("tab_siquester", "tab_shikimori",
+                                         "tab_leaderboard", "tab_coop", "tab_photo"))
+        return not (own_ui or is_tab("tab_edit")), not own_ui
+
     def _sync_console_visibility(self, index=None):
-        """Нижняя консоль и прогрессбар. Консоль скрыта на «Монтаж» и
-        «SiQuesterHYX» (там она лишь занимает место). Прогрессбар скрыт на
-        «SiQuesterHYX» (на «Монтаж» он нужен для прогресса экспорта).
+        """Нижняя консоль и прогрессбар по вкладке (_console_shown_on).
 
         Принимает индекс явно (а не только через currentChanged), чтобы можно
         было спрятать консоль ДО фактического показа страницы — иначе видео на
         «Монтаж» сперва рисуется в старой (с консолью) высоте и тут же
-        дёргается на новую, бóльшую — см. _on_tab_bar_clicked."""
+        дёргается на новую, бóльшую — см. _on_tab_bar_clicked.
+
+        Раскладка окна пересчитывается сразу (activate): setVisible лишь
+        откладывает её до следующего витка цикла, и страница успевала
+        показаться в старой высоте — холст «Монтажа» перекладывался дважды."""
         try:
             cur = self.tabs.widget(index) if isinstance(index, int) else self.tabs.currentWidget()
-            is_edit = cur is self.tab_edit
-            tsq = getattr(self, "tab_siquester", None)
-            is_siq = tsq is not None and cur is tsq
-            tsh = getattr(self, "tab_shikimori", None)
-            is_shiki = tsh is not None and cur is tsh
-            tlb = getattr(self, "tab_leaderboard", None)
-            is_lb = tlb is not None and cur is tlb
-            tcp = getattr(self, "tab_coop", None)
-            is_coop = tcp is not None and cur is tcp
-            is_photo = cur is getattr(self, "tab_photo", None)
-            self.console_panel.setVisible(not (is_edit or is_siq or is_shiki or is_lb or is_coop or is_photo))
-            show_progress = not (is_siq or is_shiki or is_lb or is_coop or is_photo)
-            self.pbar.setVisible(show_progress)
+            console, progress = self._console_shown_on(cur)
+            self.console_panel.setVisible(console)
+            self.pbar.setVisible(progress)
+            lay = self.centralWidget().layout()
+            if lay is not None:
+                lay.activate()
         except Exception:
             pass
 

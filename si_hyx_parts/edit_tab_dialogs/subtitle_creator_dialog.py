@@ -22,6 +22,10 @@ class _CueTextEdit(_api.QPlainTextEdit):
         self.setWordWrapMode(_api.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         self.setSizePolicy(_api.QSizePolicy.Policy.Expanding, _api.QSizePolicy.Policy.Fixed)
         self.setFixedHeight(self.MIN_H)
+        # Бросок над полем — это перестановка строки списка (_CueList), а не
+        # вставка текста: поле, принимающее броски, забирало бы его себе.
+        self.setAcceptDrops(False)
+        self.viewport().setAcceptDrops(False)
         self.document().documentLayout().documentSizeChanged.connect(self._fit_height)
 
     def _fit_height(self, *_):
@@ -48,6 +52,54 @@ class _CueTextEdit(_api.QPlainTextEdit):
 
 _CueTextEdit.__module__ = _api.__name__
 _api._CueTextEdit = _CueTextEdit
+
+
+class _CueList(_api.QListWidget):
+    """Список реплик, строки которого переставляются перетаскиванием.
+
+    Строки — виджеты (setItemWidget), а штатный перенос QListWidget их теряет:
+    сам перенос делает диалог (on_move(откуда, куда) — номера строк, «куда» —
+    место вставки до удаления), список он потом строит заново. Тащат за ручку
+    слева, время или фон строки; поле текста остаётся полем."""
+
+    def __init__(self, on_move):
+        super().__init__()
+        self._on_move = on_move
+        self.setDragDropMode(_api.QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(_api.Qt.DropAction.MoveAction)
+        self.setDropIndicatorShown(True)
+
+    def startDrag(self, _actions):
+        # Свой QDrag вместо штатного: тот по MoveAction удалил бы исходную
+        # строку вместе с виджетом, а картинкой брал пустой делегат.
+        item = self.currentItem()
+        if item is None:
+            return
+        drag = _api.QDrag(self)
+        drag.setMimeData(self.mimeData([item]))
+        row_w = self.itemWidget(item)
+        if row_w is not None:
+            drag.setPixmap(row_w.grab())
+            drag.setHotSpot(row_w.mapFromGlobal(_api.QCursor.pos()))
+        drag.exec(_api.Qt.DropAction.MoveAction)
+
+    def dropEvent(self, ev):
+        if ev.source() is not self or self.currentItem() is None:
+            ev.ignore()
+            return
+        src = self.currentRow()
+        pt = ev.position().toPoint()
+        item = self.itemAt(pt)
+        if item is None:
+            dst = self.count()
+        else:
+            rect = self.visualItemRect(item)
+            dst = self.row(item) + (1 if pt.y() > rect.center().y() else 0)
+        ev.setDropAction(_api.Qt.DropAction.CopyAction)
+        ev.accept()
+        if dst not in (src, src + 1):
+            # Список перестраивается — не посреди обработки броска.
+            _api.QTimer.singleShot(0, _api.partial(self._on_move, src, dst))
 
 
 class SubtitleCreatorDialog(_api.QDialog):
@@ -310,8 +362,16 @@ class SubtitleCreatorDialog(_api.QDialog):
                     self._cues.append({'start': float(c[0]), 'end': float(c[1]),
                                        'text': str(c[2]), 'style': None})
             self._resync_all()
+            # Окно открывается там, где стоит плейхед Монтажа: выбрана реплика
+            # под ним (или ближайшая следующая), список прокручен к ней.
+            first = next((i for i, c in enumerate(self._cues)
+                          if c['end'] > self._start_hint and self._cue_in_range(c)), -1)
+            if first >= 0:
+                self._select_cue(first, seek=False)
+                _api.QTimer.singleShot(0, lambda: self._scroll_to_cue(first))
         else:
             self._add_cue()
+        self._focus_timeline()
 
         self._register_shortcuts()
         # Без этого Qt отдаёт начальный фокус первому виджету в layout'е —
@@ -493,6 +553,17 @@ class SubtitleCreatorDialog(_api.QDialog):
             self._did_initial_seek = True
             self.preview.set_range(self._range_start, end)
             self.preview.seek(self._start_hint)
+            self._focus_timeline()
+
+    # Длинный диапазон таймлайн показывает окном вокруг плейхеда, а не целиком
+    # с начала файла: блоки реплик иначе сливались в полоску у 00:00.
+    _TL_FOCUS_S = 60.0
+
+    def _focus_timeline(self):
+        dur = self.timeline.duration
+        if dur > 2 * self._TL_FOCUS_S:
+            self.timeline.set_zoom(dur / self._TL_FOCUS_S,
+                                   anchor_t=self._start_hint, anchor_frac=0.5)
 
     def _on_font_changed(self, qfont):
         self._style_edit('font', qfont.family())
@@ -513,12 +584,14 @@ class SubtitleCreatorDialog(_api.QDialog):
         self.search_box.setPlaceholderText("Введите содержимое для поиска")
         self.search_box.textChanged.connect(lambda _t: self._rebuild_list())
         lay.addWidget(self.search_box)
-        self.list_cues = _api.QListWidget()
+        self.list_cues = _CueList(self._move_cue_row)
         # Строки — во всю ширину списка, без горизонтальной прокрутки: поле
         # текста переносит длинную реплику и растёт вниз (см. _CueTextEdit).
         self.list_cues.setHorizontalScrollBarPolicy(_api.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list_cues.viewport().installEventFilter(self)
         self.list_cues.currentItemChanged.connect(self._on_list_current_changed)
+        self.list_cues.verticalScrollBar().valueChanged.connect(
+            lambda _v: self._materialize_rows())
         lay.addWidget(self.list_cues, 1)
         row = _api.QHBoxLayout(); row.setSpacing(6)
         btn_add = _api.QPushButton("+ Добавить реплику")
@@ -527,33 +600,122 @@ class SubtitleCreatorDialog(_api.QDialog):
         lay.addLayout(row)
         return w
 
+    # Высота строки, пока её виджет не построен: поле текста в две строки.
+    _ROW_EST_H = 54
+
+    def _cue_in_range(self, c):
+        """Реплика попадает в диапазон, выделенный в Монтаже. Список показывает
+        только такие, как и таймлайн; остальные реплики дорожки не теряются."""
+        if c['end'] < self._range_start:
+            return False
+        return self._range_end is None or c['start'] <= self._range_end
+
     def _rebuild_list(self):
         self._syncing = True
         try:
             self.list_cues.clear()
             filt = self.search_box.text().strip().lower()
+            width = self.list_cues.viewport().width()
             for i, c in enumerate(self._cues):
+                if not self._cue_in_range(c):
+                    continue
                 if filt and filt not in c['text'].lower():
                     continue
                 item = _api.QListWidgetItem()
-                row_w = self._build_row_widget(i, c)
-                row_w._list_item = item
                 item.setData(_api.Qt.ItemDataRole.UserRole, i)
+                item.setSizeHint(_api.QSize(width, self._ROW_EST_H))
                 self.list_cues.addItem(item)
-                self.list_cues.setItemWidget(item, row_w)
-                self._fit_row(row_w)
                 if i == self._selected:
                     self.list_cues.setCurrentItem(item)
         finally:
             self._syncing = False
+        self._materialize_rows()
+
+    def _materialize_rows(self):
+        """Строит виджеты строк только у видимых строк списка (с запасом в экран
+        сверху и снизу). Сотни полей текста со стилем окна строились
+        секундами — так долго и открывалась правка дорожки целиком."""
+        lst = self.list_cues
+        vp = lst.viewport()
+        h = vp.height()
+        area = _api.QRect(0, -h, max(1, vp.width()), 3 * h)
+        built = False
+        for r in range(lst.count()):
+            item = lst.item(r)
+            if lst.itemWidget(item) is not None:
+                continue
+            rect = lst.visualItemRect(item)
+            if rect.top() > area.bottom():
+                break
+            if not rect.intersects(area):
+                continue
+            idx = item.data(_api.Qt.ItemDataRole.UserRole)
+            if not (0 <= idx < len(self._cues)):
+                continue
+            row_w = self._build_row_widget(idx, self._cues[idx])
+            row_w._list_item = item
+            lst.setItemWidget(item, row_w)
+            self._fit_row(row_w)
+            built = True
+        if built:
+            # Настоящая высота строк сдвинула нижние — досоздаём их после раскладки.
+            _api.QTimer.singleShot(0, self._materialize_rows)
+
+    def _scroll_to_cue(self, idx):
+        for r in range(self.list_cues.count()):
+            item = self.list_cues.item(r)
+            if item.data(_api.Qt.ItemDataRole.UserRole) == idx:
+                self.list_cues.scrollToItem(
+                    item, _api.QAbstractItemView.ScrollHint.PositionAtCenter)
+                break
+
+    def _row_context_menu(self, idx, txt, _pos):
+        """ПКМ по строке списка. Пока идёт поиск, первым пунктом —
+        «Перейти к строке»: сброс поиска и переход к этой реплике в полном
+        списке (на таймлайне и в превью тоже)."""
+        menu = txt.createStandardContextMenu() if txt is not None else _api.QMenu(self)
+        if self.search_box.text().strip():
+            act = _api.QAction("Перейти к строке", menu)
+            # Список перестраивается — без отсрочки удалилась бы строка,
+            # чьё меню сейчас открыто.
+            act.triggered.connect(lambda: _api.QTimer.singleShot(
+                0, _api.partial(self._goto_cue, idx)))
+            first = menu.actions()[0] if menu.actions() else None
+            menu.insertAction(first, act)
+            if first is not None:
+                menu.insertSeparator(first)
+        if menu.actions():
+            menu.exec(_api.QCursor.pos())
+        menu.deleteLater()
+
+    def _goto_cue(self, idx):
+        if not (0 <= idx < len(self._cues)):
+            return
+        self.search_box.blockSignals(True)
+        self.search_box.clear()
+        self.search_box.blockSignals(False)
+        self._selected = -1
+        self._rebuild_list()
+        self._select_cue(idx)
+        self._scroll_to_cue(idx)
 
     def _build_row_widget(self, idx, cue):
         w = _api.QWidget()
-        row = _api.QHBoxLayout(w); row.setContentsMargins(6, 4, 6, 4); row.setSpacing(6)
-        lbl_time = _api.QLabel(f"{_api.s_to_time(cue['start'])[:8]}\n{_api.s_to_time(cue['end'])[:8]}")
+        row = _api.QHBoxLayout(w); row.setContentsMargins(2, 4, 6, 4); row.setSpacing(6)
+        grip = _api.QLabel()
+        grip.setPixmap(_api.get_icon('fa5s.grip-vertical').pixmap(10, 16))
+        grip.setFixedWidth(12)
+        grip.setToolTip("Перетащите, чтобы переставить реплику")
+        row.addWidget(grip)
+        lbl_time = _api.QLabel(self._cue_time_text(cue['start'], cue['end']))
         lbl_time.setStyleSheet(f"color: {_api.C['text3']}; font-size: 10px;")
         lbl_time.setFixedWidth(56)
         row.addWidget(lbl_time)
+        w._lbl_time = lbl_time
+        # Ручка, время и фон строки нажатие не берут — его получает список,
+        # и протяжка отсюда тащит строку (_CueList.startDrag).
+        for handle in (grip, lbl_time, w):
+            handle.setCursor(_api.Qt.CursorShape.OpenHandCursor)
         txt = _api._CueTextEdit(cue['text'], on_height=_api.partial(self._fit_row, w))
         txt.textChanged.connect(_api.partial(self._on_row_text_changed, txt, idx))
         orig_focus_in = txt.focusInEvent
@@ -562,6 +724,10 @@ class SubtitleCreatorDialog(_api.QDialog):
             _orig(ev)
             self._select_cue(_i)
         txt.focusInEvent = _on_focus
+        for widget, edit in ((txt, txt), (w, None)):
+            widget.setContextMenuPolicy(_api.Qt.ContextMenuPolicy.CustomContextMenu)
+            widget.customContextMenuRequested.connect(
+                _api.partial(self._row_context_menu, idx, edit))
         row.addWidget(txt, 1)
         btn_dup = _api.QPushButton(); btn_dup.setIcon(_api.get_icon('fa5s.copy')); btn_dup.setFixedSize(24, 24)
         btn_dup.setCursor(_api.Qt.CursorShape.PointingHandCursor)
@@ -573,6 +739,12 @@ class SubtitleCreatorDialog(_api.QDialog):
         btn_del.clicked.connect(_api.partial(self._delete_cue, idx))
         row.addWidget(btn_dup); row.addWidget(btn_del)
         return w
+
+    def _cue_time_text(self, start, end):
+        """Время реплики в строке списка — от начала отрезка Монтажа, как на
+        линейке таймлайна и в счётчике превью (тайминги хранятся абсолютными)."""
+        rs = self._range_start
+        return f"{_api.s_to_clock(start - rs)}\n{_api.s_to_clock(end - rs)}"
 
     def _fit_row(self, row_w):
         """Размер строки списка: ширина — как у области списка, высота — по
@@ -592,7 +764,37 @@ class SubtitleCreatorDialog(_api.QDialog):
                 row_w = lst.itemWidget(lst.item(i))
                 if row_w is not None:
                     self._fit_row(row_w)
+                else:
+                    lst.item(i).setSizeHint(_api.QSize(watched.width(), self._ROW_EST_H))
+            self._materialize_rows()
         return super().eventFilter(watched, event)
+
+    def _move_cue_row(self, src, dst):
+        """Строку src списка бросили на место dst. Время реплик стоит на
+        месте — переезжает содержимое (текст, стиль, событие файла): строки
+        идут по времени, и переставить их значит дать реплике другое время,
+        а соседним — сдвинуться на её место по очереди."""
+        lst = self.list_cues
+        order = [lst.item(r).data(_api.Qt.ItemDataRole.UserRole) for r in range(lst.count())]
+        if not (0 <= src < len(order)) or not (0 <= dst <= len(order)):
+            return
+        if any(not (0 <= i < len(self._cues)) for i in order):
+            return
+        self._push_undo()
+        to = dst if dst < src else dst - 1
+        contents = [{k: v for k, v in self._cues[i].items() if k not in ('start', 'end')}
+                    for i in order]
+        contents.insert(to, contents.pop(src))
+        for i, content in zip(order, contents):
+            cue = self._cues[i]
+            for k in [k for k in cue if k not in ('start', 'end')]:
+                del cue[k]
+            cue.update(content)
+        new_idx = order[to]
+        self._selected = -1
+        self._resync_all()
+        self._select_cue(new_idx, seek=True)
+        self._scroll_to_cue(new_idx)
 
     def _on_row_text_changed(self, txt_widget, idx):
         if self._syncing or not (0 <= idx < len(self._cues)):
@@ -805,10 +1007,39 @@ class SubtitleCreatorDialog(_api.QDialog):
     # ── Реплики: добавление/дублирование/удаление/выбор ─────────────────────
     def _add_cue(self):
         self._push_undo()
-        start = self._cues[-1]['end'] if self._cues else self._start_hint
-        self._cues.append({'start': start, 'end': start + 2.0, 'text': '', 'style': None})
+        # Новая реплика — всегда в конец списка: следом за последней репликой
+        # диапазона (а не всей дорожки: та может лежать за его пределами, и
+        # новая пропала бы из списка). Раньше при кончившемся диапазоне она
+        # вставала к плейхеду — то есть ПЕРЕД последней, вверху списка.
+        in_range = [i for i, c in enumerate(self._cues) if self._cue_in_range(c)]
+        last = in_range[-1] if in_range else -1
+        hi = (self._range_end if self._range_end is not None
+              else self.timeline.range_start + self.timeline.duration)
+        start = (max(self._range_start, self._cues[last]['end']) if last >= 0
+                 else self._start_hint)
+        if last >= 0 and hi - start < 0.5:
+            # Места после последней реплики нет — делим её пополам и отдаём
+            # новой вторую половину, чтобы она всё равно встала последней.
+            prev = self._cues[last]
+            lo = max(self._range_start, prev['start'])
+            end = min(prev['end'], hi)
+            if end - lo >= 0.2:
+                start = lo + (end - lo) / 2.0
+                prev['end'] = start
+            else:
+                start = max(self._range_start, min(start, hi - 0.1))
+                end = start + 0.1
+        else:
+            end = min(start + 2.0, hi) if hi > start + 0.1 else start + 0.1
+        pos = last + 1 if last >= 0 else next(
+            (i for i, c in enumerate(self._cues) if c['start'] > start), len(self._cues))
+        if pos < len(self._cues):
+            end = max(start + 0.1, min(end, self._cues[pos]['start']))
+        self._cues.insert(pos, {'start': start, 'end': end, 'text': '', 'style': None})
+        if self._selected >= pos:
+            self._selected += 1
         self._resync_all()
-        self._select_cue(len(self._cues) - 1)
+        self._select_cue(pos)
 
     def _duplicate_cue(self, idx):
         if not (0 <= idx < len(self._cues)):
@@ -844,12 +1075,12 @@ class SubtitleCreatorDialog(_api.QDialog):
             self._selected -= 1
         self._resync_all()
 
-    def _select_cue(self, idx):
+    def _select_cue(self, idx, seek=True):
         if idx == self._selected:
             return
         self._selected = idx
         self.timeline.set_selected(idx)
-        if 0 <= idx < len(self._cues):
+        if seek and 0 <= idx < len(self._cues):
             self.preview.seek(self._cues[idx]['start'])
         self._refresh_all_style_ui()
         for i in range(self.list_cues.count()):
@@ -875,9 +1106,11 @@ class SubtitleCreatorDialog(_api.QDialog):
             item = self.list_cues.item(i)
             if item.data(_api.Qt.ItemDataRole.UserRole) == idx:
                 row_w = self.list_cues.itemWidget(item)
-                lbl = row_w.findChild(_api.QLabel)
+                if row_w is None:
+                    break   # строка ещё не построена — возьмёт время при постройке
+                lbl = getattr(row_w, "_lbl_time", None)
                 if lbl is not None:
-                    lbl.setText(f"{_api.s_to_time(start)[:8]}\n{_api.s_to_time(end)[:8]}")
+                    lbl.setText(self._cue_time_text(start, end))
                 break
 
     def _on_timeline_view_changed(self, offset, visible):

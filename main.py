@@ -76,6 +76,11 @@ _QT_LOG_NOISE = (
     # окно — Qt пишет «must be a top level window». Безобидно (удаление в Корзину
     # уже берёт top-level winId владельцем, см. utils.move_to_trash) — глушим.
     "must be a top level window",
+    # AVI (и другие контейнеры без pts, только dts): демуксер QtMultimedia пишет
+    # это на КАЖДЫЙ пакет — 25–50 строк в секунду воспроизведения. Каждая шла в
+    # консоль журнала (10 000 строк, у полной — удаление первой строки и
+    # перекладка) и в архив на диск, всё в GUI-потоке: видео в «Монтаже» дёргалось.
+    "received AVPacket with pts == AV_NOPTS_VALUE",
 )
 
 from si_hyx_parts.main.unified_window import (

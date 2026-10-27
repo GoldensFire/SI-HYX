@@ -39,7 +39,7 @@ def _prog_sub_style():
     return dict(DEFAULT_SUBTITLE_STYLE)
 
 
-def prog_sub_force_style(play_res_y=None, play_res_x=None):
+def prog_sub_force_style(play_res_y=None, play_res_x=None, keep_layout=False):
     """force_style ffmpeg-фильтра subtitles для программного стиля. Тот же
     список (через запятую) превью отдаёт своей libass — ass_set_style_overrides,
     — поэтому субтитры в плеере и во вшитом файле одни.
@@ -48,10 +48,14 @@ def prog_sub_force_style(play_res_y=None, play_res_x=None):
     на котором их рендерит ffmpeg), у ASS — её PlayResY/PlayResX. Без пересчёта
     кегль 21 на холсте 1080 вышел бы вчетверо мельче.
 
-    Поля стиля ASS, которых нет у программного, сбрасываются явно: иначе
-    оставались бы от оригинала — ScaleY 60 сплющивал шрифт караоке, а
-    выравнивание вправо уводило реплику к краю. ScaleX/ScaleY у force_style
-    libass — доли (1 = 100 %), не проценты, как в самом файле."""
+    Поля вида из стиля ASS, которых нет у программного, сбрасываются явно:
+    иначе оставались бы от оригинала — ScaleY 60 сплющивал шрифт караоке.
+    ScaleX/ScaleY у force_style libass — доли (1 = 100 %), не проценты, как
+    в самом файле.
+
+    keep_layout — у дорожки своя раскладка (ASS/SSA): выравнивание и отступы
+    стилей остаются её, как в оригинале (надписи сверху, реплики сбоку),
+    программный только вид. Иначе — снизу по центру с отступом программы."""
     st = _prog_sub_style()
     k = float(play_res_y or _ASS_PLAYRES_Y) / _ASS_PLAYRES_Y
     kx = float(play_res_x or _ASS_PLAYRES_X) / _ASS_PLAYRES_X
@@ -59,15 +63,17 @@ def prog_sub_force_style(play_res_y=None, play_res_x=None):
     def num(v, scale=k):
         return f"{float(v) * scale:.2f}".rstrip("0").rstrip(".")
 
+    layout = ("" if keep_layout else
+              f"Alignment=2,MarginL={num(_ASS_MARGIN_L, kx)},"
+              f"MarginR={num(_ASS_MARGIN_R, kx)},"
+              f"MarginV={num(PROG_SUB_MARGIN_V)},")
     return (f"FontName={_karaoke_style.FONT_NAME},Fontsize={num(st['size'])},Bold=1,"
             f"Italic=0,Underline=0,StrikeOut=0,ScaleX=1,ScaleY=1,Spacing=0,Angle=0,"
             f"PrimaryColour={_hex_to_ass_color(st['color'])},"
             f"OutlineColour={_hex_to_ass_color(st['outline_color'])},"
             f"BackColour={_hex_to_ass_color('#000000', st['shadow_alpha'])},"
             f"BorderStyle=1,Outline={num(st['outline'])},Shadow={num(st['shadow'])},"
-            f"Alignment=2,MarginL={num(_ASS_MARGIN_L, kx)},"
-            f"MarginR={num(_ASS_MARGIN_R, kx)},"
-            f"MarginV={num(PROG_SUB_MARGIN_V)},ScaledBorderAndShadow=yes")
+            f"{layout}ScaledBorderAndShadow=yes")
 
 
 def _ass_timestamp(t):
@@ -194,13 +200,18 @@ def _cues_to_ass(cues, play_res=None):
     play_res — холст (PlayResX, PlayResY) вместо своих 384×288: у кадра
     другой формы (9:16) libass растягивал бы буквы. У реплики может быть
     'tags' — готовые override-теги вместо анимации стиля (позиция текста
-    проекта, montage_project)."""
+    проекта, montage_project); 'raw' — готовый текст реплики с тегами
+    (кинетический текст проекта, экранирован там же)."""
     styles_txt = []
     events = []
     for i, c in enumerate(cues):
         name = f"Cue{i}"
         style = c['style']
         styles_txt.append(_style_line(name, style))
+        if 'raw' in c:
+            events.append(f"Dialogue: 0,{_ass_timestamp(c['start'])},{_ass_timestamp(c['end'])},"
+                          f"{name},,0,0,0,,{c['raw']}")
+            continue
         txt = c['text'].replace("{", "｛").replace("}", "｝")
         txt = txt.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\N")
         align = int(style.get('align') or 2)

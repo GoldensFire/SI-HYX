@@ -16,7 +16,24 @@ Public namespace: montage_tool.
 (Витерби) по отрезкам с ценой перехода: тот же файл рядом по времени,
 та же крупность три раза подряд; повторы планов потом заменяются
 следующими по оценке. Звук планов выключен, песня — на звуковой дорожке
-с ролью music; маркеры песни пишутся в проект во времени проекта."""
+с ролью music; маркеры песни пишутся в проект во времени проекта.
+
+story плана — сюжет по времени проекта: [{from, to, files, src: [[t0, t1]],
+tags_any, motion, prefer…}] — отрезку с серединой в [from, to) годятся только
+планы этих файлов, чья середина — в кусках src (время файла; [t0, t1, файл] —
+кусок одного файла); остальные поля — как у правила части.
+
+--template skeleton.json (reference.py) — ритм эталона вместо мест резов:
+резы — на те же доли новой песни (от сильной доли у начала окна), длина
+окна — столько же долей; появления слоёв и вспышки эталона — маркеры custom
+pop/flash в проекте (ссылки custom:pop#N для наложений и эффектов).
+
+--style имя (styles.py, docs/amv-styles): rhythm — шаг резов по частям в
+долях (style_slots: число резов части по шагу, места — от высокого
+приоритета) и рез раньше доли на lead_frames кадров; sections — эффекты
+(cycle — клипам части по очереди) и переход клипам части (растворение
+удлиняет клип влево на свою длину: конец перехода и все резы дальше
+остаются на долях); finish — settings.finish."""
 import json
 import math
 
@@ -75,8 +92,46 @@ def pick_window(m, duration):
 def segments(m, t0, t1, fps, min_shot):
     """Отрезки [(начало, конец)] в кадрах проекта (0 — t0 песни) по
     рекомендованным местам резов; короткие сливаются с соседом."""
-    cuts = sorted({round((s["t"] - t0) * fps) for s in m["slots"]
-                   if s.get("recommended") and t0 < s["t"] < t1})
+    return cut_segments([s["t"] for s in m["slots"] if s.get("recommended")], t0, t1, fps,
+                        min_shot)
+
+
+def style_slots(m, beats):
+    """Времена резов по шагу стиля: в каждой части — столько резов, сколько
+    даёт шаг beats[подпись] долей (default — прочим частям; нет шага —
+    рекомендованные места песни), места — от высокого приоритета (фраза,
+    сильная доля, удар), не ближе целой части шага: 1,5 доли — смесь резов
+    через 1 и 2 доли."""
+    bt = np.array([b["t"] for b in m["beats"]], float)
+    period_all = 60.0 / max(1.0, float(m.get("tempo") or 120.0))
+    out = []
+    for sec in m["sections"] or [{"t": 0.0, "end": m["duration"], "label": ""}]:
+        inside = [c for c in m["slots"] if sec["t"] - 1e-3 <= c["t"] < sec["end"] - 1e-3]
+        k = float(beats.get(sec.get("label"), beats.get("default")) or 0.0)
+        if k <= 0:
+            out += [c["t"] for c in inside if c.get("recommended")]
+            continue
+        own = bt[(bt >= sec["t"]) & (bt < sec["end"])]
+        period = float(np.median(np.diff(own))) if len(own) > 2 else period_all
+        span = min(sec["end"], m["duration"]) - sec["t"]
+        want = max(1, int(round(span / (k * period))))
+        gap = (math.floor(k) if k >= 1.0 else 0.5) * period * 0.95
+        taken = []
+        for c in sorted(inside, key=lambda c: (-c["priority"], c["t"])):
+            if len(taken) >= want:
+                break
+            if c["level"] == "offbeat" and k >= 1.0:
+                continue
+            if all(abs(c["t"] - o) >= gap for o in taken):
+                taken.append(c["t"])
+        out += taken
+    return sorted(out)
+
+
+def cut_segments(times, t0, t1, fps, min_shot, lead=0):
+    """Отрезки в кадрах проекта по временам резов песни times (рез раньше
+    на lead кадров)."""
+    cuts = sorted({round((t - t0) * fps) - int(lead) for t in times if t0 < t < t1})
     end = int(round((t1 - t0) * fps))
     bounds = [0] + [c for c in cuts if 0 < c < end] + [end]
     min_f = max(1, int(math.ceil(min_shot * fps)))
@@ -149,6 +204,29 @@ def _align_raw(shot, seg_len, hits_rel):
     return best_in, best
 
 
+def _story_rule(story, t):
+    """Правило сюжета плана для времени проекта t (первое, чей [from, to)
+    его содержит) или None."""
+    for r in story:
+        if float(r.get("from", 0.0)) <= t < float(r.get("to", float("inf"))):
+            return r
+    return None
+
+
+def _story_ok(shot, rule):
+    """План подходит отрезку сюжета: файл из files, середина плана — в одном
+    из кусков src [[t0, t1], …] (время файла; третий элемент — часть пути
+    файла, только для него)."""
+    path = shot["file"].lower()
+    files = rule.get("files") or []
+    if files and not any(str(f).lower() in path for f in files):
+        return False
+    mid = (shot["t0"] + shot["t1"]) / 2.0
+    spans = rule.get("src") or []
+    return not spans or any(float(sp[0]) <= mid <= float(sp[1])
+                            and (len(sp) < 3 or str(sp[2]).lower() in path) for sp in spans)
+
+
 def _match_section(shot, rule):
     """Бонус плана за правило части плана: теги, персонажи, крупность, движение."""
     if not rule:
@@ -164,21 +242,49 @@ def _match_section(shot, rule):
         sc += 0.2
     if rule.get("tags_none") and tags & {t.replace(" ", "_").lower() for t in rule["tags_none"]}:
         sc -= 1.0
+    if rule.get("prefer") and shot["id"] in {int(x) for x in rule["prefer"]}:
+        sc += 0.6
     return sc
+
+
+def _transition_s(rule, i, segs, fps, in_s, shot_t0):
+    """Длина перехода клипа i по правилу части (целые кадры): не больше
+    половины его и прошлого отрезка и запаса исходника до in_s; 0 — без."""
+    want = float(rule.get("transition_s", 0.0) or 0.0) if rule.get("transition") else 0.0
+    if want <= 0 or i == 0:
+        return 0.0
+    a, b = segs[i]
+    pa, pb = segs[i - 1]
+    # Желаемое — к ближнему кадру, пределы (половины отрезков, запас
+    # исходника) — вниз: нахлёст pack не урежется, резы останутся на кадрах.
+    frames = min(int(round(want * fps)), (b - a) // 2, (pb - pa) // 2,
+                 int(math.floor((in_s - shot_t0) * fps + 1e-6)))
+    return frames / fps if frames >= 2 else 0.0
 
 
 def autofill(project_path, song, db=None, plan=None, t0=None, t1=None, duration=None,
              min_shot=DEFAULT_MIN_SHOT, width=0, height=0, ctl=None, beat_model=None,
-             overwrite=False, fx="", gemini=False):
+             overwrite=False, fx="", gemini=False, template=None, style=None):
     """Черновик: проект с песней и планами каталога под места резов. Части
     песни — карта с подписями Gemini, если она уже в кэше (music --gemini)
-    или gemini=True (один запрос), иначе локальные."""
+    или gemini=True (один запрос), иначе локальные. template — скелет
+    эталона (путь или словарь reference): резы и маркеры по его долям.
+    style — стиль AMV (имя, путь или словарь styles.load_style): ритм,
+    эффекты и переходы частей, отделка кадра."""
     ctl = ctl or _api.NO_CONTROL
     plan = _plan(plan) if isinstance(plan, (str, type(None))) else dict(plan)
+    sty = _api.load_style(style) if isinstance(style, str) and style else (style or None)
+    rhythm = (sty or {}).get("rhythm") or {}
+    sec_rules = (sty or {}).get("sections") or {}
+    if rhythm.get("min_shot") and min_shot == DEFAULT_MIN_SHOT:
+        min_shot = float(rhythm["min_shot"])
     if _api.os.path.exists(str(project_path)) and not overwrite:
         raise _api.ToolError("output_exists", f"проект уже есть: {project_path} (--overwrite)")
     m = _api.music_file(song, model=beat_model or _api.DEFAULT_BEAT_MODEL, ctl=ctl,
                         gemini=gemini, reuse_gemini=True)
+    skel = _plan(template) if isinstance(template, str) else template
+    if skel and not duration:
+        duration = float(skel["beats_total"]) * 60.0 / max(1.0, float(m["tempo"] or 120.0))
     if t0 is None:
         t0, t1 = pick_window(m, float(duration or 45.0))
     t1 = m["duration"] if t1 is None else min(float(t1), m["duration"])
@@ -198,12 +304,24 @@ def autofill(project_path, song, db=None, plan=None, t0=None, t1=None, duration=
     if not found:
         raise _api.ToolError("nothing_to_render", "в каталоге нет подходящих планов (index?)")
     fps = float(plan.get("fps") or found[0]["fps"] or 24.0)
-    segs = segments(m, t0, t1, fps, min_shot)
+    marks_extra = []
+    if skel:
+        t0, t1, evs = _api.template_times(skel, m, t0)
+        segs = cut_segments([t for t, k in evs if k == "cut"], t0, t1, fps, min_shot)
+        marks_extra = [{"t": round(_api.snap_frame(t - t0, fps)[0], 6), "kind": "custom",
+                        "label": "pop" if k == "layer" else "flash"}
+                       for t, k in evs if k != "cut"]
+    elif rhythm.get("beats"):
+        segs = cut_segments(style_slots(m, rhythm["beats"]), t0, t1, fps, min_shot,
+                            int(rhythm.get("lead_frames", 0)))
+    else:
+        segs = segments(m, t0, t1, fps, min_shot)
     # Движение планов — в ранги 0…1 (энергия тактов тоже в 0…1).
     mot = np.array([s["motion"] for s in found])
     order = np.argsort(np.argsort(mot))
     mot_rank = order / max(1, len(found) - 1)
     rules = plan.get("sections") or {}
+    story = plan.get("story") or []
     prefer = {int(x) for x in plan.get("prefer", [])}
     cand, unary, aligned, spare = [], [], [], []
     for a, b in segs:
@@ -211,11 +329,14 @@ def autofill(project_path, song, db=None, plan=None, t0=None, t1=None, duration=
         sa, sb = t0 + a / fps, t0 + b / fps
         e = _energy_at(m, sa, sb)
         sec = _section_at(m, (sa + sb) / 2)
-        rule = rules.get(sec["label"]) or rules.get("default") or {}
+        told = _story_rule(story, (a + b) / 2.0 / fps)
+        rule = told or rules.get(sec["label"]) or rules.get("default") or {}
         hits = [(t - sa, s) for t, s in _hits_in(m, sa, sb)]
         rows = []
         for k, s in enumerate(found):
             if s["length"] < L + 2.0 / fps:
+                continue
+            if told and not _story_ok(s, told):
                 continue
             want = rule.get("motion")
             target = {"high": 0.9, "low": 0.15}.get(want, e)
@@ -230,7 +351,9 @@ def autofill(project_path, song, db=None, plan=None, t0=None, t1=None, duration=
         spare.append([(r[1], r[2], r[3]) for r in rows])   # все по оценке — для замены повторов
         rows = rows[:TOP_K]
         if not rows:
-            raise _api.ToolError("nothing_to_render", f"нет плана длиннее {L:.2f} с для отрезка")
+            where = f" (сюжет с {told.get('from', 0)} с)" if told else ""
+            raise _api.ToolError("nothing_to_render",
+                                 f"нет плана длиннее {L:.2f} с для отрезка {a / fps:.2f} с{where}")
         cand.append([r[1] for r in rows])
         unary.append([r[0] for r in rows])
         aligned.append({r[1]: (r[2], r[3]) for r in rows})
@@ -289,19 +412,35 @@ def autofill(project_path, song, db=None, plan=None, t0=None, t1=None, duration=
         if fx not in FX_PRESETS:
             raise _api.ToolError("usage", f"--fx: {', '.join(FX_PRESETS)}")
         effects += FX_PRESETS[fx]
+    turns = {}                           # клипов части — для cycle стиля
     for i, ((a, b), k) in enumerate(zip(segs, chosen)):
         s = found[k]
         L = (b - a) / fps
         in_s, acc = aligned[i][k]
-        ops.append({"op": "add", "shot": s["id"], "in_offset": round(in_s - s["t0"], 6),
-                    "length": round(L, 6)})
-        for e in effects:
-            ops.append({"op": "effect", "clip": "last", "effect": dict(e)})
         sec = _section_at(m, t0 + (a + b) / 2 / fps)
+        rule = sec_rules.get(sec["label"]) or sec_rules.get("default") or {}
+        cycle = rule.get("cycle") or []
+        turn = turns.get(sec["label"], 0)
+        turns[sec["label"]] = turn + 1
+        add = {"op": "add", "shot": s["id"], "in_offset": round(in_s - s["t0"], 6),
+               "length": round(L, 6)}
+        ts = _transition_s(rule, i, segs, fps, in_s, s["t0"])
+        if ts:
+            # Клип длиннее на переход и раньше на него же: pack ставит его
+            # внахлёст, а конец (и все резы дальше) остаётся на месте.
+            add.update(in_offset=round(in_s - ts - s["t0"], 6), length=round(L + ts, 6),
+                       fields={"transition": rule["transition"], "transition_s": round(ts, 6)})
+        ops.append(add)
+        own = list(rule.get("effects") or []) + (list(cycle[turn % len(cycle)]) if cycle else [])
+        for e in effects + own:
+            ops.append({"op": "effect", "clip": "last", "effect": dict(e)})
         report.append({"segment": i + 1, "start": round(a / fps, 6), "end": round(b / fps, 6),
                        "shot": s["id"], "file": s["file"], "in_s": round(in_s, 3),
                        "accent_on_hit": round(acc, 3), "motion": s["motion"], "scale": s["scale"],
-                       "section": f"{sec['label']} {sec.get('group', '')}".strip()})
+                       "section": f"{sec['label']} {sec.get('group', '')}".strip(),
+                       **({"transition_s": round(ts, 3)} if ts else {})})
+    if sty and sty.get("finish"):
+        ops.append({"op": "settings", "fields": {"finish": list(sty["finish"])}})
     song_probe = _api.media_probe.probe_media(song).get("clip") or {}
     audio = mp.Clip(src=_api.os.path.abspath(song), in_s=t0, out_s=t1, track=2, start=0.0,
                     has_video=False, audio_path=_api.os.path.abspath(song),
@@ -316,9 +455,19 @@ def autofill(project_path, song, db=None, plan=None, t0=None, t1=None, duration=
         if mk["kind"] == "slot":
             mk["t"] = round(_api.snap_frame(mk["t"], fps)[0], 6)
     _api.merge_markers(q, marks, _api.MUSIC_WRITE_KINDS, 0.0, float("inf"))
+    if marks_extra:
+        q.markers = sorted(q.markers + mp.parse_markers(marks_extra), key=lambda x: (x.t, x.kind))
     _api.montage_project.save_project(q, project_path)
     problems = mp.validate(q.to_dict(), strict=True, check_files=True)
     return {"project": _api.os.path.abspath(str(project_path)), "song": _api.os.path.abspath(song),
             "window": [round(t0, 3), round(t1, 3)], "fps": fps, "segments": report,
             "duration": round(q.duration(), 6), "candidates": len(found),
-            "tempo": m["tempo"], "problems": problems}
+            "tempo": m["tempo"], "problems": problems,
+            "template": ({"source": skel.get("source"),
+                          "pops": sum(x["label"] == "pop" for x in marks_extra),
+                          "flashes": sum(x["label"] == "flash" for x in marks_extra)}
+                         if skel else None),
+            "style": ({"name": sty.get("name"), "min_shot": min_shot,
+                       "lead_frames": int(rhythm.get("lead_frames", 0)),
+                       "transitions": sum(1 for r in report if r.get("transition_s")),
+                       "finish": len(sty.get("finish") or [])} if sty else None)}

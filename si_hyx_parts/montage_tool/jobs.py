@@ -132,6 +132,11 @@ ASSETS = {
         "member": "rife-ncnn-vulkan-refs/heads/master-windows/rife-v4.25/flownet.param",
         "sha256": "99d0f49866ff06f170c08e570e3e1b67b89019e3d11a87c8f0e7908fa50ab4c1",
         "size": 31669, "license": "MIT (TNTwise rife-ncnn-vulkan; веса hzwer Practical-RIFE)"},
+    # Персонаж без фона (Clip.matte anime): ISNet, обученный на аниме.
+    "matte/isnetis.onnx": {
+        "url": "https://huggingface.co/skytnt/anime-seg/resolve/493cb60893f47441b26ec4fb9a306bce9e342982/isnetis.onnx",
+        "sha256": "f15622d853e8260172812b657053460e20806f04b9e05147d49af7bed31a6e99",
+        "size": 176069933, "license": "Apache-2.0 (skytnt anime-seg)"},
     # Локальное зрение (look): llama.cpp с Vulkan и Qwen3.5-2B (GGUF unsloth).
     "llama/llama-b11838-bin-win-vulkan-x64.zip": {
         "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11838/llama-b11838-bin-win-vulkan-x64.zip",

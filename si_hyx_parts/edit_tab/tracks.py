@@ -714,9 +714,17 @@ class EditTabTracksMixin:
             return None
         if codec not in ('ass', 'ssa', 'mov_text') or not src:
             return None
+        path = None
         if kind == 'ext' and codec == 'ass':
+            path = ref
+        elif (codec in ('ass', 'ssa') and getattr(self, "_sub_use_ass", False)
+              and getattr(self, "_sub_sel_entry", None) == (kind, ref)):
+            # Дорожку уже показывает плеер — её .ass извлечён тем же ffmpeg
+            # (AssExtractor); второй проход по всему контейнеру долог.
+            path = getattr(self, "_ass_path", None)
+        if path:
             try:
-                with open(ref, 'r', encoding='utf-8-sig', errors='replace') as f:
+                with open(path, 'r', encoding='utf-8-sig', errors='replace') as f:
                     return f.read()
             except Exception:
                 pass
@@ -761,8 +769,13 @@ class EditTabTracksMixin:
                 cues_arg = subtitle_style.edit_cues(original) if original else None
                 if not cues_arg:
                     original = None
-                    srt = self._extract_srt_for_entry(kind, ref)
-                    cues_arg = _api._parse_srt(srt) if srt else None
+                    shown = list(getattr(self, "_sub_cues", None) or [])
+                    if shown and getattr(self, "_sub_sel_entry", None) == (kind, ref):
+                        # Реплики этой дорожки уже разобраны для показа в плеере.
+                        cues_arg = shown
+                    else:
+                        srt = self._extract_srt_for_entry(kind, ref)
+                        cues_arg = _api._parse_srt(srt) if srt else None
                 if not cues_arg:
                     _api.msgbox_warning(
                         self, "Субтитры",
@@ -1212,7 +1225,7 @@ class EditTabTracksMixin:
                 with open(path, 'r', encoding='utf-8', errors='replace') as f:
                     res = subtitle_style.play_res(f.read())
                 overrides = _api.prog_sub_force_style(
-                    res[1], play_res_x=res[0]).split(",")
+                    res[1], play_res_x=res[0], keep_layout=True).split(",")
             # Шрифт караоке — у реплик, созданных в «Создать субтитры» стилем
             # по умолчанию, и у стиля программы (системным провайдером libass
             # он не виден).
@@ -1322,13 +1335,13 @@ class EditTabTracksMixin:
         вложенные attachments контейнера и отдаём их через :fontsdir."""
         if ext_sub:
             esc = self._escape_filter_path(ext_sub)
-            vf = f"subtitles='{esc}'"
+            vf = f"subtitles={esc}"
             sub_codec = _api.os.path.splitext(ext_sub)[1].lower().lstrip('.')
         else:
             if burn_idx is None or burn_idx < 0:
                 return None
             esc = self._escape_filter_path(src)
-            vf = f"subtitles='{esc}':si={burn_idx}"
+            vf = f"subtitles={esc}:si={burn_idx}"
             try:
                 sub_codec = (self._sub_streams[burn_idx].get('codec_name') or '').lower()
             except Exception:
@@ -1341,7 +1354,7 @@ class EditTabTracksMixin:
             # ASS-копию с холстом по размеру видео (subtitle_style).
             fixed = subtitle_style.mov_text_burn_file(src, burn_idx)
             if fixed:
-                vf = f"subtitles='{self._escape_filter_path(fixed)}'"
+                vf = f"subtitles={self._escape_filter_path(fixed)}"
         if apply_prog_style:
             # Караоке-вид — РОВНО как в превью Монтажа (_paint_subtitle считает
             # пиксели по тем же правилам libass). Текстовые субтитры ffmpeg
@@ -1350,14 +1363,16 @@ class EditTabTracksMixin:
             # пересчитывается на его PlayResY, иначе на холсте 1080 текст вышел
             # бы вчетверо мельче. Превью берёт тот же force_style (см.
             # _on_ass_extracted), поэтому вид в плеере и в файле один.
+            # Раскладка у ASS/SSA — своя, как в оригинале (keep_layout).
             res = (self._ass_play_res(src, ext_sub, burn_idx)
                    if native_styled else None) or (None, None)
-            vf += (f":force_style='"
-                   f"{_api.prog_sub_force_style(res[1], play_res_x=res[0])}'")
+            style = _api.prog_sub_force_style(res[1], play_res_x=res[0],
+                                              keep_layout=native_styled)
+            vf += f":force_style='{style}'"
         fonts_dir = self._subtitle_fonts_dir(src)
         if fonts_dir:
             fesc = self._escape_filter_path(fonts_dir)
-            vf += f":fontsdir='{fesc}'"
+            vf += f":fontsdir={fesc}"
         return vf
 
     def _sub_prog_style(self, codec):

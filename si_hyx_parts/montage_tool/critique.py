@@ -4,14 +4,17 @@
 """Отчёт-критик монтажа под музыку: check-sync <проект>.
 Public namespace: montage_tool.
 
-Резы — стыки клипов основной дорожки (у перехода — начало входящего).
+Резы — стыки клипов основной дорожки (у перехода — его конец: входящий
+план виден целиком).
 Для каждого: смещение в кадрах проекта от ближайшей доли, сильной доли и
 удара (бочка, малый) по маркерам проекта (music --write или autofill).
 Итог: доля резов на сетке (±1 кадр), на сильных долях, на ударах; по
 частям песни — резов в секунду против рекомендованного по энергии части;
 гистограмма длин; повторы кусков исходника; соседние куски одного плана
 (скачок внутри плана); по каталогу — тёмные кадры, вспышки на резе,
-хардсаб, опенинг/эндинг. Проблемы — списком со временем проекта."""
+хардсаб, опенинг/эндинг. Текст песни — запаздывание (lyric_lateness):
+когда текст читается, против звука его слова. Проблемы — списком со
+временем проекта."""
 import collections
 
 import numpy as np
@@ -47,8 +50,87 @@ def _catalog_hits(db, clip):
         con.close()
 
 
-def check_sync(p, db=None):
-    """Отчёт (только JSON-типы): числа, резы с отклонениями и проблемы."""
+# Текст читается к середине появления (in_s); без in_s у анимации — как в
+# text_fx.kinetic_text. Позже звука слова больше чем на кадр — проблема.
+LYRIC_MATCH = 0.6                    # сходство подписи метки word со словом текста
+LYRIC_REACH_S = 1.0                  # метка слова ищется не дальше от начала текста
+ATTACK_REACH_S = 0.15                # атака вокала — не дальше от метки слова
+LYRIC_EARLY_S = 0.6                  # раньше — текст висит до слова слишком долго
+
+
+def _readable_at(t):
+    st = t.style or {}
+    anim = st.get("animation", "none")
+    dur = max(0.01, t.end - t.start)
+    in_s = st.get("in_s")
+    if in_s is None:
+        in_s = 0.0 if anim in ("none", "") else min(0.3, max(0.06, dur / 3))
+    return t.start + 0.5 * float(in_s)
+
+
+def vocal_attacks(p, ctl=None, python=""):
+    """Атаки вокала звука проекта (время проекта): начала звука стема вокала
+    HTDemucs из кэша карты песни (music_project; нет — считается)."""
+    from si_hyx_parts.montage_tool import analysis as _an
+    m = _api.music_project(p, 0.0, None, None, python=python, drums=True, sections=False,
+                           ctl=ctl)
+    path = _api.os.path.join(m["cache"], "stems", "vocals.wav")
+    if not _api.os.path.isfile(path):
+        raise _api.ToolError("ml_unavailable", "нет стема вокала (нужен Python генератора)")
+    env = _an.onset_envelope(_an.file_audio(path))
+    return np.array([i * _an.HOP_S + _an.ONSET_LAG_S for i in _an.pick_onsets(env)])
+
+
+def lyric_lateness(p, attacks=None):
+    """Тексты проекта против звука слов: время слова — метка word с тем же
+    словом (первое слово текста), с attacks — ближайшая к ней атака вокала.
+    {texts, matched, late, mean_late_s, max_late_s, rows, problems}."""
+    from rapidfuzz import fuzz
+    from si_hyx_parts.montage_tool.typography import _key
+    fps = p.output_format()[2]
+    words = sorted((m for m in p.markers if m.kind == "word" and m.label.strip()),
+                   key=lambda m: m.t)
+    wt = np.array([m.t for m in words])
+    rows, problems = [], []
+    for t in sorted(p.texts, key=lambda t: t.start):
+        first = next((k for k in map(_key, t.text.split()) if k), "")
+        if not first or not len(wt):
+            continue
+        i0 = int(np.searchsorted(wt, t.start - LYRIC_REACH_S))
+        i1 = int(np.searchsorted(wt, t.start + LYRIC_REACH_S))
+        cand = [(abs(words[i].t - t.start), i) for i in range(i0, i1)
+                if fuzz.ratio(first, _key(words[i].label)) / 100.0 >= LYRIC_MATCH]
+        if not cand:
+            continue
+        sung = words[min(cand)[1]].t
+        src = "word"
+        if attacks is not None and len(attacks):
+            d = _nearest(attacks, sung)
+            if d is not None and abs(d) <= ATTACK_REACH_S:
+                sung, src = sung + d, "attack"
+        seen = _readable_at(t)
+        late = seen - sung
+        row = {"t": round(t.start, 3), "text": t.id, "sung": round(sung, 3), "by": src,
+               "late_s": round(late, 3), "late_frames": round(late * fps, 2)}
+        rows.append(row)
+        if late * fps > 1.0:
+            problems.append({"t": row["t"], "kind": "lyric_late", "text": t.id,
+                             "message": f"текст читается на {late:.2f} с позже слова "
+                                        f"(начало {t.start:.2f}, слово {sung:.2f})"})
+        elif late < -LYRIC_EARLY_S:
+            problems.append({"t": row["t"], "kind": "lyric_early", "text": t.id,
+                             "message": f"текст на {-late:.2f} с раньше слова"})
+    lates = [r["late_s"] for r in rows]
+    return {"texts": len(p.texts), "matched": len(rows),
+            "late": sum(1 for r in rows if r["late_frames"] > 1.0),
+            "mean_late_s": round(float(np.mean(lates)), 3) if lates else None,
+            "max_late_s": round(float(np.max(lates)), 3) if lates else None,
+            "attacks": attacks is not None, "rows": rows, "problems": problems}
+
+
+def check_sync(p, db=None, attacks=None):
+    """Отчёт (только JSON-типы): числа, резы с отклонениями и проблемы.
+    attacks — атаки вокала (vocal_attacks) для запаздывания текста."""
     fps = p.output_format()[2]
     main = p.clips_on(p.main_track)
     if len(main) < 2:
@@ -61,7 +143,9 @@ def check_sync(p, db=None):
     hits = np.array(sorted(m.t for k in ("kick", "snare") for m in by[k]))
     if not len(beats):
         raise _api.ToolError("no_markers", "в проекте нет маркеров долей: music --write или autofill")
-    cuts = [c.start for c in main[1:]]
+    # Рез растворения — его конец (новый план виден целиком): так его ставит
+    # на долю autofill --style.
+    cuts = [c.start + p.transition_overlap(prev, c) for prev, c in zip(main, main[1:])]
     rows, problems = [], []
     for c, t in zip(main[1:], cuts):
         d_beat, d_down, d_hit = (_nearest(beats, t), _nearest(downs, t), _nearest(hits, t))
@@ -132,6 +216,9 @@ def check_sync(p, db=None):
                 if acc.get("kind") == "flash" and abs(acc["t"] - c.in_s) < 0.1:
                     problems.append({"t": round(c.start, 3), "kind": "flash_at_cut", "clip": c.id,
                                      "message": "клип начинается со вспышки"})
+    lyrics = lyric_lateness(p, attacks) if p.texts else None
+    if lyrics:
+        problems += lyrics.pop("problems")
     summary = {"cuts": n, "fps": fps,
                "on_beat": round(sum(r["on_beat"] for r in rows) / n, 3),
                "on_downbeat": round(sum(r["on_downbeat"] for r in rows) / n, 3),
@@ -140,5 +227,8 @@ def check_sync(p, db=None):
                                                             if r["beat_frames"] is not None])), 3),
                "clips": len(main), "mean_length": round(float(np.mean(lengths)), 3),
                "clips_in_catalog": catalog, "problems": len(problems)}
+    if lyrics:
+        summary["lyrics_late"] = lyrics["late"]
+        summary["lyrics_mean_late_s"] = lyrics["mean_late_s"]
     return {"summary": summary, "length_histogram": hist, "sections": sections,
-            "cuts": rows, "problems": sorted(problems, key=lambda x: x["t"])}
+            "cuts": rows, "lyrics": lyrics, "problems": sorted(problems, key=lambda x: x["t"])}

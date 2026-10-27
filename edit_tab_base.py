@@ -172,6 +172,21 @@ def s_to_time(seconds: float) -> str:
     sec = s - h * 3600 - m * 60
     return f"{h:02d}:{m:02d}:{sec:06.3f}"
 
+def s_to_clock(seconds: float) -> str:
+    """Короткая метка времени внутри отрезка: «мм:сс.сс» (с часами — «ч:мм:сс.сс»),
+    со знаком минус для времени до начала отрезка."""
+    s = float(seconds or 0.0)
+    if not math.isfinite(s):
+        s = 0.0
+    sign = "-" if s < -0.005 else ""
+    s = round(abs(s), 2)
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = s - h * 3600 - m * 60
+    if h:
+        return f"{sign}{h}:{m:02d}:{sec:05.2f}"
+    return f"{sign}{m:02d}:{sec:05.2f}"
+
 def format_fps(fps):
     if fps is None:
         return "—"

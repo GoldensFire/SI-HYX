@@ -107,8 +107,9 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
         # Номер места тайтла в списке — слева от постера (в зарезервированном
-        # левом отступе строки, см. padding-left у QListWidget::item).
-        rank = index.row() + 1
+        # левом отступе строки, см. padding-left у QListWidget::item). Место —
+        # во всей выдаче, а не на открытой странице.
+        rank = index.row() + 1 + getattr(self._tab, "_page", 0) * _api._PAGE_SIZE
         painter.save()
         f = _api.QFont(option.font)
         f.setBold(True)

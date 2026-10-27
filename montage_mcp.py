@@ -252,12 +252,17 @@ async def montage_music(
         t0: Seconds = 0.0, t1: Annotated[float | None, Field(description="конец отрезка, с")] = None,
         fps: Annotated[float, Field(description="места резов на сетке кадров этой частоты")] = 0.0,
         gemini: Annotated[bool, Field(description="подписи частей — один запрос Gemini (квота пользователя)")] = False,
-        no_drums: bool = False, brief: bool = True) -> str:
+        segment: Annotated[float, Field(description="сплошной кусок ~N с по границам частей песни")] = 0.0,
+        segment_out: Annotated[str, Field(description="вырезать этот кусок в WAV (затухание 3 с)")] = "",
+        overwrite: bool = False, no_drums: bool = False, brief: bool = True) -> str:
     """Карта песни: темп, размер, доли, такты, фразы, части (A/B…, verse/chorus), энергия,
-    удары бочки/малого/хэта, места резов с приоритетом. Первый раз ~3 мин на песню, потом из кэша."""
+    удары бочки/малого/хэта, места резов с приоритетом. Первый раз ~3 мин на песню, потом из кэша.
+    segment — выбрать сплошной кусок песни (песня до N×1,25 — целиком), segment_out — вырезать его."""
     args = [media, *_opt("--t0", t0 or None), *_opt("--t1", t1), *_opt("--fps", fps or None),
             *_opt("--write", write_project), *_opt("--track", track), *_opt("--kinds", kinds),
-            *_opt("--gemini", gemini), *_opt("--no-drums", no_drums), *_opt("--brief", brief)]
+            *_opt("--gemini", gemini), *_opt("--segment", segment or None),
+            *_opt("--segment-out", segment_out), *_opt("--overwrite", overwrite),
+            *_opt("--no-drums", no_drums), *_opt("--brief", brief)]
     return _text(await _run(ctx, "music", *args, progress=True))
 
 
@@ -266,12 +271,38 @@ async def montage_index(
         ctx: Context, target: Annotated[str, Field(description="видеофайл или папка серий")],
         db: str = "", force: bool = False,
         tagger: Annotated[str, Field(description="vit (быстрее) или eva02")] = "vit",
-        gemini: Annotated[bool, Field(description="описания сцен Gemini (квота пользователя)")] = False) -> str:
+        gemini: Annotated[bool, Field(description="описания сцен Gemini (квота пользователя)")] = False,
+        speech: Annotated[bool, Field(description="ещё реплики серий (Whisper) — для montage_lines и op voice")] = False,
+        language: Annotated[str, Field(description="язык речи: ru, ja, en… или auto")] = "auto",
+        captions: Annotated[bool, Field(description="подписи планов локальной моделью — искать словами (query)")] = False) -> str:
     """Каталог планов: границы, движение, акценты, крупность, персонажи, теги, текст, OP/ED.
-    ~15 мин на серию 24 мин 1080p (CPU); уже проиндексированные файлы пропускаются."""
+    ~15 мин на серию 24 мин 1080p (CPU); уже проиндексированные файлы пропускаются.
+    speech — ещё расшифровка речи (несколько минут на серию); captions — подписи планов
+    (llama.cpp, без сети; планы без подписи у всех файлов цели)."""
     args = [target, *_opt("--db", db), *_opt("--force", force), "--tagger", tagger,
-            *_opt("--gemini", gemini)]
+            *_opt("--gemini", gemini), *_opt("--speech", speech),
+            *(["--language", language] if speech else []), *_opt("--captions", captions)]
     return _text(await _run(ctx, "index", *args, progress=True))
+
+
+@mcp.tool(annotations=READ, structured_output=False)
+async def montage_lines(
+        say: Annotated[str, Field(description="фраза на языке серий")],
+        file: Annotated[str, Field(description="часть пути файла")] = "",
+        db: str = "", limit: int = 10) -> str:
+    """Реплики каталога (index speech=true), похожие на фразу: файл, время, слова со временем,
+    планы под репликой. Вставить голос — montage_edit op voice {src, in, out, at, clean}."""
+    return _text(await _run(None, "lines", "--say", say, *_opt("--file", file), *_opt("--db", db),
+                            "--limit", limit))
+
+
+@mcp.tool(annotations=WRITE, structured_output=False)
+async def montage_reference(
+        ctx: Context, video: Annotated[str, Field(description="готовый AMV-эталон")],
+        out: Annotated[str, Field(description="скелет JSON для montage_autofill template")] = "") -> str:
+    """Скелет эталона: резы, появления слоёв и вспышки в долях его песни, длина плана в долях,
+    доля резов на долях/полудолях. С out — файл для autofill template (ритм «как у них»)."""
+    return _text(await _run(ctx, "reference", video, *_opt("--out", out), progress=True))
 
 
 def _search_argv(query, tags, any_tags, no_tags, character, motion_min, motion_max,
@@ -342,25 +373,36 @@ async def montage_autofill(
         plan: Annotated[dict[str, Any] | None, Field(description="план: files, min_shot, exclude_tags, sections{chorus/verse/…: motion, scale, tags_any, characters}, prefer, avoid")] = None,
         fx: Annotated[str, Field(description="эффекты по ударам: amv, soft или пусто")] = "",
         library: str = "", min_shot: float = 0.35, overwrite: bool = False,
-        gemini: Annotated[bool, Field(description="части песни — запрос Gemini (карта после montage_music gemini=true берётся из кэша и так)")] = False) -> str:
-    """Черновик AMV: окно песни, резы на местах резов, планы каталога по энергии частей,
-    акцент плана — на удар. Маркеры песни пишутся в проект."""
+        gemini: Annotated[bool, Field(description="части песни — запрос Gemini (карта после montage_music gemini=true берётся из кэша и так)")] = False,
+        template: Annotated[str, Field(description="скелет эталона (montage_reference out): резы на его доли, маркеры custom pop/flash")] = "",
+        style: Annotated[str, Field(description="стиль AMV (montage_styles): шаг резов по частям, эффекты и переходы частей, отделка кадра")] = "") -> str:
+    """Черновик AMV: окно песни, резы на местах резов (или на долях эталона — template,
+    или с шагом стиля — style), планы каталога по энергии частей, акцент плана — на удар.
+    Маркеры песни пишутся в проект."""
     plan_file = _json_file(plan, "plan") if plan else ""
     try:
         args = [project, "--song", song, *_opt("--duration", duration), *_opt("--t0", t0),
                 *_opt("--t1", t1), *_opt("--plan", plan_file), *_opt("--fx", fx),
                 *_opt("--library", library), "--min-shot", min_shot, *_opt("--overwrite", overwrite),
-                *_opt("--gemini", gemini)]
+                *_opt("--gemini", gemini), *_opt("--template", template), *_opt("--style", style)]
         return _text(await _run(ctx, "autofill", *args, progress=True))
     finally:
         if plan_file:
             os.remove(plan_file)
 
 
+@mcp.tool(annotations=READ, structured_output=False)
+async def montage_styles(
+        name: Annotated[str, Field(description="имя стиля (provant…) или пусто — список")] = "") -> str:
+    """Стили AMV из docs/amv-styles: ритм, отделка частей, роли текста (edit preset
+    «стиль.роль» у text/words/lyrics) и карточки (op card); описание словами — <имя>.md."""
+    return _text(await _run(None, "styles", *([name] if name else [])))
+
+
 @mcp.tool(annotations=WRITE, structured_output=False)
 async def montage_edit(
         project: Project,
-        ops: Annotated[list[dict[str, Any]], Field(description="операции: add/trim/split/swap/move/set/delete/text/effect (см. montage_guide); время — число или ссылка на маркер (downbeat#18, section:chorus#2, slot#12.end)")],
+        ops: Annotated[list[dict[str, Any]], Field(description="операции: add/trim/split/swap/move/set/delete/text/effect/words/lyrics/voice/settings/card/strobe (см. montage_guide); время — число или ссылка на маркер (downbeat#18, section:chorus#2, slot#12.end, custom:pop#3); preset «стиль.роль» — роль текста или карточка стиля (montage_styles)")],
         db: str = "", dry_run: bool = False, lenient: bool = False) -> str:
     """Точечные правки проекта списком операций; ошибка в любой — проект не меняется."""
     ops_file = _json_file(ops, "ops")
@@ -372,10 +414,13 @@ async def montage_edit(
 
 
 @mcp.tool(annotations=READ, structured_output=False)
-async def montage_check_sync(project: Project, db: str = "") -> str:
+async def montage_check_sync(ctx: Context, project: Project, db: str = "",
+                             vocals: Annotated[bool, Field(description="запаздывание текста — по атакам вокала (стем песни из кэша; первый раз ~2 мин)")] = False) -> str:
     """Отчёт ритма: резы на долях/сильных долях/ударах (±1 кадр), плотность по частям,
-    длины планов, повторы, скачки, тёмные кадры, хардсаб, OP/ED. Звать после каждой правки."""
-    return _text(await _run(None, "check-sync", project, *_opt("--db", db)))
+    длины планов, повторы, скачки, тёмные кадры, хардсаб, OP/ED; текст песни позже звука
+    слова (lyrics, проблемы lyric_late). Звать после каждой правки."""
+    return _text(await _run(ctx, "check-sync", project, *_opt("--db", db),
+                            *_opt("--vocals", vocals), progress=vocals))
 
 
 @mcp.tool(annotations=READ, structured_output=False)
@@ -454,10 +499,13 @@ async def montage_dry_run(project: Project, output: Path, encoder: str = "auto")
 
 @mcp.tool(annotations=WRITE, structured_output=False)
 async def montage_render(ctx: Context, project: Project, output: Path, encoder: str = "auto",
-                         overwrite: bool = False) -> str:
-    """Сборка проекта в видео (прогресс — уведомлениями; отмена вызова — отмена сборки)."""
+                         overwrite: bool = False,
+                         preview: Annotated[bool, Field(description="превью: 540p и кодировщик видеокарты")] = False) -> str:
+    """Сборка проекта в видео (прогресс — уведомлениями; отмена вызова — отмена сборки).
+    preview — быстрое превью 540p на видеокарте, проект на диске не меняется."""
     return _text(await _run(ctx, "render", project, output, "--encoder", encoder,
-                            *_opt("--overwrite", overwrite), progress=True))
+                            *_opt("--overwrite", overwrite), *_opt("--preview", preview),
+                            progress=True))
 
 
 @mcp.tool(annotations=WRITE, structured_output=False)

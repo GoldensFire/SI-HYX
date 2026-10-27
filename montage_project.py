@@ -38,8 +38,8 @@ PROJECT_VERSION = 3
 # Поля v3 у клипа: пустые в файл не пишутся, и проект без них остаётся v2 —
 # его читают и прежние версии программы.
 _V3_CLIP_FIELDS = ('keyframes', 'effects', 'speed_curve', 'curve_audio', 'interpolate',
-                   'upscale')
-_V3_SETTINGS = {'upscale': '', 'deband': False}
+                   'upscale', 'crop', 'box', 'mask', 'stroke', 'blend', 'matte')
+_V3_SETTINGS = {'upscale': '', 'deband': False, 'finish': []}
 MIN_CLIP_S = 0.04          # короче клип не бывает (подрезка, разрезание)
 MIN_SPEED = 0.1            # пределы скорости клипа (доли и разы)
 MAX_SPEED = 8.0
@@ -177,6 +177,13 @@ class Clip:
     curve_audio: bool = False     # звук клипа с кривой скорости (rubberband); иначе тишина
     interpolate: str = ''         # RIFE для замедления (vulkan_fx.RIFE_MODELS); '' — нет
     upscale: str = ''             # Anime4K (vulkan_fx.UPSCALE_PRESETS); '' — как проект, none — нет
+    # v3 — слои (si_hyx_parts/montage_project/layers.py); пустые — как раньше.
+    crop: list = field(default_factory=list)        # [x0, y0, x1, y1] кусок кадра исходника
+    box: list = field(default_factory=list)         # [ширина, высота] наложения, доли кадра
+    mask: dict = field(default_factory=dict)        # форма видимой части наложения
+    stroke: dict = field(default_factory=dict)      # обводка по альфе наложения
+    blend: str = ''               # режим наложения (layers.BLEND_MODES); '' — обычный
+    matte: str = ''               # вырезать персонажа (layers.MATTE_MODELS); '' — нет
 
     def __post_init__(self):
         """Типы и пределы полей — при любом создании клипа: из файла проекта,
@@ -227,6 +234,12 @@ class Clip:
                         else '')
         if self.speed_curve and (self.is_image or self.frozen or self.reverse):
             self.speed_curve = []        # кривая — только у обычного видео/звука
+        self.crop = sanitize_crop(self.crop)
+        self.box = sanitize_box(self.box)
+        self.mask = sanitize_mask(self.mask)
+        self.stroke = sanitize_stroke(self.stroke)
+        self.blend = sanitize_blend(self.blend)
+        self.matte = sanitize_matte(self.matte) if not self.is_image else ''
 
     @property
     def frozen(self):
@@ -283,6 +296,7 @@ class TextItem:
     style: dict = field(default_factory=dict)
     pos_x: float = None
     pos_y: float = None
+    layer: int = None             # v3: над какой видеодорожкой (индекс); None — поверх всего
 
 
 @dataclass
@@ -298,6 +312,7 @@ class ProjectSettings:
     duck: float = 0.0             # 0…1: насколько голос (Track.role) приглушает музыку
     upscale: str = ''             # v3: Anime4K для кадров меньше кадра проекта; '' — нет
     deband: bool = False          # v3: deband libplacebo вместе с апскейлом
+    finish: list = field(default_factory=list)  # v3: эффекты всего кадра (effects.FINISH_TYPES)
 
 
 @dataclass
@@ -588,6 +603,50 @@ class Project:
             self.pack()
         return True
 
+    def move_group(self, ids, lead_id, track, start):
+        """Переносит выделенные клипы вместе. Ведущий lead_id (его тянут мышью)
+        встаёт как в move(): на дорожку track, на место start; остальные
+        сдвигаются на ту же разницу по времени, оставаясь на своих дорожках.
+        Клипы основной дорожки едут одним блоком в прежнем порядке (дорожка
+        магнитная), клипы свободных — каждый на свой новый start."""
+        lead = self.clip(lead_id)
+        if lead is None or not (0 <= track < len(self.tracks)):
+            return False
+        ids = set(ids) | {lead_id}
+        group = [c for c in self.clips if c.id in ids]
+        if len(group) < 2:
+            return self.move(lead_id, track, start)
+        if self.tracks[track].kind != ('video' if lead.has_video else 'audio'):
+            return False
+        main = self.main_track
+        dst = {c.id: (track if c is lead else c.track) for c in group}
+        delta = start - lead.start
+        # Свободные клипы не уходят левее начала шкалы — тогда и вся группа.
+        free = [c for c in group if dst[c.id] != main]
+        if free:
+            delta = max(delta, -min(c.start for c in free))
+        new_start = {c.id: max(0.0, c.start + delta) for c in group}
+        block = sorted((c for c in group if dst[c.id] == main),
+                       key=lambda c: (new_start[c.id], c.start))
+        for c in group:
+            c.track = dst[c.id]
+        if block:
+            # Блок встаёт перед клипом, чья середина правее начала блока (как move).
+            at = new_start[block[0].id]
+            others = [o for o in self.clips_on(main) if o.id not in ids]
+            pos = next((i for i, o in enumerate(others) if at < o.start + o.length / 2.0),
+                       len(others))
+            order = others[:pos] + block + others[pos:]
+            for i, o in enumerate(order):
+                o.start = float(i)
+        rest = sorted((c for c in group if dst[c.id] != main), key=lambda c: new_start[c.id])
+        for c in rest:
+            c.start = new_start[c.id]
+        for c in rest:
+            self._free_spot(c)
+        self.pack()
+        return True
+
     def trim(self, cid, edge, t):
         """Подрезка за край: edge 'left' или 'right', t — время проекта, куда
         тянут край. Пределы — начало и конец исходника (у картинки только
@@ -742,6 +801,12 @@ class Project:
             gaps.append("интерполяция RIFE")
         if self.settings.upscale or any(c.upscale not in ('', 'none') for c in self.clips):
             gaps.append("апскейл Anime4K")
+        if any(c.crop or c.box or c.mask or c.stroke or c.blend for c in self.clips):
+            gaps.append("обрезка, маски, обводка и режимы наложения")
+        if any(c.matte for c in self.clips):
+            gaps.append("вырезанный персонаж")
+        if self.settings.finish:
+            gaps.append("эффекты всего кадра")
         return gaps
 
     def output_format(self):
@@ -785,12 +850,22 @@ class Project:
                 v3 = True
             else:
                 settings.pop(k, None)
+        texts = []
+        for t in self.texts:
+            d = asdict(t)
+            if d.get('layer') is None:
+                d.pop('layer', None)
+            else:
+                v3 = True
+            if is_kinetic(t.style or {}):
+                v3 = True
+            texts.append(d)
         return {'version': PROJECT_VERSION if v3 else 2,
                 'settings': settings,
                 'tracks': [asdict(t) for t in self.tracks],
                 'clips': clips,
                 'markers': [asdict(m) for m in self.markers],
-                'texts': [asdict(t) for t in self.texts]}
+                'texts': texts}
 
     @classmethod
     def from_dict(cls, data, strict=False):
@@ -986,9 +1061,14 @@ def load_project(path, strict=False):
 from si_hyx_parts.montage_project.schema import (  # noqa: E402
     describe_schema, migrate_project_data, parse_markers, parse_settings, parse_texts, validate)
 from si_hyx_parts.montage_project.effects import (  # noqa: E402,F401
-    EASES, EFFECT_KEYS, EFFECT_LIMITS, EFFECT_TYPES, CURVES_PRESETS, KEYFRAME_PROPS,
+    EASES, EFFECT_KEYS, EFFECT_LIMITS, EFFECT_TYPES, CURVES_PRESETS, FINISH_TYPES, KEYFRAME_PROPS,
     curve_length, curve_source_offset, has_fx, keyframe_value, sanitize_curve, sanitize_effect,
     sanitize_effects, sanitize_keyframes, split_fx)
+from si_hyx_parts.montage_project.layers import (  # noqa: E402,F401
+    BLEND_MODES, MASK_SHAPES, MATTE_MODELS, STROKE_STYLES, matte_path, matte_span, matte_wanted,
+    sanitize_blend, sanitize_box, sanitize_crop, sanitize_mask, sanitize_matte, sanitize_stroke)
+from si_hyx_parts.montage_project.text_fx import (  # noqa: E402,F401
+    FONT_ALIASES, is_kinetic, resolve_font)
 from si_hyx_parts.montage_project.vulkan_fx import (  # noqa: E402,F401
     RIFE_MODELS, UPSCALE_PRESETS, interp_path, interp_rate, interp_wanted, shader_path,
     to_compute, upscale_of, vulkan_ok)

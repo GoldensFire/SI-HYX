@@ -139,6 +139,10 @@ _VIEWS_SORT_MAX = 100
 # если нужного числа уже достаточно. 0 = без лимита.
 _STOP_LIMIT_DEFAULT = 500
 
+# Список показывает выдачу страницами: тысячи строк с обложками в одном
+# QListWidget тормозили прокрутку и пересортировку.
+_PAGE_SIZE = 100
+
 from si_hyx_parts.shikimori_tab.user_agent import _user_agent, _client_factory
 
 
@@ -187,10 +191,14 @@ from si_hyx_parts.shikimori_tab.franchise import (
     _franchise_key,
     _title_words,
     _same_franchise_prefix,
+    _franchise_prefix_index,
+    _matches_franchise_prefix,
 )
 from si_hyx_parts.shikimori_tab.background_tasks import (
     _SearchSignals,
     _SearchTask,
+    _CacheSearchSignals,
+    _CacheSearchTask,
     _GenresSignals,
     _GenresTask,
     _ThumbSignals,

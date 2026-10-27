@@ -102,7 +102,7 @@ def test_filter_graph_puts_overlay_before_base_chain():
     g = overlay.overlay_filter_graph("crop=100:100:0:0", [("a.png", 5, 7)],
                                      escape_path=lambda p: p)
     parts = g.split(";")
-    assert parts[0] == "movie='a.png',format=rgba[sihyxovl0]"
+    assert parts[0] == "movie=a.png,format=rgba[sihyxovl0]"
     assert parts[1] == "null[sihyxbase0]"
     assert parts[2].startswith("[sihyxbase0][sihyxovl0]overlay=x=5:y=7")
     assert parts[2].endswith("[sihyxbase1]")
@@ -194,8 +194,8 @@ def test_wrap_vf_without_overlays_returns_chain(tmp_path):
 def test_wrap_vf_escapes_windows_path(tmp_path):
     st = _vf_stub([(r"C:\tmp\ovl.png", 1, 2)])
     vf = EditTab._wrap_vf(st, "")
-    # Двоеточие диска обязано быть экранировано, иначе фильтр не инициализируется.
-    assert "movie='C\\:/tmp/ovl.png'" in vf
+    # Двоеточие диска обязано быть экранировано на обоих уровнях парсера.
+    assert "movie=C\\\\:/tmp/ovl.png" in vf
 
 
 # ── Цвет: overlay обязан работать в YUV ──────────────────────────────────────

@@ -29,17 +29,30 @@ geq альфы.
   flash       — заливка color с непрозрачностью amount, гаснет за decay
                 (drawbox по кадрам: enable по номеру кадра);
   rgb_shift   — сдвиг каналов на amount пикселей (rgbashift по уровням);
+  glitch      — сбой: полосы высотой period (px при 1080) сдвинуты вбок до
+                amount ширины кадра — псевдослучайно по номеру полосы и кадра,
+                половина полос на месте, цветность — в стороны от яркости
+                (geq ступенями силы с enable по номеру кадра);
   glow        — свечение: gblur sigma + screen с непрозрачностью amount;
   motion_blur — смаз движения: tmix по frames кадрам;
   vignette    — виньетка, angle (рад);
   color       — lut3d (.cube), eq (contrast, brightness, saturation, gamma),
-                curves (preset).
+                curves (preset), tint — окраска в один цвет со своей
+                яркостью (colorize), amount < 1 — смесь с исходным цветом;
+  grain       — зерно силой amount (0…1): шум geq по X, Y и номеру кадра
+                (детерминированно, у окна — тот же), grainmerge по яркости;
+  scanlines   — строки как на ЭЛТ/VHS: каждая period-я строка (px при
+                1080) темнее на amount — неподвижный узор, multiply по яркости;
+  halftone    — точечный растр шагом period, точки темнее на amount.
+Текстуры и «вид» (vignette, color, glow без on) годятся и для всего кадра:
+ProjectSettings.finish — после текста, номер кадра — от начала проекта.
 
 Кривая скорости (Clip.speed_curve): [{"at": доля куска исходника 0…1,
 "speed": скорость}] — скорость линейна по исходнику между точками; время
 клипа τ(s) = ∫ ds / v(s) — по кускам (1/b)·ln(1 + b·s/a), setpts по нему,
 длина клипа — τ(конец). Звук такого клипа по умолчанию выключен
 (curve_audio — rubberband с командами tempo)."""
+import colorsys
 import math
 import re
 
@@ -48,27 +61,37 @@ import montage_project as _api
 KEYFRAME_PROPS = ("pos_x", "pos_y", "scale", "rotation", "opacity")
 EASES = ("linear", "ease_in", "ease_out", "ease_in_out", "hold")
 EFFECT_TYPES = ("zoom_punch", "shake", "flash", "rgb_shift", "glow", "motion_blur",
-                "vignette", "color")
+                "vignette", "color", "grain", "scanlines", "halftone", "glitch")
+TEXTURES = ("grain", "scanlines", "halftone")
+# Эффекты всего кадра (ProjectSettings.finish): без маркеров, на весь ролик.
+FINISH_TYPES = ("grain", "scanlines", "halftone", "vignette", "color", "glow")
 CURVES_PRESETS = ("none", "color_negative", "cross_process", "darker", "increase_contrast",
                   "lighter", "linear_contrast", "medium_contrast", "negative",
                   "strong_contrast", "vintage")
 # Пределы чисел эффектов (validate): поле → (мин, макс).
 EFFECT_LIMITS = {"amount": (0.0, 64.0), "decay": (0.01, 5.0), "sigma": (0.5, 100.0),
                  "frames": (2, 16), "angle": (0.0, 1.5707963), "contrast": (0.0, 3.0),
-                 "brightness": (-1.0, 1.0), "saturation": (0.0, 3.0), "gamma": (0.1, 10.0)}
-_ONE_SHOT = ("zoom_punch", "shake", "flash", "rgb_shift")
+                 "brightness": (-1.0, 1.0), "saturation": (0.0, 3.0), "gamma": (0.1, 10.0),
+                 "period": (2, 64)}
+_ONE_SHOT = ("zoom_punch", "shake", "flash", "rgb_shift", "glitch")
 _DEFAULTS = {"zoom_punch": {"amount": 0.08, "decay": 0.25},
              "shake": {"amount": 0.02, "decay": 0.3},
              "flash": {"amount": 0.8, "decay": 0.15, "color": "#ffffff"},
              "rgb_shift": {"amount": 8.0, "decay": 0.2},
+             "glitch": {"amount": 0.05, "decay": 0.1, "period": 32},
              "glow": {"amount": 0.45, "sigma": 18.0, "decay": 0.3},
              "motion_blur": {"frames": 3},
              "vignette": {"angle": 0.6},
-             "color": {}}
+             "color": {},
+             "grain": {"amount": 0.12},
+             "scanlines": {"amount": 0.3, "period": 4},
+             "halftone": {"amount": 0.25, "period": 10}}
 
 
 EFFECT_KEYS = ("type", "on", "section", "amount", "decay", "color", "sigma", "frames", "angle",
-               "lut", "contrast", "brightness", "saturation", "gamma", "curves")
+               "lut", "contrast", "brightness", "saturation", "gamma", "curves", "period", "tint")
+# Ступени силы сбоя (glitch): у каждой — свой geq на своих кадрах.
+_GLITCH_LEVELS = 4
 _COLOR_RX = re.compile(r"#[0-9A-Fa-f]{6}")
 
 
@@ -127,7 +150,7 @@ def sanitize_effect(e):
         elif k in ("section", "lut"):
             if isinstance(v, str) and v:
                 out[k] = v[:500]
-        elif k == "color":
+        elif k in ("color", "tint"):
             if isinstance(v, str) and _COLOR_RX.fullmatch(v):
                 out[k] = v.lower()
         elif k == "curves":
@@ -137,7 +160,8 @@ def sanitize_effect(e):
             f = _num(v)
             if f is not None:
                 lo, hi = EFFECT_LIMITS[k]
-                out[k] = int(min(hi, max(lo, f))) if k == "frames" else min(hi, max(lo, f))
+                out[k] = (int(min(hi, max(lo, f))) if k in ("frames", "period")
+                          else min(hi, max(lo, f)))
     return out
 
 
@@ -344,6 +368,8 @@ def main_fx_chain(project, clip, n, fps, w, h, main, label=None):
                     levels.setdefault(px, []).append(k)
             for px, frames in sorted(levels.items()):
                 out.append(f"rgbashift=rh={px}:bh={-px}:edge=smear:enable='{_enable_frames(frames)}'")
+        elif t == "glitch":
+            out += glitch_chain(e, hit_frames(project, clip, e, fps), n, fps, not main)
         elif t == "glow":
             frames = hit_frames(project, clip, e, fps)
             sig = _n(e["sigma"])
@@ -360,20 +386,117 @@ def main_fx_chain(project, clip, n, fps, w, h, main, label=None):
         elif t == "motion_blur":
             k = int(e.get("frames", 3))
             out.append(f"tmix=frames={k}")
-        elif t == "vignette":
-            out.append(f"vignette=angle={_n(e['angle'])}")
-        elif t == "color":
-            if e.get("lut"):
-                from ffmpeg_env import escape_filter_path
-                out.append(f"lut3d=file='{escape_filter_path(e['lut'])}':interp=tetrahedral")
-            eq = [f"{k}={_n(e[k])}" for k in ("contrast", "brightness", "saturation", "gamma")
-                  if k in e]
-            if eq:
-                out.append("eq=" + ":".join(eq))
-            if e.get("curves") and e["curves"] != "none":
-                out.append(f"curves=preset={e['curves']}")
+        elif t in ("vignette", "color"):
+            out += _look(e, lab)
+        elif t in TEXTURES:
+            out.append(texture_chain(e, n, fps, w, h, 0, "yuv420p" if main else "yuva420p", lab))
     if not main:
         out += overlay_fx(clip, fps)
+    return ",".join(out)
+
+
+def glitch_chain(e, frames, n, fps, alpha):
+    """Сбой (glitch) на n кадрах цепочки: огибающая ударов frames
+    ступенями _GLITCH_LEVELS, у ступени — свой geq с enable по номеру кадра.
+    Полоса — floor(Y·полос/H), её сдвиг — псевдослучайно по полосе и номеру
+    кадра N (детерминированно: выдержка = полная сборка), в доле ширины
+    плоскости — одинаково у яркости и цветности; цветность ещё разведена в
+    стороны. alpha — у кадра есть альфа (наложение): сдвигается и она."""
+    vals = envelope_values(frames, e["decay"] * fps, n)
+    levels = {}
+    for k, v in enumerate(vals):
+        if v >= 0.2:
+            levels.setdefault(max(1, round(v * _GLITCH_LEVELS)), []).append(k)
+    bands = max(4, int(round(1080.0 / max(2, int(e["period"])))))
+    rnd = f"(2*mod(abs(sin(floor(Y*{bands}/H)*12.9898+N*78.233))*43758.5453,1)-1)"
+    out = []
+    for lv, fr in sorted(levels.items()):
+        amp = _n(min(1.0, float(e["amount"])) * lv / _GLITCH_LEVELS)
+        dx = f"{amp}*W*{rnd}*gt(abs({rnd}),0.45)"
+        side = f"{amp}*W*0.35*gt(abs({rnd}),0.45)"
+        expr = (f"lum='lum(X-{dx},Y)':cb='cb(X-{dx}-{side},Y)':cr='cr(X-{dx}+{side},Y)'"
+                + (f":a='alpha(X-{dx},Y)'" if alpha else ""))
+        out.append(f"geq={expr}:enable='{_enable_frames(fr)}'")
+    return out
+
+
+def _look(e, lab=None):
+    """Виньетка и цвет (без времени); lab — метки графа для смеси tint."""
+    if e["type"] == "vignette":
+        return [f"vignette=angle={_n(e['angle'])}"]
+    out = []
+    if e.get("lut"):
+        from ffmpeg_env import escape_filter_path
+        out.append(f"lut3d=file={escape_filter_path(e['lut'])}:interp=tetrahedral")
+    eq = [f"{k}={_n(e[k])}" for k in ("contrast", "brightness", "saturation", "gamma") if k in e]
+    if eq:
+        out.append("eq=" + ":".join(eq))
+    if e.get("curves") and e["curves"] != "none":
+        out.append(f"curves=preset={e['curves']}")
+    if e.get("tint"):
+        out.append(_tint(e["tint"], min(1.0, float(e.get("amount", 1.0))), lab))
+    return out
+
+
+def _tint(color, k, lab):
+    """Окраска в цвет color (оттенок и насыщенность цвета, яркость — своя):
+    colorize; k < 1 — смесь с исходным (сверху окрашенный, blend normal)."""
+    r, g, b = (int(color[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+    h, _l, s = colorsys.rgb_to_hls(r, g, b)
+    col = f"colorize=hue={_n(h * 360.0)}:saturation={_n(s)}:lightness=0.5:mix=1"
+    if k >= 1.0 or lab is None:
+        return col
+    a, c, d = lab("tna"), lab("tnb"), lab("tnc")
+    return f"split[{a}][{c}];[{c}]{col}[{d}];[{d}][{a}]blend=all_mode=normal:all_opacity={_n(k)}"
+
+
+def texture_chain(e, n, fps, w, h, offset, fmt, lab):
+    """Текстура поверх кадра цепочки (n кадров, номер кадра + offset — для
+    зерна): кусок цепочки без ведущей запятой. Узор подгоняется к кадру
+    scale2ref, смешивается только яркость (цветность — как была)."""
+    rate = _api.fps_expr(fps)
+    x, tx, t2, x2 = lab("txa"), lab("txb"), lab("txc"), lab("txd")
+    k = h / 1080.0
+    amt = float(e["amount"])
+    if e["type"] == "grain":
+        amp = _n(min(1.0, amt) * 110.0)
+        src = (f"color=c=0x808080:s=960x540:r={rate},trim=end_frame={n},format=gray,"
+               f"geq=lum='128+{amp}*(2*mod(abs(sin(X*12.9898+Y*78.233+(N+{offset})*7.31)"
+               f"*43758.5453),1)-1)'")
+        mix = "c0_mode=grainmerge"
+    else:
+        p = max(2, int(round(int(e["period"]) * k)))
+        dark = _n(255.0 * (1.0 - min(1.0, amt)))
+        if e["type"] == "scanlines":
+            thick = max(1, p // 2)
+            pattern = f"if(lt(mod(Y,{p}),{thick}),{dark},255)"
+            size = f"8x{h}"
+        else:
+            r = _n(p * 0.32)
+            pattern = f"if(lt(hypot(mod(X,{p})-{p / 2:g},mod(Y,{p})-{p / 2:g}),{r}),{dark},255)"
+            size = f"{w}x{h}"
+        src = (f"color=c=white:s={size}:r={rate},trim=end_frame=1,format=gray,"
+               f"geq=lum='{pattern}',loop=loop={max(0, n - 1)}:size=1,"
+               f"setpts=N/({rate})/TB")
+        mix = "c0_mode=multiply"
+    return (f"null[{x}];{src},format={fmt}[{tx}];[{tx}][{x}]scale2ref=flags=neighbor[{t2}][{x2}];"
+            f"[{x2}][{t2}]blend={mix}")
+
+
+def finish_chain(effects, n, fps, w, h, offset, lab):
+    """Эффекты всего кадра (ProjectSettings.finish) на n кадрах итога;
+    offset — номер первого кадра от начала проекта. "" — нечего."""
+    out = []
+    for e in (effect_params(x) for x in effects or []):
+        t = e["type"]
+        if t in TEXTURES:
+            out.append(texture_chain(e, n, fps, w, h, offset, "yuv420p", lab))
+        elif t in ("vignette", "color"):
+            out += _look(e, lab)
+        elif t == "glow":
+            a, b, c = lab("gla"), lab("glb"), lab("glc")
+            out.append(f"split[{a}][{b}];[{b}]gblur=sigma={_n(e['sigma'])}[{c}];[{a}][{c}]blend="
+                       f"all_mode=screen:all_opacity={_n(min(1.0, float(e['amount'])))}")
     return ",".join(out)
 
 

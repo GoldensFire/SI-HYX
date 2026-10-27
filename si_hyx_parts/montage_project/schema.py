@@ -12,6 +12,7 @@ import os
 import re
 
 import montage_project as _api
+from si_hyx_parts.montage_project import text_fx as _tfx
 
 _TOP_FIELDS = ("version", "tracks", "clips", "settings", "markers", "texts")
 _TRACK_FIELDS = {"kind": str, "enabled": bool, "muted": bool, "role": str}
@@ -26,6 +27,7 @@ _CLIP_FIELDS = {
     # v3
     "keyframes": dict, "effects": list, "speed_curve": list, "curve_audio": bool,
     "interpolate": str, "upscale": str,
+    "crop": list, "box": list, "mask": dict, "stroke": dict, "blend": str, "matte": str,
 }
 # Пределы значений ключевых кадров (strict).
 _KEYFRAME_RANGE = {"pos_x": (-1.0, 2.0), "pos_y": (-1.0, 2.0), "scale": (0.02, 8.0),
@@ -33,14 +35,15 @@ _KEYFRAME_RANGE = {"pos_x": (-1.0, 2.0), "pos_y": (-1.0, 2.0), "scale": (0.02, 8
 _CLIP_REQUIRED = ("src", "in_s", "out_s", "track")
 _SETTINGS_FIELDS = {"width": int, "height": int, "fps": float, "fit": str,
                     "background": str, "loudness": float, "duck": float,
-                    "upscale": str, "deband": bool}
+                    "upscale": str, "deband": bool, "finish": list}
 _TEXT_FIELDS = {"start": float, "end": float, "text": str, "id": str, "style": dict,
-                "pos_x": float, "pos_y": float}
+                "pos_x": float, "pos_y": float, "layer": int}
 # Стиль текста проекта: ключи стиля программы (subtitle_ass.DEFAULT_SUBTITLE_STYLE).
 _TEXT_STYLE = {"font": str, "size": float, "bold": bool, "italic": bool, "underline": bool,
                "align": int, "spacing": float, "color": str, "outline_color": str,
                "outline": float, "shadow": float, "shadow_alpha": int, "animation": str}
-_TEXT_ANIMATIONS = ("none", "fade", "slide", "pop")
+_TEXT_STYLE.update({k: v[0] for k, v in _tfx.STYLE_KEYS.items()})
+_TEXT_ANIMATIONS = _tfx.ANIMATIONS
 _TEXT_MAX = 2000
 # Имя шрифта уходит в строку стиля ASS через запятые — только буквы, цифры,
 # пробел, точка, дефис и подчёркивание.
@@ -108,7 +111,13 @@ def describe_schema():
                   "keyframe_prop": list(_api.KEYFRAME_PROPS), "ease": list(_api.EASES),
                   "effect_type": list(_api.EFFECT_TYPES),
                   "curves_preset": list(_api.CURVES_PRESETS),
-                  "interpolate": list(_api.RIFE_MODELS), "upscale": list(_api.UPSCALE_PRESETS)},
+                  "interpolate": list(_api.RIFE_MODELS), "upscale": list(_api.UPSCALE_PRESETS),
+                  "blend": list(_api.BLEND_MODES), "mask_shape": list(_api.MASK_SHAPES),
+                  "stroke_style": list(_api.STROKE_STYLES), "matte": list(_api.MATTE_MODELS),
+                  "finish_effect": list(_api.FINISH_TYPES),
+                  "text_out": list(_tfx.OUT_ANIMATIONS), "font_alias": _tfx.FONT_ALIASES},
+        "text_style_kinetic": {k: {"type": json_types[v[0]], "range": list(v[1:])}
+                               for k, v in _tfx.STYLE_KEYS.items()},
         "keyframe": {"t": "number (с от начала клипа)", "v": "number", "ease": "string"},
         "keyframe_range": {k: list(v) for k, v in _KEYFRAME_RANGE.items()},
         "effect": {"keys": list(_api.EFFECT_KEYS),
@@ -142,6 +151,19 @@ def describe_schema():
             "со speed < 1 (кэш готовит render/still/preview); upscale (anime4k_s/m/l, у клипа "
             "ещё none) и settings.deband — Anime4K через libplacebo для кадров меньше кадра "
             "проекта; без Vulkan — обычное масштабирование.",
+            "v3 слои: crop [x0,y0,x1,y1] — кусок кадра исходника (доли); у наложения box "
+            "[w,h] — прямоугольник в долях кадра (вместо scale), mask {shape: rect (rect, "
+            "radius) | ellipse | strip (angle°, width, offset) | polygon (points), feather, "
+            "invert} — форма в долях прямоугольника, stroke {width — доля высоты кадра, color, "
+            "style solid|torn}, blend — режим смешения, matte rmbg — персонаж без фона "
+            "(кэш готовят render/still/preview).",
+            "v3 текст: layer — индекс видеодорожки, над которой лежит текст (под "
+            "наложениями выше: «текст за персонажем»); style: анимации blur_in, slide_blur, "
+            "grow, drop, zoom_out, typewriter, flash; in_s/out_s, out fade|blur, blur, glow + "
+            "glow_color, rotation, skew, scale_x/scale_y, alpha; font — имя или псевдоним "
+            "(enums.font_alias).",
+            "v3 settings.finish — эффекты всего кадра после текста: grain, scanlines, "
+            "halftone (amount, period), vignette, color, glow.",
         ],
     }
 
@@ -234,6 +256,8 @@ def parse_settings(raw):
     if raw.get("upscale") in _api.UPSCALE_PRESETS:
         s.upscale = raw["upscale"]
     s.deband = bool(raw.get("deband", False))
+    s.finish = [e for e in _api.sanitize_effects(raw.get("finish"))
+                if e["type"] in _api.FINISH_TYPES]
     return s
 
 
@@ -306,6 +330,13 @@ def _style_value_ok(key, v):
         return 0 <= v <= 255
     if key == "animation":
         return v in _TEXT_ANIMATIONS
+    if key == "out":
+        return v in _tfx.OUT_ANIMATIONS
+    if key == "glow_color":
+        return bool(_COLOR_RX.fullmatch(v))
+    if key in _tfx.STYLE_KEYS:
+        lo, hi = _tfx.STYLE_KEYS[key][1:]
+        return lo is None or lo <= v <= hi
     return True
 
 
@@ -323,9 +354,11 @@ def parse_texts(raw):
         raw_style = t.get("style")
         style = ({k: v for k, v in raw_style.items() if k in _TEXT_STYLE and _style_value_ok(k, v)}
                  if isinstance(raw_style, dict) else {})
+        layer = _num_or(t.get("layer"), None)
         item = _api.TextItem(start=a, end=b, text=text[:_TEXT_MAX], style=style,
                              pos_x=_num_or(t.get("pos_x"), None),
-                             pos_y=_num_or(t.get("pos_y"), None))
+                             pos_y=_num_or(t.get("pos_y"), None),
+                             layer=int(layer) if layer is not None and layer >= 0 else None)
         if isinstance(t.get("id"), str) and t["id"]:
             item.id = t["id"]
         out.append(item)
@@ -343,7 +376,7 @@ def _check_texts(raw, strict, problems):
             problems.append({"path": path, "message": "должен быть объектом"})
             continue
         _check_fields(t, _TEXT_FIELDS, path, strict, problems,
-                      required=("start", "end", "text"), nullable=("pos_x", "pos_y"))
+                      required=("start", "end", "text"), nullable=("pos_x", "pos_y", "layer"))
         a, b = _num_or(t.get("start"), None), _num_or(t.get("end"), None)
         if a is not None and a < 0:
             problems.append({"path": f"{path}.start", "message": "отрицательное время"})
@@ -394,6 +427,14 @@ def _check_settings(raw, strict, problems):
     if isinstance(up, str) and up and up not in _api.UPSCALE_PRESETS:
         problems.append({"path": "settings.upscale",
                          "message": f"одно из {', '.join(_api.UPSCALE_PRESETS)} или пусто"})
+    fin = raw.get("finish", [])
+    if isinstance(fin, list):
+        for i, e in enumerate(fin):
+            if not isinstance(e, dict) or e.get("type") not in _api.FINISH_TYPES:
+                problems.append({"path": f"settings.finish[{i}]",
+                                 "message": f"эффект одного из видов {', '.join(_api.FINISH_TYPES)}"})
+            else:
+                _check_effect(e, f"settings.finish[{i}]", False, problems)
     loud = raw.get("loudness")
     if loud is not None and _is_num(loud) and not _LOUDNESS_RANGE[0] <= loud <= _LOUDNESS_RANGE[1]:
         problems.append({"path": "settings.loudness",
@@ -524,6 +565,10 @@ def _check_clip(raw, i, kinds, main, strict, check_files, problems):
         elif check_files and not os.path.isfile(p):
             problems.append({"path": f"{path}.{name}", "message": "нет файла"})
     if track == main:
+        for name in ("matte", "mask", "stroke", "blend"):
+            if raw.get(name) not in (None, "", {}, "normal"):
+                problems.append({"path": f"{path}.{name}",
+                                 "message": "только у наложения (верхняя видеодорожка)"})
         return None                      # основная дорожка магнитная — место задаёт порядок
     if strict and raw.get("transition"):
         problems.append({"path": f"{path}.transition",
@@ -573,32 +618,8 @@ def _check_v3(raw, path, image, frozen, check_files, problems):
             if e.get("type") not in _api.EFFECT_TYPES:
                 problems.append({"path": f"{ep}.type",
                                  "message": f"одно из {', '.join(_api.EFFECT_TYPES)}"})
-            for k, v in e.items():
-                if k not in _api.EFFECT_KEYS:
-                    problems.append({"path": f"{ep}.{k}", "message": "неизвестное поле"})
-                elif k in _api.EFFECT_LIMITS:
-                    lo, hi = _api.EFFECT_LIMITS[k]
-                    if not _is_num(v) or not lo <= v <= hi:
-                        problems.append({"path": f"{ep}.{k}",
-                                         "message": f"число от {lo:g} до {hi:g}"})
-                elif k == "on":
-                    ok = (isinstance(v, str) and v in _api.MARKER_KINDS) or (
-                        isinstance(v, list) and v and all(_is_num(x) and x >= 0 for x in v))
-                    if not ok:
-                        problems.append({"path": f"{ep}.on",
-                                         "message": "вид маркера или список времён проекта"})
-                elif k == "color" and not (isinstance(v, str) and _COLOR_RX.fullmatch(v)):
-                    problems.append({"path": f"{ep}.color", "message": "цвет вида #RRGGBB"})
-                elif k == "curves" and v not in _api.CURVES_PRESETS:
-                    problems.append({"path": f"{ep}.curves",
-                                     "message": f"одно из {', '.join(_api.CURVES_PRESETS)}"})
-                elif k == "lut":
-                    if not isinstance(v, str) or not v.lower().endswith(".cube"):
-                        problems.append({"path": f"{ep}.lut", "message": "путь к файлу .cube"})
-                    elif check_files and not os.path.isfile(v):
-                        problems.append({"path": f"{ep}.lut", "message": "нет файла"})
-                elif k == "section" and not isinstance(v, str):
-                    problems.append({"path": f"{ep}.section", "message": "строка"})
+            _check_effect(e, ep, check_files, problems)
+    _check_layers(raw, path, problems)
     curve = raw.get("speed_curve")
     if isinstance(curve, list) and curve:
         if image or frozen or raw.get("reverse"):
@@ -616,6 +637,57 @@ def _check_v3(raw, path, image, frozen, check_files, problems):
             if not _is_num(pt.get("speed")) or not _api.MIN_SPEED <= pt["speed"] <= _api.MAX_SPEED:
                 problems.append({"path": f"{pp}.speed",
                                  "message": f"от {_api.MIN_SPEED:g} до {_api.MAX_SPEED:g}"})
+
+
+def _check_effect(e, ep, check_files, problems):
+    """Ключи и значения одного эффекта (клипа или settings.finish)."""
+    for k, v in e.items():
+        if k not in _api.EFFECT_KEYS:
+            problems.append({"path": f"{ep}.{k}", "message": "неизвестное поле"})
+        elif k in _api.EFFECT_LIMITS:
+            lo, hi = _api.EFFECT_LIMITS[k]
+            if not _is_num(v) or not lo <= v <= hi:
+                problems.append({"path": f"{ep}.{k}",
+                                 "message": f"число от {lo:g} до {hi:g}"})
+        elif k == "on":
+            ok = (isinstance(v, str) and v in _api.MARKER_KINDS) or (
+                isinstance(v, list) and v and all(_is_num(x) and x >= 0 for x in v))
+            if not ok:
+                problems.append({"path": f"{ep}.on",
+                                 "message": "вид маркера или список времён проекта"})
+        elif k in ("color", "tint") and not (isinstance(v, str) and _COLOR_RX.fullmatch(v)):
+            problems.append({"path": f"{ep}.{k}", "message": "цвет вида #RRGGBB"})
+        elif k == "curves" and v not in _api.CURVES_PRESETS:
+            problems.append({"path": f"{ep}.curves",
+                             "message": f"одно из {', '.join(_api.CURVES_PRESETS)}"})
+        elif k == "lut":
+            if not isinstance(v, str) or not v.lower().endswith(".cube"):
+                problems.append({"path": f"{ep}.lut", "message": "путь к файлу .cube"})
+            elif check_files and not os.path.isfile(v):
+                problems.append({"path": f"{ep}.lut", "message": "нет файла"})
+        elif k == "section" and not isinstance(v, str):
+            problems.append({"path": f"{ep}.section", "message": "строка"})
+
+
+def _check_layers(raw, path, problems):
+    """Слои клипа (layers.py): значение, которое мягкая чистка выбросила бы
+    или поменяла, — проблема: агент узнаёт, что поле не сработает."""
+    checks = (("crop", _api.sanitize_crop, "[x0, y0, x1, y1] — доли 0…1, x0 < x1, y0 < y1"),
+              ("box", _api.sanitize_box, "[ширина, высота] — доли кадра 0.02…4"),
+              ("mask", _api.sanitize_mask, f"shape: {', '.join(_api.MASK_SHAPES)} и поля формы"),
+              ("stroke", _api.sanitize_stroke, "width (доля высоты 0.001…0.08), color, "
+                                               f"style: {', '.join(_api.STROKE_STYLES)}"),
+              ("blend", _api.sanitize_blend, f"одно из {', '.join(_api.BLEND_MODES)}"),
+              ("matte", _api.sanitize_matte, f"одно из {', '.join(_api.MATTE_MODELS)} или пусто"))
+    for name, fn, hint in checks:
+        if name not in raw:
+            continue
+        v = raw[name]
+        if v in ([], {}, "") or (name == "blend" and v == "normal"):
+            continue
+        clean = fn(v)
+        if not clean or (isinstance(v, dict) and set(v) - set(clean) - {"invert"}):
+            problems.append({"path": f"{path}.{name}", "message": hint})
 
 
 def validate(data, strict=True, check_files=True):

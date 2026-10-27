@@ -112,7 +112,10 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
   [search_results](si_hyx_parts/shikimori_tab/search_results.py). Просмотры и индекс
   популярности — [pack_index](si_hyx_parts/shikimori_tab/pack_index.py): тот же
   `SongCandidate.index` и та же база Shikimori, что у генератора пака; недостающие
-  карточки дозапрашиваются в мешок `SHIKIMORIHYX_BUCKET`.
+  карточки дозапрашиваются в мешок `SHIKIMORIHYX_BUCKET`. «По кэшу» —
+  [cache_search](si_hyx_parts/shikimori_tab/cache_search.py): поиск по этой базе
+  без сети, вся выдача сразу; список — страницами по `_PAGE_SIZE`; от франшизы
+  остаётся самая просматриваемая часть (ключи по названиям + `franchise` из базы).
 - **ResultPage**, **QuestionViewer** (SIQuester) — [result_page](si_hyx_parts/siquester/result_page/)
   с [editing](si_hyx_parts/siquester/result_page/editing.py),
   [widgets_question](si_hyx_parts/siquester/widgets_question/) с
@@ -125,7 +128,9 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
 
 Загрузка: `si_hyx_parts/workers/download_result.py` — проверка результата и повторы;
 `download_validation.py` — полнота дорожек, `download_network.py` — сетевые ошибки,
-`download_process.py` — остановка дочерних процессов. Встроенные плееры резолвит
+`download_process.py` — остановка дочерних процессов, `doh_proxy.py` — локальный
+прокси с DNS-over-HTTPS, через который yt-dlp повторяет загрузку при подмене DNS
+провайдером («Failed to resolve»). Встроенные плееры резолвит
 `si_hyx_parts/utils/kodik.py` (Kodik/animego), Dream Cast —
 [si_hyx_parts/utils/dreamerscast.py](si_hyx_parts/utils/dreamerscast.py).
 VK-видео (новый SPA-плеер, недоступный экстрактору yt-dlp) —
@@ -805,7 +810,10 @@ ffmpeg/ffprobe, экранирование путей в фильтрах и в�
 `project_export`: прогресс — `-progress pipe:1` (строки JSON в stderr с
 `--progress`), отмена — `--cancel-file`/Ctrl+C (ffmpeg убивается, временный
 файл рядом с итогом удаляется), граф длиннее `INLINE_GRAPH_MAX` — файлом
-через `-/filter_complex`, +faststart — `with_faststart`. Инспекция для модели —
+через `-/filter_complex`, +faststart — `with_faststart`. `--encoder gpu`
+пробует аппаратные H.264 кадром (`working_encoders`: в сборке ffmpeg есть
+nvenc/qsv, а на Radeon работают amf и mf); `--preview` — `preview_settings`
+(короткая сторона 540, пропорции проекта, в памяти) и gpu. Инспекция для модели —
 [inspection.py](si_hyx_parts/montage_tool/inspection.py): `still`,
 `contact-sheet` (кадры по одному в 4 потока, под каждым — время проекта и id
 клипа) и `preview` (рецепт `episode_scene_check.video_input`: до 15 с, 480p,
@@ -822,7 +830,12 @@ speech/word/custom, подпись, сила, `end` у отрезков) —
 сильная доля — по басу; тишина — громкость, речь —
 `speech_sync.speech_activity`; слова и стемы — `karaoke/asr_worker.py` в
 Python генератора (`music_effects.runtime_python`), музыка стема — звук
-минус вокал. Таймлайн рисует маркеры у низа линейки и прилипает к видимым
+минус вокал. `--lyrics файл [--lyric-lines]` — слова word из файла текста
+(`align_known_lyrics`, отрезки-шум в одно слово отброшены): алфавитный —
+`align_lyrics` по словам Whisper; японский/китайский (`cjk_text`) —
+lyric-align 0.4.1 в Python генератора (`-m lyric_align.cli --karaoke`, пакет
+— `ensure_packages`), время слова — слово Whisper внутри строки, если их
+столько же, иначе символы строки; ответ `lyrics` — engine, matched, missed. Таймлайн рисует маркеры у низа линейки и прилипает к видимым
 (`_visible_markers` в project_timeline): части песни — полоса у верха
 линейки цветом подписи, фразы и места резов — штрих и треугольник сверху,
 удары барабанов — короткие штрихи только при крупном масштабе
@@ -853,7 +866,10 @@ Python генератора (`music_effects.runtime_python`), музыка ст�
 резов — `cut_slots`: приоритет фраза > сильная доля > доля > слабая с ударом,
 + удар и начало части; рекомендованные — промежуток по энергии части в
 секундах (`_spacing_s`), привязка к кадрам — `snap_slots`/`snap_frame`
-(`--lead` кадров раньше). Кэш — `~/.cache/si-hyx-montage/music/<хэш PCM>/`
+(`--lead` кадров раньше). `--segment N` — `song_segment`: сплошной кусок
+от начала до конца части длиной 0,75–1,15 × N (оценка: близость к N, начало
+песни, естественный финал, конец припева), песня ≤ 1,25 × N — целиком;
+`--segment-out` — `cut_segment` (WAV, afade 3 с). Кэш — `~/.cache/si-hyx-montage/music/<хэш PCM>/`
 (доли, стемы, признаки, карта); модели — `jobs.ASSETS` с SHA-256 (`asset`),
 пакеты — `ensure_packages` (uv, `beat-this==1.1.0`), обработчики — `run_worker`
 (замок `chiptune.gate.model_slot`, BELOW_NORMAL, отмена `--cancel-file`,
@@ -892,7 +908,13 @@ CFR дублировал их), JPEG 640 px 4 раза в секунду (клю
 `resolution: low` в Interactions (GeminiClient отдаёт части с `uri` как есть).
 Замер Majo 01 (24 мин 1080p H.264): ~15 мин — декод 105 с, TransNetV2 ещё
 ~195 с после декода, детекторы 55 с, CCIP 133 с, теги 307 с, OCR 141 с;
-узкое место — теги и TransNetV2 на CPU.
+узкое место — теги и TransNetV2 на CPU. DirectML (`vision.session`, если
+у onnxruntime он есть; замер — `tools/montage_dml_bench.py` в отдельной
+среде): TransNetV2 ×1,4, детекторы ×1,5–1,75, ViT ×1,7, CCIP ×0,74 (всегда
+CPU), EVA02 не встаёт. `index --captions` — `caption_shots`: подпись плана
+(`shots.caption`, колонка добавляется в старый каталог) — средняя миниатюра
+в `vision_local.LlamaServer` (один сервер на все планы, `gpu_layers` 99:
+~3 с на план), `search --query` ищет и по ней.
 
 Команды агента: `edit` ([edit.py](si_hyx_parts/montage_tool/edit.py)) —
 операции add/move/trim/split/swap/delete/set/text/marker/effect через методы
@@ -904,9 +926,11 @@ Project на копии, ошибка — `bad_op` с номером, проек
 подгон акцента к удару — `_align`, `in_s` на кадрах исходника; цена
 перехода — соседние планы одной сцены, та же крупность), повторы — на
 следующий по оценке. `check-sync` ([critique.py](si_hyx_parts/montage_tool/critique.py))
-— резы против маркеров beat/downbeat/kick/snare (±1 кадр), плотность по
+— резы (у перехода — его конец) против маркеров beat/downbeat/kick/snare (±1 кадр), плотность по
 частям против `_spacing_s`, длины, повторы, скачки внутри плана, по каталогу
-— хардсаб, OP/ED, темнота, вспышка на резе. `beat-strip`
+— хардсаб, OP/ED, темнота, вспышка на резе; текст — `lyric_lateness`
+(читается к середине `in_s` против метки word его первого слова, с
+`--vocals` — атаки стема вокала `vocal_attacks` из кэша карты песни). `beat-strip`
 ([beat_strip.py](si_hyx_parts/montage_tool/beat_strip.py)) — PNG ~2000 px:
 шкала, части, волна с громкостью, такты, удары, места резов, кадры клипов,
 резы. Памятка — [docs/montage-agent-amv.md](docs/montage-agent-amv.md)
@@ -918,10 +942,12 @@ Project на копии, ошибка — `bad_op` с номером, проек
 (pos_x/pos_y/scale/rotation/opacity с плавностью; на основной дорожке —
 зум, панорама и поворот одним `perspective` eval=frame по номеру кадра, у
 наложения — overlay x/y, `scale` eval=frame, `rotate`, `geq` альфы),
-`Clip.effects` (zoom_punch, shake, flash, rgb_shift, glow, motion_blur,
+`Clip.effects` (zoom_punch, shake, flash, rgb_shift, glitch, glow, motion_blur,
 vignette, color; `on` — вид маркера проекта и `section` — огибающая по
-маркерам внутри клипа, детерминированно; вспышка и RGB — ступеньками с
-`enable` по номеру кадра), `Clip.speed_curve` (скорость линейна по куску
+маркерам внутри клипа, детерминированно; вспышка, RGB и сбой — ступеньками с
+`enable` по номеру кадра; glitch — geq: полоса floor(Y·n/H), сдвиг по
+sin-хэшу полосы и N; color `tint` — colorize, amount < 1 — blend normal
+окрашенного сверху), `Clip.speed_curve` (скорость линейна по куску
 исходника, время клипа τ(s) = Σ ln(1 + b·s/a)/b — `curve_setpts`, длина и
 `source_time` — через тот же интеграл; звук выключен, `curve_audio` —
 rubberband с командами tempo через asendcmd). Инвариант окон держится так:
@@ -954,6 +980,56 @@ RIFE (`Clip.interpolate`: rife-v4.22-lite, rife-v4.25; только speed < 1) �
 релиза 20250112 запросами Range (`jobs._RangeFile`, 25 МБ вместо 827), SHA-256
 — у файлов. Замер (Vega 7): RIFE 720p ~5,8, 1080p ~2,9 выходных кадра/с
 (v4.25 ≈ v4.22-lite). `minterpolate` не используется.
+
+Слои коллажа (v3) — [layers.py](si_hyx_parts/montage_project/layers.py):
+`Clip.crop` (кусок кадра исходника до вписывания), `box` (прямоугольник
+наложения вместо scale), `mask` (rect/ellipse/strip/polygon — PNG в TEMP по
+хэшу, альфа × маска через scale2ref и blend), `stroke` (альфа размывается и
+режется порогом; torn — неподвижное geq-смещение с точкой выборки внутри
+кадра; итоговый overlay на кадр с альфой — `threads=1`: по срезам он гонялся
+на стыке, пиксели плавали от сборки к сборке), `blend` (клип на нейтральном
+холсте и blend в gbrp), `matte` — кэш куска с альфой (FFV1 yuva420p)
+подменяет исходник, как RIFE: `enhance.build_matte` (тот же входной seek,
+ISNet anime-seg `matte/isnetis.onnx` ~2 с на кадр, повтор рисунка — та же
+маска; RMBG-2.0 — ~50 с на кадр). Текст — [text_fx.py](si_hyx_parts/montage_project/text_fx.py):
+реплика с новыми ключами стиля (blur_in, grow, glow, rotation…, псевдонимы
+шрифтов) идёт в ASS готовым текстом (`raw` у `_cues_to_ass`), старые — прежними
+тегами побайтно; `TextItem.layer` — текст над этой видеодорожкой (под
+наложениями выше), граф вшивает ASS по слоям. glitch — ступени `\t(a,a+1,…)`
+масштаба/наклона/цвета, сдвиг вбок — `\frz` вокруг `\org` далеко под текстом
+(с rotation/rot_x/rot_y — без сдвига); fill_alpha + glow — два события
+(`layers_of`: ореол со скрытой заливкой и буквы с чёткой обводкой); vertical —
+знак под знаком. Окно (`_burn_text`, r0 > 0) сдвигает метки `round(…/TB)`:
+setpts отбрасывает дробь, и при 24000/1001 текст окна шёл на кадр раньше. `ProjectSettings.finish` —
+эффекты всего кадра после текста (`effects.finish_chain`; grain по номеру
+кадра проекта, scanlines/halftone — неподвижный узор, смешение только яркости).
+Проверено: кадр окна = кадр полной сборки (0), графы старых проектов — побайтно.
+
+Агенту: `edit` op `words` ([typography.py](si_hyx_parts/montage_tool/typography.py):
+метки word → тексты по слову, раскладка single/line/stack, ширина слова —
+по файлу шрифта PIL с поправкой на кегль libass, автоподгон блока), `lyrics`
+(слова и строки — из файла текста песни, время — метки word отрезка:
+`align_lyrics` — ДП, все слова отрезка в кусок текста со свободными краями,
+замена неверно услышанного слова, пропуски; без пары — время по длине), `voice`
+(кусок серии на дорожку голоса, clean — `analysis.clean_voice`, кэш
+`voice/`), `settings`. Реплики серий — [dialogue.py](si_hyx_parts/montage_tool/dialogue.py)
+(`index --speech`: Whisper по всему звуку → реплики в `speech_lines`;
+`lines --say` — rapidfuzz по реплике и паре соседних). Эталон —
+[reference.py](si_hyx_parts/montage_tool/reference.py) (`reference`: импульсы
+разности кадров 160×88, вид по клеткам 4×4 — cut/layer/flash, позиции в долях
+от первой сильной доли; `autofill --template` — резы на те же доли новой
+песни с шагом ¼ доли, слои и вспышки — маркеры custom pop/flash). Стили AMV —
+[styles.py](si_hyx_parts/montage_tool/styles.py): `docs/amv-styles/<имя>.json`
+(имя — только `[a-z0-9_-]`, склеивается с папкой), команда `styles`;
+`autofill --style` — `style_slots` (число резов части по шагу в долях, места
+по приоритету, промежуток — целая часть шага), эффекты и `cycle` частей,
+растворение — клип длиннее на переход влево (`_transition_s`, целые кадры:
+конец перехода на доле), `finish`; роли текста — `apply_preset` у
+text/words/lyrics (шрифт из списка — первый установленный с знаками текста
+операции: `_covers` сравнивает знак с .notdef). Карточки — op `card`
+([cards.py](si_hyx_parts/montage_tool/cards.py): фон PNG по хэшу spec в
+`<проект>_cards/`, наложение на свободной верхней дорожке, glitch/flash),
+мерцание — op `strobe` (opacity hold за полкадра до границы).
 
 Локальное зрение — `look` ([vision_local.py](si_hyx_parts/montage_tool/vision_local.py)):
 llama-server llama.cpp b11838 (Vulkan, zip ASSETS распакован в кэш с проверкой

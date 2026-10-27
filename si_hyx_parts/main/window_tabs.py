@@ -433,7 +433,19 @@ class UnifiedWindowTabsMixin:
         иначе старая вкладка (например «Обработка», где консоль видна) успевает
         на мгновение перерисоваться в увеличенной высоте ДО самого переключения
         на «Монтаж» (это отдельный кадр, который тот же currentChanged/showEvent
-        уже не поймать), и глаз ловит этот промежуточный прыжок холста."""
+        уже не поймать), и глаз ловит этот промежуточный прыжок холста.
+
+        Заранее — только когда место под страницей растёт (консоль или
+        прогрессбар прячутся). Если они появляются, их показывает
+        currentChanged, когда прежняя страница уже скрыта: иначе на выходе из
+        «Монтажа» его холст на глазах сжимался перед переключением."""
+        try:
+            now = self._console_shown_on(self.tabs.currentWidget())
+            then = self._console_shown_on(self.tabs.widget(index))
+        except Exception:
+            return
+        if any(b and not a for a, b in zip(now, then)):
+            return
         self.setUpdatesEnabled(False)
         try:
             self._sync_console_visibility(index)

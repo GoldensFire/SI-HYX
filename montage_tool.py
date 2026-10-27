@@ -19,7 +19,8 @@
                              что видно и что слышно;
   dry-run <проект.json> <выход>   команда ffmpeg и граф без запуска;
   render <проект.json> <выход>    сборка: прогресс (-progress), отмена,
-                             длинный граф — файлом, +faststart;
+                             длинный граф — файлом, +faststart; --preview —
+                             540p и кодировщик видеокарты;
   still <проект.json> <t> <кадр.png>        кадр проекта на времени t;
   contact-sheet <проект.json> <t0> <t1> <n> <лист.png>   n кадров сеткой
                              с временем проекта и id клипа под каждым;
@@ -35,12 +36,23 @@
                              карта песни: темп, размер, доли с номером в такте,
                              такты, фразы, части, энергия, удары барабанов,
                              места для резов (Beat This!, HTDemucs, librosa);
+                             --segment N [--segment-out song.wav] — сплошной
+                             кусок ~N с по частям песни (и вырезать его);
   index <файл|папка> [--db …] [--gemini]   каталог планов: границы, движение,
                              акценты, крупность, персонажи, теги, текст, OP/ED;
+  index … --speech           ещё реплики серий (Whisper) для lines;
+  index … --captions         ещё подписи планов локальной моделью (search --query);
+  lines --say "фраза"        реплики каталога: файл, время, слова, планы;
   search [фильтры] [--query …]   планы каталога JSON; shot-sheet <out.png> —
                              лист найденных с id; characters [--rename ID имя];
   edit <проект> --ops ops.json   правки списком операций (время — маркеры);
-  autofill <проект> --song … [--plan …]   черновик AMV из каталога под песню;
+  autofill <проект> --song … [--plan …] [--template …] [--style …]   черновик
+                             AMV из каталога под песню (ритм — свой, эталона
+                             или стиля);
+  styles [имя]               стили AMV (docs/amv-styles): ритм, отделка,
+                             роли текста и карточки для preset;
+  reference <ролик> [--out skeleton.json]   скелет готового AMV: резы,
+                             появления слоёв и вспышки в долях песни;
   check-sync <проект>        резы против долей и ударов, плотность, повторы;
   beat-strip <проект> <t0> <t1> <out.png>   ритм-лента: волна, доли, части, резы;
   look <картинка>… --prompt … [--schema …]   локальная модель зрения
@@ -114,27 +126,43 @@ from si_hyx_parts.montage_tool.project_io import (  # noqa: E402,F401
     load_project_file, project_from_data, read_project_json)
 from si_hyx_parts.montage_tool.timeline import describe_project  # noqa: E402,F401
 from si_hyx_parts.montage_tool.render import (  # noqa: E402,F401
-    check_output, dry_run, export_command, missing_files, render)
+    PREVIEW_SHORT, check_output, dry_run, export_command, missing_files, preview_settings,
+    render, working_encoders)
 from si_hyx_parts.montage_tool.inspection import (  # noqa: E402,F401
     SHEET_MAX, ask_model, contact_sheet, draw_sheet, gemini_key, preview, sheet_times, still)
 from si_hyx_parts.montage_tool.jobs import (  # noqa: E402,F401
     ASSETS, NO_CONTROL, Control, asset, cache_dir, ensure_packages, run_worker)
 from si_hyx_parts.montage_tool.analysis import (  # noqa: E402,F401
-    ANALYSIS_KINDS, SCENE_THRESHOLD, analyze_file, analyze_project, file_audio,
-    merge_markers, project_audio, stems)
+    ANALYSIS_KINDS, SCENE_THRESHOLD, align_known_lyrics, analyze_file, analyze_project,
+    clean_voice, file_audio, merge_markers, parse_lines, project_audio, refine_word_starts,
+    segment_words, stems, transcribe_segments)
 from si_hyx_parts.montage_tool.music import (  # noqa: E402,F401
     BEAT_MODELS, DEFAULT_BEAT_MODEL, MUSIC_KINDS, MUSIC_WRITE_KINDS, SECTION_LABELS,
-    clip_mapper, drum_hits, map_markers, music_file, music_project, shift_map, snap_frame,
-    snap_slots, song_map)
+    clip_mapper, cut_segment, drum_hits, map_markers, music_file, music_project, shift_map,
+    snap_frame, snap_slots, song_map, song_segment)
 from si_hyx_parts.montage_tool.library import (  # noqa: E402,F401
-    INDEX_VERSION, connect, default_db, detect_oped, index_library, library_stats, match_runs,
-    recluster_characters, rename_character, search, shot_sheet)
+    CAPTION_GPU_LAYERS, INDEX_VERSION, caption_shots, connect, default_db, detect_oped,
+    index_library, library_stats, match_runs, recluster_characters, rename_character, search,
+    shot_sheet)
+from si_hyx_parts.montage_tool.dialogue import (  # noqa: E402,F401
+    DEFAULT_SPEECH_MODEL, find_lines, group_lines, transcribe_file)
+from si_hyx_parts.montage_tool.typography import (  # noqa: E402,F401
+    LAYOUTS, REVEALS, add_lyrics, add_words, align_lyrics, fit_size, lyric_items, project_words,
+    read_lyrics, text_canvas, text_width, word_items)
+from si_hyx_parts.montage_tool.styles import (  # noqa: E402,F401
+    apply_preset, list_styles, load_style, pick_font, style_report, style_role, styles_dir)
+from si_hyx_parts.montage_tool.cards import (  # noqa: E402,F401
+    CARD_BACKGROUND, card_background, cards_dir, render_background)
 from si_hyx_parts.montage_tool.edit import (  # noqa: E402,F401
     OPS, add_clip_effect, apply_ops, edit_project, resolve_time)
-from si_hyx_parts.montage_tool.autofill import autofill, pick_window, segments  # noqa: E402,F401
-from si_hyx_parts.montage_tool.critique import check_sync  # noqa: E402,F401
+from si_hyx_parts.montage_tool.reference import (  # noqa: E402,F401
+    beat_position, beat_time, frame_events, reference, template_times)
+from si_hyx_parts.montage_tool.autofill import (  # noqa: E402,F401
+    autofill, cut_segments, pick_window, segments, style_slots)
+from si_hyx_parts.montage_tool.critique import (  # noqa: E402,F401
+    check_sync, lyric_lateness, vocal_attacks)
 from si_hyx_parts.montage_tool.beat_strip import beat_strip  # noqa: E402,F401
 from si_hyx_parts.montage_tool.enhance import build_interp, prepare_project  # noqa: E402,F401
 from si_hyx_parts.montage_tool.vision_local import (  # noqa: E402,F401
-    DEFAULT_LOOK_MODEL, LOOK_MODELS, llama_dir, look)
+    DEFAULT_LOOK_MODEL, LOOK_MODELS, LlamaServer, llama_dir, look)
 from si_hyx_parts.montage_tool.cli import main  # noqa: E402,F401

@@ -50,7 +50,7 @@ class _SubtitlePreview(_api.QWidget):
             b.setStyleSheet(b.styleSheet() + "QPushButton { padding: 0px; border: 1px solid transparent; }")
         self.slider = _api.SeekSlider(_api.Qt.Orientation.Horizontal)
         self.slider.setRange(0, 1000)
-        self.lbl_time = _api.QLabel("00:00:00.000 / 00:00:00.000")
+        self.lbl_time = _api.QLabel("00:00.00 / 00:00.00")
         self.lbl_time.setStyleSheet(f"color: {_api.C['text2']}; font-size: 11px;")
         transport.addWidget(self.btn_stop)
         transport.addWidget(self.btn_step_back)
@@ -247,7 +247,9 @@ class _SubtitlePreview(_api.QWidget):
             self.slider.blockSignals(True)
             self.slider.setValue(int(max(0.0, min(1.0, (pos_s - rs) / span)) * 1000))
             self.slider.blockSignals(False)
-        self.lbl_time.setText(f"{_api.s_to_time(pos_s)} / {_api.s_to_time(re_)}")
+        # Время внутри отрезка из Монтажа, а не от начала исходника: иначе у
+        # трёхсекундного отрезка в конце файла счётчик показывал «/ 00:00:52».
+        self.lbl_time.setText(f"{_api.s_to_clock(pos_s - rs)} / {_api.s_to_clock(span)}")
         self._refresh_subtitle(pos_s)
         self.positionChanged.emit(pos_s)
 
@@ -267,6 +269,11 @@ class _SubtitlePreview(_api.QWidget):
             pass
 
     def seek(self, pos_s):
+        # Превью не уходит за отрезок: реплика, начатая до него, перематывает
+        # на его начало, а не на кадр, которого нет ни на таймлайне, ни в итоге.
+        pos_s = max(self._range_start, float(pos_s))
+        if self._range_end is not None:
+            pos_s = min(pos_s, self._range_end)
         # Пока пайплайн не готов (см. _on_media_status), setPosition() молча
         # роняется/переопределяется бэкендом — копим цель, применяем позже.
         if not self._media_ready:

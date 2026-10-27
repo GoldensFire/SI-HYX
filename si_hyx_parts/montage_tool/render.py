@@ -38,11 +38,44 @@ def _audio_args(out_path):
     return ["-c:a", "aac", "-b:a", "192k"] if codec == "aac" else ["-c:a", codec]
 
 
+# Аппаратные H.264 в порядке ffmpeg_env.gpu_h264_args. В сборке ffmpeg они
+# есть все, а работают только те, что есть у железа (ноутбук с Radeon —
+# amf и mf; nvenc/qsv падают), поэтому для «gpu» каждый пробуется кадром.
+_HW_H264 = ("h264_nvenc", "h264_qsv", "h264_amf", "h264_mf")
+_hw_ok = {}
+
+
+def _hw_works(name):
+    if name not in _hw_ok:
+        try:
+            r = _api.subprocess.run(
+                [_api.FFMPEG, "-v", "error", "-nostdin", "-f", "lavfi", "-i",
+                 "color=s=256x144:r=24:d=0.2", "-c:v", name, "-f", "null", "-"],
+                stdin=_api.subprocess.DEVNULL, capture_output=True,
+                creationflags=_api.CREATE_NO_WINDOW, timeout=30)
+            _hw_ok[name] = r.returncode == 0
+        except (OSError, _api.subprocess.SubprocessError):
+            _hw_ok[name] = False
+    return _hw_ok[name]
+
+
+def working_encoders(encoders):
+    """Вывод `ffmpeg -encoders` без аппаратных H.264, которые на этой машине
+    не запускаются (проба кадром, результат — на процесс)."""
+    lines = encoders.splitlines()
+    for name in _HW_H264:
+        if any(name in ln.split() for ln in lines) and not _hw_works(name):
+            lines = [ln for ln in lines if name not in ln.split()]
+    return "\n".join(lines)
+
+
 def _encoder_args(encoder, encoders=None):
     if encoder not in _api.ENCODERS:
         raise _api.ToolError("bad_encoder", f"кодировщик: {', '.join(_api.ENCODERS)}")
     if encoders is None:
         encoders = _api.ffmpeg_env.available_encoders(_api.FFMPEG)
+        if encoder == "gpu" and encoders:
+            encoders = working_encoders(encoders)
     return _api.ffmpeg_env.h264_encoder_args(encoders, _api.ENCODERS[encoder])
 
 
@@ -60,6 +93,20 @@ def export_command(p, out_path, encoder="auto", encoders=None, subs=None, loudno
     if built is None:
         raise _api.ToolError("nothing_to_render", "в проекте нечего собирать")
     return built
+
+
+PREVIEW_SHORT = 540                  # превью: короткая сторона кадра, px
+
+
+def preview_settings(p, short=PREVIEW_SHORT):
+    """Проект p → превью на месте: кадр с короткой стороной short (те же
+    пропорции, чётные стороны). Кодировщик превью — gpu (AMF/NVENC/QSV с
+    откатом на CPU). (ширина, высота)."""
+    w, h, _fps = p.output_format()
+    k = min(1.0, float(short) / min(w, h))
+    p.settings.width = max(2, int(round(w * k / 2.0)) * 2)
+    p.settings.height = max(2, int(round(h * k / 2.0)) * 2)
+    return p.settings.width, p.settings.height
 
 
 def _graph_to_file(cmd, graph):

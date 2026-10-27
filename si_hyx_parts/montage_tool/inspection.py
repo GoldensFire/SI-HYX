@@ -176,7 +176,7 @@ def _timecode_filter(t0):
     if not _api.os.path.isfile(_TIMECODE_FONT):
         return ""
     font = _api.escape_filter_path(_TIMECODE_FONT)
-    return (f",drawtext=fontfile='{font}':text='%{{pts\\:hms\\:{t0:.3f}}}':"
+    return (f",drawtext=fontfile={font}:text='%{{pts\\:hms\\:{t0:.3f}}}':"
             "x=8:y=8:fontsize=22:fontcolor=white:box=1:boxcolor=black@0.6:boxborderw=4")
 
 

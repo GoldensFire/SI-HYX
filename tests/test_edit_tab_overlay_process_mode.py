@@ -211,7 +211,7 @@ def _vf_of(tmp_path, monkeypatch, item_extra, settings=None):
 def test_process_media_burns_overlays(tmp_path, monkeypatch):
     vf = _vf_of(tmp_path, monkeypatch,
                 {'overlays': [("ovl.png", 7, 9)], 'overlay_format': "yuv420"})
-    assert "movie='ovl.png'" in vf
+    assert "movie=ovl.png" in vf
     assert "overlay=x=7:y=9" in vf
     assert "format=auto" not in vf
 

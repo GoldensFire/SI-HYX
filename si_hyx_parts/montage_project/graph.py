@@ -38,6 +38,8 @@ import os
 
 import montage_project as _api
 from si_hyx_parts.montage_project import effects as _fx
+from si_hyx_parts.montage_project import layers as _ly
+from si_hyx_parts.montage_project import text_fx as _tfx
 from si_hyx_parts.montage_project import vulkan_fx as _vfx
 
 _LIMIT = 0.95                     # потолок alimiter (≈ −0.45 dBFS)
@@ -78,9 +80,10 @@ def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap, project=
     up = ""
     if project is not None:
         up = _vfx.upscale_filter(project, c, out_h)
-        # Замедление RIFE: исходник — готовый кэш промежуточных кадров
-        # (vulkan_fx.interp_source), время — от начала куска.
-        px = _vfx.interp_source(c, fps)
+        # Персонаж без фона (layers.matte_source) или замедление RIFE
+        # (vulkan_fx.interp_source): исходник — готовый кэш, время — от
+        # начала куска.
+        px = _ly.matte_source(c) if c.matte else _vfx.interp_source(c, fps)
         if px is not None:
             c = px
             tonemap = subs = None        # кэш уже в SDR и без субтитров
@@ -122,7 +125,7 @@ def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap, project=
     # вписывания: вписывание шло по размеру в пикселях, а setsar=1 потом
     # показывал кадр 16:9 как 3:2. У квадратного пикселя фильтр кадр не трогает.
     return (f"[{idx}:v:0]{tone}{burn}{pick}{up}setpts=PTS-STARTPTS,{speed_vf}"
-            f"scale=iw*sar:ih,setsar=1,{fit}setsar=1,{reverse}"
+            f"scale=iw*sar:ih,setsar=1,{_ly.crop_filter(c)}{fit}setsar=1,{reverse}"
             f"fps={rate},tpad=stop_mode=clone:stop_duration={hold},"
             f"trim=end_frame={n},setpts=PTS-STARTPTS,format={pix_fmt}")
 
@@ -151,17 +154,30 @@ def _fx_main(g, project, c, f0, f1, a, b, rate, fit, fps, w, h, subs, tonemap):
     return chain
 
 
-def _fx_overlay(g, project, c, f0, f1, a, b, rate, fit, fps, w, h, subs, tonemap):
+def _fx_overlay(g, project, c, f0, f1, a, b, rate, fit, fps, w, h, subs, tonemap, box=None):
     """То же для наложения: размер, поворот и прозрачность по ключевым
-    кадрам и эффекты — во времени клипа, затем кусок окна."""
+    кадрам и эффекты — во времени клипа, затем кусок окна. Маска и обводка
+    — раньше эффектов: в прямоугольнике клипа, до ключевых кадров размера."""
     n = f1 - f0
     chain = _source_chain(g, c, c.start, c.end, n, rate, fit, "yuva420p", subs, tonemap,
                           project, fps, h)
+    chain = _shape(g, c, chain, box, n, rate, h)
     fx = _fx.main_fx_chain(project, c, n, fps, w, h, False, g.label)
     if fx:
         chain += "," + fx + ",format=yuva420p"
     if (a, b) != (f0, f1):
         chain += f",trim=start_frame={a - f0}:end_frame={b - f0},setpts=PTS-STARTPTS"
+    return chain
+
+
+def _shape(g, c, chain, box, n, rate, h):
+    """Маска и обводка наложения после цепочки его кадров (n кадров)."""
+    if c.mask:
+        lab = g.label("ol")
+        chain = f"{chain}[{lab}];" + _ly.mask_chain(g, c.mask, box[0], box[1], n, rate, lab)
+    if c.stroke:
+        lab = g.label("ol")
+        chain = f"{chain}[{lab}];" + _ly.stroke_chain(g, c.stroke, h, lab)
     return chain
 
 
@@ -258,8 +274,10 @@ def _join(g, seq, fps):
     return lab
 
 
-def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items):
-    """База (основная дорожка) на кадрах [r0, r1) и наложения; метка итога."""
+def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items, texts=None):
+    """База (основная дорожка) на кадрах [r0, r1) и наложения; метка итога.
+    texts(дорожка, метка) — текст над этой дорожкой (TextItem.layer); метка."""
+    texts = texts or (lambda _ti, lab: lab)
     settings = project.settings
     seq, cursor = [], r0
 
@@ -298,6 +316,7 @@ def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items):
     cur = _join(g, seq, fps)
     # Наложения: верхние видеодорожки снизу вверх.
     main = project.main_track
+    cur = texts(main, cur)
     for ti in project.tracks_of('video'):
         if ti == main or not project.tracks[ti].enabled:
             continue
@@ -308,34 +327,38 @@ def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items):
             a, b = max(f0, r0), min(f1, r1)
             if b <= a:
                 continue
-            bw = max(2, int(round(w * c.scale / 2.0)) * 2)
-            bh = max(2, int(round(h * c.scale / 2.0)) * 2)
+            bw, bh = _ly.box_size(c, w, h)
             fit = _box_fit(c.fit or settings.fit, bw, bh)
             alpha = f",lut=a=val*{_api._num(c.opacity)}" if c.opacity < 1.0 else ""
             lab = g.label("o")
             if _api.has_fx(c):
                 body = _fx_overlay(g, project, c, f0, f1, a, b, rate, fit, fps, w, h,
-                                   subs, tonemap)
+                                   subs, tonemap, (bw, bh))
             else:
                 t_a, t_b = _span_times(c, a, b, f0, f1, fps)
                 body = _source_chain(g, c, t_a, t_b, b - a, rate, fit, "yuva420p", subs, tonemap,
                                      project, fps, h)
+                body = _shape(g, c, body, (bw, bh), b - a, rate, h)
             # Метки кадров — в долях 1/fps (их ставит fps=): сдвиг на целое
             # число кадров, без округления секунд.
             g.chains.append(body + f"{alpha},setpts=PTS+{a - r0}[{lab}]")
-            out = g.label("c")
             if c.keyframes and ("pos_x" in c.keyframes or "pos_y" in c.keyframes):
                 ox, oy = _fx.overlay_xy(c, r0, f0, fps)
             else:
                 ox = f"main_w*{_api._num(c.pos_x)}-overlay_w/2"
                 oy = f"main_h*{_api._num(c.pos_y)}-overlay_h/2"
+            if c.blend:
+                cur = _ly.blend_composite(g, cur, lab, c.blend, ox, oy, w, h, rate, r1 - r0)
+                continue
+            out = g.label("c")
             g.chains.append(f"[{cur}][{lab}]overlay=x={ox}:y={oy}:"
                             f"eof_action=pass:format=yuv420[{out}]")
             cur = out
+        cur = texts(ti, cur)
     return cur
 
 
-def text_cues(project, t0, t1, play_res):
+def text_cues(project, t0, t1, play_res, layer=None):
     """Реплики ASS (для subtitle_ass._cues_to_ass) текста проекта,
     задевающего [t0, t1), во времени ПРОЕКТА: вшивание идёт по меткам
     проекта, и у окна анимация текста (fade, slide) в той же фазе, что и в
@@ -346,11 +369,24 @@ def text_cues(project, t0, t1, play_res):
     res_x, res_y = play_res
     cues = []
     for item in project.texts:
-        if item.end <= t0 or item.start >= t1:
+        if item.end <= t0 or item.start >= t1 or item.layer != layer:
             continue
         style = dict(subtitle_ass.DEFAULT_SUBTITLE_STYLE)
         style.update(item.style or {})
         start, end = item.start, item.end
+        if _tfx.is_kinetic(item.style or {}):
+            align = int(style.get('align') or 2)
+            if item.pos_x is not None and item.pos_y is not None:
+                x, y = item.pos_x * res_x, item.pos_y * res_y
+            else:
+                x, y = _tfx.default_pos(align, res_x, res_y)
+            # Неон (fill_alpha + glow) — ореол отдельным событием под буквами.
+            for st in _tfx.layers_of(style):
+                cues.append({"start": start, "end": end, "style": _tfx.style_for_ass(st),
+                             "text": item.text,
+                             "raw": _tfx.kinetic_text(st, item.text, end - start, x, y,
+                                                      res_x, res_y)})
+            continue
         tags = ""
         if item.pos_x is not None and item.pos_y is not None:
             x, y = item.pos_x * res_x, item.pos_y * res_y
@@ -369,14 +405,14 @@ def text_cues(project, t0, t1, play_res):
     return cues
 
 
-def _text_file(project, t0, t1, w, h):
-    """Путь .ass текста проекта на [t0, t1) или None. Файл — в TEMP по
-    хэшу содержимого (как таблицы lut3d у hdr_tonemap): тот же текст — тот
-    же файл, удалять его после сборки не нужно."""
+def _text_file(project, t0, t1, w, h, layer=None):
+    """Путь .ass текста проекта (слоя layer) на [t0, t1) или None. Файл — в
+    TEMP по хэшу содержимого (как таблицы lut3d у hdr_tonemap): тот же
+    текст — тот же файл, удалять его после сборки не нужно."""
     import subtitle_ass
     from ffmpeg_env import TEMP_DIR
     play_res = (max(16, int(round(_TEXT_RES_Y * w / float(h)))), _TEXT_RES_Y)
-    cues = text_cues(project, t0, t1, play_res)
+    cues = text_cues(project, t0, t1, play_res, layer)
     if not cues:
         return None
     text = subtitle_ass._cues_to_ass(cues, play_res=play_res)
@@ -388,6 +424,28 @@ def _text_file(project, t0, t1, w, h):
             f.write(text)
         os.replace(tmp, path)
     return path
+
+
+def _burn_text(g, project, cur, r0, r1, fps, w, h, layer):
+    """Текст слоя layer (None — поверх всего) на [cur] кадров [r0, r1); метка."""
+    if not project.texts:
+        return cur
+    ass = _text_file(project, r0 / fps, r1 / fps, w, h, layer)
+    if not ass:
+        return cur
+    from ffmpeg_env import escape_filter_path
+    import karaoke.style
+    out = g.label("t")
+    # Метки — время проекта на время вшивания (текст в ASS — в нём же),
+    # затем снова с нуля. Сдвиг окна — round: setpts отбрасывает дробь, и
+    # 0.667333/TB при 24000/1001 давал 15.99999 → кадр 15 — текст окна
+    # шёл на кадр раньше полной сборки.
+    shift = f"round({_api._num(r0 / fps)}/TB)" if r0 else f"{_api._num(r0 / fps)}/TB"
+    g.chains.append(f"[{cur}]setpts=PTS-STARTPTS+{shift},"
+                    f"subtitles=filename={escape_filter_path(ass)}:"
+                    f"fontsdir={escape_filter_path(karaoke.style.FONT_DIR)},"
+                    f"setpts=PTS-STARTPTS[{out}]")
+    return out
 
 
 def _audio_fades(project, parts):
@@ -538,18 +596,18 @@ def build_source(project, video=True, audio=True, subs=None, tonemap=None, windo
         if g1 > g0:
             items = _main_items(project, fps)
             r0, r1 = _render_range(items, g0, g1)
-            cur = _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items)
-            ass = _text_file(project, r0 / fps, r1 / fps, w, h) if project.texts else None
-            if ass:
-                from ffmpeg_env import escape_filter_path
-                import karaoke.style
-                out = g.label("t")
-                # Метки — время проекта на время вшивания (текст в ASS — в
-                # нём же), затем снова с нуля.
-                g.chains.append(f"[{cur}]setpts=PTS-STARTPTS+{_api._num(r0 / fps)}/TB,"
-                                f"subtitles=filename='{escape_filter_path(ass)}':"
-                                f"fontsdir='{escape_filter_path(karaoke.style.FONT_DIR)}',"
-                                f"setpts=PTS-STARTPTS[{out}]")
+
+            def texts(layer, lab):
+                return _burn_text(g, project, lab, r0, r1, fps, w, h, layer)
+
+            layered = any(t.layer is not None for t in project.texts)
+            cur = _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items,
+                         texts if layered else None)
+            cur = _burn_text(g, project, cur, r0, r1, fps, w, h, None)
+            fin = _fx.finish_chain(project.settings.finish, r1 - r0, fps, w, h, r0, g.label)
+            if fin:
+                out = g.label("f")
+                g.chains.append(f"[{cur}]{fin},format=yuv420p[{out}]")
                 cur = out
             if (r0, r1) != (g0, g1):
                 out = g.label("w")

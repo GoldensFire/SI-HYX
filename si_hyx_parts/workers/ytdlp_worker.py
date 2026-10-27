@@ -2,9 +2,12 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """YtdlpWorker. Public namespace: workers."""
+from urllib.parse import urlsplit
+
 import workers as _api
 from .download_network import is_network_error, network_hint
 from .download_process import stop_process
+from . import doh_proxy
 from .vk_direct import (
     USER_AGENT as VK_USER_AGENT, VkResolveError, best_mp4, is_vk_video_url,
     resolve_vk_media, safe_filename,
@@ -519,6 +522,9 @@ class YtdlpWorker(_api.QThread):
             # Прокси (если задан в настройках вкладки загрузок)
             if proxy:
                 cmd += ["--proxy", proxy]
+            elif doh_proxy.host_needs_bypass(urlsplit(url).hostname):
+                # На этом сайте системный DNS уже подвёл — сразу через DoH.
+                cmd += ["--proxy", doh_proxy.proxy_url()]
 
             # Kodik m3u8 требует Referer на домен плеера
             if kodik and kodik.get('referer'):
@@ -722,6 +728,19 @@ class YtdlpWorker(_api.QThread):
                 rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(
                     cmd_fallback, iid, is_audio_only)
 
+            # DNS провайдера не отдал адрес (подмена/блокировка: getaddrinfo
+            # 11001/11003), хотя сам сайт доступен. Повторяем через локальный
+            # прокси, который резолвит хосты по DNS-over-HTTPS.
+            if (self.is_running and not proxy and "--proxy" not in cmd
+                    and not _resolved() and doh_proxy.is_dns_error(" ".join(tail))):
+                host = urlsplit(url).hostname or ""
+                self.log_sig.emit(f"DNS провайдера не отдаёт адрес {host} — "
+                                  "повтор через DNS-over-HTTPS (1.1.1.1)…")
+                doh_proxy.remember_host(host)
+                cmd = cmd[:-1] + ["--proxy", doh_proxy.proxy_url(), cmd[-1]]
+                rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(
+                    cmd, iid, is_audio_only)
+
             out_fullpath, clean_res_str = verified_download(
                 self, cmd, iid, is_audio_only,
                 (rc, out_fullpath, clean_res_str, tail))
@@ -859,6 +878,16 @@ class YtdlpWorker(_api.QThread):
                 "  Подождите 2–5 минут и повторите — после паузы обычно качается с "
                 "1–2 попытки. Ускорить помогает VPN/смена IP. Долбить подряд не нужно: "
                 "это только продлевает ограничение.")
+        elif "[rutube]" in low and "options json" in low and "404" in low:
+            # Rutube на гео-блок отвечает 404 на play/options (blocking_rule).
+            self.log_sig.emit(
+                "СОВЕТ (Rutube): видео закрыто для вашей страны (гео-блок, часто «только РФ»). "
+                "Укажите в поле «Прокси» прокси с российским IP, например "
+                "socks5h://127.0.0.1:ПОРТ от VPN-клиента с российским сервером.")
+        elif doh_proxy.is_dns_error(err_msg):
+            self.log_sig.emit(
+                "СОВЕТ: DNS не отдал адрес сайта даже через DNS-over-HTTPS. "
+                "Проверьте подключение к интернету или укажите прокси.")
         elif "Forbidden" in err_msg or "403" in err_msg:
             u = self.c.get("url", "")
             if _api.host_matches(u, "tiktok.com"):

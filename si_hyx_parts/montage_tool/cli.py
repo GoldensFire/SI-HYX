@@ -82,15 +82,30 @@ def _cmd_describe(args):
     return out
 
 
+def _preview_arg(p, args):
+    """--preview: кадр 540p и кодировщик на видеокарте (проект на диске не
+    меняется). Отчёт для ответа или None."""
+    if not args.preview:
+        return None
+    w, h = _api.preview_settings(p)
+    if args.encoder == "auto":
+        args.encoder = "gpu"
+    return {"width": w, "height": h, "encoder": args.encoder}
+
+
 def _cmd_dry_run(args):
     p, problems = _api.load_project_file(args.project, strict=not args.lenient)
+    preview = _preview_arg(p, args)
     out = _api.dry_run(p, args.output, encoder=args.encoder)
     out["problems"] = problems
+    if preview:
+        out["preview"] = preview
     return out
 
 
 def _cmd_render(args):
     p, problems = _api.load_project_file(args.project, strict=not args.lenient)
+    preview = _preview_arg(p, args)
     cancel_file = args.cancel_file
 
     def _stop():
@@ -103,6 +118,8 @@ def _cmd_render(args):
     out = _api.render(p, args.output, encoder=args.encoder, overwrite=args.overwrite,
                       on_progress=_progress if args.progress else None, should_stop=_stop)
     out["problems"] = problems
+    if preview:
+        out["preview"] = preview
     return out
 
 
@@ -145,9 +162,14 @@ def _cmd_ask(args):
 
 
 def _ml_opts(args):
+    lyrics = getattr(args, "lyrics", "")
+    if lyrics and not _api.os.path.isfile(lyrics):
+        raise _api.ToolError("missing_files", f"нет файла текста: {lyrics}")
     return {"python": args.ml_python, "device": args.device,
             "language": args.language, "model": args.model,
-            "beat_model": getattr(args, "beat_model", ""), "ctl": _control(args)}
+            "beat_model": getattr(args, "beat_model", ""), "ctl": _control(args),
+            "lyrics": _api.os.path.abspath(lyrics) if lyrics else "",
+            "lyric_lines": _api.parse_lines(getattr(args, "lyric_lines", ""))}
 
 
 def _kinds_arg(args):
@@ -203,6 +225,13 @@ def _cmd_music(args):
     opts = {"model": args.beat_model, "python": args.ml_python, "drums": not args.no_drums,
             "sections": not args.no_sections, "gemini": args.gemini, "ctl": ctl}
     m = _api.music_file(args.media, args.t0, args.t1, args.stream, **opts)
+    if args.segment_out and not args.segment:
+        raise _api.ToolError("usage", "--segment-out — вместе с --segment N")
+    if args.segment:
+        m["segment"] = _api.song_segment(m, args.segment)
+        if args.segment_out:
+            m["segment"]["output"] = _api.cut_segment(args.media, m["segment"], args.segment_out,
+                                                      args.stream, args.overwrite)
     fps = args.fps
     if args.write:
         p, problems = _api.load_project_file(args.write, strict=not args.lenient)
@@ -237,9 +266,18 @@ def _cmd_music(args):
 
 
 def _cmd_index(args):
+    speech = None
+    if args.speech:
+        speech = {"model": args.speech_model, "language": args.language,
+                  "python": args.ml_python}
     return _api.index_library(args.target, args.db or None, _control(args), force=args.force,
                               tagger=args.tagger, gemini=args.gemini,
-                              gemini_model=args.gemini_model)
+                              gemini_model=args.gemini_model, speech=speech,
+                              captions=args.captions, caption_gpu_layers=args.gpu_layers)
+
+
+def _cmd_lines(args):
+    return _api.find_lines(args.db or None, args.say, args.file, args.limit, args.min_score)
 
 
 def _list_arg(v):
@@ -262,7 +300,7 @@ def _cmd_search(args):
     out = _search_found(args)
     if args.brief:
         keep = ("id", "file", "t0", "t1", "length", "scale", "motion", "characters", "tags",
-                "character_tags", "accents", "oped", "score")
+                "character_tags", "accents", "oped", "caption", "score")
         out["shots"] = [{k: s[k] for k in keep if k in s} for s in out["shots"]]
     return out
 
@@ -309,12 +347,24 @@ def _cmd_autofill(args):
     return _api.autofill(args.project, args.song, args.library or None, args.plan or None,
                          t0=args.t0, t1=args.t1, duration=args.duration, min_shot=args.min_shot,
                          ctl=_control(args), beat_model=args.beat_model, overwrite=args.overwrite,
-                         fx=args.fx, gemini=args.gemini)
+                         fx=args.fx, gemini=args.gemini, template=args.template or None,
+                         style=args.style or None)
+
+
+def _cmd_styles(args):
+    if args.name:
+        return _api.style_report(args.name)
+    return {"styles": _api.list_styles(), "folder": _api.styles_dir()}
+
+
+def _cmd_reference(args):
+    return _api.reference(args.video, args.out or None, _control(args), args.beat_model)
 
 
 def _cmd_check_sync(args):
     p, problems = _api.load_project_file(args.project, strict=not args.lenient)
-    out = _api.check_sync(p, args.db or None)
+    attacks = _api.vocal_attacks(p, _control(args), args.ml_python) if args.vocals else None
+    out = _api.check_sync(p, args.db or None, attacks)
     out["load_problems"] = problems
     return out
 
@@ -380,6 +430,9 @@ def _analysis_args(sp):
     sp.add_argument("--scene-threshold", type=float, default=_api.SCENE_THRESHOLD)
     sp.add_argument("--vocals", action="store_true",
                     help="слова — по вокалу (отделить HTDemucs; только для песен)")
+    sp.add_argument("--lyrics", default="",
+                    help="файл текста песни: слова word — из него, время — lyric-align")
+    sp.add_argument("--lyric-lines", default="", help="строки файла текста: 9-24,30")
     sp.add_argument("--beat-model", choices=_api.BEAT_MODELS, default=_api.DEFAULT_BEAT_MODEL,
                     help="Beat This! для бита и карты песни")
     sp.add_argument("--progress", action="store_true", help="этапы строками JSON в stderr")
@@ -422,6 +475,8 @@ def build_parser():
         sp.add_argument("output")
         _lenient_arg(sp)
         sp.add_argument("--encoder", choices=sorted(_api.ENCODERS), default="auto")
+        sp.add_argument("--preview", action="store_true",
+                        help="превью: кадр 540p (пропорции проекта) и --encoder gpu")
         if fn is _cmd_render:
             sp.add_argument("--overwrite", action="store_true",
                             help="перезаписать существующий итог")
@@ -493,6 +548,10 @@ def build_parser():
     sp.add_argument("--gemini", action="store_true",
                     help="подписи частей — один запрос Gemini по звуку (квота пользователя)")
     sp.add_argument("--brief", action="store_true", help="без длинных списков долей и ударов")
+    sp.add_argument("--segment", type=float, default=0.0,
+                    help="сплошной кусок ~N с по границам частей (песня ≤ N×1,25 — целиком)")
+    sp.add_argument("--segment-out", default="", help="вырезать кусок в WAV (затухание 3 с)")
+    sp.add_argument("--overwrite", action="store_true", help="перезаписать --segment-out")
     sp.add_argument("--ml-python", default="", help="Python генератора (torch, demucs)")
     sp.add_argument("--progress", action="store_true", help="этапы строками JSON в stderr")
     sp.add_argument("--cancel-file", default="", help="появился этот файл — отмена")
@@ -507,9 +566,26 @@ def build_parser():
     sp.add_argument("--gemini", action="store_true",
                     help="описания сцен: серия в File API, один запрос Gemini (квота пользователя)")
     sp.add_argument("--gemini-model", default="", help="модель Gemini (по умолчанию — Flash-Lite)")
+    sp.add_argument("--speech", action="store_true",
+                    help="реплики серий (Whisper) — для lines и op voice")
+    sp.add_argument("--speech-model", default=_api.DEFAULT_SPEECH_MODEL,
+                    help="модель faster-whisper (small — быстрее, medium — точнее)")
+    sp.add_argument("--language", default="auto", help="язык речи (ru, ja, en…; auto)")
+    sp.add_argument("--ml-python", default="", help="Python с faster-whisper")
+    sp.add_argument("--captions", action="store_true",
+                    help="подписи планов локальной моделью (llama.cpp, Qwen3.5-2B) для --query")
+    sp.add_argument("--gpu-layers", type=int, default=_api.CAPTION_GPU_LAYERS,
+                    help="слои текста подписей на видеокарте (0 — процессор)")
     sp.add_argument("--progress", action="store_true", help="этапы строками JSON в stderr")
     sp.add_argument("--cancel-file", default="", help="появился этот файл — отмена")
     sp.set_defaults(fn=_cmd_index)
+    sp = sub.add_parser("lines", help="реплики каталога по фразе (index --speech)")
+    sp.add_argument("--say", required=True, help="фраза (язык — как в сериях)")
+    sp.add_argument("--db", default="")
+    sp.add_argument("--file", default="", help="часть пути файла")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--min-score", type=float, default=0.6, help="сходство 0…1")
+    sp.set_defaults(fn=_cmd_lines)
     sp = sub.add_parser("search", help="поиск планов каталога")
     _search_args(sp)
     sp.add_argument("--brief", action="store_true", help="только главные поля")
@@ -543,6 +619,10 @@ def build_parser():
                     help="длина окна, с (без t0 — окно выбирается по частям)")
     sp.add_argument("--min-shot", type=float, default=0.35)
     sp.add_argument("--fx", default="", help="эффекты по ударам: amv или soft")
+    sp.add_argument("--template", default="",
+                    help="скелет эталона (reference --out): резы на его доли, маркеры custom pop/flash")
+    sp.add_argument("--style", default="",
+                    help="стиль AMV (styles): шаг резов по частям, эффекты и переходы, отделка")
     sp.add_argument("--gemini", action="store_true",
                     help="части песни — запрос Gemini (готовая карта music --gemini берётся из кэша и так)")
     sp.add_argument("--beat-model", choices=_api.BEAT_MODELS, default=_api.DEFAULT_BEAT_MODEL)
@@ -550,9 +630,24 @@ def build_parser():
     sp.add_argument("--progress", action="store_true")
     sp.add_argument("--cancel-file", default="")
     sp.set_defaults(fn=_cmd_autofill)
+    sp = sub.add_parser("styles", help="стили AMV (docs/amv-styles): список или один с шрифтами ролей")
+    sp.add_argument("name", nargs="?", default="", help="имя стиля или путь к .json")
+    sp.set_defaults(fn=_cmd_styles)
+    sp = sub.add_parser("reference", help="скелет готового AMV: резы и слои в долях песни")
+    sp.add_argument("video")
+    sp.add_argument("--out", default="", help="записать скелет JSON (для autofill --template)")
+    sp.add_argument("--beat-model", choices=_api.BEAT_MODELS, default=_api.DEFAULT_BEAT_MODEL)
+    sp.add_argument("--progress", action="store_true")
+    sp.add_argument("--cancel-file", default="")
+    sp.set_defaults(fn=_cmd_reference)
     sp = sub.add_parser("check-sync", help="отчёт: резы против долей и ударов, плотность, повторы")
     sp.add_argument("project")
     sp.add_argument("--db", default="", help="каталог планов (тёмные кадры, хардсаб, OP/ED)")
+    sp.add_argument("--vocals", action="store_true",
+                    help="запаздывание текста — по атакам вокала (стем HTDemucs из кэша песни)")
+    sp.add_argument("--ml-python", default="", help="Python генератора (demucs)")
+    sp.add_argument("--progress", action="store_true", help="этапы строками JSON в stderr")
+    sp.add_argument("--cancel-file", default="", help="появился этот файл — отмена")
     _lenient_arg(sp)
     sp.set_defaults(fn=_cmd_check_sync)
     sp = sub.add_parser("beat-strip", help="ритм-лента PNG: волна, доли, части, резы, клипы")

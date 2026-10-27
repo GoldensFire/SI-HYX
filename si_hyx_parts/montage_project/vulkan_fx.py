@@ -115,7 +115,7 @@ def upscale_filter(project, c, out_h):
         return ""
     from ffmpeg_env import escape_filter_path
     deband = ":deband=true" if project.settings.deband else ""
-    return (f"libplacebo=w=iw*2:h=ih*2:custom_shader_path='{escape_filter_path(path)}'"
+    return (f"libplacebo=w=iw*2:h=ih*2:custom_shader_path={escape_filter_path(path)}"
             f"{deband}:format=yuv420p,")
 
 

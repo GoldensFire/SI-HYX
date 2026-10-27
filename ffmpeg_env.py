@@ -44,11 +44,23 @@ FFMPEG = resolve_tool("ffmpeg")
 FFPROBE = resolve_tool("ffprobe")
 
 
+def _escape_filter_level(s, special):
+    """Экранирует символы special обратным слэшем — один уровень парсера."""
+    return "".join("\\" + c if c in special else c for c in s)
+
+
 def escape_filter_path(p):
-    """Экранирует путь для libavfilter (movie/subtitles/lut3d/fontsdir):
-    прямые слэши + экранированное двоеточие диска + экранированная кавычка.
-    Без экранирования двоеточия фильтр на Windows не инициализируется."""
-    return str(p).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    """Путь как значение опции фильтра (movie/subtitles/lut3d/fontsdir/…).
+
+    libavfilter разбирает строку фильтра ДВАЖДЫ: сначала фильтрграф (делит
+    фильтры по `,`/`;`, метки по `[`/`]`), затем опции фильтра (`:` между
+    опциями, `=` между ключом и значением). Поэтому экранируем в два прохода,
+    а не оборачиваем путь в кавычки: `'` внутри кавычек закрывает строку, и
+    файл вида `Megami ''…'' [1080p].mkv` ломал граф (`Invalid argument`).
+    Возвращаемая строка подставляется в фильтр БЕЗ собственных кавычек."""
+    s = str(p).replace("\\", "/")
+    s = _escape_filter_level(s, "\\':=")
+    return _escape_filter_level(s, "\\'[],;")
 
 
 def available_encoders(ffmpeg=None):

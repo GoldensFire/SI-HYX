@@ -24,16 +24,16 @@ from msgbox import (msgbox_information, msgbox_warning)
 from edit_tab_base import (
     C, DEFAULT_SUBTITLE_STYLE, _karaoke_font_family, _load_subtitle_presets,
     _pixelize_block_sequence, _save_subtitle_presets, make_divider,
-    make_icon_btn, s_to_time
+    make_icon_btn, s_to_clock, s_to_time
 )
 from edit_tab_widgets import (_SubtitlePreview, _SubtitleTimeline)
-from PyQt6.QtCore import (QEvent, QSize)
-from PyQt6.QtGui import (QShortcut, QTextOption)
+from PyQt6.QtCore import (QEvent, QRect, QSize, QTimer)
+from PyQt6.QtGui import (QAction, QCursor, QDrag, QShortcut, QTextOption)
 from PyQt6.QtWidgets import (
-    QAbstractButton, QButtonGroup, QColorDialog, QDialogButtonBox,
-    QDoubleSpinBox, QFontComboBox, QGridLayout, QGroupBox, QInputDialog,
-    QListWidget, QListWidgetItem, QPlainTextEdit, QRadioButton, QScrollBar,
-    QSizePolicy, QTabWidget, QToolButton
+    QAbstractButton, QAbstractItemView, QButtonGroup, QColorDialog,
+    QDialogButtonBox, QDoubleSpinBox, QFontComboBox, QGridLayout, QGroupBox,
+    QInputDialog, QListWidget, QListWidgetItem, QMenu, QPlainTextEdit,
+    QRadioButton, QScrollBar, QSizePolicy, QTabWidget, QToolButton
 )
 
 from si_hyx_parts.edit_tab_dialogs.video_mask_dialog import _VideoMaskDialog

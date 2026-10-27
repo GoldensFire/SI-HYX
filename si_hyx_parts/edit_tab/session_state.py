@@ -111,7 +111,8 @@ class EditTabSessionMixin:
         """Выбрали дорожку (звук, субтитры) — запоминаем её для этого файла.
         Сброс списков при открытии файла (_loading_tracks) выбором не считается."""
         key = self._session_file_key()
-        if key is None or getattr(self, "_loading_tracks", False):
+        if (key is None or getattr(self, "_loading_tracks", False)
+                or getattr(self, "_session_restoring", False)):
             return
         files = self._session_files
         files.pop(key, None)
@@ -125,16 +126,23 @@ class EditTabSessionMixin:
         return (_api.os.path.normcase(_api.os.path.abspath(str(a)))
                 == _api.os.path.normcase(_api.os.path.abspath(str(b))))
 
-    def _session_restore_tracks(self, audio=True):
-        """Файл открыт (finish_loading_file): дорожки — как в прошлый раз.
-        audio=False — звук уже выбрал проект по своим кускам."""
+    def _session_restore_tracks(self):
+        """Файл открыт (finish_loading_file): звук — по кускам проекта, если
+        они из этого файла, иначе и субтитры — как выбирали в прошлый раз.
+
+        Пока дорожки встают на место, выбор не запоминается: звук кусков
+        проекта (отмена вернула прежний проект) переписывал запись файла
+        с ещё не восстановленными субтитрами — и они выключались."""
         key = self._session_file_key()
-        rec = self._session_files.get(key) if key else None
-        if not rec:
-            return
-        if audio:
-            self._session_pick_audio(rec.get('audio'))
-        self._session_pick_subs(rec.get('subs'))
+        rec = dict(self._session_files.get(key) or {}) if key else {}
+        self._session_restoring = True
+        try:
+            governed = self._project_restore_audio()
+            if not governed:
+                self._session_pick_audio(rec.get('audio'))
+            self._session_pick_subs(rec.get('subs'))
+        finally:
+            self._session_restoring = False
 
     def _session_pick_audio(self, spec):
         if not isinstance(spec, list) or not spec:
@@ -192,7 +200,7 @@ class EditTabSessionMixin:
             return
         view = self._session_view
         if view is not None:
-            tl.pps = max(0.5, min(400.0, view[0]))
+            tl.pps = max(tl.min_pps(), min(400.0, view[0]))
             tl.set_offset(view[1])
         if self.actual_source_file is not None:
             return      # файл уже открыли (бросок, лента) — плеер занят им

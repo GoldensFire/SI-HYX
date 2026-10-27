@@ -48,3 +48,35 @@ def _same_franchise_prefix(a: str, b: str, min_words: int = 4) -> bool:
 
 _same_franchise_prefix.__module__ = _api.__name__
 _api._same_franchise_prefix = _same_franchise_prefix
+
+def _franchise_prefix_index(keys, min_words: int = 4) -> set:
+    """Индекс для _matches_franchise_prefix: (число слов, префикс без последнего
+    слова) и (число слов, префикс без двух последних) каждого ключа. Перебор
+    _same_franchise_prefix по всем исключённым франшизам на каждый тайтл
+    вешал «По кэшу» на тысячах тайтлов × тысячах франшиз из паков."""
+    index = set()
+    for k in keys:
+        w = _api._title_words(k)
+        n = len(w)
+        if n >= min_words:
+            index.add((n, tuple(w[:n - 1])))
+            index.add((n, tuple(w[:n - 2])))
+    return index
+
+_franchise_prefix_index.__module__ = _api.__name__
+_api._franchise_prefix_index = _franchise_prefix_index
+
+def _matches_franchise_prefix(key: str, index: set, min_words: int = 4) -> bool:
+    """То же, что any(_same_franchise_prefix(key, ex) for ex in keys), но за
+    O(1) по индексу _franchise_prefix_index(keys). Ключ длины m совпадает с
+    ключом длины m (общие m-1 слов), m+1 (общие m-1) или m-1 (общие m-2)."""
+    w = _api._title_words(key)
+    m = len(w)
+    if m < min_words or not index:
+        return False
+    head = tuple(w[:m - 1])
+    return ((m, head) in index or (m + 1, head) in index
+            or (m - 1 >= min_words and (m - 1, tuple(w[:m - 2])) in index))
+
+_matches_franchise_prefix.__module__ = _api.__name__
+_api._matches_franchise_prefix = _matches_franchise_prefix

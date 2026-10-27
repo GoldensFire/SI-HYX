@@ -26,7 +26,7 @@ from config import (
 from edit_tab_base import (
     C, QAudioOutput, QMediaPlayer, QVideoSink, _fullscreen_icon,
     _paint_subtitle, _paint_subtitle_styled, install_audio_device_recovery,
-    make_icon_btn, s_to_time
+    make_icon_btn, s_to_clock, s_to_time
 )
 from edit_tab_overlay import (MIN_SIZE_NORM)
 from edit_tab_workers import (_SeekThumbnailer, overlay_top_left, track_box_at)

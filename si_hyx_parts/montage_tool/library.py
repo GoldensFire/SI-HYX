@@ -10,7 +10,8 @@ SQLite (по умолчанию ~/.cache/si-hyx-montage/index/library.sqlite) и
 (размер + первые и последние 4 МБ). Один файл — по очереди этапами, каждая
 модель грузится на свой этап и выгружается (память общая с видеокартой):
 декод и планы (shots.py), миниатюры, лица/головы/фигуры → крупность плана,
-CCIP по фигурам → персонажи, теги WD, текст, цвета, речь, отпечаток звука.
+CCIP по фигурам → персонажи, теги WD, текст, цвета, речь, отпечаток звука;
+по запросу — подписи планов локальной моделью зрения (caption_shots).
 После файлов — кластеры персонажей по всей библиотеке (имена, данные
 characters --rename, переходят к новому кластеру по большинству) и
 повторы звука ≥ 60 с между файлами (chromaprint) → опенинг/эндинг; такие
@@ -48,7 +49,7 @@ CREATE TABLE IF NOT EXISTS shots(
     dup_ratio REAL, static INTEGER, brightness REAL, saturation REAL, colors TEXT,
     accents TEXT, faces INTEGER, heads INTEGER, persons INTEGER, scale TEXT,
     face_frac REAL, rating TEXT, text TEXT, has_text INTEGER, hardsub INTEGER,
-    speech REAL, oped TEXT, keyframes TEXT, description TEXT, gemini TEXT);
+    speech REAL, oped TEXT, keyframes TEXT, description TEXT, gemini TEXT, caption TEXT);
 CREATE INDEX IF NOT EXISTS shots_file ON shots(file_id);
 CREATE TABLE IF NOT EXISTS shot_tags(shot_id INTEGER, tag TEXT, score REAL, cat INTEGER);
 CREATE INDEX IF NOT EXISTS shot_tags_tag ON shot_tags(tag);
@@ -59,6 +60,10 @@ CREATE INDEX IF NOT EXISTS crops_shot ON crops(shot_id);
 CREATE TABLE IF NOT EXISTS characters(id INTEGER PRIMARY KEY, name TEXT, size INTEGER);
 CREATE TABLE IF NOT EXISTS prints(file_id INTEGER PRIMARY KEY, data BLOB);
 CREATE TABLE IF NOT EXISTS oped(file_id INTEGER, t0 REAL, t1 REAL, kind TEXT, other INTEGER);
+CREATE TABLE IF NOT EXISTS speech_lines(
+    id INTEGER PRIMARY KEY, file_id INTEGER, t0 REAL, t1 REAL, text TEXT, words TEXT,
+    model TEXT);
+CREATE INDEX IF NOT EXISTS speech_lines_file ON speech_lines(file_id);
 """
 
 
@@ -76,6 +81,8 @@ def connect(db=None):
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
     con.executescript(_SCHEMA)
+    if "caption" not in {r[1] for r in con.execute("PRAGMA table_info(shots)")}:
+        con.execute("ALTER TABLE shots ADD COLUMN caption TEXT")   # каталог до подписей
     return con
 
 
@@ -418,6 +425,7 @@ def _drop_file(con, fid):
     con.execute("DELETE FROM shots WHERE file_id=?", (fid,))
     con.execute("DELETE FROM prints WHERE file_id=?", (fid,))
     con.execute("DELETE FROM oped WHERE file_id=? OR other=?", (fid, fid))
+    con.execute("DELETE FROM speech_lines WHERE file_id=?", (fid,))
     con.execute("DELETE FROM files WHERE id=?", (fid,))
 
 
@@ -646,11 +654,65 @@ def describe_scenes(con, file_id, ctl=None, model="", client=None):
     return len(scenes)
 
 
+# ── Подписи планов локальной моделью ─────────────────────────────────────────
+# Средняя миниатюра плана (320 px, ~110 токенов подсказки у Qwen3.5-2B):
+# замер на Vega 7 — ~3 с на план с текстом на видеокарте (gpu_layers 99:
+# подсказка с картинкой считается быстрее, чем на процессоре); лента из трёх
+# кадров — 4–6 с, подписи не лучше. Подпись — одна фраза по-английски (как
+# теги WD), её находит search --query словами, без картинок.
+CAPTION_PROMPT = ("One anime frame. In one English sentence of at most 20 words say who is "
+                  "shown (look, clothes), what they do and where, and the mood. No names.")
+CAPTION_TOKENS = 48
+CAPTION_GPU_LAYERS = 99
+
+
+def caption_shots(con, file_ids, ctl=None, gpu_layers=CAPTION_GPU_LAYERS, limit=None):
+    """Подписи планов (shots.caption) без подписи у файлов file_ids: один
+    запуск llama-server на все. {captions: {file_id: число}, время на план}."""
+    from si_hyx_parts.montage_tool import vision_local as _vl
+    ctl = ctl or _api.NO_CONTROL
+    todo = []
+    for fid in file_ids:
+        todo += con.execute("SELECT id, file_id, keyframes FROM shots WHERE file_id=? AND "
+                            "kind='shot' AND COALESCE(caption,'')='' ORDER BY idx",
+                            (fid,)).fetchall()
+    if limit is not None:
+        todo = todo[:int(limit)]
+    if not todo:
+        return {"captions": {}, "seconds_per_shot": None}
+    done = collections.Counter()
+    t0 = time.monotonic()
+    with _vl.LlamaServer(_vl.DEFAULT_LOOK_MODEL, gpu_layers, ctl) as srv:
+        t_load = time.monotonic()
+        for k, r in enumerate(todo):
+            ctl.check()
+            keys = [k for k in json.loads(r["keyframes"] or "[]") if _api.os.path.isfile(k)]
+            if not keys:
+                continue
+            url = _vl._image_url(keys[len(keys) // 2])
+            if k % 25 == 0:
+                ctl.stage("captions", shot=k + 1, total=len(todo))
+            text = _vl.answer_text(srv.ask(_vl.chat_body([url], CAPTION_PROMPT,
+                                                         max_tokens=CAPTION_TOKENS)))
+            text = " ".join(text.split())[:300]
+            if text:
+                with con:
+                    con.execute("UPDATE shots SET caption=? WHERE id=?", (text, r["id"]))
+                done[r["file_id"]] += 1
+    n = sum(done.values())
+    return {"captions": {str(k): v for k, v in done.items()}, "load_s": round(t_load - t0, 1),
+            "seconds_per_shot": round((time.monotonic() - t_load) / max(1, n), 2)}
+
+
 # ── Индекс ───────────────────────────────────────────────────────────────────
 def index_library(target, db=None, ctl=None, force=False, tagger="vit", gemini=False,
-                  gemini_model=""):
+                  gemini_model="", speech=None, captions=False,
+                  caption_gpu_layers=CAPTION_GPU_LAYERS):
     """Индекс файла или папки; новые и изменённые файлы — заново. gemini —
-    ещё и описания сцен (describe_scenes) у файлов, где их нет."""
+    ещё и описания сцен (describe_scenes) у файлов, где их нет; speech —
+    {model, language, python}: реплики (dialogue.transcribe_file) у файлов,
+    где их нет; captions — подписи планов локальной моделью (caption_shots)
+    у планов без подписи."""
     ctl = ctl or _api.NO_CONTROL
     if tagger not in _vision.TAGGERS:
         raise _api.ToolError("usage", f"теггер: {', '.join(_vision.TAGGERS)}")
@@ -704,6 +766,31 @@ def index_library(target, db=None, ctl=None, force=False, tagger="vit", gemini=F
                     if e.code == "cancelled":
                         raise
                     out["gemini"][str(fid)] = {"error": e.code, "message": e.message}
+        if speech is not None:
+            out["speech"] = {}
+            for res in results:
+                fid = res.get("file_id")
+                if fid is None:
+                    continue
+                if con.execute("SELECT 1 FROM speech_lines WHERE file_id=? LIMIT 1",
+                               (fid,)).fetchone():
+                    continue
+                try:
+                    with model_slot(ctl.stop):
+                        out["speech"][str(fid)] = {"lines": _api.transcribe_file(
+                            con, fid, res["path"], ctl, **speech)}
+                except _api.ToolError as e:  # нет обработчика — каталог без реплик
+                    if e.code == "cancelled":
+                        raise
+                    out["speech"][str(fid)] = {"error": e.code, "message": e.message}
+        if captions:
+            ids = [res["file_id"] for res in results if res.get("file_id") is not None]
+            try:
+                out["captions"] = caption_shots(con, ids, ctl, caption_gpu_layers)
+            except _api.ToolError as e:      # нет модели или сервер не поднялся — без подписей
+                if e.code == "cancelled":
+                    raise
+                out["captions"] = {"error": e.code, "message": e.message}
         if changed:
             with model_slot(ctl.stop):
                 out["characters"] = recluster_characters(con, ctl)
@@ -743,14 +830,16 @@ def _shot_dict(con, r, tags, chars, files):
             "character_tags": [t for t, _s, c in tags if c == 4],
             "rating": r["rating"], "text": r["text"], "hardsub": bool(r["hardsub"]),
             "speech": r["speech"], "oped": r["oped"],
-            "keyframes": json.loads(r["keyframes"] or "[]"), "description": r["description"]}
+            "keyframes": json.loads(r["keyframes"] or "[]"), "description": r["description"],
+            "caption": r["caption"]}
 
 
 def search(db=None, tags_all=(), tags_any=(), tags_none=(), character="", motion_min=None,
            motion_max=None, min_len=None, max_len=None, bright_min=None, bright_max=None,
            scale=(), no_text=False, include_oped=False, include_transitions=False, file="",
            query="", static=None, limit=50, ids=()):
-    """Планы по фильтрам и запросу (rapidfuzz по тегам, тексту и описанию)."""
+    """Планы по фильтрам и запросу (rapidfuzz по тегам, тексту, описанию и
+    подписи)."""
     con = connect(db)
     try:
         files = {r["id"]: r for r in con.execute("SELECT id, path, fps FROM files")}
@@ -828,7 +917,8 @@ def search(db=None, tags_all=(), tags_any=(), tags_none=(), character="", motion
             words = [w for w in query.lower().replace("_", " ").split() if len(w) > 1]
             for s in out:
                 doc = [t for t, _sc, _c in tag_rows[s["id"]]] + [s["text"] or "",
-                                                                  s["description"] or ""]
+                                                                  s["description"] or "",
+                                                                  s["caption"] or ""]
                 toks = set(" ".join(doc).replace("_", " ").replace(",", " ").lower().split())
                 best = [max((fuzz.ratio(w, t) for t in toks), default=0.0) / 100.0
                         for w in words]

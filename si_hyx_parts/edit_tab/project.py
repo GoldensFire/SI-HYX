@@ -1446,6 +1446,15 @@ class EditTabProjectMixin:
         """Смена состояния плеера (on_playback_changed)."""
         if playing:
             self._proj_transition = False
+        elif (self._proj_play is not None and not self._proj_transition
+                and self.player.playbackState() == _api.QMediaPlayer.PlaybackState.StoppedState
+                and self.player.position() / 1000.0 >= self.duration - 0.1):
+            # Плеер доиграл файл до конца (кусок до конца файла, граница не
+            # успела; Qt перед остановкой ставит позицию на длину файла): это
+            # конец куска, а не пауза пользователем — дальше следующий кусок
+            # или конец просмотра на последнем кадре.
+            self._proj_transition = True
+            self._proj_boundary_end()
         elif self._proj_play is not None and not self._proj_transition:
             # Пауза пользователем (Пробел, СТОП) — просмотр проекта окончен;
             # плеер остаётся на проекте, Пробел продолжит с плейхеда проекта.

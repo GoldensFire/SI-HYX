@@ -2,6 +2,7 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """ffmpeg: проверка, кодировщики, фильтры накладки и громкость; разбор версии. Public namespace: utils."""
+import ffmpeg_env
 import utils as _api
 
 
@@ -59,11 +60,9 @@ _api.overlay_chroma_format = overlay_chroma_format
 
 
 def escape_filter_path(p):
-    """Экранирует путь для libavfilter (movie/subtitles/fontsdir): прямые слэши
-    + экранированное двоеточие диска (обратный слэш перед `:`) + экранированная
-    кавычка. Без
-    экранирования двоеточия фильтр на Windows не инициализируется."""
-    return str(p).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    """Путь как значение опции фильтра — без кавычек (см. ffmpeg_env):
+    двухуровневое экранирование выдерживает и `'`, и `:`, и `[`/`]`."""
+    return ffmpeg_env.escape_filter_path(p)
 
 escape_filter_path.__module__ = _api.__name__
 _api.escape_filter_path = escape_filter_path
@@ -94,7 +93,7 @@ def overlay_filter_graph(base_chain, rendered, escape_path=None,
     fmt = (pix_fmt or "yuv420").strip()
     parts = []
     for i, (png, _x, _y) in enumerate(rendered):
-        parts.append(f"movie='{esc(png)}',format=rgba[sihyxovl{i}]")
+        parts.append(f"movie={esc(png)},format=rgba[sihyxovl{i}]")
     parts.append(f"{pre_chain or 'null'}[sihyxbase0]")
     last = len(rendered) - 1
     for i, (_png, x, y) in enumerate(rendered):

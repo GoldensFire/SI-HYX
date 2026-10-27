@@ -41,6 +41,12 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
         self._settings_sync_timer = _api.QTimer(self)
         self._settings_sync_timer.setInterval(500)
         self._settings_sync_timer.timeout.connect(self._settings_sync_tick)
+        # Запуски, ждущие окончания текущего воркера: (очередь, on_start).
+        # Сюда встаёт «Обрезать и обработать» Монтажа, пока «Обработка» занята,
+        # и сама очередь вкладки, если файлы добавили во время чужого запуска
+        # (обрезки) — см. enqueue_run и add_paths.
+        self._run_queue: list = []
+        self._queued_ids: set = set()   # iid'ы, помеченные «Ожидание» до своего запуска
         self.setup_ui()
         self.thumb_sig.connect(self.set_thumb)
         self.media_info_sig.connect(self._apply_media_info)
@@ -410,6 +416,7 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
                 self._item_map[iid] = it
                 self.tree.scrollToItem(it)
                 self.pool.start(_api.LocalThumbnailRunnable(p, iid, self.thumb_sig))
+                self._join_running_queue(iid, it)
 
                 if ft == "MEDIA":
                     def _bg(path_local, iid_local):
@@ -685,15 +692,71 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
         except Exception:
             pass
 
+    def _worker_busy(self):
+        w = getattr(self, 'worker', None)
+        try:
+            return w is not None and w.isRunning()
+        except Exception:
+            return False
+
+    def enqueue_run(self, target, on_start=None):
+        """Запускает очередь target сразу или, если воркер занят, ставит её в
+        _run_queue следом. on_start(worker) вызывается, когда воркер этой
+        очереди создан и запущен. Возвращает метку ожидающего запуска (для
+        cancel_queued_run) или None, если запуск пошёл сразу."""
+        if not self._worker_busy():
+            if self._run_items(target) and on_start is not None:
+                on_start(self.worker)
+            return None
+        entry = (target, on_start)
+        self._run_queue.append(entry)
+        return entry
+
+    def cancel_queued_run(self, entry):
+        """Снимает ещё не начатый запуск из enqueue_run. False — уже начат."""
+        try:
+            self._run_queue.remove(entry)
+            return True
+        except ValueError:
+            return False
+
+    def _join_running_queue(self, iid, tree_item):
+        """Файл добавлен во время работы воркера — сразу помечаем его «в работе».
+        Очередь вкладки (self.items) живая, её воркер подхватит файл сам; если
+        же воркер гонит чужой запуск (обрезку Монтажа, одиночный файл), очередь
+        вкладки встаёт следом за ним и стартует без нажатия «НАЧАТЬ»."""
+        if not self._worker_busy():
+            return
+        if (self.worker.queue is not self.items
+                and not any(t is self.items for t, _ in self._run_queue)):
+            self._run_queue.append((self.items, None))
+        self._queued_ids.add(iid)
+        tree_item.setData(0, _api.ITEM_STATUS_ROLE, 'proc')
+
+    def _start_queued_run(self):
+        if not self._run_queue:
+            return
+        w = getattr(self, 'worker', None)
+        # finished_all приходит в самом конце run(), поток вот-вот завершится.
+        if w is not None and w.isRunning() and not w.wait(2000):
+            _api.QTimer.singleShot(100, self._start_queued_run)
+            return
+        target, on_start = self._run_queue.pop(0)
+        if self._run_items(target):
+            if on_start is not None:
+                on_start(self.worker)
+        else:
+            self._start_queued_run()
+
     def _run_items(self, target):
-        if not target: return
+        """Запускает ProcessWorker на очереди target. True — воркер запущен."""
+        if not target: return False
         # Не запускаем второй воркер поверх активного (двойной клик во время работы)
-        if getattr(self, 'worker', None) is not None:
-            try:
-                if self.worker.isRunning():
-                    self.main.log("Дождитесь завершения текущей обработки.")
-                    return
-            except Exception: pass
+        if self._worker_busy():
+            self.main.log("Дождитесь завершения текущей обработки.")
+            return False
+        if target is self.items:
+            self._queued_ids.clear()
         s = self._collect_settings()
         if hasattr(self.main, "clear_global_result"):
             self.main.clear_global_result()
@@ -726,8 +789,19 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
                                          running=True)
         self.worker.start()
         self._settings_sync_timer.start()
+        return True
 
     def stop(self):
+        # «СТОП» снимает и ожидающий запуск очереди вкладки; обрезки Монтажа
+        # в очереди остаются — их отменяет кнопка Монтажа.
+        if any(t is self.items for t, _ in self._run_queue):
+            self._run_queue[:] = [e for e in self._run_queue if e[0] is not self.items]
+            for iid in self._queued_ids:
+                item = self._find_item(iid)
+                if item:
+                    item.setData(0, _api.ITEM_STATUS_ROLE, None)
+            self._queued_ids.clear()
+            self.tree.viewport().update()
         if self.worker:
             try: self.worker.stop()
             except Exception: pass
@@ -735,6 +809,7 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
     _RE_IMG_PASS = _api.re.compile(r"картинки (\d+)/(\d+)")
 
     def on_stat(self, iid, txt, code):
+        self._queued_ids.discard(iid)
         try:
             i = self._find_item(iid)
             if i:
@@ -860,6 +935,13 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
         self.main.log("Готово")
         try: _api.play_done_sound()
         except Exception: pass
+        # Файл, добавленный в самый конец прогона, воркер мог уже не застать.
+        if (any(iid in self._item_data_map for iid in self._queued_ids)
+                and not any(t is self.items for t, _ in self._run_queue)):
+            self._run_queue.append((self.items, None))
+        if self._run_queue:
+            # Не изнутри finished_all: следом его же получают слоты обрезки.
+            _api.QTimer.singleShot(0, self._start_queued_run)
 
 
 MediaTab.__module__ = _api.__name__

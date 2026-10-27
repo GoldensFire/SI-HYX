@@ -55,6 +55,43 @@ _SearchTask.__module__ = _api.__name__
 _api._SearchTask = _SearchTask
 
 
+class _CacheSearchSignals(_api.QObject):
+    # list[Anime], {id: (просмотры, ключ франшизы Shikimori)}
+    finished = _api.pyqtSignal(list, object)
+    failed = _api.pyqtSignal(str)
+
+_CacheSearchSignals.__module__ = _api.__name__
+_api._CacheSearchSignals = _CacheSearchSignals
+
+
+class _CacheSearchTask(_api.QRunnable):
+    """«По кэшу»: поиск по базе Shikimori генератора аниме-паков, без сети —
+    вся выдача приходит одним сигналом (см. cache_search)."""
+
+    def __init__(self, criteria: '_api.AnimeFilter'):
+        super().__init__()
+        self.setAutoDelete(False)
+        self.criteria = criteria
+        self.signals = _api._CacheSearchSignals()
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        from .cache_search import search
+        try:
+            found, info = search(self.criteria, stopped=lambda: self._stop)
+            if not self._stop:
+                self.signals.finished.emit(found, info)
+        except Exception as e:  # noqa: BLE001 — любая ошибка базы → сообщение в GUI
+            if not self._stop:
+                self.signals.failed.emit(f"Поиск по базе не удался: {e}")
+
+_CacheSearchTask.__module__ = _api.__name__
+_api._CacheSearchTask = _CacheSearchTask
+
+
 class _GenresSignals(_api.QObject):
     finished = _api.pyqtSignal(str, list)   # content_type, genres
     failed = _api.pyqtSignal(str)

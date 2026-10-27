@@ -14,7 +14,8 @@ llama.cpp. Рассуждение модели выключено (--reasoning o
 по умолчанию на процессоре (gpu_layers=0): на iGPU Vega 7 с общей памятью
 генерация 2B медленнее (~7 т/с), чем на 6 ядрах (~10 т/с); на дискретной
 карте — gpu_layers=99. Сервер — по одному на машину (model_slot, как у
-обработчиков), приоритет пониженный."""
+обработчиков), приоритет пониженный. LlamaServer держит один сервер на
+много вопросов (подписи планов index --captions)."""
 import base64
 import io
 import socket
@@ -116,6 +117,113 @@ def _http(url, body=None, timeout=10.0):
         return _api.json.loads(r.read().decode("utf-8"))
 
 
+class LlamaServer:
+    """llama-server на время блока with: под model_slot, с пониженным
+    приоритетом; ask(body) — один запрос chat/completions с отменой."""
+
+    def __init__(self, model=DEFAULT_LOOK_MODEL, gpu_layers=0, ctl=None):
+        if model not in LOOK_MODELS:
+            raise _api.ToolError("usage", f"модель: {', '.join(LOOK_MODELS)}")
+        self.model, self.gpu_layers = model, int(gpu_layers)
+        self.ctl = ctl or _api.NO_CONTROL
+        self.proc = self.log = self._slot = None
+        self.load_s = 0.0
+
+    def __enter__(self):
+        from chiptune.gate import model_slot
+        from chiptune.notes import QualityError
+        ctl = self.ctl
+        root = llama_dir(ctl)
+        weights, mmproj = (_api.asset(name, ctl) for name in LOOK_MODELS[self.model])
+        port = _free_port()
+        self.base = f"http://127.0.0.1:{port}"
+        cmd = [_api.os.path.join(root, "llama-server.exe"), "-m", weights, "--mmproj", mmproj,
+               "--host", "127.0.0.1", "--port", str(port), "-ngl", str(self.gpu_layers),
+               "-c", "8192", "-np", "1", "--reasoning", "off", "--no-webui"]
+        self._slot = model_slot(ctl.stop)
+        try:
+            self._slot.__enter__()
+        except QualityError as e:
+            raise _api.ToolError("cancelled", str(e)) from e
+        try:
+            self.log = _api.tempfile.TemporaryFile()
+            t0 = time.monotonic()
+            ctl.stage("look", what="load", model=self.model)
+            self.proc = _api.subprocess.Popen(cmd, stdin=_api.subprocess.DEVNULL, stdout=self.log,
+                                              stderr=self.log, cwd=root,
+                                              creationflags=_api.CREATE_NO_WINDOW | _BELOW_NORMAL)
+            while True:
+                if self.proc.poll() is not None:
+                    raise _api.ToolError("ml_failed",
+                                         f"llama-server завершился: код {self.proc.returncode}",
+                                         detail=_log_tail(self.log))
+                ctl.check()
+                try:
+                    if _http(self.base + "/health", timeout=2).get("status") == "ok":
+                        break
+                except (OSError, ValueError):
+                    pass
+                if time.monotonic() - t0 > _READY_TIMEOUT:
+                    raise _api.ToolError("ml_timeout", "llama-server не запустился",
+                                         detail=_log_tail(self.log))
+                time.sleep(0.3)
+            self.load_s = time.monotonic() - t0
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        if self.proc is not None:
+            _kill(self.proc)
+            self.proc = None
+        if self.log is not None:
+            self.log.close()
+            self.log = None
+        if self._slot is not None:
+            self._slot.__exit__(None, None, None)
+            self._slot = None
+        return False
+
+    def ask(self, body, timeout=1800):
+        """Ответ chat/completions на body; файл отмены — сервер убивается."""
+        box = {}
+
+        def _ask():
+            try:
+                box["res"] = _http(self.base + "/v1/chat/completions", body, timeout=timeout)
+            except (OSError, ValueError) as e:
+                box["err"] = e
+        th = threading.Thread(target=_ask, daemon=True)
+        th.start()
+        while th.is_alive():
+            th.join(0.5)
+            if self.ctl.stop():
+                _kill(self.proc)
+                raise _api.ToolError("cancelled", "отменено файлом отмены")
+        if "err" in box:
+            raise _api.ToolError("ml_failed", f"llama-server: {box['err']}",
+                                 detail=_log_tail(self.log))
+        return box["res"]
+
+
+def chat_body(urls, prompt, schema=None, max_tokens=512):
+    """Тело запроса: картинки (data URL) и текст; schema — ответ по JSON Schema."""
+    content = [{"type": "image_url", "image_url": {"url": u}} for u in urls]
+    content.append({"type": "text", "text": prompt})
+    body = {"messages": [{"role": "user", "content": content}],
+            "max_tokens": int(max_tokens), "temperature": 0}
+    if schema:
+        body["response_format"] = {"type": "json_schema",
+                                   "json_schema": {"name": "answer", "schema": schema}}
+    return body
+
+
+def answer_text(res):
+    msg = ((res.get("choices") or [{}])[0].get("message") or {})
+    return (msg.get("content") or "").strip()
+
+
 def look(images, prompt, schema=None, model=DEFAULT_LOOK_MODEL, max_tokens=512,
          gpu_layers=0, ctl=None):
     """Вопрос prompt по картинкам images локальной модели. schema — JSON
@@ -131,69 +239,13 @@ def look(images, prompt, schema=None, model=DEFAULT_LOOK_MODEL, max_tokens=512,
     for p in images:
         if not _api.os.path.isfile(p):
             raise _api.ToolError("bad_media", f"нет файла: {p}")
-    content = [{"type": "image_url", "image_url": {"url": _image_url(p)}} for p in images]
-    content.append({"type": "text", "text": prompt})
-    body = {"messages": [{"role": "user", "content": content}],
-            "max_tokens": int(max_tokens), "temperature": 0}
-    if schema:
-        body["response_format"] = {"type": "json_schema",
-                                   "json_schema": {"name": "answer", "schema": schema}}
-    root = llama_dir(ctl)
-    weights, mmproj = (_api.asset(name, ctl) for name in LOOK_MODELS[model])
-    from chiptune.gate import model_slot
-    from chiptune.notes import QualityError
-    port = _free_port()
-    base = f"http://127.0.0.1:{port}"
-    cmd = [_api.os.path.join(root, "llama-server.exe"), "-m", weights, "--mmproj", mmproj,
-           "--host", "127.0.0.1", "--port", str(port), "-ngl", str(int(gpu_layers)),
-           "-c", "8192", "-np", "1", "--reasoning", "off", "--no-webui"]
-    try:
-        with model_slot(ctl.stop), _api.tempfile.TemporaryFile() as log:
-            t0 = time.monotonic()
-            ctl.stage("look", what="load", model=model)
-            proc = _api.subprocess.Popen(cmd, stdin=_api.subprocess.DEVNULL, stdout=log, stderr=log,
-                                         cwd=root, creationflags=_api.CREATE_NO_WINDOW | _BELOW_NORMAL)
-            try:
-                while True:
-                    if proc.poll() is not None:
-                        raise _api.ToolError("ml_failed", f"llama-server завершился: код {proc.returncode}",
-                                             detail=_log_tail(log))
-                    ctl.check()
-                    try:
-                        if _http(base + "/health", timeout=2).get("status") == "ok":
-                            break
-                    except (OSError, ValueError):
-                        pass
-                    if time.monotonic() - t0 > _READY_TIMEOUT:
-                        raise _api.ToolError("ml_timeout", "llama-server не запустился",
-                                             detail=_log_tail(log))
-                    time.sleep(0.3)
-                load_s = time.monotonic() - t0
-                ctl.stage("look", what="answer", images=len(images))
-                box = {}
-
-                def _ask():
-                    try:
-                        box["res"] = _http(base + "/v1/chat/completions", body, timeout=1800)
-                    except (OSError, ValueError) as e:
-                        box["err"] = e
-                th = threading.Thread(target=_ask, daemon=True)
-                th.start()
-                while th.is_alive():
-                    th.join(0.5)
-                    if ctl.stop():
-                        _kill(proc)
-                        raise _api.ToolError("cancelled", "отменено файлом отмены")
-                if "err" in box:
-                    raise _api.ToolError("ml_failed", f"llama-server: {box['err']}",
-                                         detail=_log_tail(log))
-            finally:
-                _kill(proc)
-    except QualityError as e:
-        raise _api.ToolError("cancelled", str(e)) from e
-    res = box["res"]
-    msg = ((res.get("choices") or [{}])[0].get("message") or {})
-    answer = (msg.get("content") or "").strip()
+    body = chat_body([_image_url(p) for p in images], prompt, schema, max_tokens)
+    t0 = time.monotonic()
+    with LlamaServer(model, gpu_layers, ctl) as srv:
+        ctl.stage("look", what="answer", images=len(images))
+        res = srv.ask(body)
+        load_s = srv.load_s
+    answer = answer_text(res)
     tm = res.get("timings") or {}
     out = {"model": model, "engine": f"llama.cpp {LLAMA_BUILD} vulkan", "images": list(images),
            "answer": answer,
