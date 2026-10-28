@@ -145,7 +145,7 @@ class RMBGRemover:
         """Возвращает альфа-маску переднего плана (H, W) uint8 [0..255] под размер
         входного изображения. 255 = объект (оставить), 0 = фон (прозрачный)."""
         if cv2 is None:
-            raise RuntimeError("opencv-python не установлен (pip install opencv-python)")
+            raise RuntimeError("OpenCV не установлен (pip install opencv-python-headless)")
         sess = self._ensure_session()
         img_bgr = np.ascontiguousarray(img_bgr)
         if img_bgr.ndim == 3 and img_bgr.shape[2] == 4:

@@ -21,8 +21,10 @@ rg -n "class .*Mixin" si_hyx_parts/animepack
 - [si_hyx_parts/kuhi/](si_hyx_parts/kuhi/) — собственная библиотека источников
   серий со своей лицензией; `siquester/` — встроенный редактор паков SIQuesterHYX.
 - Проверки: `python tools/check_hygiene.py` (pyflakes, кодировка, голые except,
-  правила CodeQL из `tools/check_security.py`; `--alerts` — открытые алерты GitHub)
-  и `python tools/check_file_sizes.py` (предупреждение о файлах длиннее 1500 строк).
+  правила CodeQL из `tools/check_security.py`; `--alerts` — открытые алерты GitHub),
+  `python tools/check_file_sizes.py` (предупреждение о файлах длиннее 1500 строк)
+  и `python tools/check_requirements.py` (окружение против пинов `requirements.txt`;
+  его же перед сборкой запускает `build.bat`).
 
 | Публичный модуль | Что это | Реализация |
 |---|---|---|

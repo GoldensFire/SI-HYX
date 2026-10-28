@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 #
 # Сборка SI-HYX (PyInstaller, onedir). Это ЕДИНЫЙ источник правды для сборки —
-# build.bat вызывает именно его (`pyinstaller --noconfirm SI-HYX.spec`), а не
+# build.bat вызывает именно его (`python -m PyInstaller --noconfirm SI-HYX.spec`), а не
 # длинную команду в одну строку. Меняешь набор пакетов/иконку/исключения —
 # правишь здесь.
 #

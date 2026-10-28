@@ -36,6 +36,8 @@ def _models():
     from rapidocr.utils.typings import LangRec, ModelType, OCRVersion
 
     root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".cache")
+    # Имя папки осталось от 3.9.2: набор моделей PP-OCRv6/v5 тот же, поэтому
+    # после обновления rapidocr не качаем их заново.
     root = root / "SI-HYX" / "rapidocr-3.9.2"
     root.mkdir(parents=True, exist_ok=True)
     common = {"Global.model_root_dir": str(root), "Global.use_cls": False,

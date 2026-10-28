@@ -226,6 +226,8 @@ class OCR:
         from rapidocr import RapidOCR
         from rapidocr.utils.typings import ModelType, OCRVersion
         root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".cache")
+        # Имя папки осталось от 3.9.2: набор моделей PP-OCRv6/v5 тот же, поэтому
+        # после обновления rapidocr не качаем их заново.
         root = root / "SI-HYX" / "rapidocr-3.9.2"
         root.mkdir(parents=True, exist_ok=True)
         self.engine = RapidOCR(params={

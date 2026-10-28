@@ -123,10 +123,25 @@ def dyhit_available():
         return False
     return True
 
+# Порядок предпочтения запасных трекеров OpenCV. CSRT/KCF есть только в
+# opencv-contrib-python, MIL — в базовом opencv-python(-headless), поэтому
+# сборка без contrib всё равно получает рабочий запасной движок.
+_OPENCV_TRACKERS = ("CSRT", "KCF", "MIL")
+
+
+def _opencv_tracker_kind():
+    """Лучший доступный трекер OpenCV или '' (CSRT → KCF → MIL)."""
+    if cv2 is None:
+        return ""
+    for kind in _OPENCV_TRACKERS:
+        if hasattr(cv2, f"Tracker{kind}_create"):
+            return kind
+    return ""
+
+
 def opencv_tracker_available():
-    """True, если в сборке OpenCV есть трекеры (CSRT/KCF) — запасной движок."""
-    return cv2 is not None and (hasattr(cv2, "TrackerCSRT_create")
-                                or hasattr(cv2, "TrackerKCF_create"))
+    """True, если в сборке OpenCV есть хоть один трекер (CSRT/KCF/MIL)."""
+    return bool(_opencv_tracker_kind())
 
 # ─── Чистая геометрия (повторяет lib/test/tracker/vittrack_utils.py и box_ops) ──
 
@@ -509,12 +524,15 @@ class DyHiTTracker:
             return None
 
 class OpenCVTracker:
-    """Запасной трекер на встроенных в OpenCV алгоритмах (CSRT по умолчанию,
-    KCF — если CSRT в сборке нет). Используется, когда файла модели DyHiT нет:
-    качество ниже, зато работает всегда и без onnxruntime."""
+    """Запасной трекер на встроенных в OpenCV алгоритмах (CSRT → KCF → MIL).
+    Используется, когда файла модели DyHiT нет: качество ниже, зато работает
+    всегда и без onnxruntime."""
 
     def __init__(self, kind="CSRT", smooth=0.0, fps=25.0):
-        self.kind = kind if hasattr(cv2, f"Tracker{kind}_create") else "KCF"
+        self.kind = (kind if hasattr(cv2, f"Tracker{kind}_create")
+                     else _opencv_tracker_kind())
+        if not self.kind:
+            raise RuntimeError("В этой сборке OpenCV нет трекеров (CSRT/KCF/MIL)")
         self.smooth = float(smooth)
         self.smoother = BoxSmoother(smooth, fps)
         self._trk = None
@@ -568,7 +586,7 @@ def create_tracker(prefer="auto", smooth=0.0, fps=25.0):
     При prefer='dyhit' и отсутствии модели бросает RuntimeError (вызывающий код
     сам решает, показать ли подсказку про models/). При 'auto' молча откатывается."""
     if cv2 is None:
-        raise RuntimeError("Не установлен OpenCV (opencv-python) — "
+        raise RuntimeError("Не установлен OpenCV (opencv-python-headless) — "
                            "отслеживание объекта недоступно")
     if prefer in ("auto", "dyhit") and dyhit_available():
         return DyHiTTracker(smooth=smooth, fps=fps)
@@ -577,13 +595,14 @@ def create_tracker(prefer="auto", smooth=0.0, fps=25.0):
             "Модель DyHiT не найдена. Положите .onnx-файл трекера в папку "
             f"models (ожидается {expected_model_path()})")
     if not opencv_tracker_available():
-        raise RuntimeError("В этой сборке OpenCV нет трекеров (CSRT/KCF)")
+        raise RuntimeError("В этой сборке OpenCV нет трекеров (CSRT/KCF/MIL)")
     return OpenCVTracker(smooth=smooth, fps=fps)
 
 def active_backend_label():
     """Короткое имя движка, который будет выбран сейчас — для подписи в диалоге."""
     if dyhit_available():
         return "DyHiT (нейросеть, ONNX)"
-    if opencv_tracker_available():
-        return "CSRT (OpenCV, запасной)"
+    kind = _opencv_tracker_kind()
+    if kind:
+        return f"{kind} (OpenCV, запасной)"
     return "недоступно"

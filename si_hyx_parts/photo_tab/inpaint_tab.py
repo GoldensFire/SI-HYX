@@ -53,8 +53,8 @@ class InpaintTab(_api.QWidget):
     def _build_unavailable(self):
         lay = _api.QVBoxLayout(self)
         msg = ("Подвкладка «Удаление объектов» недоступна.\n\n"
-               "Нужны пакеты: opencv-python, numpy, onnxruntime.\n"
-               "Установка:  pip install opencv-python onnxruntime")
+               "Нужны пакеты: opencv-python-headless, numpy, onnxruntime.\n"
+               "Установка:  pip install opencv-python-headless onnxruntime")
         if _api._INPAINT_ERR:
             msg += f"\n\n{_api._INPAINT_ERR}"
         lbl = _api.QLabel(msg)

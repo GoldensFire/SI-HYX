@@ -26,17 +26,17 @@ VERSION_INFO_TXT = os.path.join(ROOT, "version_info.txt")
 BUILD_BAT = os.path.join(ROOT, "build.bat")
 
 VERSION_RE = re.compile(r"^\d+\.\d+\.\d+$")
-STEP_RE = re.compile(r"^\[STEP (\d+)/8\]")
+STEP_RE = re.compile(r"^\[STEP (\d+)/(\d+)\]")
 
 # Вес каждого шага build.bat в общем времени сборки (сумма = 100). PyInstaller
-# (шаг 2) доминирует по времени — компиляция всех зависимостей. Веса —
+# (шаг 3) доминирует по времени — компиляция всех зависимостей. Веса —
 # приблизительные (нет телеметрии по факту), но дают вменяемый ETA, а не
 # просто «крутилку». CUM_BEFORE[n] — прогресс (%), достигнутый к МОМЕНТУ
-# появления метки "[STEP n/8]" в выводе (т.е. все шаги 1..n-1 уже завершены).
-STEP_WEIGHTS = {1: 3, 2: 55, 3: 2, 4: 5, 5: 10, 6: 5, 7: 15, 8: 5}
+# появления метки "[STEP n/9]" в выводе (т.е. все шаги 1..n-1 уже завершены).
+STEP_WEIGHTS = {1: 3, 2: 2, 3: 55, 4: 2, 5: 5, 6: 10, 7: 5, 8: 15, 9: 3}
 CUM_BEFORE = {}
 _acc = 0
-for _n in range(1, 9):
+for _n in range(1, 10):
     CUM_BEFORE[_n] = _acc
     _acc += STEP_WEIGHTS[_n]
 del _acc, _n

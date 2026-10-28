@@ -751,7 +751,7 @@ class EditTabEffectsMixin:
                 "Не найден ни один трекер. Для нейросетевого варианта положите "
                 "файл модели DyHiT/HiT (.onnx) в папку models — ожидается "
                 f"{dyhit_tracker.expected_model_path()} — либо установите "
-                "opencv-python с трекерами (CSRT).")
+                "OpenCV с трекером (CSRT/KCF/MIL).")
             return
 
         # Кадр для выбора области — из оригинала на текущей позиции, полный размер

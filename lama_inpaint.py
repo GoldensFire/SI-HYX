@@ -71,7 +71,7 @@ def load_bgr(path: str) -> "np.ndarray":
     Для форматов, которые OpenCV не знает (avif/heic/svg…), откатываемся на Pillow.
     Бросает исключение, если открыть не удалось."""
     if cv2 is None:
-        raise RuntimeError("opencv-python не установлен (pip install opencv-python)")
+        raise RuntimeError("OpenCV не установлен (pip install opencv-python-headless)")
     data = np.fromfile(path, dtype=np.uint8)
     img = cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
     if img is not None:
@@ -91,7 +91,7 @@ def save_bgr(path: str, img_bgr: "np.ndarray", quality: int = 95) -> None:
     """Сохраняет BGR uint8 в файл по расширению. Unicode-безопасно (imencode +
     tofile). PNG — без потерь, JPEG/WEBP — с качеством quality."""
     if cv2 is None:
-        raise RuntimeError("opencv-python не установлен")
+        raise RuntimeError("OpenCV не установлен")
     ext = os.path.splitext(path)[1].lower() or ".png"
     params = []
     if ext in (".jpg", ".jpeg"):
@@ -305,7 +305,7 @@ class LaMaInpainter:
         маска пуста — возвращает копию исходника.
         """
         if cv2 is None:
-            raise RuntimeError("opencv-python не установлен (pip install opencv-python)")
+            raise RuntimeError("OpenCV не установлен (pip install opencv-python-headless)")
         img_bgr = np.ascontiguousarray(img_bgr)
         H, W = img_bgr.shape[:2]
         if mask.shape[:2] != (H, W):
