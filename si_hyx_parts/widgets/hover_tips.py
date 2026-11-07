@@ -205,6 +205,32 @@ def _enable_clear_button(ed) -> None:
 _enable_clear_button.__module__ = _api.__name__
 _api._enable_clear_button = _enable_clear_button
 
+# Отступ текста от левой рамки счётчика: рамка 1 px + padding 7 px из правила
+# QSpinBox в config.STYLESHEET.
+_SPIN_EDIT_INSET = 8
+
+
+def _inset_spin_edit(ed) -> None:
+    """Возвращает отступ текста в счётчиках (QSpinBox/QDoubleSpinBox).
+
+    До Qt 6.12 таблица стилей ставила поле ввода счётчика внутрь его padding
+    (x = 8), с 6.12 поле начинается от самой рамки (x = 0) и padding из QSS на
+    него не действует — числа во всей программе прилипли к левому краю. Добираем
+    недостающее полями текста; если Qt снова даст отступ сам, добавка станет 0.
+    """
+    try:
+        if not isinstance(ed.parentWidget(), _api.QAbstractSpinBox):
+            return
+        left = max(0, _SPIN_EDIT_INSET - ed.x())
+        m = ed.textMargins()
+        if m.left() != left:
+            ed.setTextMargins(left, m.top(), m.right(), m.bottom())
+    except Exception:
+        pass
+
+_inset_spin_edit.__module__ = _api.__name__
+_api._inset_spin_edit = _inset_spin_edit
+
 def _widen_truncated_combo(combo) -> None:
     """Обрезанному выпадающему списку — свободную ширину рядом с ним.
 
@@ -441,6 +467,9 @@ class HoverTipManager(_api.QObject):
             # Polish — он приходит один раз, ещё до показа виджета.
             if et == _api.QEvent.Type.Polish and isinstance(obj, _api.QLineEdit):
                 _api._enable_clear_button(obj)
+                return False
+            if et == _api.QEvent.Type.Resize and isinstance(obj, _api.QLineEdit):
+                _api._inset_spin_edit(obj)
                 return False
             if et == _api.QEvent.Type.Resize and isinstance(obj, _api.QComboBox):
                 _api._widen_truncated_combo(obj)
