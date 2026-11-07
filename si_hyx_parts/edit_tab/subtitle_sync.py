@@ -67,8 +67,7 @@ def _extract_srt_text(src, rel_idx):
 
 def _read_text(path):
     try:
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
-            return f.read()
+        return _api.read_subtitle_text(path)
     except OSError:
         return None
 

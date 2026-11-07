@@ -31,6 +31,9 @@ class DarknessReveal:
         self.gamma = 1.0 + 1.6 * strength
         self.blur = image.height / 720 * (2 + 6 * strength)
 
+    def set_image(self, image: Image.Image) -> None:
+        self.image = image
+
     def render(self, progress: float) -> Image.Image:
         rest = _remaining(progress)
         frame = self.image
@@ -56,6 +59,9 @@ class OverexposureReveal:
         self.linear = (np.asarray(image, dtype=np.float32) / 255.0) ** 2.2
         self.exposure = 4.0 + 20.0 * strength     # ×15 при 55
         self.lift = 0.27 - 0.22 * strength        # доля контраста на старте
+
+    def set_image(self, image: Image.Image) -> None:
+        self.linear = (np.asarray(image, dtype=np.float32) / 255.0) ** 2.2
 
     def render(self, progress: float) -> Image.Image:
         rest = _remaining(progress)

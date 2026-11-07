@@ -148,12 +148,19 @@ def test_failure_and_stop_clean_temporary_files(generator, monkeypatch, failure)
     gen.s.frame_effect = "tiles"
     cand = candidate()
 
-    def fail(cmd, timeout):
-        Path(cmd[-1]).write_bytes(b"partial video")
+    def fail(width, height, fps, total, key_at, frames, output, on_close=None):
+        # Кодировщик успел принять пару кадров из трубы и упал.
+        next(frames)
+        next(frames)
+        Path(output).write_bytes(b"partial video")
+        if on_close is not None:
+            on_close()
         return 1, "test failure"
 
-    monkeypatch.setattr(gen, "_run_killable", fail)
-    if failure == "stop":
+    if failure == "encode":
+        monkeypatch.setattr(gen, "_encode_frames", fail)
+    elif failure == "stop":
+        # «Стоп» посреди трубы: настоящий ffmpeg, кадры перестают идти.
         checks = iter([False, False, True])
         monkeypatch.setattr(gen, "stopped", lambda: next(checks, True))
     elif failure == "invalid_image":

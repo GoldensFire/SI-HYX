@@ -83,6 +83,9 @@ class ProjectTimeline(_api.QWidget):
     прокрутка, Ctrl+колесо — масштаб, клик по заголовку дорожки — вкл/выкл;
     у видеодорожки со звуком в заголовке ещё динамик — звук дорожки вкл/выкл
     (картинка остаётся). На клипах со звуком — волна (wave_provider).
+    Текст проекта (титры, строки и слова песни от montage_tool) — полоса
+    «Текст» над дорожками, только когда он есть: перенос, края — подрезка,
+    двойной клик — правка текста, Delete — удалить (actionRequested text_*).
 
     Правки модели делает сам (перенос, подрезка, вкл/выкл дорожки и её звука), объявляя
     editStarted ДО первой правки (вкладка снимает снимок для отмены) и edited
@@ -111,9 +114,14 @@ class ProjectTimeline(_api.QWidget):
     ROW_MAIN_H = 66
     ROW_VIDEO_H = 30
     ROW_AUDIO_H = 30
+    # Полоса текста проекта (Project.texts) над дорожками — только когда текст
+    # есть; пересекающиеся по времени тексты (строка и её слова) — в подполосы.
+    TEXT_LANE_H = 16
+    TEXT_LANES_MAX = 4
     EDGE_PX = 6
     SNAP_PX = 8
     DRAG_PX = 4
+    MIN_TEXT_S = 0.05
 
     def __init__(self, project, parent=None):
         super().__init__(parent)
@@ -126,6 +134,10 @@ class ProjectTimeline(_api.QWidget):
         # Присваивание selected выделяет ровно этот клип.
         self._sel_ids = set()
         self.selected = ""
+        # Выделенный текст проекта (id TextItem): клипы и текст не выделяются вместе.
+        self.selected_text = ""
+        self._text_lanes_key = None
+        self._text_lanes_val = ({}, 0)
         # thumb_provider(clip, время файла, высота в px) -> QPixmap|None: кадр
         # для полосы превью вдоль клипа, как в Filmora (вкладка достаёт кадры
         # фоном и зовёт invalidate(), когда они приехали; пока кадра нет —
@@ -155,6 +167,8 @@ class ProjectTimeline(_api.QWidget):
     def selected(self, cid):
         self._selected = cid or ""
         self._sel_ids = {self._selected} if self._selected else set()
+        if self._selected:
+            self.selected_text = ""
 
     def selected_ids(self):
         """Все выделенные клипы — id в порядке модели."""
@@ -176,6 +190,8 @@ class ProjectTimeline(_api.QWidget):
         changed = (primary or "") != self._selected
         self._selected = primary or ""
         self._sel_ids = ids
+        if ids:
+            self.selected_text = ""
         if changed:
             self.selectionChanged.emit(self._selected)
         self.update()
@@ -187,6 +203,8 @@ class ProjectTimeline(_api.QWidget):
             self.selected = ""
         else:
             self._sel_ids = {i for i in self._sel_ids if self.project.clip(i) is not None}
+        if self.text_item(self.selected_text) is None:
+            self.selected_text = ""
         self.refresh()
 
     def refresh(self):
@@ -209,8 +227,8 @@ class ProjectTimeline(_api.QWidget):
         return self.ROW_MAIN_H if ti == self.project.main_track else self.ROW_VIDEO_H
 
     def rows(self):
-        """[(индекс дорожки, y, высота)] сверху вниз."""
-        out, y = [], self.RULER_H
+        """[(индекс дорожки, y, высота)] сверху вниз (под полосой текста)."""
+        out, y = [], self.RULER_H + self.text_band_h()
         for ti in self.project.display_order():
             h = self._row_h(ti)
             out.append((ti, y, h))
@@ -218,7 +236,82 @@ class ProjectTimeline(_api.QWidget):
         return out
 
     def content_height(self):
-        return self.RULER_H + sum(self._row_h(ti) for ti in self.project.display_order()) + 2
+        return (self.RULER_H + self.text_band_h()
+                + sum(self._row_h(ti) for ti in self.project.display_order()) + 2)
+
+    # ── Текст проекта ────────────────────────────────────────────────────────
+    def _texts(self):
+        return getattr(self.project, "texts", None) or []
+
+    def text_item(self, tid):
+        return next((t for t in self._texts() if t.id == tid), None) if tid else None
+
+    def text_lanes(self):
+        """({id текста: подполоса}, число подполос): тексты, пересекающиеся
+        по времени, — в разные подполосы (жадно по началу); больше
+        TEXT_LANES_MAX — в последнюю, внахлёст."""
+        texts = self._texts()
+        key = tuple((t.id, t.start, t.end) for t in texts)
+        if key == self._text_lanes_key:
+            return self._text_lanes_val
+        ends, lanes = [], {}
+        for t in sorted(texts, key=lambda t: (t.start, t.end)):
+            lane = next((i for i, e in enumerate(ends) if e <= t.start + 1e-6), None)
+            if lane is None:
+                if len(ends) < self.TEXT_LANES_MAX:
+                    ends.append(t.end)
+                    lane = len(ends) - 1
+                else:
+                    lane = len(ends) - 1
+                    ends[lane] = max(ends[lane], t.end)
+            else:
+                ends[lane] = t.end
+            lanes[t.id] = lane
+        self._text_lanes_key = key
+        self._text_lanes_val = (lanes, len(ends))
+        return self._text_lanes_val
+
+    def text_band_h(self):
+        n = self.text_lanes()[1]
+        return n * self.TEXT_LANE_H + 4 if n else 0
+
+    def text_rect(self, t, start=None, end=None):
+        lanes, _n = self.text_lanes()
+        y = self.RULER_H + 2 + lanes.get(t.id, 0) * self.TEXT_LANE_H
+        s = t.start if start is None else start
+        e = t.end if end is None else end
+        x0 = self.x_of(s)
+        return QRectF(x0, y, max(2.0, (e - s) * self.pps), self.TEXT_LANE_H - 2)
+
+    def hit_text(self, pos):
+        """(текст, край) под точкой в полосе текста: край — 'left'/'right'."""
+        band = self.text_band_h()
+        if not band or pos.x() < self.HEADER_W or not (
+                self.RULER_H <= pos.y() < self.RULER_H + band):
+            return None, None
+        for t in reversed(self._texts()):
+            r = self.text_rect(t)
+            if r.top() <= pos.y() <= r.bottom() and r.left() - 2 <= pos.x() <= r.right() + 2:
+                edge = None
+                if r.width() >= 3 * self.EDGE_PX:
+                    if pos.x() - r.left() <= self.EDGE_PX:
+                        edge = 'left'
+                    elif r.right() - pos.x() <= self.EDGE_PX:
+                        edge = 'right'
+                return t, edge
+        return None, None
+
+    def in_text_band(self, y):
+        band = self.text_band_h()
+        return bool(band) and self.RULER_H <= y < self.RULER_H + band
+
+    def select_text(self, tid):
+        """Выделить текст проекта (клипы с выделения снимаются)."""
+        if self._sel_ids:
+            self._set_selection(())
+        self.selected_text = tid or ""
+        self.selectionChanged.emit(self._selected)
+        self.update()
 
     def lane_width(self):
         return max(1, self.width() - self.HEADER_W)
@@ -353,6 +446,9 @@ class ProjectTimeline(_api.QWidget):
         for c in self.project.clips:
             if c.id not in exclude:
                 pts += [c.start, c.end]
+        for t in self._texts():
+            if t.id not in exclude:
+                pts += [t.start, t.end]
         # Маркеры (сцены, биты, речь…) — только видимые: битов в песне сотни.
         lo, hi = self.offset, self.t_of(self.width())
         for m in self._visible_markers(lo, hi):
@@ -398,6 +494,12 @@ class ProjectTimeline(_api.QWidget):
                 self.edited.emit()
                 self.update()
             return
+        if self.in_text_band(pos.y()):
+            self._press_text(pos)
+            return
+        if self.selected_text:
+            self.selected_text = ""
+            self.update()
         ctrl = bool(ev.modifiers() & _api.Qt.KeyboardModifier.ControlModifier)
         clip, edge = self.hit(pos)
         if clip is None and pos.y() >= self.RULER_H:
@@ -437,10 +539,67 @@ class ProjectTimeline(_api.QWidget):
                       'collapse': collapse}
         self.update()
 
+    def _press_text(self, pos):
+        """Нажатие в полосе текста: по тексту — выделение и начало переноса
+        (у края — подрезки); по пустому месту — плейхед, как по линейке."""
+        t, edge = self.hit_text(pos)
+        if t is None:
+            self.select_text("")
+            self._drag = {'mode': 'scrub', 'x0': pos.x(), 'moved': False}
+            self.seekRequested.emit(max(0.0, self.t_of(pos.x())))
+            return
+        self.select_text(t.id)
+        self._drag = {'mode': 'ttrim' if edge else 'tpress', 'edge': edge, 'tid': t.id,
+                      'x0': pos.x(), 'y0': pos.y(), 'grab': self.t_of(pos.x()) - t.start,
+                      'started': False}
+
+    def _drag_text(self, d, pos):
+        """Перенос и подрезка текста проекта: модель меняется сразу, как при
+        подрезке клипа; прилипает к краям клипов, текстов и маркерам."""
+        t = self.text_item(d['tid'])
+        if t is None:
+            self._drag = None
+            return
+        if d['mode'] == 'tpress':
+            if abs(pos.x() - d['x0']) < self.DRAG_PX and abs(pos.y() - d['y0']) < self.DRAG_PX:
+                return
+            d['mode'] = 'tmove'
+            self.setCursor(_api.Qt.CursorShape.ClosedHandCursor)
+        if not d['started']:
+            self.editStarted.emit()
+            d['started'] = True
+        lanes_before = self.text_lanes()[1]
+        at = self.t_of(pos.x())
+        if d['mode'] == 'ttrim':
+            s = self._snap(at, t.id)
+            if d['edge'] == 'left':
+                t.start = max(0.0, min(s, t.end - self.MIN_TEXT_S))
+            else:
+                t.end = max(t.start + self.MIN_TEXT_S, s)
+        else:
+            length = t.end - t.start
+            start = max(0.0, at - d['grab'])
+            snapped = self._snap(start, t.id)
+            if abs(snapped - start) > 1e-9:
+                start = snapped
+            else:
+                start = max(0.0, self._snap(start + length, t.id) - length)
+            t.start, t.end = start, start + length
+        if self.text_lanes()[1] != lanes_before:
+            self.refresh()               # подполос стало больше/меньше — высота
+        else:
+            self.update()
+
     def mouseMoveEvent(self, ev):
         pos = ev.position()
         d = self._drag
         if d is None:
+            if self.in_text_band(pos.y()):
+                t, edge = self.hit_text(pos)
+                self.setCursor(_api.Qt.CursorShape.SizeHorCursor if edge else
+                               _api.Qt.CursorShape.OpenHandCursor if t is not None else
+                               _api.Qt.CursorShape.ArrowCursor)
+                return
             clip, edge = self.hit(pos)
             header = pos.x() < self.HEADER_W and self.row_of(pos.y()) is not None
             cur = (_api.Qt.CursorShape.SizeHorCursor if edge else
@@ -468,6 +627,9 @@ class ProjectTimeline(_api.QWidget):
             hit = {c.id for c in self.project.clips if self.clip_rect(c).intersects(band)}
             self._set_selection(d['base'] | hit)
             self.update()
+            return
+        if d['mode'] in ('tpress', 'tmove', 'ttrim'):
+            self._drag_text(d, pos)
             return
         clip = self.project.clip(d['id'])
         if clip is None:
@@ -530,6 +692,9 @@ class ProjectTimeline(_api.QWidget):
             self.scrubFinished.emit()
         elif d['mode'] == 'trim' and d['started']:
             self.edited.emit()
+        elif d['mode'] in ('tmove', 'ttrim') and d['started']:
+            self.project.texts.sort(key=lambda t: (t.start, t.end))
+            self.edited.emit()
         elif d['mode'] == 'move' and 'track' in d:
             clip = self.project.clip(d['id'])
             if clip is not None:
@@ -543,14 +708,33 @@ class ProjectTimeline(_api.QWidget):
         self.update()
 
     def mouseDoubleClickEvent(self, ev):
+        t, _edge = self.hit_text(ev.position())
+        if t is not None:
+            self.actionRequested.emit('text_edit', t.id)
+            return
         clip, _edge = self.hit(ev.position())
         if clip is not None:
             self.seekRequested.emit(max(0.0, self.t_of(ev.position().x())))
 
+    def _add_text_action(self, menu):
+        menu.addAction("Добавить текст у плейхеда…",
+                       lambda: self.actionRequested.emit('text_add', ''))
+
     def contextMenuEvent(self, ev):
         pos = ev.pos()
-        clip, _edge = self.hit(_api.QPointF(pos))
         menu = QMenu(self)
+        text, _edge = self.hit_text(_api.QPointF(pos))
+        if text is not None:
+            self.select_text(text.id)
+            menu.addAction("Свойства текста…",
+                           lambda: self.actionRequested.emit('text_edit', text.id))
+            menu.addAction("Удалить текст\tDel",
+                           lambda: self.actionRequested.emit('text_delete', text.id))
+            menu.addSeparator()
+            self._add_text_action(menu)
+            menu.exec(ev.globalPos())
+            return
+        clip, _edge = self.hit(_api.QPointF(pos))
         if clip is not None:
             if clip.id not in self._sel_ids:
                 self._set_selection({clip.id}, clip.id)
@@ -573,6 +757,8 @@ class ProjectTimeline(_api.QWidget):
                            else "Копировать\tCtrl+C",
                            lambda: self.actionRequested.emit('copy', clip.id))
             self._add_paste_action(menu)
+            menu.addAction("Свойства клипа…",
+                           lambda: self.actionRequested.emit('props', clip.id))
             menu.addSeparator()
             if clip.audio_path:
                 act = menu.addAction("Без звука",
@@ -598,12 +784,15 @@ class ProjectTimeline(_api.QWidget):
                               lambda: self.actionRequested.emit('speed:custom', clip.id))
         else:
             self._add_paste_action(menu)
+            self._add_text_action(menu)
             menu.addSeparator()
             menu.addAction("Добавить видеодорожку",
                            lambda: self.actionRequested.emit('add_track:video', ''))
             menu.addAction("Добавить аудиодорожку",
                            lambda: self.actionRequested.emit('add_track:audio', ''))
             menu.addAction("Весь проект в окне", self.zoom_to_fit)
+            menu.addAction("Настройки проекта…",
+                           lambda: self.actionRequested.emit('project_settings', ''))
         menu.exec(ev.globalPos())
 
     def _add_paste_action(self, menu):
@@ -613,6 +802,11 @@ class ProjectTimeline(_api.QWidget):
         act.setEnabled(bool(self.can_paste()) if self.can_paste is not None else False)
 
     def keyPressEvent(self, ev):
+        if (ev.key() in (_api.Qt.Key.Key_Delete, _api.Qt.Key.Key_Backspace)
+                and self.text_item(self.selected_text) is not None):
+            self.actionRequested.emit('text_delete', self.selected_text)
+            ev.accept()
+            return
         if ev.key() in (_api.Qt.Key.Key_Delete, _api.Qt.Key.Key_Backspace) and self.selected:
             self.actionRequested.emit('delete', self.selected)
             ev.accept()
@@ -633,11 +827,13 @@ class ProjectTimeline(_api.QWidget):
                       for c in proj.clips)
         tracks = tuple((t.kind, t.enabled, t.muted) for t in proj.tracks)
         markers = getattr(proj, "markers", [])
+        texts = tuple((t.id, t.start, t.end, t.text) for t in self._texts())
         d = self._drag or {}
         drag = (d.get('id'), d.get('track'), d.get('start')) if d.get('mode') == 'move' else None
         return (self.width(), self.height(), self.devicePixelRatioF(), self.offset,
                 self.pps, self.selected, frozenset(self._sel_ids), id(proj), clips,
-                tracks, (id(markers), len(markers)), drag, self._version)
+                tracks, (id(markers), len(markers)), texts, self.selected_text,
+                drag, self._version)
 
     def paintEvent(self, ev):
         key = self._static_signature()
@@ -719,7 +915,8 @@ class ProjectTimeline(_api.QWidget):
                 self._paint_insert_mark(p, group, min(on_main))
             for c, start, ti in ghosts:
                 self._paint_clip(p, c, self.clip_rect(c, start=start, track=ti), ghost=True)
-        if self.project.is_empty():
+        self._paint_texts(p, w)
+        if self.project.is_empty() and not self._texts():
             p.setPen(_api.QColor(C['text3']))
             p.drawText(QRectF(self.HEADER_W + 12, self.RULER_H, w - self.HEADER_W - 24,
                               h - self.RULER_H),
@@ -732,6 +929,41 @@ class ProjectTimeline(_api.QWidget):
         self._paint_headers(p, rows)
         p.end()
         return pm
+
+    def _paint_texts(self, p, w):
+        """Полоса текста проекта: плашки по времени, в каждой — сам текст
+        одной строкой."""
+        band = self.text_band_h()
+        if not band:
+            return
+        C = _api.C
+        p.fillRect(QRectF(self.HEADER_W, self.RULER_H, w - self.HEADER_W, band),
+                   _api.QColor(C['surface2']))
+        font = _api.QFont(self.font())
+        font.setPixelSize(10)
+        p.setFont(font)
+        fm = _api.QFontMetrics(font)
+        lo, hi = self.offset, self.t_of(w)
+        base = _api.QColor(C['accent2'])
+        for t in self._texts():
+            if t.end < lo or t.start > hi:
+                continue
+            r = self.text_rect(t)
+            fill = _api.QColor(base)
+            fill.setAlpha(150)
+            p.setPen(_api.QPen(_api.QColor(C['playhead']), 2) if t.id == self.selected_text
+                     else _api.QPen(base.darker(150), 1))
+            p.setBrush(fill)
+            p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+            left = max(r.left(), float(self.HEADER_W)) + 4
+            avail = int(r.right() - left - 3)
+            if avail < 10:
+                continue
+            label = " ".join(str(t.text).split())
+            p.setPen(_api.QColor("#ffffff"))
+            p.drawText(QRectF(left, r.top(), avail, r.height()),
+                       int(_api.Qt.AlignmentFlag.AlignLeft | _api.Qt.AlignmentFlag.AlignVCenter),
+                       fm.elidedText(label, _api.Qt.TextElideMode.ElideRight, avail))
 
     def _paint_insert_mark(self, p, moving_ids, start):
         """Куда встанут переносимые клипы на основной дорожке — вертикальная
@@ -1023,6 +1255,16 @@ class ProjectTimeline(_api.QWidget):
             p.drawText(QRectF(box.left() + 6, box.top(), text_w, box.height()),
                        int(_api.Qt.AlignmentFlag.AlignVCenter | _api.Qt.AlignmentFlag.AlignLeft),
                        self.project.track_short(ti))
+        band = self.text_band_h()
+        if band:
+            box = self._header_box(self.RULER_H, band)
+            p.setPen(_api.Qt.PenStyle.NoPen)
+            p.setBrush(_api.QColor(C['surface3']))
+            p.drawRoundedRect(box, 4, 4)
+            p.setPen(_api.QColor(C['text']))
+            p.drawText(QRectF(box.left() + 6, box.top(), box.width() - 8, min(box.height(), 16)),
+                       int(_api.Qt.AlignmentFlag.AlignVCenter | _api.Qt.AlignmentFlag.AlignLeft),
+                       "Текст")
         p.setPen(_api.QPen(_api.QColor(C['border']), 1))
         p.drawLine(self.HEADER_W - 1, 0, self.HEADER_W - 1, self.height())
 

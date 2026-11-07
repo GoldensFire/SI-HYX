@@ -205,7 +205,89 @@ class ProcessImagesMixin:
 
         return path, rot_tmp_file, orig_w, orig_h
 
+    def _strip_ai_watermarks(self, path, raw_name, av, tmp_files):
+        """Снимает видимые вотермарки Gemini (белая звезда) и Meta AI (логотип
+        и надпись) у правого нижнего угла, если они найдены уверенно.
+        Возвращает путь, с которого дальше кодировать: временный PNG без
+        знаков (его путь добавляется в tmp_files) или исходный, если знаков
+        нет, галочка выключена или что-то не вышло. EXIF-поворот применяется
+        здесь же: у PNG его уже нет."""
+        if not av.get('gemini_wm', True) or not (_api.Image and _api.ImageOps):
+            return path
+        try:
+            import numpy as np
+            import gemini_watermark
+            import meta_watermark
+            if gemini_watermark.cv2 is None and meta_watermark.cv2 is None:
+                return path
+            with _api.Image.open(path) as src:
+                if getattr(src, 'n_frames', 1) > 1:   # анимацию не трогаем
+                    return path
+                icc = src.info.get('icc_profile')
+                im = _api.ImageOps.exif_transpose(src)
+                has_alpha = im.mode in ('RGBA', 'LA', 'PA', 'La', 'RGBa') or \
+                    (im.mode == 'P' and 'transparency' in im.info)
+                arr = np.asarray(im.convert('RGBA' if has_alpha else 'RGB'))
+            removed = []
+            if gemini_watermark.cv2 is not None:
+                found = gemini_watermark.find_watermark(
+                    arr, hint=raw_name.startswith('Gemini_Generated_Image'))
+                if found:
+                    arr = gemini_watermark.remove_watermark(arr, found)
+                    removed.append('Gemini')
+            if meta_watermark.cv2 is not None:
+                found = meta_watermark.find_watermark(arr)
+                if found:
+                    lama = self._meta_inpainter()
+                    try:
+                        arr = meta_watermark.remove_watermark(arr, found, lama)
+                    except Exception as e:
+                        if lama is None:
+                            raise
+                        self.log.emit(f"LaMa не сработала ({e}), знак Meta AI "
+                                      "залит по соседям")
+                        self._meta_lama = False
+                        arr = meta_watermark.remove_watermark(arr, found)
+                    removed.append('Meta AI')
+            if not removed:
+                return path
+            tmp = _api.os.path.join(_api.TEMP_DIR, f"ai_wm_{_api.uuid.uuid4().hex}.png")
+            _api.Image.fromarray(arr).save(tmp, **({'icc_profile': icc} if icc else {}))
+            tmp_files.append(tmp)
+            self.log.emit(f"Вотермарка {' и '.join(removed)} снята: {_api.os.path.basename(path)}")
+            return tmp
+        except Exception as e:
+            self.log.emit(f"Вотермарки не сняты ({_api.os.path.basename(path)}): {e}")
+            return path
+
+    def _meta_inpainter(self):
+        """LaMa для знака Meta AI или None, если модели нет или она уже
+        отказала в этом запуске. Сессия ONNX живёт в дочернем процессе:
+        её сборка держит GIL ~20 с и заморозила бы окно. Один на запуск,
+        выгружается в конце run()."""
+        with self._meta_lama_lock:
+            if self._meta_lama is None:
+                self._meta_lama = False
+                try:
+                    import lama_inpaint
+                    lama = lama_inpaint.LaMaProcessInpainter()
+                    if lama.is_available():
+                        self._meta_lama = lama
+                except Exception:
+                    pass
+            return self._meta_lama or None
+
     def process_avif(self, item, cb):
+        # Временный PNG без вотермарок нужен до конца обработки файла.
+        tmp_files = []
+        try:
+            return self._process_image_item(item, cb, tmp_files)
+        finally:
+            for t in tmp_files:
+                try: _api.os.remove(t)
+                except Exception: pass
+
+    def _process_image_item(self, item, cb, tmp_files):
         path = item['path']
         base, ext = _api.os.path.splitext(path)
 
@@ -225,6 +307,7 @@ class ProcessImagesMixin:
         suffix = "" if av.get('overwrite_src') else "_Сжатый"
         out_name = sanitized + suffix + ".avif"
         out = _api.os.path.join(out_dir, out_name)
+        path = self._strip_ai_watermarks(path, raw_name, av, tmp_files)
 
         # Выбранный пользователем формат: png/jpg/ico обрабатываем через Pillow
         # (без ffmpeg), avif/webp — основной конвейер ниже.

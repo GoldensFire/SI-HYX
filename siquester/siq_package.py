@@ -86,6 +86,53 @@ def _safe_replace(tmp: str, dst: str) -> None:
     raise last_err if last_err is not None else OSError(f"could not replace {dst}")
 
 
+_GENERIC_READ = 0x80000000
+_FILE_SHARE_READ_WRITE_DELETE = 0x1 | 0x2 | 0x4
+_OPEN_EXISTING = 3
+_FILE_ATTRIBUTE_NORMAL = 0x80
+
+
+def _open_zip_shared(path: str) -> zipfile.ZipFile:
+    """Открывает .siq на чтение, не мешая другим программам заменять файл.
+
+    SiqPackage держит архив открытым всё время жизни (медиа достаётся лениво).
+    Обычный ``open()`` в Windows запрещает FILE_SHARE_DELETE, поэтому, пока
+    SI-HYX был запущен, SIQuester не мог атомарно подменить пак при сохранении
+    (File.Replace → «файл занят другим процессом») и переписывал его на месте
+    через File.Copy: файл менялся под нашим открытым дескриптором, а .siq
+    становился скрытым (копировались атрибуты скрытого временного файла).
+    С FILE_SHARE_DELETE замена проходит атомарно, а этот дескриптор продолжает
+    читать ту версию архива, которую открыл.
+    """
+    if os.name != 'nt':
+        return zipfile.ZipFile(path, 'r')
+
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = _ctypes.WinDLL('kernel32', use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.restype = wintypes.HANDLE
+    create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+
+    handle = create_file(os.fspath(path), _GENERIC_READ, _FILE_SHARE_READ_WRITE_DELETE, None,
+                         _OPEN_EXISTING, _FILE_ATTRIBUTE_NORMAL, None)
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        raise _ctypes.WinError(_ctypes.get_last_error())
+
+    fp = os.fdopen(msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY), 'rb')
+    try:
+        zf = zipfile.ZipFile(fp, 'r')
+    except Exception:
+        fp.close()
+        raise
+    # Архив владеет файлом, как при открытии по пути: close() (с учётом ещё
+    # открытых записей) закрывает и дескриптор, а не оставляет его висеть.
+    zf._filePassed = 0
+    return zf
+
+
 # ── Формат v4: <scenario><atom> вместо <params><param type="content"><item> ────
 # Соответствие типов/размещения взято из SIQuester (SIPackages/Question.cs,
 # Question.Upgrade + GetContentType/GetPlacement) — см. исходники на Диске:
@@ -175,7 +222,7 @@ class SiqPackage:
         self._parse()
 
     def _parse(self):
-        self._zip = zipfile.ZipFile(self.path, 'r')
+        self._zip = _open_zip_shared(self.path)
         # Build media map AND a size map in a single infolist() pass.
         # _zip_sizes lets mp3_duration compute total_bytes without a seek/read.
         self._zip_sizes: dict[str, int] = {}
@@ -483,7 +530,7 @@ class SiqPackage:
                 if self._zip is not None:
                     try: self._zip.close()
                     except Exception: pass
-                self._zip = zipfile.ZipFile(self.path, 'r')
+                self._zip = _open_zip_shared(self.path)
                 _do_extract(self._zip)
                 self._extract_cache[zpath] = out
                 return out
@@ -607,7 +654,7 @@ class SiqPackage:
             except Exception:
                 pass
 
-            self._zip = zipfile.ZipFile(self.path, 'r')
+            self._zip = _open_zip_shared(self.path)
             # Rebuild the size map so mp3_duration probes stay accurate.
             self._zip_sizes = {info.filename: info.file_size
                                for info in self._zip.infolist()}
@@ -618,7 +665,7 @@ class SiqPackage:
                 try: os.remove(tmp)
                 except Exception: pass
             if self._zip is None:
-                try: self._zip = zipfile.ZipFile(self.path, 'r')
+                try: self._zip = _open_zip_shared(self.path)
                 except Exception: pass
             return False
 
@@ -1277,7 +1324,7 @@ class SiqPackage:
                         with open(file_path, 'rb') as mf, zout.open(mi, 'w') as dst:
                             _shutil.copyfileobj(mf, dst, length=1 << 20)
                 _safe_replace(tmp, self.path)
-                self._zip = zipfile.ZipFile(self.path, 'r')
+                self._zip = _open_zip_shared(self.path)
                 # Keep _zip_sizes consistent: add the new entry's size from disk.
                 try:
                     self._zip_sizes[zip_name] = os.path.getsize(file_path)
@@ -1304,7 +1351,7 @@ class SiqPackage:
                     try: os.remove(tmp)
                     except Exception: pass
                 if self._zip is None:
-                    try: self._zip = zipfile.ZipFile(self.path, 'r')
+                    try: self._zip = _open_zip_shared(self.path)
                     except Exception: pass
                 return False
         except Exception as e:

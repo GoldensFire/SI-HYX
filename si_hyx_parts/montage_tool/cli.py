@@ -20,7 +20,8 @@ _USAGE_CODES = {"usage", "project_not_found", "project_too_large", "project_inva
                 "project_invalid", "missing_files", "bad_output", "output_exists",
                 "bad_encoder", "nothing_to_render", "probe_failed", "project_version",
                 "bad_range", "bad_media", "bad_schema", "gemini_no_key", "bad_track",
-                "ml_unavailable", "no_clip", "bad_op", "bad_plan", "no_markers"}
+                "ml_unavailable", "no_clip", "bad_op", "bad_plan", "no_markers",
+                "audio_copy_unavailable"}
 
 
 class _Parser(argparse.ArgumentParser):
@@ -105,6 +106,8 @@ def _cmd_dry_run(args):
 
 def _cmd_render(args):
     p, problems = _api.load_project_file(args.project, strict=not args.lenient)
+    # Проект для вкладки «Монтаж» — до превью (оно меняет формат только сборки).
+    handoff = None if args.no_project else p.copy()
     preview = _preview_arg(p, args)
     cancel_file = args.cancel_file
 
@@ -116,10 +119,20 @@ def _cmd_render(args):
                "time": round(sec, 3), "duration": round(total, 3)}, _api.sys.stderr)
 
     out = _api.render(p, args.output, encoder=args.encoder, overwrite=args.overwrite,
-                      on_progress=_progress if args.progress else None, should_stop=_stop)
+                      on_progress=_progress if args.progress else None, should_stop=_stop,
+                      audio_copy=args.audio_copy)
     out["problems"] = problems
     if preview:
         out["preview"] = preview
+    if handoff is not None:
+        # Видео собрано — его проект ложится рядом и уходит во вкладку
+        # «Монтаж» (montage_handoff): пользователь правит его на таймлайне.
+        try:
+            entry = _api.montage_handoff.publish(handoff, out["output"], source=args.project,
+                                                 preview=bool(preview))
+            out["montage_project"] = entry["project"]
+        except OSError as e:
+            out["montage_project_error"] = f"проект для вкладки не записан: {e}"
     return out
 
 
@@ -273,7 +286,8 @@ def _cmd_index(args):
     return _api.index_library(args.target, args.db or None, _control(args), force=args.force,
                               tagger=args.tagger, gemini=args.gemini,
                               gemini_model=args.gemini_model, speech=speech,
-                              captions=args.captions, caption_gpu_layers=args.gpu_layers)
+                              captions=args.captions, caption_gpu_layers=args.gpu_layers,
+                              gpu=not args.no_gpu, recluster=not args.no_recluster)
 
 
 def _cmd_lines(args):
@@ -484,6 +498,12 @@ def build_parser():
                             help="прогресс строками JSON в stderr")
             sp.add_argument("--cancel-file", default="",
                             help="появился этот файл — сборка отменяется")
+            sp.add_argument("--no-project", action="store_true",
+                            help="не класть проект рядом с итогом и не передавать его "
+                                 "во вкладку «Монтаж»")
+            sp.add_argument("--audio-copy", action="store_true",
+                            help="звук итога — поток песни как есть, без перекодирования "
+                                 "(весь звук проекта — один клип с начала до конца)")
         sp.set_defaults(fn=fn)
     sp = sub.add_parser("still", help="кадр проекта")
     sp.add_argument("project")
@@ -576,6 +596,10 @@ def build_parser():
                     help="подписи планов локальной моделью (llama.cpp, Qwen3.5-2B) для --query")
     sp.add_argument("--gpu-layers", type=int, default=_api.CAPTION_GPU_LAYERS,
                     help="слои текста подписей на видеокарте (0 — процессор)")
+    sp.add_argument("--no-gpu", action="store_true",
+                    help="без видеокарты: всё на процессоре, экран не подтормаживает")
+    sp.add_argument("--no-recluster", action="store_true",
+                    help="не пересчитывать персонажей (потом — characters --recluster)")
     sp.add_argument("--progress", action="store_true", help="этапы строками JSON в stderr")
     sp.add_argument("--cancel-file", default="", help="появился этот файл — отмена")
     sp.set_defaults(fn=_cmd_index)
@@ -600,6 +624,8 @@ def build_parser():
     sp.add_argument("--db", default="")
     sp.add_argument("--rename", nargs=2, metavar=("ID", "ИМЯ"), help="дать кластеру имя")
     sp.add_argument("--recluster", action="store_true", help="пересобрать кластеры")
+    sp.add_argument("--progress", action="store_true", help="этапы строками JSON в stderr")
+    sp.add_argument("--cancel-file", default="", help="появился этот файл — отмена")
     sp.set_defaults(fn=_cmd_characters)
     sp = sub.add_parser("edit", help="точечные правки проекта списком операций")
     sp.add_argument("project")

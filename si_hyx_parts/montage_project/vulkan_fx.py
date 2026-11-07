@@ -12,6 +12,15 @@ hook_frag(), hook() пишет его в out_image). Применяется, т�
 исходника меньше кадра проекта (нужен апскейл); нет Vulkan (vulkan_ok) или
 файла шейдера (готовит montage_tool) — обычное масштабирование.
 
+Каждый экземпляр libplacebo держит до конца сборки ~50 МБ текстур в
+device-local куче iGPU (256 МБ): больше ~21 клипа в одном графе — ffmpeg
+падает (0xC0000005). Поэтому клип берётся из кэша апскейла (upscale_source:
+кусок исходника — или кэша вырезки / RIFE — уже в 2×, по процессу ffmpeg на
+клип, готовит montage_tool), а libplacebo в графе — запасной путь без кэша;
+там все экземпляры делят одно устройство Vulkan (SourceGraph.input_args).
+Альфа вырезки идёт мимо libplacebo: масштабируется отдельно и
+возвращается alphamerge.
+
 RIFE (rife-ncnn-vulkan, TNTwise, MIT) — замедленный клип (play_speed < 1,
 Clip.interpolate = модель) берётся из кэша промежуточного видео: кадров с
 частотой fps_проекта / speed на тот же кусок исходника, так что после
@@ -34,6 +43,9 @@ UPSCALE_PRESETS = {
 RIFE_MODELS = ("rife-v4.22-lite", "rife-v4.25")
 CACHE_ENV = "SI_HYX_MONTAGE_CACHE"
 _RIFE_VERSION = 1
+_UPSCALE_VERSION = 1
+# Общее устройство Vulkan для всех libplacebo графа (глобальные опции ffmpeg).
+VULKAN_DEVICE_ARGS = ["-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk"]
 
 
 def cache_root():
@@ -104,19 +116,79 @@ def upscale_of(project, c):
     return c.upscale or project.settings.upscale or ""
 
 
-def upscale_filter(project, c, out_h):
-    """libplacebo с Anime4K для клипа c или "": выключено, кадр исходника не
-    меньше кадра проекта, нет Vulkan или файла шейдера."""
+def upscale_wanted(project, c, out_h):
+    """Пресет апскейла клипа c или "": выключен, картинка, кадр исходника не
+    меньше кадра проекта."""
     preset = upscale_of(project, c)
     if not preset or c.is_image or not c.height or c.height >= out_h:
         return ""
+    return preset
+
+
+def upscale_vf(preset, deband, alpha=False, lab=None):
+    """Цепочка апскейла 2× с запятой в конце или "": нет Vulkan или файла
+    шейдера. alpha — у кадра есть альфа (вырезка): libplacebo получает кадр
+    без неё, альфа масштабируется отдельно; lab — метки (обязательна при
+    alpha)."""
     path = shader_path(preset)
     if not os.path.isfile(path) or not vulkan_ok():
         return ""
     from ffmpeg_env import escape_filter_path
-    deband = ":deband=true" if project.settings.deband else ""
-    return (f"libplacebo=w=iw*2:h=ih*2:custom_shader_path={escape_filter_path(path)}"
-            f"{deband}:format=yuv420p,")
+    pl = (f"libplacebo=w=iw*2:h=ih*2:custom_shader_path={escape_filter_path(path)}"
+          f"{':deband=true' if deband else ''}:format=yuv420p")
+    if not alpha:
+        return pl + ","
+    k, a, al, u = lab("uk"), lab("ua"), lab("ual"), lab("uu")
+    # format до split: иначе согласование форматов отдаёт split кадр без
+    # альфы (ветке libplacebo она не нужна) и alphaextract не настраивается.
+    return (f"format=yuva420p,split[{k}][{a}];[{a}]alphaextract,scale=iw*2:ih*2[{al}];"
+            f"[{k}]format=yuv420p,{pl}[{u}];[{u}][{al}]alphamerge,")
+
+
+def upscale_filter(project, c, out_h, alpha=False, lab=None):
+    """libplacebo с Anime4K для клипа c или "": выключено, кадр исходника не
+    меньше кадра проекта, нет Vulkan или файла шейдера. alpha, lab — как у
+    upscale_vf."""
+    preset = upscale_wanted(project, c, out_h)
+    if not preset:
+        return ""
+    return upscale_vf(preset, project.settings.deband, alpha, lab)
+
+
+def upscale_key(base, preset, deband):
+    """Ключ кэша апскейла: исходник base (файл или кэш вырезки / RIFE) —
+    путь, размер, время правки, кусок; пресет и deband."""
+    try:
+        st = os.stat(base.src)
+        stamp = f"{st.st_size}:{st.st_mtime_ns}"
+    except OSError:
+        stamp = "missing"
+    a, b = _api.matte_span(base)
+    raw = (f"{os.path.abspath(base.src)}|{stamp}|{a:.6f}|{b:.6f}|{preset}|{int(bool(deband))}|"
+           f"v{_UPSCALE_VERSION}")
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def upscale_path(base, preset, deband):
+    return os.path.join(cache_root(), "upscale", f"{upscale_key(base, preset, deband)}.mkv")
+
+
+def upscale_source(project, c, base, out_h):
+    """Клип-заместитель для цепочки картинки: исходник — кэш апскейла куска
+    base (кусок с нуля, как у matte_source) или None: апскейла нет, кэш не
+    готов. c — клип проекта (пресет, размер кадра), base — что граф читал
+    бы без апскейла: c или его кэш вырезки / RIFE."""
+    preset = upscale_wanted(project, c, out_h)
+    if not preset:
+        return None
+    path = upscale_path(base, preset, project.settings.deband)
+    if not os.path.isfile(path):
+        return None
+    from dataclasses import replace
+    a, b = _api.matte_span(base)
+    if base.frozen:
+        return replace(base, src=path, freeze_at=0.0, src_duration=b - a, matte="")
+    return replace(base, src=path, in_s=0.0, out_s=b - a, src_duration=b - a, matte="")
 
 
 # ── RIFE ─────────────────────────────────────────────────────────────────────

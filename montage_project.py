@@ -38,7 +38,7 @@ PROJECT_VERSION = 3
 # Поля v3 у клипа: пустые в файл не пишутся, и проект без них остаётся v2 —
 # его читают и прежние версии программы.
 _V3_CLIP_FIELDS = ('keyframes', 'effects', 'speed_curve', 'curve_audio', 'interpolate',
-                   'upscale', 'crop', 'box', 'mask', 'stroke', 'blend', 'matte')
+                   'upscale', 'crop', 'box', 'mask', 'stroke', 'shadow', 'blend', 'matte')
 _V3_SETTINGS = {'upscale': '', 'deband': False, 'finish': []}
 MIN_CLIP_S = 0.04          # короче клип не бывает (подрезка, разрезание)
 MIN_SPEED = 0.1            # пределы скорости клипа (доли и разы)
@@ -182,6 +182,7 @@ class Clip:
     box: list = field(default_factory=list)         # [ширина, высота] наложения, доли кадра
     mask: dict = field(default_factory=dict)        # форма видимой части наложения
     stroke: dict = field(default_factory=dict)      # обводка по альфе наложения
+    shadow: dict = field(default_factory=dict)      # мягкая тень под наложением
     blend: str = ''               # режим наложения (layers.BLEND_MODES); '' — обычный
     matte: str = ''               # вырезать персонажа (layers.MATTE_MODELS); '' — нет
 
@@ -238,6 +239,7 @@ class Clip:
         self.box = sanitize_box(self.box)
         self.mask = sanitize_mask(self.mask)
         self.stroke = sanitize_stroke(self.stroke)
+        self.shadow = sanitize_shadow(self.shadow)
         self.blend = sanitize_blend(self.blend)
         self.matte = sanitize_matte(self.matte) if not self.is_image else ''
 
@@ -801,8 +803,8 @@ class Project:
             gaps.append("интерполяция RIFE")
         if self.settings.upscale or any(c.upscale not in ('', 'none') for c in self.clips):
             gaps.append("апскейл Anime4K")
-        if any(c.crop or c.box or c.mask or c.stroke or c.blend for c in self.clips):
-            gaps.append("обрезка, маски, обводка и режимы наложения")
+        if any(c.crop or c.box or c.mask or c.stroke or c.shadow or c.blend for c in self.clips):
+            gaps.append("обрезка, маски, обводка, тени и режимы наложения")
         if any(c.matte for c in self.clips):
             gaps.append("вырезанный персонаж")
         if self.settings.finish:
@@ -1017,14 +1019,39 @@ class SourceGraph:
     fps: float
 
     def input_args(self):
-        return [a for args in self.inputs for a in args]
+        # libplacebo в графе (Anime4K без кэша) — все на одном устройстве
+        # Vulkan: своё устройство на экземпляр роняло ffmpeg уже на ~22.
+        hw = list(VULKAN_DEVICE_ARGS) if "libplacebo=" in self.graph else []
+        return hw + [a for args in self.inputs for a in args]
+
+
+PROJECT_SUFFIX = ".montage.json"     # файл проекта, который открывает вкладка «Монтаж»
+
+
+def backup_path(path):
+    """Куда save_project откладывает прежнюю версию файла. Файл проекта
+    (`x.montage.json`) открывается во вкладке — его прежняя версия
+    называется тоже как проект, `x.bak.montage.json`, и открывается так же;
+    у прочих файлов (montage_project.json вкладки) — `путь.bak`."""
+    path = str(path)
+    if path.lower().endswith(PROJECT_SUFFIX):
+        return path[:-len(PROJECT_SUFFIX)] + ".bak" + PROJECT_SUFFIX
+    return path + ".bak"
+
+
+def is_project_file(path):
+    """Файл, который вкладка открывает проектом, а не медиа: `.json` (в том
+    числе `x.montage.json`, `x.bak.montage.json`) и прежняя версия старого
+    образца `x.montage.json.bak`."""
+    low = str(path).lower()
+    return low.endswith(".json") or low.endswith(PROJECT_SUFFIX + ".bak")
 
 
 def save_project(project, path):
     """Атомарная запись проекта, как у пресетов субтитров
     (edit_tab_base._save_subtitle_presets): tmp на диск с fsync, прежний
-    файл — в .bak, затем tmp на место. Сбой между двумя переносами оставляет
-    .bak — его подхватит load_project."""
+    файл — в backup_path, затем tmp на место. Сбой между двумя переносами
+    оставляет прежнюю версию — её подхватит load_project."""
     path = str(path)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -1032,18 +1059,20 @@ def save_project(project, path):
         f.flush()
         os.fsync(f.fileno())
     if os.path.exists(path):
-        os.replace(path, path + ".bak")
+        os.replace(path, backup_path(path))
     os.replace(tmp, path)
 
 
 def load_project(path, strict=False):
-    """Проект из файла. Файла нет — его .bak (сбой посреди save_project),
-    нет и его — пустой проект. Файл есть, но не загружается (не JSON,
-    версия новее программы, строгая проверка) — ProjectError с path этого
-    файла: вызывающий решает, что с ним делать, и не затирает его молча."""
+    """Проект из файла. Файла нет — его прежняя версия (сбой посреди
+    save_project), нет и её — пустой проект. Файл есть, но не загружается
+    (не JSON, версия новее программы, строгая проверка) — ProjectError с
+    path этого файла: вызывающий решает, что с ним делать, и не затирает
+    его молча."""
     path = str(path)
-    if not os.path.exists(path) and os.path.exists(path + ".bak"):
-        path += ".bak"
+    if not os.path.exists(path):
+        # `путь.bak` — и прежнее имя прежней версии файла проекта.
+        path = next((b for b in (backup_path(path), path + ".bak") if os.path.exists(b)), path)
     if not os.path.exists(path):
         return Project()
     try:
@@ -1065,12 +1094,14 @@ from si_hyx_parts.montage_project.effects import (  # noqa: E402,F401
     curve_length, curve_source_offset, has_fx, keyframe_value, sanitize_curve, sanitize_effect,
     sanitize_effects, sanitize_keyframes, split_fx)
 from si_hyx_parts.montage_project.layers import (  # noqa: E402,F401
-    BLEND_MODES, MASK_SHAPES, MATTE_MODELS, STROKE_STYLES, matte_path, matte_span, matte_wanted,
-    sanitize_blend, sanitize_box, sanitize_crop, sanitize_mask, sanitize_matte, sanitize_stroke)
+    BLEND_MODES, MASK_SHAPES, MATTE_MODELS, SHADOW_FIELDS, STROKE_STYLES, matte_path,
+    matte_source, matte_span, matte_wanted, sanitize_blend, sanitize_box, sanitize_crop,
+    sanitize_mask, sanitize_matte, sanitize_shadow, sanitize_stroke)
 from si_hyx_parts.montage_project.text_fx import (  # noqa: E402,F401
     FONT_ALIASES, is_kinetic, resolve_font)
 from si_hyx_parts.montage_project.vulkan_fx import (  # noqa: E402,F401
-    RIFE_MODELS, UPSCALE_PRESETS, interp_path, interp_rate, interp_wanted, shader_path,
-    to_compute, upscale_of, vulkan_ok)
+    RIFE_MODELS, UPSCALE_PRESETS, VULKAN_DEVICE_ARGS, interp_path, interp_rate, interp_wanted,
+    interp_source, shader_path, to_compute, upscale_of, upscale_path, upscale_vf, upscale_wanted,
+    vulkan_ok)
 from si_hyx_parts.montage_project.graph import (  # noqa: E402,F401
     build_export, build_source, loudnorm_filter, text_cues)

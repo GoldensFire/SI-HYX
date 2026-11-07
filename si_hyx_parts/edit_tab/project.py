@@ -22,9 +22,11 @@ Ctrl+V вставляет их у плейхеда (Project.paste). Ещё фа�
 через «голоса» (project_audio).
 
 Модель — montage_project.Project; виджет — edit_tab_widgets.ProjectTimeline.
-Проект сохраняется сам (MONTAGE_PROJECT_PATH) и переживает перезапуск."""
+Проект сохраняется сам (MONTAGE_PROJECT_PATH) и переживает перезапуск; файл
+проекта и проекты нейросети — project_link, текст проекта — project_texts."""
 import bisect
 import dataclasses
+import threading
 from collections import OrderedDict
 
 import hdr_tonemap
@@ -38,6 +40,8 @@ import edit_tab as _api
 _INLINE_GRAPH_MAX = 6000
 # Кадров полосы превью в памяти (~10 КБ каждый) — дальше вытесняются старые.
 _THUMB_CACHE_MAX = 900
+# За сколько до конца куска разбирать ffprobe файл следующего куска (в фоне).
+_PROBE_LEAD_S = 3.0
 
 
 class EditTabProjectMixin:
@@ -67,8 +71,11 @@ class EditTabProjectMixin:
         self._proj_thumb_timer = None
         self._proj_waves = {}          # волна файла: путь → (сэмплы, длительность)
         self._proj_clipboard = []      # копии клипов для Ctrl+V (project_copy)
+        self._link_init()              # файл проекта и проекты нейросети (project_link)
+        self._fx_init()                # просмотр с эффектами и текстом (project_fx)
         self._pmix_init()              # звук дорожек в просмотре (project_audio)
         self._snd_init()               # звук просмотра своим трактом (project_sound)
+        self._deck_init()              # картинка стыков — деками (project_decks)
 
     # ── Панель ───────────────────────────────────────────────────────────────
     def _build_project_panel(self):
@@ -84,11 +91,7 @@ class EditTabProjectMixin:
 
         # Чего живой плеер не покажет (он играет клипы по одному и без
         # эффектов): видно только в собранном файле и в превью montage_tool.
-        self.lbl_proj_preview_gap = _api.QLabel()
-        self.lbl_proj_preview_gap.setWordWrap(True)
-        self.lbl_proj_preview_gap.setStyleSheet(f"color: {_api.C['text3']}; font-size: 11px;")
-        self.lbl_proj_preview_gap.hide()
-        lay.addWidget(self.lbl_proj_preview_gap)
+        self._link_build_bar(lay)
 
         tl = _api.ProjectTimeline(self.project)
         tl.thumb_provider = self._project_thumb
@@ -99,7 +102,7 @@ class EditTabProjectMixin:
         tl.scrubFinished.connect(self._project_scrub_finished)
         tl.selectionChanged.connect(lambda _cid: self._project_update_ui())
         tl.editStarted.connect(self._project_snapshot)
-        tl.edited.connect(self._project_changed)
+        tl.edited.connect(self._project_edited)
         tl.actionRequested.connect(self._project_action)
         tl.viewChanged.connect(self._project_sync_scroll)
         self.project_timeline = tl
@@ -148,20 +151,15 @@ class EditTabProjectMixin:
             return
         n = len(self.project.clips)
         sel = self.project.clip(self.project_timeline.selected)
-        self.btn_proj_delete.setEnabled(sel is not None)
+        self.btn_proj_delete.setEnabled(sel is not None
+                                        or bool(self.project_timeline.selected_text))
         for b in (self.btn_proj_split, self.btn_trim_start, self.btn_trim_end):
             b.setEnabled(n > 0)
         self.btn_proj_undo.setEnabled(bool(self._proj_undo) or (n == 0 and bool(self.undo_stack)))
         self.btn_proj_redo.setEnabled(bool(self._proj_redo))
         self._update_total_time()
         self.update_selection_label()
-        gap_lbl = getattr(self, "lbl_proj_preview_gap", None)
-        if gap_lbl is not None:
-            gaps = self.project.live_preview_gaps()
-            gap_lbl.setText("Просмотр во вкладке играет клипы без эффектов. "
-                            f"Только в собранном файле и в превью montage_tool: {', '.join(gaps)}."
-                            if gaps else "")
-            gap_lbl.setVisible(bool(gaps))
+        self._fx_update_mode()
         if n > 0:
             # Плеер на проекте: играть есть что, даже если на экране картинка.
             self.btn_play.setEnabled(True)
@@ -211,6 +209,7 @@ class EditTabProjectMixin:
             _mp.save_project(self.project, _api.MONTAGE_PROJECT_PATH)
         except Exception:
             pass
+        self._link_write_back()
 
     def _proj_status(self, text):
         try:
@@ -223,7 +222,7 @@ class EditTabProjectMixin:
     # ── Правка ───────────────────────────────────────────────────────────────
     def _project_snapshot(self):
         """Снимок ДО правки — для отмены (Ctrl+Z)."""
-        self._proj_undo.append(self.project.to_dict())
+        self._proj_undo.append(self._proj_state())
         self._proj_redo.clear()
 
     def _project_changed(self):
@@ -233,10 +232,55 @@ class EditTabProjectMixin:
             self.project_stop()
         self._proj_active = not self.project.is_empty()
         self._project_save()
+        self._fx_project_changed()
         self.project_timeline.refresh()
         self._project_sync_source()
         self._project_update_ui()
         self._snd_schedule_prepare()
+
+    def _project_edited(self):
+        """Правка мышью на таймлайне (край клипа, перенос, текст). Просмотр не
+        обрывается: после правки он идёт дальше с того же места уже по новому
+        проекту — растянутый на ходу клип играет до своего нового конца."""
+        if self._proj_play is None or self._fx_mode:
+            self._project_changed()
+            return
+        t = self.project_timeline.playhead
+        self._project_changed()             # останавливает просмотр
+        self._proj_resume_at(t)
+
+    def _proj_resume_at(self, t):
+        """Просмотр заново с t (после правки проекта на ходу). False — t за
+        последним кадром проекта: просмотр не начат."""
+        plan = self._project_plan()
+        if not plan or t >= min(plan[-1]['t1'] - 0.05, self._proj_last_frame_t() - 1e-3):
+            return False
+        self.project_timeline.set_playhead(t, follow=False)
+        self.project_play()
+        return self._proj_play is not None
+
+    @staticmethod
+    def _proj_plan_sig(plan):
+        return [(round(s['t0'], 4), round(s['t1'], 4), round(s.get('s0', 0.0), 4),
+                 round(s.get('s1', 0.0), 4), s['clip'].id if s['clip'] is not None else None)
+                for s in plan]
+
+    def _proj_replan_live(self, idx, offset):
+        """Конец куска на ходу просмотра, а проект за это время поменялся
+        (клип тянут за край, не отпуская мышь): просмотр заново по новому
+        плану с того же места. Без этого растянутый клип обрывался на прежнем
+        конце, а последний — вместе со всем просмотром. True — перезапущен."""
+        plan = self._proj_play
+        if not plan:
+            return False
+        fresh = self._project_plan()
+        if self._proj_plan_sig(fresh) == self._proj_plan_sig(plan):
+            return False
+        t = plan[idx]['t0'] + max(0.0, offset) if idx < len(plan) else plan[-1]['t1']
+        self.project_stop()
+        if not self._proj_resume_at(t):
+            self._project_seek(min(t, self._proj_last_frame_t()))
+        return True
 
     def _project_replace(self, project):
         self.project = project
@@ -253,14 +297,14 @@ class EditTabProjectMixin:
     def project_undo(self):
         if not self._proj_undo:
             return
-        self._proj_redo.append(self.project.to_dict())
-        self._project_replace(_mp.Project.from_dict(self._proj_undo.pop()))
+        self._proj_redo.append(self._proj_state())
+        self._project_restore_state(self._proj_undo.pop())
 
     def project_redo(self):
         if not self._proj_redo:
             return
-        self._proj_undo.append(self.project.to_dict())
-        self._project_replace(_mp.Project.from_dict(self._proj_redo.pop()))
+        self._proj_undo.append(self._proj_state())
+        self._project_restore_state(self._proj_redo.pop())
 
     def _project_has_focus(self):
         tl = getattr(self, "project_timeline", None)
@@ -329,20 +373,50 @@ class EditTabProjectMixin:
 
     def _project_burn_subs(self):
         """Вшивание субтитров в проект: {ключ файла: фильтр subtitles=…} для
-        открытого файла, если стоит «Вшить субтитры» и выбрана дорожка и в
-        проекте есть его куски; иначе None. Выбор дорожки относится к открытому
-        файлу (индекс si= — его), поэтому куски других файлов идут без субтитров."""
-        if not (self.chk_burn_subs.isChecked() and self.cmb_subs.currentIndex() > 0):
+        каждого видеофайла проекта, если стоит «Вшить субтитры»; иначе None.
+        Файл, о котором панель, — с дорожкой из списка; остальные — с той, что
+        выбирали для них (session_state; ею же они идут в просмотре). Раньше
+        субтитры получали только куски открытого файла, и в проекте из
+        нескольких файлов остальные куски выходили без субтитров."""
+        if not self.chk_burn_subs.isChecked():
             return None
-        src = self.actual_source_file
-        if not src or getattr(self, "is_still_image", False):
+        shown = self._tracks_file()
+        if getattr(self, "_deck_tv", None) is None and getattr(self, "is_still_image", False):
+            shown = None
+        shown_key = _mp.source_key(shown) if shown else None
+        subs = {}
+        for c in self.project.clips:
+            if not c.has_video or c.is_image:
+                continue
+            key = _mp.source_key(c.src)
+            if key in subs:
+                continue
+            if key == shown_key:
+                idx = self.cmb_subs.currentIndex()
+                vf = (self._subtitles_vf(c.src, self.selected_sub_ext_path, idx - 1)
+                      if idx > 0 else None)
+            else:
+                vf = self._project_remembered_subs_vf(c.src)
+            subs[key] = vf
+        subs = {k: v for k, v in subs.items() if v}
+        return subs or None
+
+    def _project_remembered_subs_vf(self, src):
+        """Фильтр субтитров файла по его запомненному выбору дорожки или None
+        («Выкл», дорожки или файла больше нет)."""
+        rec = self._session_files.get(_mp.source_key(src)) or {}
+        spec = rec.get('subs')
+        if not isinstance(spec, list) or len(spec) < 2:
             return None
-        if not any(c.has_video and not c.is_image and self._proj_is_loaded(c.src)
-                   for c in self.project.clips):
+        if spec[0] == 'ext':
+            ext = str(spec[1])
+            return self._subtitles_vf(src, ext) if _api.os.path.exists(ext) else None
+        if spec[0] != 'emb':
             return None
-        vf = self._subtitles_vf(src, self.selected_sub_ext_path,
-                                self.cmb_subs.currentIndex() - 1)
-        return {_mp.source_key(src): vf} if vf else None
+        meta = _api.run_ffprobe(src) or {}
+        streams = [s for s in meta.get('streams', []) if s.get('codec_type') == 'subtitle']
+        i = next((i for i, s in enumerate(streams) if s.get('index') == spec[1]), None)
+        return self._subtitles_vf(src, None, i, streams) if i is not None else None
 
     def _project_restore_audio(self):
         """Открыли файл, куски которого лежат в проекте, → в списке дорожек
@@ -382,20 +456,26 @@ class EditTabProjectMixin:
             self.cmb_audio.setCurrentIndex(idx)
         return True
 
-    def _project_retarget_audio(self):
+    def _project_retarget_audio(self, src=None, sound=None):
         """В источнике выбрали другую дорожку или озвучку → видеоклипы этого
         файла звучат ею. Клип запоминает звук, когда кладётся в проект, и
         просмотр проекта играл прежнюю дорожку голосом, а выбранную глушил:
-        для него основной плеер звучал «не тем» звуком клипа."""
+        для него основной плеер звучал «не тем» звуком клипа.
+
+        src и sound (путь, индекс потока) — файл куска на деке и звук,
+        выбранный для него в панели (project_decks); по умолчанию — открытый
+        файл и его звук."""
         if getattr(self, "project_timeline", None) is None or self.project.is_empty():
             return
-        if getattr(self, "is_still_image", False):
+        if src is None and getattr(self, "is_still_image", False):
             return
-        path, idx = self._source_audio()
+        path, idx = sound if sound is not None else self._source_audio()
+        norm = self._proj_norm(src) if src is not None else None
         changed = []
         for c in self.project.clips:
             if (c.is_image or not c.has_video or c.audio_detached
-                    or not self._proj_is_loaded(c.src)):
+                    or not (self._proj_is_loaded(c.src) if norm is None
+                            else self._proj_norm(c.src) == norm)):
                 continue
             if c.audio_path != path or c.audio_stream != idx:
                 c.audio_path, c.audio_stream = path, idx
@@ -605,6 +685,8 @@ class EditTabProjectMixin:
         ids = sel if (not cid or cid in sel) else [cid]
         ids = [i for i in ids if self.project.clip(i) is not None]
         if not ids:
+            if not cid and self.project_timeline.selected_text:
+                self.project_text_delete()
             return
         self._project_snapshot()
         for i in ids:
@@ -651,11 +733,12 @@ class EditTabProjectMixin:
         self._project_seek(min(end, self._proj_last_frame_t()))
 
     def project_clear(self):
-        """Убирает все клипы (отмена — Ctrl+Z). Вызывается из «Очистить»."""
-        if self.project.is_empty():
+        """Убирает все клипы и текст (отмена — Ctrl+Z). Вызывается из «Очистить»."""
+        if self.project.is_empty() and not self.project.texts and not self._proj_link:
             return
         self._project_snapshot()
         self.project_stop()
+        self._proj_unlink()
         self._project_replace(_mp.Project())
         self.project_timeline.set_playhead(0.0)
         self._proj_cur_id = ""
@@ -672,7 +755,13 @@ class EditTabProjectMixin:
     def _project_action(self, action, cid):
         p = self.project
         clip = p.clip(cid) if cid else None
-        if action == 'split':
+        if action.startswith('text_'):
+            self._project_text_action(action, cid)
+        elif action == 'props':
+            self.project_clip_props(cid)
+        elif action == 'project_settings':
+            self.project_settings_dialog()
+        elif action == 'split':
             self.project_split(cid)
         elif action == 'delete':
             self.project_delete(cid)
@@ -842,7 +931,10 @@ class EditTabProjectMixin:
         return self._proj_waves.get(self._proj_norm(clip.src))
 
     def _project_shutdown(self):
+        self._link_stop()
+        self._fx_shutdown()
         self._pmix_stop()
+        self._deck_shutdown()
         self._snd_shutdown()
         worker = getattr(self, "_proj_thumb_worker", None)
         if worker is not None:
@@ -913,6 +1005,9 @@ class EditTabProjectMixin:
         показывает кадр проекта в точке t."""
         t = max(0.0, float(t))
         self._proj_active = not self.project.is_empty()
+        if self._fx_mode:
+            self._fx_seek(t)
+            return
         tl = self.project_timeline
         tl.set_playhead(t, follow=False)
         self._paint_project_time(t)
@@ -1043,6 +1138,9 @@ class EditTabProjectMixin:
         проекта приедет за плеером сам."""
         if getattr(self, "project_timeline", None) is None or self.project.is_empty():
             return False
+        if self._fx_mode:
+            self._fx_step(step)
+            return True
         c = self.project.clip(self._proj_cur_id)
         if c is not None and abs(c.speed - 1.0) > 1e-6:
             # Ускоренный клип: шаг кадра проекта — это speed кадров файла,
@@ -1060,7 +1158,14 @@ class EditTabProjectMixin:
         fps = (c.fps if c is not None and c.fps else 0.0) or self.fps or 30.0
         t = tl.playhead
         nt = t + step / fps
-        if (c is not None and not c.is_image and self._proj_ready_for(c.src)
+        # Шаг по файлу — только если плеер ПОКАЗЫВАЕТ этот клип: в проекте без
+        # видео план — одна пустота, плеер на её клики не перематывается и
+        # стоит не у плейхеда (шаг от его позиции уводил за клип — плейхед не
+        # двигался).
+        seg = next((s for s in self._project_plan() if s['t0'] <= t < s['t1']), None)
+        shown = (c is not None and seg is not None and seg['clip'] is not None
+                 and seg['clip'].src == c.src)
+        if (shown and not c.is_image and self._proj_ready_for(c.src)
                 and c.start - 1e-6 <= t < c.end and c.start - 1e-6 <= nt < c.end - 1e-6):
             return False
         nt = max(0.0, min(nt, self.project.duration() - 0.5 / fps))
@@ -1126,7 +1231,7 @@ class EditTabProjectMixin:
         if self.project.is_empty():
             self.seek_to(self.current_out)
             return
-        if self._proj_play is not None:
+        if self._proj_play is not None or self._fx_playing:
             self.project_stop()
         self._project_seek(self._proj_last_frame_t())
 
@@ -1154,7 +1259,8 @@ class EditTabProjectMixin:
         проект из нескольких кусков — спросить: добавить в конец или начать
         заново. False — передумали, файл не открываем."""
         kind = 'fresh'
-        if len(self.project.clips) > 1:
+        # Связанный с файлом проект (нейросети, открытый) молча не заменяется.
+        if len(self.project.clips) > 1 or (self._proj_link and self.project.clips):
             box = _api.QMessageBox(self)
             box.setWindowTitle("Монтаж")
             box.setText(f"В проекте {len(self.project.clips)} клипов. Что сделать с файлом?\n"
@@ -1187,10 +1293,19 @@ class EditTabProjectMixin:
         elif kind == 'show' and self._proj_is_loaded(pend[1]):
             if not getattr(self, "is_still_image", False):
                 self.seek_to(pend[2])
+                # Файл открыт без паузы на 0 (finish_loading_file): плеер
+                # стоит, и пауза запускает его прямо с кадра места.
+                try:
+                    if (self.player.playbackState()
+                            == _api.QMediaPlayer.PlaybackState.StoppedState):
+                        self.player.pause()
+                except Exception:
+                    pass
         elif kind == 'fresh' and self._proj_is_loaded(pend[1]):
             # Открыли файл — он целиком и есть проект (отмена вернёт прежний).
-            if not self.project.is_empty():
+            if not self.project.is_empty() or self.project.texts or self._proj_link:
                 self._project_snapshot()
+                self._proj_unlink()
                 self.project = _mp.Project()
                 self.project_timeline.set_project(self.project)
             self.project_timeline.set_playhead(0.0, follow=False)
@@ -1211,7 +1326,11 @@ class EditTabProjectMixin:
 
     def _project_drop(self, paths):
         """Файлы, брошенные на таймлайн (или «＋»), — в конец проекта целиком,
-        по очереди."""
+        по очереди. Файл проекта (.json и его .bak) открывается проектом."""
+        projects = [x for x in paths if _mp.is_project_file(x)]
+        if projects:
+            self.project_open_file(projects[0])
+            return
         self._proj_drop_queue = list(paths)
         self._project_drop_next()
 
@@ -1249,6 +1368,9 @@ class EditTabProjectMixin:
         return True
 
     def project_toggle_play(self):
+        if self._fx_mode:
+            self._fx_toggle()
+            return
         if self._proj_play is not None:
             self.project_stop()
         else:
@@ -1256,6 +1378,9 @@ class EditTabProjectMixin:
 
     def project_play(self):
         """Просмотр проекта с плейхеда проекта (с начала, если он в конце)."""
+        if self._fx_mode:
+            self._fx_play()
+            return
         plan = self._project_plan()
         if not plan or (not any(s['clip'] is not None for s in plan)
                         and not self.project.audio_parts()):
@@ -1277,8 +1402,13 @@ class EditTabProjectMixin:
         self._pmix_start()
         self._project_update_ui()
         self._proj_play_segment(idx, max(0.0, t - plan[idx]['t0']))
+        # Пустоту и проект без видео играют голоса, плеер стоит — сигнала
+        # «играю» от него не будет.
+        self._sync_play_icon()
 
     def project_stop(self):
+        deck_t = self._deck_stop_begin()    # просмотр шёл на деках — время кадра
+        self._fx_stop()
         if self._proj_play is not None:
             # До _pmix_stop: тот возвращает громкость ползунка, и хвост очереди
             # устройства заглушённого клипа зазвучал бы в полную силу.
@@ -1299,6 +1429,9 @@ class EditTabProjectMixin:
         self._proj_set_rate(1.0)
         self._set_play_bound(False)
         self._project_update_ui()
+        self._sync_play_icon()          # плеер мог и не играть (голоса по стене)
+        if deck_t is not None:
+            self._deck_stop_end(deck_t)
 
     def _proj_set_rate(self, speed):
         """Скорость основного плеера под клип проекта (1 — обычная)."""
@@ -1315,6 +1448,8 @@ class EditTabProjectMixin:
         plan = self._proj_play
         if plan is None:
             return
+        if cont and self._proj_replan_live(idx, offset):
+            return
         self._pmix_hold = None
         while (idx < len(plan) and plan[idx]['clip'] is None
                and not self._pmix_covers(plan[idx]['t0'] + offset, plan[idx]['t1'])):
@@ -1327,6 +1462,8 @@ class EditTabProjectMixin:
             # кадр, начинающийся ровно на out клипа, то есть уже вырезанный.
             self._project_seek(self._proj_last_frame_t())
             return
+        if self._deck_play_segment(idx, offset, cont):
+            return                      # кусок играет дека (project_decks)
         seg = plan[idx]
         clip = seg['clip']
         self._proj_set_rate(1.0 if clip is None or clip.is_image else clip.speed)
@@ -1371,6 +1508,7 @@ class EditTabProjectMixin:
             self._pmix_hold = (seg['t0'], seg['t1'])
             self._snd_ensure_playing()
             self.project_timeline.set_playhead(start_t)
+            self._paint_project_time(start_t)
             left = max(0.05, seg['t1'] - start_t)
             gen = getattr(self, "_proj_image_gen", 0) + 1
             self._proj_image_gen = gen
@@ -1476,6 +1614,31 @@ class EditTabProjectMixin:
         t = seg['t0'] + (src_s - seg['s0']) / max(_mp.MIN_SPEED, seg['clip'].speed)
         self.project_timeline.set_playhead(min(seg['t1'], max(seg['t0'], t)))
         self._bridge_prefetch(src_s)
+        self._proj_probe_ahead(src_s)
+        self._deck_tick()
+
+    def _proj_probe_ahead(self, src_s):
+        """У конца куска, за которым идёт кусок другого видеофайла, тот файл
+        заранее разбирается ffprobe в фоне: на стыке load_file возьмёт разбор
+        из кеша run_ffprobe, а не будет ждать его в GUI-потоке (80–110 мс
+        стоящей картинки)."""
+        plan = self._proj_play
+        nxt = self._proj_idx + 1
+        if plan is None or nxt >= len(plan):
+            return
+        cur = plan[self._proj_idx]['clip']
+        clip = plan[nxt]['clip']
+        if (cur is None or clip is None or clip.is_image
+                or self._proj_is_loaded(clip.src)
+                or (plan[self._proj_idx]['s1'] - src_s) / max(_mp.MIN_SPEED, cur.speed)
+                > _PROBE_LEAD_S):
+            return
+        key = (id(plan), nxt)
+        if getattr(self, "_proj_probe_req", None) == key:
+            return
+        self._proj_probe_req = key
+        threading.Thread(target=_api.run_ffprobe, args=(clip.src,), daemon=True,
+                         name="proj-probe").start()
 
     def _proj_play_limit(self):
         """Конец текущего куска во времени источника, пока идёт просмотр."""

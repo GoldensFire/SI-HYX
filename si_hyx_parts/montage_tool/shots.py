@@ -236,62 +236,86 @@ def transnet(tn, session, ctl, diff=None, scdet=None):
     return np.concatenate(one)[:n], np.concatenate(many)[:n], skipped, total
 
 
-class TransNetStream(threading.Thread):
+class TransNetStream:
     """TransNetV2 одновременно с декодом: окно (середина — 50 кадров с
     центра c, края — по 25 кадров, у начала и конца файла — повтор
     крайнего кадра, как в transnet) считается, как только его кадры есть в
     FrameStats; декод и Python-обработка кадра занимают не все ядра.
-    finish() — кадров больше не будет; result() — как у transnet."""
+    Сеть не успевает за декодом, и к его концу остаётся до половины окон:
+    их finish() досчитывает вдвоём — tail() даёт второй сеанс (окна
+    независимы, порядок восстанавливается по c). finish() — кадров больше
+    не будет; ответ — как у transnet."""
 
-    def __init__(self, stats, session, ctl):
-        super().__init__(daemon=True)
-        self.stats, self.session, self.ctl = stats, session, ctl
+    def __init__(self, stats, session, ctl, tail=None):
+        self.stats, self.ctl, self.tail = stats, ctl, tail
         self._final = threading.Event()
+        self._lock = threading.Lock()
+        self._next = 0
+        self._out = {}
+        self._threads = [threading.Thread(target=self._work, args=(session,), daemon=True)]
         self.error = None
-        self.one, self.many = [], []
         self.skipped = self.total = 0
+
+    def start(self):
+        self._threads[0].start()
 
     def finish(self):
         self._final.set()
-        self.join()
+        if self.tail is not None and self._threads[0].is_alive() and self.error is None:
+            with self._lock:
+                left = self.stats.n - self._next
+            if left > 400:                   # хвост дольше загрузки второго сеанса
+                t = threading.Thread(target=self._work, args=(self.tail(),), daemon=True)
+                t.start()
+                self._threads.append(t)
+        for t in self._threads:
+            t.join()
         if self.error is not None:
             raise self.error
         n = self.stats.n
-        if not self.one:
+        if not self._out:
             return np.zeros(0), np.zeros(0), 0, 0
-        return (np.concatenate(self.one)[:n], np.concatenate(self.many)[:n],
-                self.skipped, self.total)
+        cs = sorted(self._out)
+        return (np.concatenate([self._out[c][0] for c in cs])[:n],
+                np.concatenate([self._out[c][1] for c in cs])[:n], self.skipped, self.total)
 
-    def run(self):
+    def _claim(self, n, final):
+        """Центр следующего окна; None — окон больше нет, -1 — кадров ещё нет."""
+        with self._lock:
+            c = self._next
+            if final and c >= n:
+                return None
+            if not final and n < c + 75 + 1:
+                return -1
+            self._next += 50
+            self.total += 1
+            return c
+
+    def _work(self, session):
         try:
-            name = self.session.get_inputs()[0].name
-            c = 0
+            name = session.get_inputs()[0].name
             while True:
-                if self.ctl.stop():
+                if self.ctl.stop() or self.error is not None:
                     return
                 final = self._final.is_set()
-                n = self.stats.n
-                if final and c >= n:
+                c = self._claim(self.stats.n, final)
+                if c is None:
                     break
-                if not final and n < c + 75 + 1:
-                    if self.ctl.stop():
-                        return
+                if c < 0:
                     self._final.wait(0.05)
                     continue
+                n = self.stats.n
                 tn = self.stats.tn
                 diff = self.stats.cols["diff"]
-                self.total += 1
                 if _quiet(tn, diff, {}, max(0, c - 3), min(n, c + 53)):
-                    self.one.append(np.zeros(50, np.float32))
-                    self.many.append(np.zeros(50, np.float32))
-                    self.skipped += 1
+                    self._out[c] = (np.zeros(50, np.float32), np.zeros(50, np.float32))
+                    with self._lock:
+                        self.skipped += 1
                 else:
                     idx = np.clip(np.arange(c - 25, c + 75), 0, n - 1)
                     x = tn[idx].astype(np.float32)[None]
-                    p, q = self.session.run(None, {name: x})
-                    self.one.append(p[0, 25:75, 0])
-                    self.many.append(q[0, 25:75, 0])
-                c += 50
+                    p, q = session.run(None, {name: x})
+                    self._out[c] = (p[0, 25:75, 0], q[0, 25:75, 0])
         except Exception as e:           # noqa: BLE001 — отдаётся в finish()
             self.error = e
 

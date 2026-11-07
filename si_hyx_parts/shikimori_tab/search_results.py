@@ -4,6 +4,8 @@
 """ShikimoriHYX: поиск, исключения, сортировка по просмотрам и индексу, заполнение списка."""
 import shikimori_tab as _api
 
+from .cache_search import query_tier, query_words
+
 
 class ShikimoriSearchMixin:
     """ShikimoriHYX: поиск, исключения, сортировка по просмотрам и индексу, заполнение списка."""
@@ -50,16 +52,27 @@ class ShikimoriSearchMixin:
             content_type=self._content_type(),
         )
 
-    def start_search(self, cache_only: bool = False):
+    def start_search(self, cache_only=None, *, quiet: bool = False):
         if self._task is not None:
             return  # уже идёт поиск
+        if cache_only is None:
+            # Галочка «По кэшу»: пока она стоит, «Найти» и Enter ищут по базе.
+            chk = getattr(self, "chk_cache", None)
+            cache_only = bool(chk is not None and chk.isChecked())
         criteria = self._collect_filter()
         err = criteria.validate()
         if err:
-            _api.msgbox_warning(self, "Проверьте фильтры", err)
+            if quiet:
+                # Авто-загрузка при открытии вкладки — без модальных окон.
+                self.lbl_status.setText(err)
+            else:
+                _api.msgbox_warning(self, "Проверьте фильтры", err)
             return
         # Новый поиск — чистим список и потоково наполняем его по мере страниц.
         self._cache_only = cache_only
+        self._query_words = query_words(criteria.query)
+        self._query_tier_memo = {}
+        self._quiet_failure = bool(quiet)
         self._stop_views_task()
         self.list.clear()
         self._anime_by_id.clear()
@@ -86,6 +99,81 @@ class ShikimoriSearchMixin:
         self._task = task
         self._pool.start(task)
 
+    def _on_cache_toggled(self, on: bool):
+        """Галочка «По кэшу»: включили — сразу показываем список из базы."""
+        if not _api._HAS_API:
+            return
+        if self._task is not None:
+            self._stop_search_task()
+            self.lbl_status.setText("Остановлено.")
+        if not on:
+            if not self._results:
+                self.lbl_status.setText("Готово к поиску.")
+            return
+        # Пока галочка стоит, обычный «Найти» тоже идёт по базе (start_search
+        # читает её состояние). Здесь же сразу грузим текущие фильтры.
+        self.start_search(True)
+
+    def _stop_search_task(self):
+        """Останавливает текущий поиск и отписывает его сигналы.
+
+        Нужно перед немедленным запуском другого режима: иначе запоздавшая
+        страница сетевого поиска успела бы дописаться в список уже нового,
+        кешевого поиска."""
+        task = self._task
+        self._task = None
+        self._quiet_failure = False
+        if task is None:
+            return
+        try:
+            task.stop()
+        except Exception:
+            pass
+        for name in ("batch", "finished", "failed", "progress"):
+            sig = getattr(task.signals, name, None)
+            if sig is not None:
+                try:
+                    sig.disconnect()
+                except Exception:
+                    pass
+        self._set_busy(False)
+
+    def _schedule_cache_on_open(self):
+        """Авто-загрузка при открытии вкладки, если галочка сохранена включённой.
+
+        Если из настроек ждут восстановления жанры, сначала дождёмся их списка:
+        иначе первый поиск по базе пойдёт без выбранных жанров."""
+        if not self.chk_cache.isChecked():
+            return
+        if self._pending_genres or self._pending_excl:
+            self._cache_wait_genres = True
+            return
+        _api.QTimer.singleShot(0, self._load_cache_on_open)
+
+    def _load_cache_on_open(self):
+        """Вкладка открыта с сохранённой галочкой — сразу список из базы.
+
+        Только когда вкладку видно и главное окно достроило отложенные вкладки:
+        поток разбирает базу (~230 МБ) чистым Python и держит GIL, а на старте
+        главный поток в это время строил «Аниме-пак» и стоял по 5–9 с. Пока
+        вкладку не открывали, поиск ждёт showEvent."""
+        self._cache_on_open_pending = True
+        if not self.isVisible():
+            return
+        if getattr(self.main, "_deferred_tabs", None):
+            _api.QTimer.singleShot(500, self._load_cache_on_open)
+            return
+        self._cache_on_open_pending = False
+        if (self.chk_cache.isChecked() and self._task is None
+                and self._views_task is None):
+            self.start_search(quiet=True)
+
+    def _on_genres_ready_for_cache(self):
+        """Жанры восстановлены (или не пришли) — можно грузить кеш с фильтрами."""
+        if getattr(self, "_cache_wait_genres", False):
+            self._cache_wait_genres = False
+            _api.QTimer.singleShot(0, self._load_cache_on_open)
+
     def cancel_search(self):
         """«Стоп» работает на ОБОИХ этапах: и во время поиска, и во время
         дозагрузки просмотров (сортировки). Накопленное всегда оставляем."""
@@ -103,9 +191,7 @@ class ShikimoriSearchMixin:
             return
         # 2) Идёт поиск — останавливаем его.
         if self._task is not None:
-            self._task.stop()
-        self._set_busy(False)
-        self._task = None
+            self._stop_search_task()
         n = len(self._results)
         self._set_actions_enabled(n > 0)
         # Сортировка по просмотрам — досортируем то, что успели набрать (её тоже
@@ -115,6 +201,8 @@ class ShikimoriSearchMixin:
             self.lbl_status.setText(f"Остановлено, сортирую {self._sort_phrase()}…")
             self._begin_views_sort()
         else:
+            if n:
+                self._display_results()
             self.lbl_status.setText(
                 f"Остановлено. Найдено: {len(self._raw_results)}, "
                 f"после фильтра: {n}" if n else "Остановлено.")
@@ -123,8 +211,7 @@ class ShikimoriSearchMixin:
         """Очищает список результатов (кнопка «Очистить»). Идущий поиск/дозагрузку
         просмотров останавливает; кеш просмотров сохраняем — пригодится повторно."""
         if self._task is not None:
-            self._task.stop()
-            self._task = None
+            self._stop_search_task()
         self._stop_views_task()
         self._set_busy(False)
         self.list.clear()
@@ -153,6 +240,7 @@ class ShikimoriSearchMixin:
         """Потоково добавляет новые тайтлы страницы (с учётом исключения паков)."""
         if self._task is None:
             return
+        self._learn_excluded_franchises(items)
         page_end = (self._page + 1) * _api._PAGE_SIZE
         for a in items:
             self._raw_results.append(a)
@@ -182,12 +270,14 @@ class ShikimoriSearchMixin:
                     f"Лимит {limit} достигнут, сортирую {self._sort_phrase()}…")
                 self._begin_views_sort()
             else:
+                self._display_results()   # совпавшие главным названием — вверх
                 self.lbl_status.setText(
                     f"Лимит {limit} достигнут. Найдено: {len(self._raw_results)}, "
                     f"после фильтра: {n}")
 
     def _on_search_finished(self, results: list):
         self._task = None
+        self._quiet_failure = False
         self._set_busy(False)
         # Полный результат — авторитетный; пересобираем список начисто (на случай
         # дублей/исключений), даём финальный статус.
@@ -202,6 +292,7 @@ class ShikimoriSearchMixin:
         """«По кэшу»: вся выдача из базы генератора сразу, просмотры — из её
         карточек. Индекс досчитывается следом (_begin_views_sort)."""
         self._task = None
+        self._quiet_failure = False
         self._set_busy(False)
         for aid, (views, franchise) in info.items():
             self._views_cache[aid] = views
@@ -215,12 +306,18 @@ class ShikimoriSearchMixin:
     def _on_search_failed(self, message: str):
         self._task = None
         self._set_busy(False)
-        self.lbl_status.setText("Ошибка запроса.")
+        quiet = bool(getattr(self, "_quiet_failure", False))
+        self._quiet_failure = False
+        self.lbl_status.setText(message if quiet else "Ошибка запроса.")
+        if quiet:
+            # Авто-загрузка при открытии вкладки не должна лезть с модальным
+            # окном: человек ещё ничего не нажимал. Статус всё равно скажет,
+            # что база пуста или недоступна.
+            return
         _api.msgbox_critical(self, "Shikimori", f"Не удалось выполнить поиск:\n{message}")
 
     def _set_busy(self, busy: bool):
         self.btn_search.setEnabled(not busy)
-        self.btn_search_cache.setEnabled(not busy)
         self.btn_cancel.setEnabled(busy)
 
     def _set_actions_enabled(self, on: bool):
@@ -229,9 +326,56 @@ class ShikimoriSearchMixin:
         self.btn_export_csv.setEnabled(on)
 
     # ── Применение исключения паков и заполнение списка ────────────────────────
-    def _is_excluded(self, a: '_api.Anime') -> bool:
-        if not self._excluded:
+    def _term_in_question_text(self, term: str) -> bool:
+        """Встречается ли название в тексте вопроса отдельным словом/фразой.
+
+        Простое `in` дало бы ложные срабатывания на коротких названиях внутри
+        других слов, поэтому проверяем границы слова (`\\w`). Результат кешируем:
+        в выдаче тысячи тайтлов, а названий у них заметно меньше.
+
+        Регулярку строим только для названий, которые есть в тексте простой
+        подстрокой: re.search компилирует новый шаблон на каждое название, и
+        на 20 тыс. тайтлах «По кэшу» это вешало вкладку на десятки секунд."""
+        cache = self._question_term_cache
+        if term in cache:
+            return cache[term]
+        found = False
+        haystack = self._excluded_question_haystack
+        if term and haystack and term in haystack:
+            found = bool(_api.re.search(
+                r"(?<!\w)" + _api.re.escape(term) + r"(?!\w)", haystack))
+        cache[term] = found
+        return found
+
+    def _question_mentions(self, nt: str, nn: str) -> bool:
+        """Название тайтла (или его корень) упомянуто в тексте вопроса."""
+        if not self._excluded_question_haystack:
             return False
+        terms = []
+        for name in (nt, nn):
+            if not name:
+                continue
+            for term in (name, _api._base_title(name),
+                         _api._franchise_key(name)):
+                if term and term not in terms:
+                    terms.append(term)
+        return any(self._term_in_question_text(term) for term in terms)
+
+    def _name_excluded(self, a: '_api.Anime') -> bool:
+        """Совпало ли НАЗВАНИЕ тайтла с ответом/текстом вопроса из пака.
+
+        Ответ запоминается по id до смены паков (_rebuild_excluded_bases):
+        за один проход его спрашивают и _learn_excluded_franchises, и
+        _is_excluded, а потоковая выдача — ещё и на каждой странице."""
+        if not self._excluded and not self._excluded_question_haystack:
+            return False
+        memo = self._name_excluded_memo
+        hit = memo.get(a.id)
+        if hit is None:
+            hit = memo[a.id] = self._match_excluded_name(a)
+        return hit
+
+    def _match_excluded_name(self, a: '_api.Anime') -> bool:
         nt, nn = _api._norm_title(a.title), _api._norm_title(a.name)
         if nt in self._excluded or nn in self._excluded:
             return True
@@ -242,13 +386,19 @@ class ShikimoriSearchMixin:
                 return True
             if nn and _api._base_title(nn) in self._excluded_bases:
                 return True
+        # Название могло быть только в ТЕКСТЕ вопроса (ответ — имя героя,
+        # предмет или разгаданное слово), поэтому проверяем и его.
+        return self._question_mentions(nt, nn)
+
+    def _is_excluded(self, a: '_api.Anime') -> bool:
+        if (not self._excluded and not self._excluded_question_haystack
+                and not self._excluded_franchises):
+            return False
+        if self._name_excluded(a):
+            return True
         # Франшиза целиком: пак с «Наруто» прячет «Наруто: Ураганные хроники».
         if self._collapse_franchise and self._excluded_franchises:
-            keys = self._fkeys.get(a.id)
-            if keys is None:
-                keys = frozenset(k for k in (_api._franchise_key(a.title),
-                                             _api._franchise_key(a.name)) if k)
-                self._fkeys[a.id] = keys
+            keys = self._franchise_keys(a)
             for k in keys:
                 if k in self._excluded_franchises:
                     return True
@@ -258,6 +408,25 @@ class ShikimoriSearchMixin:
                 if _api._matches_franchise_prefix(k, self._excluded_prefixes):
                     return True
         return False
+
+    def _learn_excluded_franchises(self, raw):
+        """Закрывает франшизы исключённых паками тайтлов, даже если у пака нет
+        манифеста.
+
+        «Атака титанов» из пака и «Атака! Титаны средней школы» из выдачи —
+        один franchise у Shikimori, хотя названия разные. В «По кэшу» карточки
+        уже приносят franchise (cache_search); в сетевом поиске — после
+        дозагрузки просмотров."""
+        if ((not self._excluded and not self._excluded_question_haystack)
+                or not self._franchise_of):
+            return
+        for a in raw:
+            franchise = self._franchise_of.get(a.id)
+            if not franchise or "#" + franchise in self._excluded_franchises:
+                continue
+            if self._name_excluded(a):
+                self._excluded_shiki_franchises.add(franchise)
+                self._excluded_franchises.add("#" + franchise)
 
     def _franchise_keys(self, a) -> set:
         """Ключи франшизы тайтла: по русскому названию, по ромадзи и, если тайтл
@@ -290,6 +459,7 @@ class ShikimoriSearchMixin:
         мог остаться её спин-офф. Тайтлы без известных просмотров уступают
         тем, у кого они есть, а между собой идут в порядке выдачи."""
         raw = self._raw_results
+        self._learn_excluded_franchises(raw)
         kept = [a for a in raw if not self._is_excluded(a)]
         hidden = len(raw) - len(kept)
         seen = set()
@@ -318,8 +488,17 @@ class ShikimoriSearchMixin:
     def _rebuild_excluded_bases(self):
         """Пересобирает «базовые» формы и «ключи франшиз» исключённых названий."""
         self._excluded_bases = {b for b in (_api._base_title(x) for x in self._excluded) if b}
-        self._excluded_franchises = {f for f in (_api._franchise_key(x) for x in self._excluded) if f}
-        self._excluded_prefixes = _api._franchise_prefix_index(self._excluded_franchises)
+        name_keys = {f for f in (_api._franchise_key(x) for x in self._excluded) if f}
+        # Ключ самого Shikimori живёт в отдельном пространстве имён («#konosuba»,
+        # «#shingeki_no_kyojin») и с названием «атака титанов» не совпадает.
+        # Он приходит из манифеста пака и ловит части с другим названием.
+        self._excluded_franchises = name_keys | {
+            "#" + f for f in self._excluded_shiki_franchises if f}
+        self._excluded_prefixes = _api._franchise_prefix_index(name_keys)
+        self._excluded_question_haystack = "\n".join(
+            self._excluded_question_texts)
+        self._question_term_cache = {}
+        self._name_excluded_memo = {}
 
     def _apply_exclusions(self):
         """Фильтрует «сырые» результаты по выбранным пакам и схлопывает франшизы."""
@@ -384,7 +563,22 @@ class ShikimoriSearchMixin:
         упорядочивает их по кешу просмотров (неизвестные — в конец)."""
         if self._views_sort_active():
             self._results.sort(key=self._sort_key, reverse=True)
+        self._order_by_query()
         self._fill_list(self._results)
+
+    def _query_tier(self, a) -> int:
+        """Ступень совпадения запроса с главным названием (см. query_tier)."""
+        memo = self._query_tier_memo
+        tier = memo.get(a.id)
+        if tier is None:
+            tier = memo[a.id] = query_tier(self._query_words, (a.russian, a.name))
+        return tier
+
+    def _order_by_query(self):
+        """Тайтлы, у которых запрос есть в главном названии, — первыми; внутри
+        ступени сохраняется выбранная сортировка (sort устойчив)."""
+        if getattr(self, "_query_words", ()):
+            self._results.sort(key=self._query_tier)
 
     def _stop_views_task(self):
         if self._views_task is not None:
@@ -431,7 +625,6 @@ class ShikimoriSearchMixin:
         # «Стоп» активен и во время сортировки — её тоже можно прервать.
         self.btn_cancel.setEnabled(True)
         self.btn_search.setEnabled(False)
-        self.btn_search_cache.setEnabled(False)
         task = _api._ViewsTask(ids, self._content_type(), fetch_ids=fetch_ids,
                                network=not self._cache_only)
         task.signals.item.connect(self._on_views_item)
@@ -454,14 +647,20 @@ class ShikimoriSearchMixin:
         # узнали число у тайтла, сразу ставим его на своё место (не ждём конца
         # дозагрузки). Порядок строк и номера мест обновляются вживую.
         # Из базы карточки приходят пачкой — пересобираем список не на каждую.
+        # Пауза между пересборками — не меньше утроенной цены последней: на
+        # 20 тыс. тайтлах «По кэшу» пересборка идёт десятые доли секунды, и
+        # с фиксированными 150 мс окно было бы занято ею почти всё время.
         if self._views_sort_active() and not getattr(self, "_views_resort_pending", False):
             self._views_resort_pending = True
-            _api.QTimer.singleShot(150, self._flush_views_resort)
+            cost = getattr(self, "_views_resort_cost", 0.0)
+            _api.QTimer.singleShot(max(150, int(cost * 3000)), self._flush_views_resort)
 
     def _flush_views_resort(self):
         self._views_resort_pending = False
         if self._views_sort_active():
+            started = _api.time.perf_counter()
             self._resort_by_views(done=False)
+            self._views_resort_cost = _api.time.perf_counter() - started
 
     def _index_tooltip_for(self, aid) -> str:
         """Подсказка к «индексу популярности» — формула генератора аниме-пака."""
@@ -478,7 +677,6 @@ class ShikimoriSearchMixin:
         # Сортировка завершилась сама — возвращаем кнопки в обычное состояние.
         self.btn_cancel.setEnabled(False)
         self.btn_search.setEnabled(True)
-        self.btn_search_cache.setEnabled(True)
         self._resort_by_views(done=True)
 
     def _resort_by_views(self, done: bool = False):
@@ -494,6 +692,7 @@ class ShikimoriSearchMixin:
         # Узнали просмотры и франшизы — от франшизы остаётся самая популярная часть.
         self._results = self._filtered()[0]
         self._results.sort(key=self._sort_key, reverse=True)
+        self._order_by_query()
         self._fill_list(self._results)
         if cur_id is not None:
             for i in range(self.list.count()):

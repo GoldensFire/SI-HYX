@@ -140,6 +140,13 @@ class RevealRenderer:
             extra = {"from_center": True} if effect == "puzzle_center" else {}
             self.external = cls(self.image, self.strength, self.rng, self.anchor, **extra)
 
+    def set_frame(self, image: Image.Image) -> None:
+        """Следующий кадр видео (Монтаж): плитки, точка детали, волны и
+        перестановка пазла остаются прежними, меняется только содержимое."""
+        self.image = image.convert("RGB")
+        if self.external is not None:
+            self.external.set_image(self.image)
+
     def _tile_ranks(self) -> Image.Image:
         w, h = self.image.size
         # 16×9 на обычном 16:9 — плитки мельче и их заметно

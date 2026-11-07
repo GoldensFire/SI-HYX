@@ -564,6 +564,17 @@ class InpaintTab(_api.QWidget):
         if hasattr(self, "_switch_holder"):
             self._switch_holder.addWidget(widget)
 
+    def hideEvent(self, ev):
+        """Ушли с подвкладки (например, в «Объединить фото») — закрываем
+        всплывающие панели «Фигуры»/«Текст». Это отдельные Tool-окна, сами они
+        не скрываются вместе с родителем и оставались висеть поверх чужого
+        режима."""
+        for fly in (getattr(self, "_shape_flyout", None),
+                    getattr(self, "_text_flyout", None)):
+            if fly is not None:
+                fly.hide()
+        super().hideEvent(ev)
+
     # ── Цвет кисти ────────────────────────────────────────────────────────────
     def _update_color_swatch(self, color):
         self.btn_brush_color.setStyleSheet(

@@ -290,6 +290,9 @@ class MediaTabSettingsMixin:
         self.ck_overwrite_src.setChecked(False)
         favi.addRow(_api.label_with_info("Скорость:", "левее — медленнее и компактнее файл, правее — быстрее, но больше"), self.sl_aspd)
         favi.addRow(_api.row_with_info(self.ck_overwrite_src, "ОПАСНО: удаляет исходное изображение и оставляет только сжатую версию (с именем оригинала, без «_Сжатый»). Оригинал не восстановить. По умолчанию выключено."))
+        self.ck_gemini_wm = _api.QCheckBox("Убирать вотермарки Gemini и Meta AI")
+        self.ck_gemini_wm.setChecked(True)
+        favi.addRow(_api.row_with_info(self.ck_gemini_wm, "Находит у правого нижнего угла белую звезду Gemini или логотип с надписью «Meta AI» и снимает их перед кодированием. У Gemini прозрачность знака известна, поэтому картинка под ним восстанавливается вместе с текстурой; у Meta AI знак заливается по соседям. Картинки без знаков не меняются."))
         self._favi_form = favi
         gavi.setLayout(favi); rv_inner.addWidget(gavi)
 
@@ -517,12 +520,12 @@ class MediaTabSettingsMixin:
         """Обновляет подпись пути экспорта и видимость кнопки сброса."""
         try:
             if self.export_dir and _api.os.path.isdir(self.export_dir):
-                self.lbl_export_dir.setText(self.export_dir)
+                self.lbl_export_dir.set_full_text(self.export_dir)
                 self.lbl_export_dir.setToolTip(self.export_dir)
                 self.btn_export_reset.setEnabled(True)
             else:
-                self.lbl_export_dir.setText("По умолчанию экспорт в папку исходника")
-                self.lbl_export_dir.setToolTip("")
+                self.lbl_export_dir.set_full_text("Экспорт рядом с исходником")
+                self.lbl_export_dir.setToolTip("Экспорт рядом с исходником")
                 self.btn_export_reset.setEnabled(False)
         except Exception: pass
 

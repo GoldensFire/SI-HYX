@@ -175,6 +175,8 @@ class EditTabTimelineSeekMixin:
                        and not getattr(self, "_prerolling", False))
         except Exception:
             playing = False
+        # Просмотр на деках (project_decks) идёт при стоящем основном плеере.
+        playing = playing or getattr(self, "_deck_on", False)
         self._tl_drag_resume = playing
         if not playing:
             return

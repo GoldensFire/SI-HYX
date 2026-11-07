@@ -99,15 +99,42 @@ def _installed_fonts():
     return out
 
 
+@functools.lru_cache(maxsize=1)
+def _bundled_fonts():
+    """Шрифты программы в karaoke/fonts — fontsdir текста проекта (их видит
+    libass без установки): {«семейство начертание» и у обычного ещё
+    «семейство» в нижнем регистре: путь}."""
+    from PIL import ImageFont
+    import karaoke.style
+    folder = str(karaoke.style.FONT_DIR)
+    out = {}
+    for fn in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+        if not fn.lower().endswith((".ttf", ".otf")):
+            continue
+        path = os.path.join(folder, fn)
+        try:
+            family, sub = ImageFont.truetype(path, 10).getname()
+        except OSError:
+            continue
+        family, sub = str(family or "").strip().lower(), str(sub or "").strip().lower()
+        out.setdefault(f"{family} {sub}".strip(), path)
+        if sub in ("", "regular", "normal"):
+            out.setdefault(family, path)
+    return out
+
+
 def _font_path(name, bold):
-    """Файл шрифта по имени: известные файлы, затем реестр (обычное или
-    жирное начертание) или None."""
+    """Файл шрифта по имени: известные файлы, шрифты программы, затем реестр
+    (обычное или жирное начертание) или None."""
     if name in _FONT_FILES:
         return os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts",
                             _FONT_FILES[name][1 if bold else 0])
-    fonts = _installed_fonts()
     order = (" bold", "", " regular") if bold else ("", " regular", " bold")
-    return next((fonts[name + s] for s in order if name + s in fonts), None)
+    for fonts in (_bundled_fonts(), _installed_fonts()):
+        hit = next((fonts[name + s] for s in order if name + s in fonts), None)
+        if hit:
+            return hit
+    return None
 
 
 @functools.lru_cache(maxsize=32)
@@ -160,6 +187,80 @@ def fit_size(text, style, width, px, py, res_x, res_y):
             k = min(k, tall / (n * size))
     return round(size * k, 2) if k < 1.0 else size
 
+
+# Слоги (op columns: слово по слогам в колонках). Гласные латиницы и
+# кириллицы; y после согласной — гласная. Группа согласных между гласными
+# у латиницы отдаёт вправо самое длинное допустимое начало слога
+# (su-pre-ma-cy, ta-ble, win-ter), у кириллицы — всё, кроме й/ь/ъ, первой из
+# двойных и сонорного перед согласной (ве-ли-чи-е, ле-ген-да).
+_VOWELS = frozenset("aeiouyàâäéèêëîïôöùûüаеёиоуыэюя")
+# s+согласная внутри слова делится (des-ti-ny, dy-nas-ty) — её тут нет.
+_ONSETS = frozenset(("bl", "br", "ch", "cl", "cr", "dr", "fl", "fr", "gl", "gr", "kn", "ph",
+                     "pl", "pr", "qu", "sh", "th", "tr", "tw", "wh", "wr", "shr", "thr"))
+_DIGRAPHS = frozenset(("ch", "ck", "gh", "ph", "sh", "th", "wh"))
+_SONORANTS = frozenset("лмнр")
+_SYLLABLE_SEPS = ("-", "·", "‧", ".")
+
+
+def syllables(word):
+    """Слоги слова: LEGACY → [LE, GA, CY], «легенда» → [ле, ген, да].
+    Дефис, «·» или точка в слове — границы, заданные вручную. Регистр — как
+    в слове; слово без второй гласной — один слог."""
+    w = str(word or "").strip()
+    for sep in _SYLLABLE_SEPS:
+        if sep in w:
+            return [x for x in w.split(sep) if x]
+    low = w.lower()
+    n = len(low)
+    if not n:
+        return []
+    cyr = any("а" <= ch <= "я" or ch == "ё" for ch in low)
+
+    def vowel(i):
+        if low[i] == "y":
+            return i > 0 and low[i - 1] not in _VOWELS
+        return low[i] in _VOWELS
+
+    vow = [i for i in range(n) if vowel(i)]
+    # Немая e на конце (come, hate), но не -le после согласной (ta-ble).
+    if (not cyr and len(vow) > 1 and vow[-1] == n - 1 and low[-1] == "e" and n >= 3
+            and not vowel(n - 2) and not (low[n - 2] == "l" and not vowel(n - 3))):
+        vow.pop()
+    groups = []
+    for i in vow:
+        if groups and i == groups[-1][1] + 1 and not cyr:
+            groups[-1][1] = i                # дифтонг латиницы — одна гласная слога
+        else:
+            groups.append([i, i])
+    if len(groups) < 2:
+        return [w]
+    cuts = []
+    for (_a0, a1), (b0, _b1) in zip(groups, groups[1:]):
+        cons = low[a1 + 1:b0]
+        k = len(cons)
+        if k <= 1:
+            cut = a1 + 1                     # ле-ген, ma-cy; зияние — между гласными
+        elif cyr:
+            soft = max((j for j, ch in enumerate(cons) if ch in "йьъ"), default=-1)
+            if soft >= 0:
+                left = soft + 1
+            elif cons[0] == cons[1] or cons[0] in _SONORANTS:
+                left = 1
+            else:
+                left = 0
+            cut = a1 + 1 + min(left, k - 1) if left < k else b0
+        else:
+            left = k - 1
+            for m in range(k, 1, -1):
+                if cons[k - m:] in _ONSETS:
+                    left = k - m
+                    break
+            cut = a1 + 1 + left
+            if low[cut - 1:cut + 1] in _DIGRAPHS:
+                cut += 1 if cut + 1 < b0 else -1
+        cuts.append(cut)
+    bounds = [0] + cuts + [n]
+    return [w[a:b] for a, b in zip(bounds, bounds[1:]) if b > a]
 
 def word_items(words, opts, res_x, res_y):
     """Тексты проекта (словари для parse_texts) для слов [(t, end, текст)]."""
@@ -277,8 +378,9 @@ def text_canvas(p):
 
 
 def _add_items(p, raw):
-    """Тексты raw (словари parse_texts) — в проект; их id."""
-    items = _api.montage_project.parse_texts(raw)
+    """Тексты raw (словари parse_texts) — в проект; их id. Цвет "auto" —
+    под план (text_color)."""
+    items = _api.montage_project.parse_texts(_api.resolve_auto_colors(p, raw))
     bad = sorted({k for r, it in zip(raw, items) for k in r["style"] if k not in it.style})
     if len(items) != len(raw) or bad:
         raise ValueError(f"стиль слов: неверные ключи или значения {bad} (schema: text_style)")

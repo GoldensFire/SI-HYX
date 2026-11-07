@@ -6,6 +6,8 @@ import workers as _api
 from si_hyx_parts.workers.process_filters import ProcessFiltersMixin
 from si_hyx_parts.workers.process_images import ProcessImagesMixin
 from si_hyx_parts.workers.process_project import ProcessProjectMixin
+from reveal_pipe import COLOR_ARGS as _REVEAL_COLOR
+from si_hyx_parts.workers.process_reveal import reveal_feed
 
 
 def _build_atempo_chain(speed_factor: float) -> list:
@@ -81,6 +83,8 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
         self._active_count = 0
         self._active_lock = _api.threading.Lock()
         self._max_threads = 1
+        self._meta_lama = None  # LaMa для знака Meta AI (_meta_inpainter)
+        self._meta_lama_lock = _api.threading.Lock()
         self._priority_flag = self._priority_creationflag(settings.get('priority', 'normal'))
 
     _AI_BRANDS = ('gemini', 'chatgpt')
@@ -97,6 +101,10 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
 
     def measure_loudness(self, path, start=None, dur=None):
         return _api.measure_loudness(path, should_stop=lambda: self.stop_flag, start=start, dur=dur)
+
+    def loudnorm_stats(self, path, start=None, dur=None, stream=None):
+        return _api.loudnorm_stats(path, should_stop=lambda: self.stop_flag,
+                                   start=start, dur=dur, stream=stream)
 
     @staticmethod
     def _priority_creationflag(priority):
@@ -268,6 +276,27 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
         audio_only = bool(item.get('audio_only'))
         is_video = (vcodec is not None) and not audio_only
 
+        # Эффект проявления из Монтажа, который считается по кадрам: видео
+        # приходит в кодировщик по трубе уже с ним (process_reveal), звук —
+        # вторым входом. Рез, накладки и субтитры сделал декодер трубы, поэтому
+        # кодировщику остаются только фильтры самой «Обработки», а время
+        # отрезка у него начинается с нуля.
+        # Картинка из Монтажа (item['still']) идёт трубой всегда: без -loop
+        # кодировщик увидел бы один кадр.
+        feed = (reveal_feed(self, item, path)
+                if is_video and video_enabled and ((item.get('reveal') or {}).get('effect')
+                                                   or item.get('still'))
+                else None)
+        src_fps = feed.fps if feed is not None else None
+        enc_item = item
+        feed_kw = {'feeder': feed} if feed is not None else {}
+        if feed is not None:
+            trim_pre, trim_post, t0, t0_video = [], [], 0.0, 0.0
+            a_map_sel = f"1:{audio_index}" if audio_index is not None else "1:a?"
+            enc_item = {k: v for k, v in item.items()
+                        if k not in ('reveal', 'overlays', 'burn_subs', 'sdr_tonemap')}
+            enc_item['reveal_rgb'] = feed.encode_vf
+
         out_ext = ".mp4" if is_video else ".opus"
         out_name = _api.os.path.basename(base)
         sanitized = self._sanitize_name(out_name)
@@ -291,10 +320,18 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
         audio_bitrate = self.get_target_bitrate_str(path, sel_br)
 
         before_lufs = None
+        loud_stats = None
         if not remove_audio:
+            # Замер ровно того, что пойдёт в кодирование: выбранная в Монтаже
+            # дорожка и сам вырезаемый отрезок. Он же — «Было LUFS» и основа
+            # второго прохода loudnorm (см. _build_audio_filters).
             try:
-                before_lufs = (self.measure_loudness(path, start=trim[0], dur=item.get('dur'))
-                                if trim else self.measure_loudness(path))
+                loud_stats = (self.loudnorm_stats(path, start=trim[0],
+                                                  dur=max(0.0, trim[1] - trim[0]),
+                                                  stream=audio_index)
+                              if trim else self.loudnorm_stats(path, stream=audio_index))
+                if loud_stats:
+                    before_lufs = float(loud_stats['input_i'])
             except Exception: pass
         # Замер громкости делается всегда (для «Было LUFS») и для длинных файлов
         # длится минуты — если за это время нажали «Стоп», прерываемся здесь же.
@@ -318,7 +355,15 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                         fade_out_dur, *_ = _api.get_media_info(path)
                     except Exception:
                         fade_out_dur = 0.0
-            audio_filters = self._build_audio_filters(sa, t0, fade_out_dur, speed_factor)
+            # Замер годится второму проходу, только если кодируется ровно та
+            # одна дорожка, что мерили: «-map 0:a?» на файле с несколькими
+            # дорожками отдаёт фильтр каждой из них, а замер у нас один.
+            measured = None
+            if loud_stats and sa.get('norm') and (
+                    audio_index is not None or _api.audio_stream_count(path) == 1):
+                measured = loud_stats
+            audio_filters = self._build_audio_filters(sa, t0, fade_out_dur, speed_factor,
+                                                      measured=measured)
 
         temp_files = []
         attempted_out = out
@@ -451,12 +496,17 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                 timing_args = ["-fps_mode", "passthrough"] if keep_timing else []
                 # current_input здесь всегда == path: step1_needed исключает
                 # single_pass_video (см. выше), поэтому trim ещё не применён.
-                cmd_step2 = [_api.FFMPEG, "-y"] + trim_pre + ["-i", current_input] + trim_post \
+                src_in = (feed.input_args if feed is not None
+                          else trim_pre + ["-i", current_input] + trim_post)
+                color_args = (list(_REVEAL_COLOR) if feed is not None
+                              else self._color_args(item, current_input))
+                cmd_step2 = [_api.FFMPEG, "-y"] + src_in \
                             + self._map_av_args(remove_audio, a_map_sel) + timing_args \
                             + ["-map_metadata", "-1", "-map_chapters", "-1"]
 
-                vf_list = self._build_video_filters(sv, item, current_input, trim,
-                                                    t0, t0_video, speed_factor)
+                vf_list = self._build_video_filters(sv, enc_item, current_input, trim,
+                                                    t0, t0_video, speed_factor,
+                                                    src_fps=src_fps)
                 # Наложенные картинки из Монтажа (режим обрезки «Перекодировать
                 # настройками «Обработки»»): PNG приходят уже отрисованными под
                 # размер ИСХОДНОГО кадра, поэтому overlay идёт ПЕРВЫМ — до
@@ -464,7 +514,7 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                 # `format=` берём по pix_fmt исходника: при `auto` граф с RGBA
                 # уводил весь кадр в RGB и цвет итога уезжал (см.
                 # overlay_chroma_format).
-                vf_arg = self._overlay_vf(vf_list, item, current_input)
+                vf_arg = self._overlay_vf(vf_list, enc_item, current_input)
                 # Пробные кодирования подбора CRF/оценки получают vf_list как есть:
                 # _resolve_crf сам оставит в нём геометрию кадра и добавит те же
                 # накладки (см. _metric_vf), чтобы метрика считалась по картинке
@@ -475,7 +525,7 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                 # в профиле «Тёмные сцены» настройка FPS молча игнорировалась:
                 # 60-кадровый источник с «Исходный (max 30)» выходил как 60 fps.
                 fps_args = self._fps_args(sv.get('fps', 'Исходный') or 'Исходный',
-                                          current_input)
+                                          current_input, src_fps)
                 cmd_step2 += fps_args
 
                 preset_mode = sv.get('preset_mode', 'std')
@@ -494,7 +544,8 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                 # замер итоговой оценки XPSNR) — те же, что пойдут в реальный
                 # финальный энкод этого профиля (см. is_dark_scenes/else дальше).
                 preset_for_search = sv.get('pre', 0) if is_dark_scenes else sv.get('pre', 8)
-                search_pix_fmt = self._choose_pix_fmt(self._source_has_alpha(current_input))
+                search_pix_fmt = self._choose_pix_fmt(
+                    feed is None and self._source_has_alpha(current_input))
                 # Сэмпл строится ОДИН раз и переживает и подбор CRF, и
                 # последующий разовый замер оценки — поэтому убираем его здесь.
                 # Когда замеров не будет вовсе (метрика выкл. и колонка оценки
@@ -522,16 +573,16 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                     # поэтому используем один проход. Для CRF (постоянное качество)
                     # 2-pass всё равно не даёт выигрыша. crf — либо ручной, либо
                     # уже подобран _metric_crf_search под целевую метрику (см. блок выше).
-                    has_alpha = self._source_has_alpha(current_input)
+                    has_alpha = feed is None and self._source_has_alpha(current_input)
                     pix_fmt = self._choose_pix_fmt(has_alpha)
                     preset_val = max(0, min(13, sv.get('pre', 0)))
                     est = max(1, int(_api.os.path.getsize(current_input)/400000)) if _api.os.path.exists(current_input) else 10
 
                     cmd_dark = [
                         _api.FFMPEG, "-y",
-                    ] + trim_pre + ["-i", current_input] + trim_post \
+                    ] + src_in \
                       + self._map_av_args(remove_audio, a_map_sel) + timing_args + ["-map_metadata", "-1", "-map_chapters", "-1"] \
-                      + self._color_args(item, current_input) + fps_args \
+                      + color_args + fps_args \
                       + self._av1_encoder_args(crf, preset_val, pix_fmt, video_tune)
                     if vf_arg:
                         cmd_dark += ["-vf", vf_arg]
@@ -543,13 +594,15 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                     self.log.emit("🌑 Тёмные сцены: кодирование (AV1 10-бит, CRF)...")
                     # Адаптивное ETA по окну FPS (один проход CRF → has_second_pass=False).
                     _tf = self._estimate_total_frames(current_input, speed_factor, cmd_dark,
-                                                       dur_override=(item.get('dur') if trim else None))
+                                                       dur_override=(item.get('dur') if (trim or feed) else None),
+                                                       src_fps=src_fps)
                     _calc = _api.RealETACalculator(_tf, pass_num=1, has_second_pass=False) if _tf > 0 else None
-                    self.run_ffmpeg_capture(cmd_dark, est, cb, label="AV1 кодирование (тёмные сцены)", eta_calc=_calc, cancel_check=lambda: item["iid"] in self.removed_ids)
+                    self.run_ffmpeg_capture(cmd_dark, est, cb, label="AV1 кодирование (тёмные сцены)", eta_calc=_calc, cancel_check=lambda: item["iid"] in self.removed_ids,
+                                            **feed_kw)
 
                 else:
                     # Стандартный профиль
-                    has_alpha = self._source_has_alpha(current_input)
+                    has_alpha = feed is None and self._source_has_alpha(current_input)
                     pix_fmt = self._choose_pix_fmt(has_alpha)
 
                     if has_alpha and 'libvpx-vp9' in _api.detect_ffmpeg_encoders():
@@ -567,10 +620,10 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                                       "-pix_fmt", "yuva420p"]
                     elif has_alpha:
                         self.log.emit("⚠ libvpx-vp9 недоступен — альфа будет потеряна (SVT-AV1 alpha не поддерживает)")
-                        cmd_step2 += self._color_args(item, current_input)
+                        cmd_step2 += color_args
                         cmd_step2 += self._av1_encoder_args(crf, max(0, min(8, sv.get('pre', 8))), self._choose_pix_fmt(False), video_tune)
                     else:
-                        cmd_step2 += self._color_args(item, current_input)
+                        cmd_step2 += color_args
                         cmd_step2 += self._av1_encoder_args(crf, max(0, min(8, sv.get('pre', 8))), pix_fmt, video_tune)
 
                     if vf_arg: cmd_step2 += ["-vf", vf_arg]
@@ -582,9 +635,11 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                     est = max(1, int(_api.os.path.getsize(current_input)/400000)) if _api.os.path.exists(current_input) else 10
                     # Адаптивное ETA по скользящему окну FPS (одно-проходный CRF).
                     _tf = self._estimate_total_frames(current_input, speed_factor, cmd_step2,
-                                                       dur_override=(item.get('dur') if trim else None))
+                                                       dur_override=(item.get('dur') if (trim or feed) else None),
+                                                       src_fps=src_fps)
                     _calc = _api.RealETACalculator(_tf, pass_num=1, has_second_pass=False) if _tf > 0 else None
-                    self.run_ffmpeg_capture(cmd_step2, est, cb, label="Pass 2 (Video)", eta_calc=_calc, cancel_check=lambda: item["iid"] in self.removed_ids)
+                    self.run_ffmpeg_capture(cmd_step2, est, cb, label="Pass 2 (Video)", eta_calc=_calc, cancel_check=lambda: item["iid"] in self.removed_ids,
+                                            **feed_kw)
 
             else:
                 if current_input != path:
@@ -943,6 +998,9 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
 
         if self._img_pool is not None:
             self._img_pool.waitForDone()
+        if self._meta_lama:
+            self._meta_lama.unload()
+        self._meta_lama = None
 
         self.active_threads.emit(0, 0)
         self.finished_all.emit()

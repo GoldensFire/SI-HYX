@@ -11,9 +11,9 @@
 # QRunnable), GUI обновляется только через сигналы/слоты — интерфейс не виснет.
 #
 # Раскладка: СЛЕВА — список найденных тайтлов с обложками; СПРАВА — панель
-# настроек (фильтры, исключение паков SiQuesterHYX, экспорт). Обложки грузятся
-# асинхронно и кешируются. Нижние прогрессбар/консоль главного окна на этой
-# вкладке скрыты (см. _sync_console_visibility в main.py).
+# настроек (фильтры, исключение паков, экспорт). Обложки грузятся асинхронно и
+# кешируются. Нижние прогрессбар/консоль главного окна на этой вкладке скрыты
+# (см. _sync_console_visibility в main.py).
 #
 # Слой API/фильтрации вынесен в shikimori_api.py (без Qt). Здесь — только GUI и
 # оркестровка фоновых задач. Вкладка по умолчанию ВЫКЛЮЧЕНА (включается в
@@ -42,7 +42,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QComboBox, QSpinBox, QDoubleSpinBox, QListWidget,
     QListWidgetItem, QFileDialog, QScrollArea, QGroupBox,
     QDialog, QCheckBox, QDialogButtonBox, QFrame, QStyledItemDelegate,
-    QStyleOptionViewItem, QStyle, QApplication,
+    QStyleOptionViewItem, QStyle, QApplication, QAbstractItemView,
 )
 from msgbox import msgbox_critical, msgbox_warning, msgbox_information
 
@@ -158,6 +158,12 @@ _TRANSLIT_FOLDS = (
 
 from si_hyx_parts.shikimori_tab.translit_fold import _translit_fold, _norm_title
 
+# Подписи реплик генератора («Исполнитель — 『LiSA』», «Автор — 『…』»): после
+# снятия песни от них остаётся подпись, а не название тайтла.
+_ANSWER_LABELS = frozenset({
+    "исполнитель", "исполнители", "исполнитель оригинала", "автор",
+    "рейтинг mal",
+})
 
 # Хвостовой «сезонный» маркер: отдельный токен в конце названия — число (1–2
 # цифры), римская цифра, либо слово «сезон/season/часть/part/tv/тв/cour» с/без
@@ -219,7 +225,12 @@ _COPY_ICON_SZ = 16       # размер кнопки «копировать»
 _COPY_TITLE_GAP = 6      # отступ кнопки от конца названия
 _COPY_FEEDBACK_MS = 1500  # сколько держать «галочку» после копирования
 _RANK_W = 30             # ширина левого отступа строки под номер места тайтла
+# Правый отступ строки: место под «огонёк» индекса и «глаз» просмотров. Без него
+# делегат рисовал значки ПОВЕРХ длинного названия/оригинального названия.
+# У огонька в скобках ещё и уровень — «12 345 (17)».
+_BADGES_RESERVE_W = 195
 
+from si_hyx_parts.shikimori_tab.pack_texts import read_pack_texts
 from si_hyx_parts.shikimori_tab.views_badge_delegate import _ViewsBadgeDelegate, _TriStateGenre
 
 from si_hyx_parts.shikimori_tab.genre_picker_dialog import _GenrePickerDialog

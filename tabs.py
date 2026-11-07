@@ -42,7 +42,7 @@ from utils import (
     parse_youtube_start_seconds, play_done_sound, save_settings
 )
 from widgets import (
-    DraggableTreeWidget, InvertedWheelComboBox, LocalThumbnailRunnable,
+    DraggableTreeWidget, ElidedLabel, InvertedWheelComboBox, LocalThumbnailRunnable,
     PreviewNameDelegate, RemoteThumbnailRunnable, SpeedSpinBox,
     StatusColorDelegate, ZeroSpinBox, _JumpSlider, _icon_btn, info_badge,
     label_with_info, row_with_info, show_image_compare,

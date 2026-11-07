@@ -28,12 +28,12 @@ from config import (
     subprocess_env, ytdlp_base_cmd
 )
 from utils import (
-    clean_ansi, clean_url, detect_ffmpeg_encoders, download_cdn_direct,
-    fmt_bitrate_with_codec, get_cookies_path, get_fps_float,
+    audio_stream_count, clean_ansi, clean_url, detect_ffmpeg_encoders,
+    download_cdn_direct, fmt_bitrate_with_codec, get_cookies_path, get_fps_float,
     get_media_info, get_video_codec, get_video_codec_label, host_matches,
     human_size, is_animego_site, is_direct_cdn_video, is_dreamerscast_site,
-    is_embed_candidate, measure_loudness, require_svt, resolve_dreamerscast,
-    resolve_kodik
+    is_embed_candidate, loudnorm_linear_opts, loudnorm_stats, measure_loudness,
+    require_svt, resolve_dreamerscast, resolve_kodik
 )
 from utils import _cookie_matches_domain, _RE_DIGITS
 from utils import escape_filter_path, get_pix_fmt, overlay_chroma_format, overlay_filter_graph

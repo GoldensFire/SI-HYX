@@ -61,10 +61,12 @@ LYRIC_EARLY_S = 0.6                  # раньше — текст висит д
 def _readable_at(t):
     st = t.style or {}
     anim = st.get("animation", "none")
+    if anim in ("none", ""):
+        return t.start                   # без анимации in_s не действует (text_fx)
     dur = max(0.01, t.end - t.start)
     in_s = st.get("in_s")
     if in_s is None:
-        in_s = 0.0 if anim in ("none", "") else min(0.3, max(0.06, dur / 3))
+        in_s = min(0.3, max(0.06, dur / 3))
     return t.start + 0.5 * float(in_s)
 
 

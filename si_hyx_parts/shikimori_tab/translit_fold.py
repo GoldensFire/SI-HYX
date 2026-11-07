@@ -2,6 +2,8 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """_translit_fold. Public namespace: shikimori_tab."""
+from functools import lru_cache
+
 import shikimori_tab as _api
 
 
@@ -13,6 +15,9 @@ def _translit_fold(s: str) -> str:
 _translit_fold.__module__ = _api.__name__
 _api._translit_fold = _translit_fold
 
+# Исключение паков нормализует одни и те же названия десятки раз на тайтл
+# (_base_title и _franchise_key зовут её заново), а «По кэшу» — 20 тыс. тайтлов.
+@lru_cache(maxsize=1 << 17)
 def _norm_title(s: str) -> str:
     """Нормализация названия для сравнения с ответами паков: нижний регистр,
     схлопнутые пробелы, без хвостовой пунктуации/скобок-сезонов по краям.

@@ -77,6 +77,28 @@ YouTubecookies.txt
 # Локальные настройки и рабочие копии ИИ-агентов (Claude Code и др.)
 .claude/
 .codex/
+.cursor/
+.gemini/
+.aider*
+.continue/
+.windsurf/
+.mcp.json
+.cursorrules
+.windsurfrules
+# Инструкции и памятки для ИИ-агентов — только на машине разработчика.
+/AGENTS.md
+/CLAUDE.md
+/CLAUDE.local.md
+/GEMINI.md
+/CODE_MAP.md
+/.github/copilot-instructions.md
+/docs/montage-agent-amv.md
+/docs/amv-playbook.md
+# Стили AMV (разборы эталонных клипов) — личные заготовки, не в репозиторий.
+/docs/amv-styles/
+
+# Отдельные локальные страницы, не входящие в приложение.
+/anime_genre_game.html
 
 # Временные папки ручных проверок (.tmp_pixiv_live_check и т.п.)
 .tmp*/

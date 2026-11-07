@@ -31,7 +31,7 @@ from PyQt6.QtCore import (QEvent, QRect, QSize, QTimer)
 from PyQt6.QtGui import (QAction, QCursor, QDrag, QShortcut, QTextOption)
 from PyQt6.QtWidgets import (
     QAbstractButton, QAbstractItemView, QButtonGroup, QColorDialog,
-    QDialogButtonBox, QDoubleSpinBox, QFontComboBox, QGridLayout, QGroupBox,
+    QDialogButtonBox, QDoubleSpinBox, QFontComboBox, QFormLayout, QGridLayout, QGroupBox,
     QInputDialog, QListWidget, QListWidgetItem, QMenu, QPlainTextEdit,
     QRadioButton, QScrollBar, QSizePolicy, QTabWidget, QToolButton
 )
@@ -43,3 +43,5 @@ from si_hyx_parts.edit_tab_dialogs.track_attach_dialog import _TrackAttachDialog
 from si_hyx_parts.edit_tab_dialogs.subtitle_creator_dialog import SubtitleCreatorDialog
 from si_hyx_parts.edit_tab_dialogs.pixelize_dialog import _PixelizeDialog
 from si_hyx_parts.edit_tab_dialogs.export_settings_dialog import _ExportSettingsDialog
+from si_hyx_parts.edit_tab_dialogs.project_props_dialog import (
+    ClipPropsDialog, EffectsEditor, ProjectSettingsDialog, TextPropsDialog)

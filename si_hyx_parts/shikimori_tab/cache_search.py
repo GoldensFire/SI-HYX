@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import random
+import re
 from dataclasses import replace
 
 from shikimori_api import Anime, kinds_for, statuses_for
@@ -68,6 +69,40 @@ def anime_from_card(card: dict) -> Anime:
 
 def _fold(s) -> str:
     return str(s or "").casefold().replace("ё", "е")
+
+
+_NON_WORD = re.compile(r"\W+")
+
+
+def query_words(query) -> tuple:
+    """Слова запроса в той же свёртке, что и названия (регистр, ё → е)."""
+    return tuple(w for w in _fold(query).split() if w)
+
+
+def query_tier(words, names) -> int:
+    """Насколько тайтл совпал с запросом ГЛАВНЫМ названием (рус. и ромадзи).
+
+    0 — название начинается с запроса или каждое слово запроса начинает
+    слово названия («Я» → «Я — гений…»); 1 — все слова есть в названии,
+    но внутри слов («Моя геройская академия»); 2 — совпало только в синонимах,
+    английском или японском названии: так находят и сервер Shikimori, и
+    «По кэшу» («Я» → «Дороро»). Сортировка ставит такие тайтлы в конец."""
+    if not words:
+        return 0
+    parts = [p for w in words for p in _NON_WORD.split(w) if p]
+    phrase = " ".join(words)
+    best = 2
+    for name in names:
+        n = _fold(name)
+        if not n or not all(w in n for w in words):
+            continue
+        if n.startswith(phrase):
+            return 0
+        tokens = [t for t in _NON_WORD.split(n) if t]
+        if parts and all(any(t.startswith(p) for t in tokens) for p in parts):
+            return 0
+        best = 1
+    return best
 
 
 def _names(card: dict) -> list:

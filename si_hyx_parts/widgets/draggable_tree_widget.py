@@ -232,6 +232,10 @@ class PhotoDragList(_api.QTreeWidget):
         self.setDragDropMode(_api.QAbstractItemView.DragDropMode.InternalMove)
         self.setSelectionMode(_api.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setRootIsDecorated(False)
+        # Индикатор вставки рисуем сами (см. paintEvent): перетаскивание всегда
+        # переставляет строки верхнего уровня, без вложения в чужую строку.
+        self.setDropIndicatorShown(False)
+        self._drop_row = None
         self.setAlternatingRowColors(True)
         self.setUniformRowHeights(True)
         self.setStyleSheet("""
@@ -257,19 +261,95 @@ class PhotoDragList(_api.QTreeWidget):
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
+        if event.source() is self:
+            # Внутреннее перетаскивание: всегда переставляем строки верхнего
+            # уровня. Стандартный InternalMove в середине строки создавал
+            # ВЛОЖЕННУЮ строку — она не видна (дерево без треугольников) и
+            # картинка «исчезала».
+            self._drop_row = self._drop_insert_row(event.position().toPoint())
+            self.viewport().update()
+            event.setDropAction(_api.Qt.DropAction.MoveAction)
+            event.accept()
+            return
         if event.mimeData().hasUrls():
             event.setDropAction(_api.Qt.DropAction.CopyAction)
             event.accept()
         else:
             super().dragMoveEvent(event)
 
+    def dragLeaveEvent(self, event):
+        if self._drop_row is not None:
+            self._drop_row = None
+            self.viewport().update()
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event):
+        if event.source() is self:
+            row = self._drop_insert_row(event.position().toPoint())
+            self._drop_row = None
+            self._move_selected_to(row)
+            self.viewport().update()
+            event.setDropAction(_api.Qt.DropAction.MoveAction)
+            event.accept()
+            return
         if event.mimeData().hasUrls():
             event.accept()
             links = [str(url.toLocalFile()) for url in event.mimeData().urls()]
             self.add_files(links)
         else:
             super().dropEvent(event)
+
+    def _drop_insert_row(self, pos):
+        """Строка верхнего уровня (0..count), ПЕРЕД которой встанут выбранные.
+        Верхняя половина строки — перед ней, нижняя — после неё; пустое место
+        под списком — в конец."""
+        item = self.itemAt(pos)
+        if item is None:
+            return self.topLevelItemCount()
+        rect = self.visualItemRect(item)
+        row = self.indexOfTopLevelItem(item)
+        return row if pos.y() < rect.center().y() else row + 1
+
+    def _move_selected_to(self, row):
+        """Переставляет выбранные строки верхнего уровня в позицию row.
+        Данные строк (путь, статус, миниатюра) сохраняются — это те же объекты."""
+        selected = [it for it in self.get_all_items() if it.isSelected()]
+        if not selected:
+            return
+        # Сколько выбранных строк стояло ДО позиции вставки: после их изъятия
+        # целевой индекс сдвигается.
+        shift = sum(1 for i in range(row) if self.topLevelItem(i).isSelected())
+        rest = [it for it in self.get_all_items() if not it.isSelected()]
+        dest = max(0, min(row - shift, len(rest)))
+        # takeTopLevelItem передаёт владение вызывающему — держим возвращённые
+        # объекты, иначе Python удалит их до вставки.
+        taken = []
+        for it in selected:
+            taken.append(self.takeTopLevelItem(self.indexOfTopLevelItem(it)))
+        for off, it in enumerate(taken):
+            if it is None:
+                continue
+            self.insertTopLevelItem(dest + off, it)
+            it.setSelected(True)
+        if taken and taken[0] is not None:
+            self.setCurrentItem(taken[0])
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._drop_row is None:
+            return
+        count = self.topLevelItemCount()
+        if count:
+            index = min(max(self._drop_row, 0), count - 1)
+            rect = self.visualItemRect(self.topLevelItem(index))
+            y = rect.top() if self._drop_row < count else rect.bottom()
+            left, right = rect.left(), rect.right()
+        else:
+            y, left, right = 0, 0, self.viewport().width()
+        painter = _api.QPainter(self.viewport())
+        painter.setPen(_api.QPen(_api.QColor(0x89, 0xb4, 0xfa), 2))
+        painter.drawLine(left, y, right, y)
+        painter.end()
 
     # ── Add files ──────────────────────────────────────────
     def add_files(self, paths):

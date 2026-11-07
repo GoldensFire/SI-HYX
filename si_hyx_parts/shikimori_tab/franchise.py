@@ -2,9 +2,12 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """Ключ франшизы и сравнение названий. Public namespace: shikimori_tab."""
+from functools import lru_cache
+
 import shikimori_tab as _api
 
 
+@lru_cache(maxsize=1 << 17)
 def _franchise_key(s: str) -> str:
     """«Ключ франшизы» — базовое название без сезона/части И без подзаголовка:
     «Атака титанов 2» → «атака титанов», «Наруто: Ураганные хроники» → «наруто»,
@@ -20,11 +23,12 @@ def _franchise_key(s: str) -> str:
 _franchise_key.__module__ = _api.__name__
 _api._franchise_key = _franchise_key
 
-def _title_words(s: str) -> list:
+@lru_cache(maxsize=1 << 17)
+def _title_words(s: str) -> tuple:
     """Слова названия (дефис = разделитель, как пробел): «девочки-мечтательницы»
-    → [«девочки», «мечтательницы»], чтобы дефисные/пробельные варианты одного
-    тайтла дробились на слова одинаково."""
-    return [w for w in _api.re.split(r"[\s\-–—]+", s) if w]
+    → («девочки», «мечтательницы»), чтобы дефисные/пробельные варианты одного
+    тайтла дробились на слова одинаково. Кортеж — результат кешируется."""
+    return tuple(w for w in _api.re.split(r"[\s\-–—]+", s) if w)
 
 _title_words.__module__ = _api.__name__
 _api._title_words = _title_words

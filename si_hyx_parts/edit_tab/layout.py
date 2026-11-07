@@ -5,40 +5,8 @@
 import edit_tab as _api
 
 
-class _ElidedLabel(_api.QLabel):
-    """Подпись в одну строку: длинный текст сокращается «…» посередине по
-    реальной ширине подписи. Раньше имя файла резалось до последних 27
-    символов («…s OVA 1 [BDRemux 1080p].mkv»), а путь — до 210 px по шрифту
-    без стилей, хотя место в подписи оставалось. Ширину берёт у панели и сама
-    её не распирает."""
-
-    def __init__(self, text=""):
-        super().__init__(text)
-        self._full_text = None
-        self.setTextFormat(_api.Qt.TextFormat.PlainText)
-        self.setSizePolicy(_api.QSizePolicy.Policy.Ignored,
-                           _api.QSizePolicy.Policy.Preferred)
-        self.setMinimumWidth(1)
-
-    def set_full_text(self, text):
-        self._full_text = str(text)
-        self.ensurePolished()      # размер шрифта из styleSheet — до замера
-        self._elide_full_text()
-
-    def clear_full_text(self, text):
-        self._full_text = None
-        self.setText(text)
-
-    def resizeEvent(self, ev):
-        super().resizeEvent(ev)
-        self._elide_full_text()
-
-    def _elide_full_text(self):
-        if self._full_text is None:
-            return
-        width = max(0, self.contentsRect().width())
-        self.setText(self.fontMetrics().elidedText(
-            self._full_text, _api.Qt.TextElideMode.ElideMiddle, width))
+# Подпись с «…» посередине — общая с «Обработкой» (widgets.ElidedLabel).
+_ElidedLabel = _api.ElidedLabel
 
 
 class EditTabLayoutMixin:
@@ -623,20 +591,26 @@ class EditTabLayoutMixin:
                                        "(требует перекодировки)")
         self.btn_crop_frame.toggled.connect(self._toggle_frame_crop)
         self.btn_crop_frame.setEnabled(False)
-        # «Пикселизация — проявление»: видео стартует крупными блоками и постепенно
-        # проясняется (для угадайки). Параметры задаются в диалоге, эффект
-        # применяется при «Экспорт» (требует перекодировки, как и кадрирование).
+        # «Эффект проявления»: видео стартует спрятанным (крупные блоки или
+        # другой эффект кадров генератора паков) и постепенно проясняется (для
+        # угадайки). Параметры задаются в диалоге, эффект применяется при
+        # «Экспорт» (требует перекодировки, как и кадрирование).
         self._pixelize_active = False
+        self._pixelize_effect = "pixelize"
         self._pixelize_steps = 6
         self._pixelize_block = 64
+        # «+ Файлы» диалога эффекта: ещё картинки, из каждой — своё видео.
+        self._still_batch = []
         self.btn_pixelize = _api.make_icon_btn("")
         self.btn_pixelize.setIcon(_api.get_icon('fa5s.th'))
         self.btn_pixelize.setIconSize(_api.QSize(18, 18))
         self._relax_width(self.btn_pixelize)
         self.btn_pixelize.setCheckable(True)
-        self.btn_pixelize.setToolTip("Пикселизация: видео начнётся крупными «пикселями» "
-                                     "и постепенно станет чётким (для угадайки). "
-                                     "Применяется при «Экспорт» (перекодировка)")
+        self.btn_pixelize.setToolTip("Эффект проявления: видео начнётся крупными "
+                                     "«пикселями» или другим эффектом кадров из "
+                                     "генератора паков и постепенно станет чётким "
+                                     "(для угадайки). Применяется при «Экспорт» "
+                                     "(перекодировка)")
         self.btn_pixelize.toggled.connect(self._toggle_pixelize)
         self.btn_pixelize.setEnabled(False)
         # ВИДИМОЕ состояние «включено»: make_icon_btn не стилизует :checked, и
@@ -897,9 +871,19 @@ class EditTabLayoutMixin:
                                   "(или перетащите файл на таймлайн)", self.project_add_file)
         self.btn_proj_fit = _tbtn('fa5s.expand-arrows-alt', "Весь проект в окне",
                                   lambda: self.project_timeline.zoom_to_fit())
+        # Эффекты и текст проекта просмотр показывает всегда (project_fx).
         self.btn_proj_more = _tbtn('fa5s.ellipsis-h', "Ещё", lambda: None)
         more = _api.QMenu(self.btn_proj_more)
         more.addAction("Добавить файл в проект…", self.project_add_file)
+        more.addAction("Добавить текст у плейхеда…", self.project_text_add)
+        more.addSeparator()
+        more.addAction("Открыть проект…", self.project_open_dialog)
+        more.addAction("Сохранить проект как…", self.project_save_as)
+        more.addAction("Настройки проекта…", self.project_settings_dialog)
+        more.addAction("Свойства выделенного клипа…", lambda: self.project_clip_props())
+        ai_menu = more.addMenu("Проекты нейросети")
+        ai_menu.setToolTipsVisible(True)
+        ai_menu.aboutToShow.connect(lambda m=ai_menu: self._aiproj_fill_menu(m))
         more.addSeparator()
         more.addAction("Добавить видеодорожку", lambda: self._project_action('add_track:video', ''))
         more.addAction("Добавить аудиодорожку", lambda: self._project_action('add_track:audio', ''))
@@ -945,7 +929,8 @@ class EditTabLayoutMixin:
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(100)
         self.vol_slider.setFixedWidth(84)
-        self.vol_slider.setStyleSheet(self._slider_style(_api.C["text2"], compact=True))
+        # Вид — как у ползунка полноэкранного режима.
+        self.vol_slider.setStyleSheet(_api.VolumeSlider.bar_style())
         self.vol_slider.valueChanged.connect(self._on_volume_changed)
         row.addWidget(self.vol_slider)
 

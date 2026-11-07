@@ -9,18 +9,30 @@ Public namespace: montage_tool.
 640², RGB/255, NMS по IoU 0,7, порог — threshold.json модели). CCIP
 (OpenRAIL) — признаки персонажа 768 по кадру 384² (нормировка CLIP) и
 модель-метрика «разница пар»: тот же персонаж — разница ≤ порога; кластеры
-— DBSCAN на этой метрике с eps и min_samples из cluster.json. Теги — WD
+— средняя связь на этой метрике (library.recluster_characters). Теги — WD
 tagger v3 (SmilingWolf, Apache-2.0): квадрат с белыми полями 448², BGR
 0…255, выход — вероятности; общие ≥ 0,35, персонажи ≥ 0,85, рейтинг —
 наибольший из четырёх. Текст — rapidocr приложения (PP-OCRv6 small, те же
-файлы моделей, что у генерации). Сам dghs-imgutils не ставится: он требует
-numpy < 2. Провайдер — DirectML, если есть, иначе CPU (у приложения CPU)."""
+файлы моделей, что у генерации; детектор строк — по меньшей стороне 480, а
+не 736: кадр 640×360 не растягивается вчетверо, текст тот же). Сам
+dghs-imgutils не ставится: он требует numpy < 2. Провайдер — DirectML,
+если есть; у приложения его нет, и теги и TransNetV2 идут в
+Python с onnxruntime-directml (WorkerSession, dml_worker.py), иначе CPU."""
 import csv
+import io
 import json
+import struct
+import sys
+import threading
 
 import numpy as np
 
 import montage_tool as _api
+
+DML_PYTHON_ENV = "SI_HYX_DML_PYTHON"
+_DML_WORKER = _api.os.path.join(_api.os.path.dirname(_api.os.path.abspath(__file__)),
+                                "dml_worker.py")
+_WORKER_START_S = 120                 # запуск Python, импорт ORT и сборка графа DirectML
 
 # Модели из jobs.ASSETS: имя → (onnx, порог-json).
 DETECTORS = {"face": ("anime/face_detect_v1.4_n.onnx", "anime/face_detect_v1.4_n.threshold.json"),
@@ -34,12 +46,15 @@ _CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], np.float32)[:, None, 
 _CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], np.float32)[:, None, None]
 
 
-def session(path, threads=6, dml=True):
+def session(path, threads=6, dml=True, worker=False):
     """InferenceSession: DirectML (iGPU) → CPU; DirectML не поднялся — CPU.
     dml=False — только CPU. Замер Vega 7 (tools/montage_dml_bench.py,
     onnxruntime-directml 1.24.4 против CPU 6 потоков): TransNetV2 ×1,4,
     детекторы ×1,5–1,75, WD ViT ×1,7 (пачка 1), CCIP ×0,74 — медленнее,
-    EVA02 на DirectML не встаёт (уходит на CPU)."""
+    EVA02 на DirectML не встаёт (уходит на CPU). У onnxruntime приложения
+    DirectML нет: worker=True — тогда модель считается в Python с
+    onnxruntime-directml (dml_python) через WorkerSession, и CPU свободен
+    для остальных моделей."""
     import onnxruntime as ort
     so = ort.SessionOptions()
     so.intra_op_num_threads = threads
@@ -55,7 +70,143 @@ def session(path, threads=6, dml=True):
                                         providers=["DmlExecutionProvider", "CPUExecutionProvider"])
         except Exception:                # noqa: BLE001 — iGPU не взлетел: CPU
             pass
+    elif dml and worker and dml_python():
+        try:
+            return WorkerSession(path, dml_python(), threads)
+        except (OSError, ValueError) as e:
+            print(f"montage_tool: DirectML-обработчик не поднялся ({e}) — CPU", file=sys.stderr)
     return ort.InferenceSession(path, sess_options=so, providers=["CPUExecutionProvider"])
+
+
+def dml_python():
+    """Python с onnxruntime-directml: SI_HYX_DML_PYTHON или dml-venv в кэше
+    montage_tool (как в tools/montage_dml_bench.py); нет — ""."""
+    exe = _api.os.environ.get(DML_PYTHON_ENV, "")
+    if not exe:
+        exe = _api.os.path.join(_api.cache_dir(), "dml-venv",
+                                *(("Scripts", "python.exe") if _api.os.name == "nt" else ("bin", "python")))
+    return exe if _api.os.path.isfile(exe) else ""
+
+
+class _Node:
+    """Вход или выход модели — как NodeArg onnxruntime (имя и форма)."""
+
+    def __init__(self, d):
+        self.name, self.shape = d["name"], d["shape"]
+
+
+class _Meta:
+    def __init__(self, meta):
+        self.custom_metadata_map = meta
+
+
+class WorkerSession:
+    """Сеанс модели в процессе dml_worker.py (DirectML своей среды) с видом
+    InferenceSession: get_inputs, get_outputs, get_modelmeta, run. Сеанс
+    на iGPU не встал (провайдер — CPU) — ValueError: CPU приложения быстрее
+    без пересылки. Обработчик упал посреди работы — дальше свой сеанс на
+    CPU (fell_back)."""
+
+    def __init__(self, path, python, threads=6):
+        self.path, self.threads = path, threads
+        self.fell_back = False
+        self._local = None
+        self._lock = threading.Lock()
+        self._proc = _api.subprocess.Popen(
+            [python, "-I", "-X", "utf8", _DML_WORKER, str(path), str(threads)],
+            stdin=_api.subprocess.PIPE, stdout=_api.subprocess.PIPE,
+            stderr=_api.subprocess.DEVNULL, creationflags=_api.CREATE_NO_WINDOW)
+        got = []
+        t = threading.Thread(target=lambda: got.append(_frame_read(self._proc.stdout)), daemon=True)
+        t.start()
+        t.join(_WORKER_START_S)
+        info = json.loads(got[0].decode("utf-8")) if got and got[0] else {}
+        if info.get("provider") != "DmlExecutionProvider":
+            self.close()
+            raise ValueError(info.get("error") or f"провайдер {info.get('provider') or 'нет ответа'}")
+        self._inputs = [_Node(d) for d in info["inputs"]]
+        self._outputs = [_Node(d) for d in info["outputs"]]
+        self._meta = _Meta(info.get("meta") or {})
+
+    def get_inputs(self):
+        return self._inputs
+
+    def get_outputs(self):
+        return self._outputs
+
+    def get_modelmeta(self):
+        return self._meta
+
+    def run(self, output_names, feeds):
+        with self._lock:
+            if self._local is None:
+                try:
+                    res = self._remote(feeds)
+                except (OSError, ValueError) as e:
+                    print(f"montage_tool: DirectML-обработчик ({e}) — дальше CPU", file=sys.stderr)
+                    self.close()
+                    self._local = session(self.path, self.threads, dml=False)
+                    self.fell_back = True
+                else:
+                    if output_names is None:
+                        return res
+                    names = [o.name for o in self._outputs]
+                    return [res[names.index(n)] for n in output_names]
+            return self._local.run(output_names, feeds)
+
+    def _remote(self, feeds):
+        p = self._proc
+        if p is None or p.poll() is not None:
+            raise OSError("процесс завершился")
+        _frame_write(p.stdin, json.dumps({"inputs": list(feeds)}).encode("utf-8"))
+        for x in feeds.values():
+            buf = io.BytesIO()
+            np.save(buf, np.ascontiguousarray(x), allow_pickle=False)
+            _frame_write(p.stdin, buf.getvalue())
+        p.stdin.flush()
+        head = _frame_read(p.stdout)
+        if head is None:
+            raise OSError("обработчик не ответил")
+        res = json.loads(head.decode("utf-8"))
+        if not res.get("ok"):
+            raise ValueError(res.get("error") or "ошибка обработчика")
+        out = []
+        for _ in range(int(res["n"])):
+            data = _frame_read(p.stdout)
+            if data is None:
+                raise OSError("ответ оборван")
+            out.append(np.load(io.BytesIO(data), allow_pickle=False))
+        return out
+
+    def close(self):
+        p, self._proc = getattr(self, "_proc", None), None
+        if p is None:
+            return
+        try:
+            p.stdin.close()                  # конец stdin — обработчик выходит сам
+            p.wait(timeout=5)
+        except (OSError, _api.subprocess.TimeoutExpired):
+            p.kill()
+            p.wait()
+        finally:
+            p.stdout.close()
+
+    def __del__(self):
+        self.close()
+
+
+def _frame_read(f):
+    head = f.read(4)
+    if len(head) < 4:
+        return None
+    n = struct.unpack("<I", head)[0]
+    data = f.read(n)
+    return data if len(data) == n else None
+
+
+def _frame_write(f, data):
+    f.write(struct.pack("<I", len(data)))
+    f.write(data)
 
 
 def _iou_nms(boxes, scores, thr=0.7):
@@ -81,9 +232,11 @@ def _iou_nms(boxes, scores, thr=0.7):
 class Detector:
     """YOLO deepghs: detect(RGB uint8) → [(x0, y0, x1, y1, оценка)]."""
 
-    def __init__(self, kind, ctl=None):
+    def __init__(self, kind, ctl=None, worker=False):
         onnx, thr = DETECTORS[kind]
-        self.sess = session(_api.asset(onnx, ctl or _api.NO_CONTROL))
+        # worker — обработчик DirectML: детекторы идут на iGPU до тегов (×1,5–1,75),
+        # пока процессор читает текст; рядом с тегами они стояли бы в очереди.
+        self.sess = session(_api.asset(onnx, ctl or _api.NO_CONTROL), worker=worker)
         with open(_api.asset(thr, ctl or _api.NO_CONTROL), "r", encoding="utf-8") as f:
             self.threshold = float(json.load(f).get("threshold", 0.25))
         meta = self.sess.get_modelmeta().custom_metadata_map
@@ -116,11 +269,9 @@ class CCIP:
     def __init__(self, ctl=None):
         ctl = ctl or _api.NO_CONTROL
         self.feat = session(_api.asset("anime/ccip_feat.onnx", ctl), dml=False)   # на DirectML медленнее
-        self.metric = session(_api.asset("anime/ccip_metrics.onnx", ctl), threads=1)
+        self.metric = session(_api.asset("anime/ccip_metrics.onnx", ctl), threads=4)
         with open(_api.asset("anime/ccip_metrics.json", ctl), "r", encoding="utf-8") as f:
             self.threshold = float(json.load(f)["threshold"])
-        with open(_api.asset("anime/ccip_cluster.json", ctl), "r", encoding="utf-8") as f:
-            self.cluster = json.load(f)
 
     def features(self, crops):
         import cv2
@@ -130,65 +281,36 @@ class CCIP:
         x = (x.astype(np.float32) / 255.0).transpose(0, 3, 1, 2)
         x = (x - _CLIP_MEAN) / _CLIP_STD
         name = self.feat.get_inputs()[0].name
-        return np.concatenate([self.feat.run(None, {name: x[i:i + 4]})[0]
-                               for i in range(0, len(x), 4)]).astype(np.float32)
+        # По одной фигуре: на CPU пачка 4 медленнее на фигуру (0,74 с против 0,66).
+        return np.concatenate([self.feat.run(None, {name: x[i:i + 1]})[0]
+                               for i in range(len(x))]).astype(np.float32)
 
-    def differences(self, feats):
-        """Матрица разниц пар (n×n)."""
-        n = len(feats)
-        if n == 0:
-            return np.zeros((0, 0), np.float32)
+    def differences(self, a, b=None):
+        """Разницы пар: a×a или (b задан) a×b. Модель считает «каждый с
+        каждым» внутри батча, поэтому a и b — блоки (до 1024)."""
         name = self.metric.get_inputs()[0].name
-        if n <= 2048:
-            return self.metric.run(None, {name: feats})[0]
-        # Модель считает всё «каждый с каждым» в одном батче — большие
-        # библиотеки по блокам.
-        out = np.zeros((n, n), np.float32)
-        step = 1024
-        for i in range(0, n, step):
-            for j in range(i, n, step):
-                a, b = feats[i:i + step], feats[j:j + step]
-                d = self.metric.run(None, {name: np.concatenate([a, b])})[0]
-                out[i:i + len(a), j:j + len(b)] = d[:len(a), len(a):]
-                out[j:j + len(b), i:i + len(a)] = d[len(a):, :len(a)]
-        return out
-
-
-def dbscan(dist, eps, min_samples):
-    """Метки DBSCAN по готовой матрице расстояний (-1 — шум)."""
-    n = len(dist)
-    labels = np.full(n, -1, int)
-    neigh = [np.flatnonzero(dist[i] <= eps) for i in range(n)]
-    core = np.array([len(x) >= min_samples for x in neigh])
-    c = 0
-    for i in range(n):
-        if labels[i] != -1 or not core[i]:
-            continue
-        labels[i] = c
-        stack = list(neigh[i])
-        while stack:
-            j = stack.pop()
-            if labels[j] == -1:
-                labels[j] = c
-                if core[j]:
-                    stack.extend(neigh[j])
-        c += 1
-    return labels
+        if b is None:
+            return self.metric.run(None, {name: a})[0]
+        return self.metric.run(None, {name: np.concatenate([a, b])})[0][:len(a), len(a):]
 
 
 class Tagger:
     """WD tagger v3: tag(RGB) → (общие {тег: оценка}, персонажи, рейтинг)."""
 
-    def __init__(self, kind="vit", ctl=None):
+    def __init__(self, kind="vit", ctl=None, worker=True):
         onnx, tags = TAGGERS[kind]
         ctl = ctl or _api.NO_CONTROL
         self.kind = kind
-        self.sess = session(_api.asset(onnx, ctl))
+        self.sess = session(_api.asset(onnx, ctl), worker=worker)
         with open(_api.asset(tags, ctl), "r", encoding="utf-8") as f:
             rows = list(csv.DictReader(f))
         self.names = [r["name"] for r in rows]
         self.cats = np.array([int(r["category"]) for r in rows])
         self.size = int(self.sess.get_inputs()[0].shape[1])
+        # На iGPU пачка 4 — одна команда ~2,6 с: Windows считает видеокарту
+        # зависшей (TDR, DXGI_ERROR_DEVICE_HUNG) и сбрасывает её; по одному
+        # кадру ~0,6 с.
+        self.step = 1 if isinstance(self.sess, WorkerSession) else 4
 
     def _prep(self, rgb):
         import cv2
@@ -205,8 +327,8 @@ class Tagger:
             return []
         name = self.sess.get_inputs()[0].name
         out = []
-        for i in range(0, len(images), 4):
-            x = np.stack([self._prep(im) for im in images[i:i + 4]])
+        for i in range(0, len(images), self.step):
+            x = np.stack([self._prep(im) for im in images[i:i + self.step]])
             for p in self.sess.run(None, {name: x})[0]:
                 rating = {self.names[k]: float(p[k]) for k in np.flatnonzero(self.cats == 9)}
                 general = {self.names[k]: round(float(p[k]), 3)
@@ -234,6 +356,8 @@ class OCR:
             "Global.model_root_dir": str(root), "Global.use_cls": False,
             "Global.log_level": "error", "Det.thresh": .3, "Det.box_thresh": .5,
             "Det.ocr_version": OCRVersion.PPOCRV6, "Det.model_type": ModelType.SMALL,
+            # Замер на 411 планах: ×2,5 быстрее 736, кадры с текстом — 74 и 74.
+            "Det.limit_side_len": 480,
             "Rec.ocr_version": OCRVersion.PPOCRV6, "Rec.model_type": ModelType.SMALL})
 
     def read(self, rgb):

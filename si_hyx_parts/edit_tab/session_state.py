@@ -7,6 +7,8 @@
 остановились, лежит в настройках Монтажа (EDITOR_SETTINGS_PATH, ключ
 'session'):
 
+* файл проекта, с которым связан проект вкладки, и время последнего
+  показанного проекта нейросети (project_link);
 * плейхед проекта и вид таймлайна (масштаб, прокрутка). При первом показе
   вкладки файл под плейхедом открывается сам — на экране тот же кадр, а не
   пустой плеер до первого клика по шкале;
@@ -45,12 +47,14 @@ class EditTabSessionMixin:
             # запуска не затираем нулями.
             playhead = self._session_playhead
             view = list(self._session_view) if self._session_view else None
-        return {'playhead': playhead, 'view': view, 'files': self._session_files}
+        return {'playhead': playhead, 'view': view, 'files': self._session_files,
+                **self._link_state()}
 
     def _session_load(self, state):
         """Состояние из load_settings."""
         if not isinstance(state, dict):
             return
+        self._link_load_state(state)
         files = state.get('files')
         if isinstance(files, dict):
             self._session_files = {str(k): v for k, v in files.items() if isinstance(v, dict)}
@@ -68,8 +72,13 @@ class EditTabSessionMixin:
 
     # ── Дорожки файла ────────────────────────────────────────────────────────
     def _session_file_key(self):
-        src = getattr(self, "actual_source_file", None)
-        if not src or getattr(self, "is_still_image", False):
+        if getattr(self, "_deck_tv", None) is not None:
+            src = self._deck_tv['src']      # панель о файле куска на деке
+        else:
+            src = getattr(self, "actual_source_file", None)
+            if getattr(self, "is_still_image", False):
+                return None
+        if not src:
             return None
         return _api.os.path.normcase(_api.os.path.abspath(str(src)))
 

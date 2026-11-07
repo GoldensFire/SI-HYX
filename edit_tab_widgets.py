@@ -52,6 +52,7 @@ from si_hyx_parts.edit_tab_widgets.player_widgets import (
 from si_hyx_parts.edit_tab_widgets.painted_video_canvas import _PaintedVideoCanvas
 
 from si_hyx_parts.edit_tab_widgets.project_timeline import ProjectTimeline
+from si_hyx_parts.edit_tab_widgets.fx_preview_view import FxPreviewView
 
 
 # ─── Холст видео на GPU: окно Qt Quick + QML VideoOutput ─────────────────────

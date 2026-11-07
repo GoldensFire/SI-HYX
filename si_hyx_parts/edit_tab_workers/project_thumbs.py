@@ -105,7 +105,7 @@ class ProjectThumbWorker(_api.QThread):
             if src in self._hdr:
                 return self._hdr[src]
         hdr = None
-        if _api.os.environ.get("QT_FFMPEG_DECODING_HW_DEVICE_TYPES"):
+        if _api.hw_video_decode_enabled():
             props = _api.edit_tab_frames.probe_video_props(src)
             if (props.get("transfer") == "smpte2084" and props.get("width", 0) > 0
                     and props.get("height", 0) > 0 and not props.get("rotation", 0) % 360):

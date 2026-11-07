@@ -24,15 +24,17 @@ import time
 import wave
 import edit_tab_frames
 import montage_project
-from config import (CREATE_NO_WINDOW, FFMPEG, FFPROBE, QThread, Qt, pyqtSignal)
-from edit_tab_base import (QAudioFormat, QAudioSink, QMediaDevices, _parse_srt,
+from config import (CREATE_NO_WINDOW, FFMPEG, FFPROBE, QThread, Qt, hw_video_decode_enabled,
+                    pyqtSignal)
+from edit_tab_base import (QAudioFormat, QAudioSink, QMediaDevices, QMediaPlayer, QVideoSink,
+                           _parse_srt, read_subtitle_text, subtitle_text_encoding,
                            time_to_s)
 try:
-    from PyQt6.QtMultimedia import QAudio
+    from PyQt6.QtMultimedia import QAudio, QVideoFrame
 except ImportError:                 # без QtMultimedia звук просмотра не поднимется
-    QAudio = None
+    QAudio = QVideoFrame = None
 from utils import csv_first
-from PyQt6.QtCore import (QFile, QFileDevice, QIODevice, QObject, QTimer,
+from PyQt6.QtCore import (QFile, QFileDevice, QIODevice, QObject, QTimer, QUrl,
                           pyqtSlot)
 from PyQt6.QtGui import (QImage)
 
@@ -56,6 +58,8 @@ from si_hyx_parts.edit_tab_workers.track_path_worker import TrackPathWorker
 
 from si_hyx_parts.edit_tab_workers.track_overlay_worker import TrackOverlayWorker
 
+from si_hyx_parts.edit_tab_workers.reveal_video_worker import RevealVideoWorker
+
 from si_hyx_parts.edit_tab_workers.proxy_worker import ProxyWorker
 
 from si_hyx_parts.edit_tab_workers.waveform_loaders import (
@@ -69,3 +73,7 @@ from si_hyx_parts.edit_tab_workers.ass_extractor import AssExtractor, _SeekThumb
 from si_hyx_parts.edit_tab_workers.project_thumbs import ProjectThumbWorker
 
 from si_hyx_parts.edit_tab_workers.project_sound import ProjectSoundEngine
+
+from si_hyx_parts.edit_tab_workers.video_deck import VideoDeck
+
+from si_hyx_parts.edit_tab_workers.fx_preview import FxPreview

@@ -829,6 +829,7 @@ class UnifiedWindowSettingsMixin:
                     'aspd': int(tm.sl_aspd.value()),
                     'cq': int(tm.s_cq.value()),
                     'overwrite_src': bool(tm.ck_overwrite_src.isChecked()) if hasattr(tm, 'ck_overwrite_src') else False,
+                    'gemini_wm': bool(tm.ck_gemini_wm.isChecked()),
                     'fit_passes': int(tm.s_passes.value()),
                     'img_fmt': _api.strip_default_tag(tm.c_img_fmt.currentText()),
                     'chroma': _api.strip_default_tag(tm.c_chroma.currentText()).replace(':', '')
@@ -932,7 +933,7 @@ class UnifiedWindowSettingsMixin:
                 tm.ck_no_audio,
                 tm.ck_norm, tm.ck_fade, tm.ck_fade_in, tm.ck_deg, tm.ck_u8,
                 tm.chk_enable_video, tm.btn_mode_dark,
-                tm.ck_overwrite_src,
+                tm.ck_overwrite_src, tm.ck_gemini_wm,
                 tm.ck_lim, tm.ck_dim,
                 tm.ck_vfade_in, tm.ck_vfade_out, tm.ck_crop_black,
                 ty.chk_k,

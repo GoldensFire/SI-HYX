@@ -237,6 +237,7 @@ from si_hyx_parts.utils.media_info import pretty_audio_codec, fmt_bitrate_with_c
 
 from si_hyx_parts.utils.media_info import (
     get_media_info,
+    audio_stream_count,
     csv_fields,
     csv_first,
     get_fps_float,
@@ -258,6 +259,8 @@ from si_hyx_parts.utils.ffmpeg_tools import (
     escape_filter_path,
     overlay_filter_graph,
     measure_loudness,
+    loudnorm_stats,
+    loudnorm_linear_opts,
 )
 from si_hyx_parts.utils.desktop import (
     play_done_sound,

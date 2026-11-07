@@ -274,7 +274,7 @@ class EditTabProjectSoundMixin:
         t.start()
 
     def _snd_prepare_now(self):
-        if self._snd_active or not self._snd_wanted():
+        if self._snd_active or getattr(self, "_fx_mode", False) or not self._snd_wanted():
             return
         try:
             if self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState:
@@ -290,6 +290,7 @@ class EditTabProjectSoundMixin:
             return
         if not self._snd.prepared_for(self.project, ta):
             self._snd.prepare(self.project, ta)
+        self._deck_prepare(ta)          # и картинка следующих кусков (project_decks)
 
     def _snd_shutdown(self):
         eng, self._snd = self._snd, None

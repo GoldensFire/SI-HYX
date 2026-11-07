@@ -536,12 +536,17 @@ class EditTabProjectAudioMixin:
         hold = self._pmix_hold
         running = self._pmix_running()
         if hold is not None and running:
-            self.project_timeline.set_playhead(min(hold[1], max(hold[0], t)))
+            # Картинка или пустота под звуком: плеер стоит и sync_ui время под
+            # видео не двигает — его ведут часы проекта.
+            t_hold = min(hold[1], max(hold[0], t))
+            self.project_timeline.set_playhead(t_hold)
+            self._paint_project_time(t_hold)
         if getattr(self, "_snd_active", False):
             if hold is None and self._proj_transition and running:
                 # Грузится файл следующего куска: звук тракта не ждёт загрузки
                 # — и плейхед идёт за ним, а не стоит.
                 self.project_timeline.set_playhead(t)
+                self._paint_project_time(t)
             return                      # звук всех дорожек — у тракта, голосов нет
         if self._pmix_on_segment(t):
             # Громкость основного плеера — только пока он на своём куске: на

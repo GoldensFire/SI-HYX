@@ -163,6 +163,23 @@ get_media_info.__module__ = _api.__name__
 _api.get_media_info = get_media_info
 
 
+def audio_stream_count(path):
+    """Число аудиодорожек файла; 0 — их нет или ffprobe файл не прочитал."""
+    try:
+        p = _api.subprocess.run(
+            [_api.FFPROBE, "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "json", path],
+            stdout=_api.subprocess.PIPE, stderr=_api.subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=_api.CREATE_NO_WINDOW, timeout=30)
+        return len(_api.json.loads(p.stdout or "{}").get("streams") or [])
+    except Exception:
+        return 0
+
+audio_stream_count.__module__ = _api.__name__
+_api.audio_stream_count = audio_stream_count
+
+
 def csv_fields(out, sep=","):
     """Непустые поля первой строки CSV-вывода ffprobe (`-of csv=p=0`).
 

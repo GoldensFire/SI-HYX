@@ -414,6 +414,14 @@ class UnifiedWindow(
             self._deferred_tabs.append(self._add_animepack_upgrade_tab)
         if self._deferred_tabs:
             _api.QTimer.singleShot(0, self._build_deferred_tabs_step)
+        if (getattr(self, "_animepack_tab_enabled", False)
+                or getattr(self, "_animepack_upgrade_tab_enabled", False)):
+            # Отпечаток ключа Gemini (PBKDF2) — в фоне, пока строится окно.
+            try:
+                import gemini_usage
+                gemini_usage.prewarm(self.get_api_key("gemini"))
+            except Exception:
+                pass
 
         # Восстанавливаем сохранённый порядок вкладок (перетаскивание мышью).
         try:
@@ -651,6 +659,7 @@ class UnifiedWindow(
             except Exception: pass
             if hasattr(tm, "ck_overwrite_src"):
                 tm.ck_overwrite_src.setChecked(av.get("overwrite_src", False))
+            tm.ck_gemini_wm.setChecked(av.get("gemini_wm", True))
             _api.combo_set_value(tm.c_img_fmt, av.get("img_fmt", "avif"))
             try:
                 _chroma = str(av.get("chroma", "420"))

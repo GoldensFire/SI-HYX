@@ -20,17 +20,27 @@ def _reflect(coords: np.ndarray, size: int) -> np.ndarray:
     return np.where(folded > size - 1, period - folded, folded)
 
 
-def remap(pixels: np.ndarray, src_x: np.ndarray, src_y: np.ndarray) -> Image.Image:
-    """Каждый пиксель берётся из (src_x, src_y) исходника, билинейно."""
-    h, w = pixels.shape[:2]
+def remap_plan(w: int, h: int, src_x: np.ndarray, src_y: np.ndarray) -> tuple:
+    """Индексы и веса билинейной выборки из (src_x, src_y) — от кадра не
+    зависят, поэтому у видео считаются один раз на ступень."""
     x = _reflect(src_x, w)
     y = _reflect(src_y, h)
     x0 = np.floor(x).astype(np.intp)
     y0 = np.floor(y).astype(np.intp)
     x1 = np.minimum(x0 + 1, w - 1)
     y1 = np.minimum(y0 + 1, h - 1)
-    fx = (x - x0)[..., None]
-    fy = (y - y0)[..., None]
+    return x0, y0, x1, y1, (x - x0)[..., None], (y - y0)[..., None]
+
+
+def remap(pixels: np.ndarray, src_x: np.ndarray, src_y: np.ndarray) -> Image.Image:
+    """Каждый пиксель берётся из (src_x, src_y) исходника, билинейно."""
+    h, w = pixels.shape[:2]
+    return apply_plan(pixels, remap_plan(w, h, src_x, src_y))
+
+
+def apply_plan(pixels: np.ndarray, plan: tuple) -> Image.Image:
+    """Билинейная выборка кадра по готовому remap_plan."""
+    x0, y0, x1, y1, fx, fy = plan
     top = pixels[y0, x0] * (1 - fx) + pixels[y0, x1] * fx
     bottom = pixels[y1, x0] * (1 - fx) + pixels[y1, x1] * fx
     out = top * (1 - fy) + bottom * fy
@@ -43,6 +53,17 @@ class _Warp:
         h, w = self.pixels.shape[:2]
         self.w, self.h = w, h
         self.grid_y, self.grid_x = np.mgrid[0:h, 0:w].astype(np.float32)
+        self._plan_key, self._plan = None, None
+
+    def set_image(self, image: Image.Image) -> None:
+        self.pixels = np.asarray(image, dtype=np.float32)
+
+    def render(self, progress: float) -> Image.Image:
+        # Ступень видео держится много кадров подряд: выборка та же.
+        if self._plan_key != progress:
+            self._plan_key = progress
+            self._plan = remap_plan(self.w, self.h, *self._coords(progress))
+        return apply_plan(self.pixels, self._plan)
 
 
 class WaveReveal(_Warp):
@@ -58,11 +79,11 @@ class WaveReveal(_Warp):
         self.phase_x = rng.uniform(0, 2 * math.pi)
         self.phase_y = rng.uniform(0, 2 * math.pi)
 
-    def render(self, progress: float) -> Image.Image:
+    def _coords(self, progress: float):
         amp = self.amplitude * _remaining(progress, 1.2)
         dx = amp * np.sin(2 * math.pi * self.grid_y / self.length_x + self.phase_x)
         dy = amp * np.sin(2 * math.pi * self.grid_x / self.length_y + self.phase_y)
-        return remap(self.pixels, self.grid_x + dx, self.grid_y + dy)
+        return self.grid_x + dx, self.grid_y + dy
 
 
 class SwirlReveal(_Warp):
@@ -78,12 +99,12 @@ class SwirlReveal(_Warp):
         self.falloff = np.clip(1.0 - np.hypot(self.dx, self.dy) / radius, 0, 1) ** 2
         self.center = (cx, cy)
 
-    def render(self, progress: float) -> Image.Image:
+    def _coords(self, progress: float):
         theta = self.angle * _remaining(progress, 1.4) * self.falloff
         cos, sin = np.cos(theta), np.sin(theta)
         cx, cy = self.center
-        return remap(self.pixels, cx + self.dx * cos - self.dy * sin,
-                     cy + self.dx * sin + self.dy * cos)
+        return (cx + self.dx * cos - self.dy * sin,
+                cy + self.dx * sin + self.dy * cos)
 
 
 class StripesReveal:
@@ -97,6 +118,9 @@ class StripesReveal:
         low, high = 0.18 + 0.12 * strength, 0.35 + 0.3 * strength
         self.shifts = [rng.choice((-1, 1)) * rng.uniform(low, high) * w
                        for _ in range(count)]
+
+    def set_image(self, image: Image.Image) -> None:
+        self.image = image
 
     def render(self, progress: float) -> Image.Image:
         rest = _remaining(progress, 1.3)

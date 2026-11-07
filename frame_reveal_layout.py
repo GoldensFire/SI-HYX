@@ -18,6 +18,9 @@ class ThumbnailReveal:
         # Доля площади на старте: 1,3% при 55 — это примерно 140×80 из 1280×720.
         self.start = max(0.004, 0.035 - 0.04 * strength)
 
+    def set_image(self, image: Image.Image) -> None:
+        self.image = image
+
     def render(self, progress: float) -> Image.Image:
         p = max(0.0, min(1.0, float(progress)))
         side = math.sqrt(self.start + (1 - self.start) * p ** 1.65)
@@ -61,6 +64,9 @@ class PuzzleReveal:
         self.order = pieces
         self.cycle = list(range(len(self.boxes)))
         rng.shuffle(self.cycle)
+
+    def set_image(self, image: Image.Image) -> None:
+        self.image = image
 
     def render(self, progress: float) -> Image.Image:
         p = max(0.0, min(1.0, float(progress)))

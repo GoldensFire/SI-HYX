@@ -57,6 +57,8 @@ from si_hyx_parts.widgets.hover_tips import (
     install_hover_tips,
 )
 
+from si_hyx_parts.widgets.elided_label import ElidedLabel
+
 from si_hyx_parts.widgets.info_badge import (
     _InfoBadge,
     info_badge,

@@ -127,7 +127,21 @@ class EditTabTracksMixin:
         if codec: parts.append(codec)
         return " ".join(parts) or f"Дорожка {i + 1}"
 
+    def _tracks_file(self):
+        """Файл, о котором панель звука и субтитров: открытый, а на ходу
+        просмотра проекта — файл куска, который играет дека (project_decks)."""
+        tv = getattr(self, "_deck_tv", None)
+        return tv['src'] if tv is not None else getattr(self, "actual_source_file", None)
+
+    def _sub_now_s(self):
+        """Время файла для показа субтитров: на деке — её кадр."""
+        if getattr(self, "_deck_on", False) and getattr(self, "_deck_shown", -1) >= 0:
+            return self._deck_shown / 1_000_000.0
+        return self._ui_time_s()
+
     def _populate_track_combos(self):
+        # Списки нового файла — панель снова о файле основного плеера.
+        self._deck_tv = None
         self._loading_tracks = True
         # Новый файл → сбрасываем оверлей субтитров от предыдущего (combo
         # переустанавливается на «Выкл», но on_sub_track_changed под флагом молчит).
@@ -181,6 +195,9 @@ class EditTabTracksMixin:
         remember = getattr(self, "_session_remember_tracks", None)
         if remember is not None:
             remember()                  # выбор этого файла — до следующего запуска
+        if getattr(self, "_deck_tv", None) is not None:
+            self._deck_tracks_audio_changed(kind, ref)  # файл куска на деке, не плеера
+            return
         if kind == 'none':
             # Звук выключен: гасим и внешнюю озвучку, волну оставляем как есть.
             self.selected_audio_ext_path = None
@@ -292,7 +309,7 @@ class EditTabTracksMixin:
         """Подпись внешней озвучки. Файл из подпапки — вместе с её путём
         («Eng Sound / файл.mka»): по папке обычно и видно, чья это озвучка."""
         base = _api.os.path.basename(str(path))
-        src = getattr(self, "actual_source_file", None)
+        src = self._tracks_file()
         if not src:
             return base
         try:
@@ -357,12 +374,17 @@ class EditTabTracksMixin:
         (Rus Sound, Audio, Озвучка…) — у фильма с переводом имя бывает своё.
         Остальное (папка озвучки на весь сезон, чужие mp3 рядом) откладывается
         в self._audio_ext_hidden — его открывает «Показать другие файлы…»."""
+        found, self._audio_ext_hidden = self._external_audio_files(src)
+        return found
+
+    def _external_audio_files(self, src):
+        """(сразу в список, отложенные) для _scan_external_audio — без записи
+        в состояние вкладки: зовётся и из потока разбора файлов дек."""
         found, hidden, folders = [], [], {}
         try:
             base = _api.os.path.dirname(str(src))
             if not base or not _api.os.path.isdir(base):
-                self._audio_ext_hidden = []
-                return []
+                return [], []
             own = _api.os.path.normcase(_api.os.path.abspath(str(src)))
             key = media_name_key(src)
             seen = 0
@@ -394,8 +416,7 @@ class EditTabTracksMixin:
                 (found if len(paths) == 1 else hidden).extend(paths)
         except Exception:
             pass
-        self._audio_ext_hidden = self._sort_external_subs(hidden, src)
-        return self._sort_external_subs(found, src)
+        return self._sort_external_subs(found, src), self._sort_external_subs(hidden, src)
 
     def _ensure_ext_audio_player(self):
         if self._ext_audio_player is None:
@@ -510,12 +531,17 @@ class EditTabTracksMixin:
         посторонними файлами. Отфильтрованные складываются в
         self._sub_ext_hidden — доступны через пункт «Показать другие файлы»
         в списке дорожек (см. _expand_external_subs)."""
+        found, self._sub_ext_hidden = self._external_sub_files(src, expanded)
+        return found
+
+    def _external_sub_files(self, src, expanded=False):
+        """(свои, отложенные) для _scan_external_subs — без записи в состояние
+        вкладки: зовётся и из потока разбора файлов дек."""
         found, hidden = [], []
         try:
             base = _api.os.path.dirname(str(src))
             if not base or not _api.os.path.isdir(base):
-                self._sub_ext_hidden = []
-                return []
+                return [], []
             stem = _api.os.path.splitext(_api.os.path.basename(str(src)))[0].lower()
             key = media_name_key(src)
             for root, dirs, files in _api.os.walk(base):
@@ -533,12 +559,11 @@ class EditTabTracksMixin:
                         own = related or names_relate(media_name_key(fn), key)
                         (found if own else hidden).append(p)
                         if len(found) + len(hidden) >= 500:
-                            self._sub_ext_hidden = self._sort_external_subs(hidden, src)
-                            return self._sort_external_subs(found, src)
+                            return (self._sort_external_subs(found, src),
+                                    self._sort_external_subs(hidden, src))
         except Exception:
             pass
-        self._sub_ext_hidden = self._sort_external_subs(hidden, src)
-        return self._sort_external_subs(found, src)
+        return self._sort_external_subs(found, src), self._sort_external_subs(hidden, src)
 
     def _expand_external_subs(self):
         """«Показать другие файлы» — досыпает в cmb_subs файлы, отфильтрованные
@@ -672,8 +697,7 @@ class EditTabTracksMixin:
             src, idx = ref, 0
             if str(ref).lower().endswith('.srt'):
                 try:
-                    with open(ref, 'r', encoding='utf-8', errors='replace') as f:
-                        return f.read()
+                    return _api.read_subtitle_text(ref)
                 except Exception:
                     pass
         if not src:
@@ -715,7 +739,7 @@ class EditTabTracksMixin:
         if codec not in ('ass', 'ssa', 'mov_text') or not src:
             return None
         path = None
-        if kind == 'ext' and codec == 'ass':
+        if kind == 'ext' and codec in ('ass', 'ssa'):
             path = ref
         elif (codec in ('ass', 'ssa') and getattr(self, "_sub_use_ass", False)
               and getattr(self, "_sub_sel_entry", None) == (kind, ref)):
@@ -724,8 +748,7 @@ class EditTabTracksMixin:
             path = getattr(self, "_ass_path", None)
         if path:
             try:
-                with open(path, 'r', encoding='utf-8-sig', errors='replace') as f:
-                    return f.read()
+                return _api.read_subtitle_text(path)
             except Exception:
                 pass
         return subtitle_style.extract_ass(src, idx, codec)
@@ -968,7 +991,7 @@ class EditTabTracksMixin:
         перерисовываем кадр ASS при изменении геометрии."""
         if self._subs_in_frame:
             if self._sub_use_ass and self._ass is not None:
-                try: self._update_subtitle(self._ui_time_s())
+                try: self._update_subtitle(self._sub_now_s())
                 except Exception: pass
             return
         ov = self.sub_overlay
@@ -1000,7 +1023,7 @@ class EditTabTracksMixin:
         if self._sub_use_ass and self._ass is not None:
             try:
                 self._ass.set_frame_size(ov.width(), ov.height())
-                self._update_subtitle(self._ui_time_s())
+                self._update_subtitle(self._sub_now_s())
             except Exception:
                 pass
         if not ov.isVisible():
@@ -1051,17 +1074,21 @@ class EditTabTracksMixin:
         self._sub_use_overlay = False
         self._hide_sub_display()
         self.selected_sub_ext_path = None
+        # Панель о файле куска на деке: дорожки — его, а основной плеер стоит
+        # на другом файле, и его субтитры не трогаем.
+        on_deck = getattr(self, "_deck_tv", None) is not None
 
         # Пункт 0 = «Выкл» → субтитры выключены.
         if idx <= 0 or (idx - 1) >= len(self._sub_entries):
-            try: self.player.setActiveSubtitleTrack(-1)
-            except Exception: pass
+            if not on_deck:
+                try: self.player.setActiveSubtitleTrack(-1)
+                except Exception: pass
             return
 
         kind, ref = self._sub_entries[idx - 1]
         if kind == 'emb':
             sub_i = ref
-            src = self.actual_source_file
+            src = self._tracks_file()
             try:
                 codec = (self._sub_streams[sub_i].get('codec_name') or '').lower()
             except Exception:
@@ -1077,14 +1104,16 @@ class EditTabTracksMixin:
         if is_bitmap or not src:
             # Битмап-дорожка (или нет источника) → встроенный рендер. Для внешних
             # файлов битмап-кодеков нет, поэтому это только встроенные дорожки.
-            if kind == 'emb':
+            # Дека даёт только картинку — битмап-субтитров её файла не показать.
+            if kind == 'emb' and not on_deck:
                 try: self.player.setActiveSubtitleTrack(sub_i)
                 except Exception: pass
             return
 
         # Текстовые субтитры → свой рендер; встроенный (с плашкой) гасим.
-        try: self.player.setActiveSubtitleTrack(-1)
-        except Exception: pass
+        if not on_deck:
+            try: self.player.setActiveSubtitleTrack(-1)
+            except Exception: pass
         self._sub_use_overlay = True
         self._prepare_sub_display()
         self._sub_token += 1
@@ -1238,7 +1267,7 @@ class EditTabTracksMixin:
             self._sub_use_ass = True
             self._prepare_sub_display()
             self._ensure_ass_timer()
-            self._update_subtitle(self._ui_time_s())
+            self._update_subtitle(self._sub_now_s())
         except Exception:
             self._sub_use_ass = False
             if self._ass is not None:
@@ -1253,7 +1282,7 @@ class EditTabTracksMixin:
             return   # пришёл результат от уже неактуального выбора — игнорируем
         self._sub_cues = cues or []
         try:
-            self._update_subtitle(self._ui_time_s())
+            self._update_subtitle(self._sub_now_s())
         except Exception:
             pass
 
@@ -1324,8 +1353,10 @@ class EditTabTracksMixin:
         except Exception:
             pass
 
-    def _subtitles_vf(self, src, ext_sub=None, burn_idx=-1):
+    def _subtitles_vf(self, src, ext_sub=None, burn_idx=-1, streams=None):
         """Фильтр ffmpeg `subtitles=…` для вшивания выбранной дорожки, или None.
+        streams — дорожки субтитров src, если это не открытый файл (кусок
+        проекта из другого файла); burn_idx — номер среди них.
 
         Одно место на оба пути экспорта: собственную перекодировку Монтажа
         (_execute_cut) и «перекодировать настройками «Обработки»» (там тот же
@@ -1335,7 +1366,13 @@ class EditTabTracksMixin:
         вложенные attachments контейнера и отдаём их через :fontsdir."""
         if ext_sub:
             esc = self._escape_filter_path(ext_sub)
-            vf = f"subtitles={esc}"
+            # Внешний SRT/VTT может быть в cp1251: без charenc ffmpeg читает
+            # его как UTF-8 и вшивает «�» вместо кириллицы.
+            try:
+                charenc = _api.subtitle_text_encoding(ext_sub)
+            except Exception:
+                charenc = ""
+            vf = f"subtitles={esc}" + (f":charenc={charenc}" if charenc else "")
             sub_codec = _api.os.path.splitext(ext_sub)[1].lower().lstrip('.')
         else:
             if burn_idx is None or burn_idx < 0:
@@ -1343,7 +1380,8 @@ class EditTabTracksMixin:
             esc = self._escape_filter_path(src)
             vf = f"subtitles={esc}:si={burn_idx}"
             try:
-                sub_codec = (self._sub_streams[burn_idx].get('codec_name') or '').lower()
+                sub_codec = ((self._sub_streams if streams is None else streams)[burn_idx]
+                             .get('codec_name') or '').lower()
             except Exception:
                 sub_codec = ''
         native_styled = sub_codec in ('ass', 'ssa')
@@ -1407,8 +1445,7 @@ class EditTabTracksMixin:
         text = None
         if ext_sub:
             try:
-                with open(ext_sub, 'r', encoding='utf-8-sig', errors='replace') as f:
-                    text = f.read()
+                text = _api.read_subtitle_text(ext_sub)
             except Exception:
                 text = None
         elif burn_idx is not None and burn_idx >= 0:

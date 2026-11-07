@@ -60,9 +60,10 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
         fm = opt.fontMetrics
         title = (index.data(_api.Qt.ItemDataRole.UserRole + 2) or "").split("\n")[0]
         tw = fm.horizontalAdvance(title)
-        # X — сразу за концом названия, но не за правым краем строки.
+        # X — сразу за концом названия, но не за правым краем ТЕКСТОВОЙ области
+        # (справа оставлено место под значки индекса/просмотров).
         x = tr.left() + tw + _api._COPY_TITLE_GAP
-        x = min(x, option.rect.right() - 8 - _api._COPY_ICON_SZ)
+        x = min(x, tr.right() + 1 - _api._COPY_ICON_SZ)
         x = max(x, tr.left())
         # Y — по центру ПЕРВОЙ строки названия. Текст в ячейке выровнен по вертикали
         # по центру (Qt.AlignVCenter), т.е. блок из нескольких строк начинается не от
@@ -93,7 +94,7 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
         fm = opt.fontMetrics
         tw = fm.horizontalAdvance(orig)
         x = tr.left() + tw + _api._COPY_TITLE_GAP
-        x = min(x, option.rect.right() - 8 - _api._COPY_ICON_SZ)
+        x = min(x, tr.right() + 1 - _api._COPY_ICON_SZ)
         x = max(x, tr.left())
         full = index.data(_api.Qt.ItemDataRole.DisplayRole) or ""
         block_h = fm.boundingRect(
@@ -107,7 +108,7 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
         # Номер места тайтла в списке — слева от постера (в зарезервированном
-        # левом отступе строки, см. padding-left у QListWidget::item). Место —
+        # левом отступе строки, см. padding-left у QListWidget#shikimori_results). Место —
         # во всей выдаче, а не на открытой странице.
         rank = index.row() + 1 + getattr(self._tab, "_page", 0) * _api._PAGE_SIZE
         painter.save()
@@ -163,7 +164,7 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
             text)
         painter.restore()
 
-        # «Индекс популярности» (значок-огонёк + число) — слева от просмотров.
+        # «Индекс популярности» (значок-огонёк + число + уровень) — слева от просмотров.
         # Та же величина, по которой сортирует режим «По индексу популярности»
         # и считается сложность в генераторе аниме-пака (pack_index).
         try:
@@ -172,6 +173,11 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
             idx_val = 0
         if idx_val and idx_val > 0:
             itext = f"{int(round(idx_val)):,}".replace(",", " ")
+            # Уровень вопроса генератора по этому индексу — в скобках рядом.
+            row = getattr(self._tab, "_index_rows", {}).get(aid) or {}
+            level = row.get("level")
+            if level not in (None, ""):
+                itext += f" ({level})"
             itw = fm.horizontalAdvance(itext)
             ix_text = x_icon - 14 - itw
             ix_icon = ix_text - gap - icon_sz

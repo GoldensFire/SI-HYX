@@ -52,6 +52,12 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         self._frame_waiting = False
         self._pending_timer = None
         self._committed_pts = -1
+        # Просмотр проекта на деках (EditTabProjectDecksMixin): картинку дают
+        # они, а не основной плеер; QVideoSink текущей деки и её кусок в pts.
+        self._deck_mode = False
+        self._deck_sink = None
+        self._deck_floor_us = None
+        self._deck_bound_us = None
         self._setup_quick()
         if self._quick is not None:
             # Сцена — нативное окно и перекрывает обычные дочерние виджеты
@@ -399,6 +405,8 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         if getattr(self, "_quick", None) is None:
             super()._on_frame(frame)
             return
+        if self._deck_mode:
+            return                      # картинку дают деки, плеер стоит на прошлом куске
         # Аудиофайл (видеоряда нет): «поздние» кадры прошлого источника не
         # должны перекрывать сообщение «нет видео».
         if self._audio_only_msg:
@@ -559,7 +567,11 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         self._frame_waiting = False
         if self._audio_only_msg or self._out_sink is None:
             return
-        frame = self._sink.videoFrame()
+        deck = self._deck_mode
+        sink = self._deck_sink if deck else self._sink
+        if sink is None:
+            return
+        frame = sink.videoFrame()
         try:
             if not frame.isValid():
                 return
@@ -569,16 +581,25 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         # Этот кадр уже на сцене (отдали его раньше, чем дошло его событие).
         if pts >= 0 and pts == self._committed_pts:
             return
-        if self._bound_us is not None and pts >= 0 and pts >= self._bound_us:
-            return
-        if self._below_floor(pts):
-            return
-        if self._pin_rejects(pts):
-            return
+        if deck:
+            # Дека за время ожидания могла уйти за свой кусок.
+            if pts >= 0 and ((self._deck_floor_us is not None and pts < self._deck_floor_us)
+                             or (self._deck_bound_us is not None
+                                 and pts >= self._deck_bound_us)):
+                return
+        else:
+            if self._bound_us is not None and pts >= 0 and pts >= self._bound_us:
+                return
+            if self._below_floor(pts):
+                return
+            if self._pin_rejects(pts):
+                return
         self._commit_frame(frame, pts, now)
 
     # ── Кадры, которые ставит вкладка ────────────────────────────────────────
     def set_exact_frame(self, img, span_us=None, pts_us=None):
+        if self._deck_mode:
+            return                      # кадр основного плеера — не к месту деки
         if getattr(self, "_quick", None) is not None:
             if isinstance(img, _api.QVideoFrame):
                 if self._show_own_video_frame(img):
@@ -592,6 +613,8 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         super().set_exact_frame(img, span_us, pts_us)
 
     def show_bridge_frame(self, img, pts_us):
+        if self._deck_mode:
+            return
         if getattr(self, "_quick", None) is not None:
             if isinstance(img, _api.QVideoFrame):
                 if self._show_own_video_frame(img):
@@ -617,10 +640,49 @@ class VideoCanvas(_api._PaintedVideoCanvas):
                 self._clear_scene_frame()
         super().set_static_image(qimg)
 
-    def clear_frame(self):
-        if getattr(self, "_quick", None) is not None:
+    def clear_frame(self, keep_picture=False):
+        """keep_picture — сцена держит показанный кадр: проект открывает файл
+        следующего куска, и до его кадра на экране прежний, а не чёрный. Часы
+        и пин кадра сбрасываются в любом случае."""
+        if getattr(self, "_quick", None) is not None and not keep_picture:
             self._clear_scene_frame()
         super().clear_frame()
+
+    # ── Деки просмотра проекта ───────────────────────────────────────────────
+    def deck_capable(self):
+        """Кадры дек (EditTabProjectDecksMixin) показывает только сцена Qt Quick."""
+        return getattr(self, "_quick", None) is not None
+
+    def set_deck_mode(self, on):
+        """Картинку просмотра проекта дают деки: кадры основного плеера, точные
+        кадры и мост на экран не идут (плеер стоит на прошлом куске)."""
+        self._deck_mode = bool(on)
+        if not on:
+            self.set_deck_source(None)
+
+    def set_deck_source(self, sink, floor_us=None, bound_us=None):
+        """QVideoSink текущей деки и её кусок [floor, bound) в pts: кадр, ждавший
+        свободной сцены, берётся из него и за кусок не выходит."""
+        self._deck_sink = sink
+        self._deck_floor_us = floor_us
+        self._deck_bound_us = bound_us
+        self._frame_waiting = False
+        self._committed_pts = -1
+
+    def present_deck_frame(self, frame):
+        """Кадр деки — на сцену тем же путём, что кадр плеера (ждёт свободную
+        сцену), но мимо фильтров плеера: граница OUT и пин — его, не деки."""
+        if getattr(self, "_quick", None) is None or not self._deck_mode:
+            return
+        try:
+            if frame is None or not frame.isValid():
+                return
+        except Exception:
+            return
+        now = _api.time.monotonic()
+        self._frame_img = None
+        self._last_player_frame_at = now
+        self._present_frame(frame, self._pts_of(frame), now)
 
     def set_audio_only_message(self, text):
         if getattr(self, "_quick", None) is not None and text:

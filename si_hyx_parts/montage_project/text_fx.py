@@ -26,7 +26,29 @@ shadow, align, animation none/fade/slide/pop):
              уходит в стену;
   vertical   знак под знаком (вертикальная японская строка; пробелы и
              переводы строк выбрасываются);
-  scale_x/scale_y — %;  alpha — непрозрачность 0…1.
+  scale_x/scale_y — %;  alpha — непрозрачность 0…1;
+  grunge     0…1 — потёртые буквы: мелкие дыры (\\iclip-рисунок по месту
+             текста, узор — по тексту и месту, у окна тот же);
+  scratch    0…1 — горизонтальные царапины-просветы по буквам;
+  plate      0…1 — тёмная размытая плашка под текстом (событие под буквами:
+             толстая размытая обводка цвета plate_color без заливки);
+  chroma     px при 1080 — хроматика: красная и голубая копии букв, сдвинутые
+             влево и вправо, под самим текстом;
+  spread     разрядка растёт за всю реплику на столько (\\fsp, холст);
+  letter_colors — цвета букв по кругу (две краски, «записка с вырезками»);
+  dropout    0…1 — сбой букв: отдельные буквы ненадолго пропадают (узор и
+             моменты — по crc32 текста, у копий те же);
+  window     0…1 — буквы-окно: поверх букв граф кладёт тот же кадр с
+             другим светом (window_light — eq brightness), насыщенностью
+             (window_saturation) и тоном (window_tint) — маской из этих же
+             букв (window_mask_style), с силой window;
+  window_invert в буквах-окне негатив кадра: белые буквы в режиме
+             «разница» — на тёмном кадре светлые, на светлом — в
+             дополнительном цвете (свет и насыщенность по умолчанию — как
+             у кадра: 0 и 1).
+animation ещё flicker (мигает за in_s и остаётся), track_in (буквы
+съезжаются из широкой разрядки); out — ещё flicker и letters (буквы гаснут
+по одной в случайном порядке за out_s).
 Шрифт — имя системного шрифта или псевдоним FONT_ALIASES (condensed —
 Impact, serif — Georgia, script — Segoe Script, japanese — Yu Gothic…).
 
@@ -34,6 +56,8 @@ Impact, serif — Georgia, script — Segoe Script, japanese — Yu Gothic…).
 перекрытые реплики) и свой текст с экранированием (у typewriter — теги
 каждой буквы); старые реплики собираются прежними тегами побайтно."""
 import math
+import random
+import zlib
 
 FONT_ALIASES = {
     "condensed": "Impact", "impact": "Impact", "serif": "Georgia", "classic": "Times New Roman",
@@ -42,9 +66,9 @@ FONT_ALIASES = {
 }
 OLD_ANIMATIONS = ("none", "fade", "slide", "pop")
 NEW_ANIMATIONS = ("blur_in", "slide_blur", "grow", "drop", "zoom_out", "typewriter", "flash",
-                  "glitch")
+                  "glitch", "flicker", "track_in")
 ANIMATIONS = OLD_ANIMATIONS + NEW_ANIMATIONS
-OUT_ANIMATIONS = ("none", "fade", "blur", "glitch")
+OUT_ANIMATIONS = ("none", "fade", "blur", "glitch", "flicker", "letters")
 # Новые ключи стиля: тип и пределы (schema). scale_x/scale_y знает и
 # прежний _style_line (растяжение строки стиля).
 STYLE_KEYS = {"in_s": (float, 0.0, 3.0), "out_s": (float, 0.0, 3.0), "out": (str, None, None),
@@ -54,7 +78,26 @@ STYLE_KEYS = {"in_s": (float, 0.0, 3.0), "out_s": (float, 0.0, 3.0), "out": (str
               "grow": (float, 10.0, 400.0), "alpha": (float, 0.0, 1.0),
               "letter_s": (float, 0.0, 1.0), "fill_alpha": (float, 0.0, 1.0),
               "rot_x": (float, -89.0, 89.0), "rot_y": (float, -89.0, 89.0),
-              "vertical": (bool, None, None)}
+              "vertical": (bool, None, None),
+              "grunge": (float, 0.0, 1.0), "scratch": (float, 0.0, 1.0),
+              "plate": (float, 0.0, 1.0), "plate_color": (str, None, None),
+              "chroma": (float, 0.0, 40.0), "spread": (float, 0.0, 400.0),
+              "letter_colors": (list, None, None), "dropout": (float, 0.0, 1.0),
+              "window": (float, 0.0, 1.0), "window_light": (float, -1.0, 1.0),
+              "window_saturation": (float, 0.0, 3.0), "window_tint": (str, None, None),
+              "window_invert": (bool, None, None)}
+# Ключи стиля цветом #RRGGBB (schema, окно свойств текста).
+COLOR_KEYS = ("glow_color", "plate_color", "window_tint")
+# Буквы-окно без своих значений: свет и насыщенность кадра в буквах.
+WINDOW_LIGHT, WINDOW_SATURATION = 0.3, 1.25
+# Сбой букв (dropout): пропаданий у буквы не больше, длина пропадания, мс.
+_DROPOUT_MAX, _DROPOUT_MS = 6, (40, 160)
+# Цвета копий хроматики: левая, правая.
+_CHROMA = ("#ff1a3c", "#1ad8ff")
+# Мигание (flicker): доли in_s/out_s, где реплика видна (чётные — скрыта).
+_FLICKER = (0.0, 0.18, 0.34, 0.5, 0.64, 0.8)
+# Дыр гранжа и царапин в реплике не больше (длина рисунка \\iclip).
+_MAX_HOLES, _MAX_SCRATCHES = 320, 48
 # Ступени сбоя (glitch) к своему виду: доля времени появления, масштаб по x и
 # y, наклон \\fax, сдвиг в долях ширины холста, цвет букв и обводки.
 _GLITCH_STEPS = ((0.0, 1.9, 1.2, 0.35, 0.05, "#ff2a4a"),
@@ -117,11 +160,157 @@ def vertical_text(text):
 def layers_of(style):
     """Стили событий реплики снизу вверх. С fill_alpha и glow — два: ореол
     (обводка толщиной glow цвета свечения, размытая, заливка скрыта) и сами
-    буквы с чёткой обводкой outline; иначе — один стиль как есть."""
+    буквы с чёткой обводкой outline; иначе — один стиль как есть. Под ними —
+    плашка (plate) и копии хроматики (chroma): ключ _part, сдвиг копии — _dx."""
     if not (style.get("glow") and "fill_alpha" in style):
-        return [style]
-    body = {k: v for k, v in style.items() if k not in ("glow", "glow_color")}
-    return [dict(style, fill_alpha=0.0), body]
+        main = [style]
+    else:
+        body = {k: v for k, v in style.items() if k not in ("glow", "glow_color")}
+        main = [dict(style, fill_alpha=0.0), body]
+    under = []
+    if style.get("plate"):
+        under.append(dict(style, _part="plate"))
+    d = float(style.get("chroma", 0.0) or 0.0)
+    if d:
+        ghost = {k: v for k, v in style.items()
+                 if k not in ("glow", "glow_color", "fill_alpha", "plate", "letter_colors")}
+        for dx, col in ((-d, _CHROMA[0]), (d, _CHROMA[1])):
+            under.append(dict(ghost, color=col, outline=0, shadow=0,
+                              alpha=0.85 * float(style.get("alpha", 1.0)), _part="chroma", _dx=dx))
+    return under + main
+
+
+def window_spec(style):
+    """Вид кадра в буквах-окне — ключ группы маски: (сила, свет,
+    насыщенность, тон, негатив) или None, если window не задан. У негатива
+    (window_invert) свет и насыщенность по умолчанию — как у кадра."""
+    a = min(1.0, float(style.get("window", 0.0) or 0.0))
+    if a <= 0:
+        return None
+    invert = bool(style.get("window_invert"))
+    light, sat = (0.0, 1.0) if invert else (WINDOW_LIGHT, WINDOW_SATURATION)
+    return (round(a, 3), round(float(style.get("window_light", light)), 3),
+            round(float(style.get("window_saturation", sat)), 3),
+            str(style.get("window_tint") or "").lower(), invert)
+
+
+def window_mask_style(style):
+    """Стиль маски букв-окна: белые буквы с той же анимацией и местом, без
+    обводки, тени, свечения, плашки и хроматики; непрозрачность — alpha ×
+    fill_alpha × window (на чёрном холсте это и есть альфа окна)."""
+    out = {k: v for k, v in style.items()
+           if k not in ("glow", "glow_color", "plate", "plate_color", "chroma", "letter_colors",
+                        "fill_alpha")}
+    out.update(color="#ffffff", outline_color="#ffffff", outline=0, shadow=0,
+               alpha=float(style.get("alpha", 1.0)) * float(style.get("fill_alpha", 1.0))
+               * min(1.0, float(style.get("window", 0.0) or 0.0)))
+    return out
+
+
+def _letter_tags(style, text, dur, t_in, t_out, blur):
+    """Теги каждой видимой буквы (по порядку) для ухода letters и сбоя
+    dropout; пустые строки — буквам ничего не нужно. Порядок ухода и
+    моменты сбоя — по crc32 текста: у копий хроматики и маски окна те же."""
+    n = sum(1 for ch in text if ch.strip())
+    tags = [""] * n
+    if not n:
+        return tags
+    final = _alpha_tags(style, always=True)
+    if style.get("out") == "letters" and t_out > 0:
+        order = list(range(n))
+        random.Random(zlib.crc32(f"out|{text}".encode("utf-8"))).shuffle(order)
+        fade = max(1, int(t_out * 0.4))
+        step = (t_out - fade) / max(1, n - 1)
+        for rank, i in enumerate(order):
+            a = dur - t_out + int(rank * step)
+            tags[i] += f"\\t({a},{a + fade},\\blur{blur + 6:g}\\alpha&HFF&)"
+    drop = float(style.get("dropout", 0.0) or 0.0)
+    lo, hi = t_in, dur - (t_out if style.get("out", "none") != "none" else 0)
+    if drop > 0 and hi - lo > _DROPOUT_MS[1] * 2:
+        count = min(_DROPOUT_MAX, max(1, int(round(drop * (hi - lo) / 2000.0))))
+        for i in range(n):
+            rnd = random.Random(zlib.crc32(f"drop|{text}|{i}".encode("utf-8")))
+            if rnd.random() > drop:
+                continue
+            marks = sorted(rnd.randint(lo, hi - _DROPOUT_MS[1]) for _k in range(count))
+            end = lo
+            for a in marks:
+                if a < end:
+                    continue
+                b = a + rnd.randint(*_DROPOUT_MS)
+                tags[i] += f"\\t({a},{a + 1},\\alpha&HFF&)\\t({b},{b + 1},{final})"
+                end = b + 1
+    return tags
+
+
+def _text_box(style, text, x, y):
+    """Прямоугольник текста на холсте с запасом (оценка по числу знаков: у
+    \\iclip дыры вне букв ничего не меняют) — (x0, y0, x1, y1)."""
+    size = float(style.get("size", 48))
+    lines = (vertical_text(text) if style.get("vertical") else text).split("\n") or [""]
+    sx = float(style.get("scale_x", 100)) / 100.0
+    sy = float(style.get("scale_y", 100)) / 100.0
+    sp = float(style.get("spacing", 0) or 0) + float(style.get("spread", 0) or 0)
+    w = max(len(line) for line in lines) * (size * 0.78 * sx + max(0.0, sp)) + size * 0.4
+    h = len(lines) * size * 1.15 * sy + size * 0.3
+    align = int(style.get("align") or 2)
+    col, row = (align - 1) % 3, (align - 1) // 3
+    x0 = x - w * (0.0, 0.5, 1.0)[col]
+    y0 = y - h * (1.0, 0.5, 0.0)[row]
+    return x0, y0, x0 + w, y0 + h
+
+
+def _grunge_clip(style, text, x, y):
+    """\\iclip(рисунок) дыр гранжа и царапин в месте текста или ""; узор
+    детерминирован (crc32 текста, кегля и места)."""
+    g, s = float(style.get("grunge", 0) or 0), float(style.get("scratch", 0) or 0)
+    if g <= 0 and s <= 0:
+        return ""
+    size = float(style.get("size", 48))
+    x0, y0, x1, y1 = _text_box(style, text, x, y)
+    rnd = random.Random(zlib.crc32(f"{text}|{size:g}|{x:.0f}|{y:.0f}".encode("utf-8")))
+    shapes = []
+    r_min, r_max = size * 0.01, size * 0.035
+    n = int(min(_MAX_HOLES, g * (x1 - x0) * (y1 - y0) / max(1.0, (size * 0.09) ** 2)))
+    for _k in range(n):
+        cx, cy = rnd.uniform(x0, x1), rnd.uniform(y0, y1)
+        r = rnd.uniform(r_min, r_max)
+        pts = []
+        for j in range(5):                   # неровная клякса из 5 точек
+            a = j * 2 * math.pi / 5 + rnd.uniform(-0.4, 0.4)
+            rr = r * rnd.uniform(0.55, 1.25)
+            pts.append(f"{cx + rr * math.cos(a):.1f} {cy + rr * math.sin(a):.1f}")
+        shapes.append(f"m {pts[0]} l {' '.join(pts[1:])}")
+    for _k in range(int(min(_MAX_SCRATCHES, s * 40))):
+        cy = rnd.uniform(y0 + (y1 - y0) * 0.15, y1 - (y1 - y0) * 0.15)
+        ln = rnd.uniform(0.08, 0.5) * (x1 - x0)
+        cx = rnd.uniform(x0, x1 - ln)
+        th = min(rnd.uniform(0.012, 0.03) * size, rnd.uniform(0.6, 1.4))
+        shapes.append(f"m {cx:.1f} {cy:.1f} l {cx + ln:.1f} {cy + th * 0.3:.1f} "
+                      f"{cx + ln:.1f} {cy + th:.1f} {cx:.1f} {cy + th * 0.7:.1f}")
+    return f"\\iclip({' '.join(shapes)})" if shapes else ""
+
+
+_HIDE = "\\alpha&HFF&"
+
+
+def _flicker_in(final, t_in):
+    """Мигание при появлении: скрыта, видна, скрыта… — к виду final."""
+    tags = [_HIDE]
+    for i, frac in enumerate(_FLICKER[1:], 1):
+        a = int(round(frac * t_in))
+        tags.append(f"\\t({a},{a + 1},{final if i % 2 else _HIDE})")
+    return "".join(tags)
+
+
+def _flicker_out(final, dur, t_out):
+    """Мигание при уходе за последние t_out мс, в конце реплика скрыта."""
+    tags = []
+    for i, frac in enumerate(_FLICKER[1:], 1):
+        a = dur - t_out + int(round(frac * t_out))
+        tags.append(f"\\t({a},{a + 1},{_HIDE if i % 2 else final})")
+    tags.append(f"\\t({dur - 1},{dur},{_HIDE})")
+    return "".join(tags)
 
 
 def _alpha_tags(style, always=False):
@@ -175,13 +364,20 @@ def _glitch_out(style, dur, t_out, sx, sy, res_x, res_y, jitter):
 
 
 def kinetic_text(style, text, duration_s, x, y, res_x, res_y):
-    """Готовый текст реплики ASS: override-теги и экранированный текст."""
+    """Готовый текст реплики ASS: override-теги и экранированный текст.
+    Часть _part (layers_of): plate — плашка (буквы скрыты, видна толстая
+    размытая обводка; мигание и сбой у неё — плавным появлением), chroma —
+    цветная копия, сдвинутая на _dx (px при 1080)."""
     dur = max(10, int(round(duration_s * 1000)))
+    part = style.get("_part")
     anim = style.get("animation", "none")
+    out = style.get("out", "none")
+    if part == "plate":
+        anim = "fade" if anim in ("typewriter", "flicker", "glitch", "flash", "track_in") else anim
+        out = "fade" if out in ("glitch", "flicker") else out
     t_in = int(round(1000 * float(style.get("in_s", min(0.3, max(0.06, duration_s / 3))))))
     t_in = max(1, min(t_in, dur))
     t_out = min(dur, int(round(1000 * float(style.get("out_s", 0.0)))))
-    out = style.get("out", "none")
     align = int(style.get("align") or 2)
     sx = float(style.get("scale_x", 100))
     sy = float(style.get("scale_y", 100))
@@ -190,6 +386,10 @@ def kinetic_text(style, text, duration_s, x, y, res_x, res_y):
         blur = max(blur, float(style["glow"]) * 0.6)
     if style.get("vertical"):
         text = vertical_text(text)
+    # Узор гранжа — от места самой реплики, у копий хроматики дыры там же
+    # (не сдвинуты): сквозь дыру букв не просвечивает цветная копия.
+    grunge = "" if part == "plate" else _grunge_clip(style, text, x, y)
+    x += float(style.get("_dx", 0.0) or 0.0) * res_y / 1080.0
     tags = [f"\\an{align}"]
     if "rotation" in style:
         tags.append(f"\\frz{-float(style['rotation']):g}")
@@ -215,7 +415,7 @@ def kinetic_text(style, text, duration_s, x, y, res_x, res_y):
     else:
         tags.append(f"\\pos({x:.0f},{y:.0f})")
     fade_in = {"fade": t_in, "blur_in": t_in, "zoom_out": t_in, "slide_blur": min(t_in, 120),
-               "drop": min(t_in, 120)}.get(anim, 0)
+               "drop": min(t_in, 120), "track_in": min(t_in, 150)}.get(anim, 0)
     fade_out = t_out if out == "fade" else 0
     if fade_in or fade_out:
         tags.append(f"\\fad({fade_in},{fade_out})")
@@ -234,13 +434,48 @@ def kinetic_text(style, text, duration_s, x, y, res_x, res_y):
                     f"\\3c{_color(edge or '#000000')})")
     elif anim == "glitch":
         tags.append(_glitch_in(style, t_in, sx, sy, res_x, res_y, jitter))
+    elif anim == "flicker":
+        tags.append(_flicker_in(_alpha_tags(style, always=True), t_in))
+    sp0 = float(style.get("spacing", 0) or 0)
+    spread = float(style.get("spread", 0) or 0)
+    if anim == "track_in":
+        wide = sp0 + float(style.get("size", 48)) * 0.9
+        tags.append(f"\\fsp{wide:g}\\t(0,{t_in},0.5,\\fsp{sp0:g})")
+    if spread:
+        a = t_in if anim == "track_in" else 0
+        tags.append(f"\\t({a},{dur},\\fsp{sp0 + spread:g})")
     if blur and anim not in ("blur_in", "slide_blur"):
         tags.append(f"\\blur{blur:g}")
     if out == "blur" and t_out:
         tags.append(f"\\t({dur - t_out},{dur},\\blur20\\alpha&HFF&)")
     elif glitch_out:
         tags.append(_glitch_out(style, dur, t_out, sx, sy, res_x, res_y, jitter))
+    elif out == "flicker" and t_out:
+        tags.append(_flicker_out(_alpha_tags(style, always=True), dur, t_out))
+    if part == "plate":
+        size = float(style.get("size", 48))
+        a = float(style.get("plate", 0.6)) * float(style.get("alpha", 1.0))
+        tags.append(f"\\1a&HFF&\\3c{_color(style.get('plate_color') or '#000000')}"
+                    f"\\3a{_ass_alpha(a)}\\bord{size * 0.36:.1f}\\shad0\\blur{size * 0.24:.1f}")
+        return "{" + "".join(tags) + "}" + _escape(text)
+    tags.append(grunge)
     body = _escape(text)
+    colors = [] if part else [c for c in style.get("letter_colors") or [] if isinstance(c, str)]
+    # Уход по буквам и сбой букв — теги у каждой буквы (пусто — как раньше).
+    extra = _letter_tags(style, text.replace("\r", ""), dur, t_in, t_out, blur)
+    if (colors or any(extra)) and anim != "typewriter":
+        parts, i = [], 0
+        for ch in text.replace("\r", ""):
+            if ch == "\n":
+                parts.append("\\N")
+            elif ch.strip():
+                col = f"\\1c{_color(colors[i % len(colors)])}" if colors else ""
+                own = col + extra[i]
+                parts.append(f"{{{own}}}{_escape(ch)}" if own else _escape(ch))
+                i += 1
+            else:
+                parts.append(ch)
+        body = "".join(parts)
     if anim == "typewriter":
         chars = list(text.replace("\r", ""))
         step = t_in / max(1, len(chars))
@@ -250,14 +485,16 @@ def kinetic_text(style, text, duration_s, x, y, res_x, res_y):
         final = _alpha_tags(style, always=True)
         soft = f"\\blur{blur + 4:g}" if fade else ""
         sharp = f"\\blur{blur:g}" if fade else ""
-        parts = []
+        parts, k = [], 0
         for i, ch in enumerate(chars):
             if ch == "\n":
                 parts.append("\\N")
             elif ch.strip():
                 a = int(i * step)
-                parts.append(f"{{\\alpha&HFF&{soft}\\t({a},{a + max(1, fade)},{final}{sharp})}}"
-                             f"{_escape(ch)}")
+                col = f"\\1c{_color(colors[k % len(colors)])}" if colors else ""
+                parts.append(f"{{\\alpha&HFF&{soft}{col}\\t({a},{a + max(1, fade)},{final}{sharp})"
+                             f"{extra[k]}}}{_escape(ch)}")
+                k += 1
             else:
                 parts.append(ch)
         body = "".join(parts)

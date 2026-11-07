@@ -293,7 +293,16 @@ def _hw_decode_device_types():
         pass
     return "d3d11va,dxva2"
 
-os.environ.setdefault("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", _hw_decode_device_types())
+# Выключено — значение "none" (такого устройства нет, список пуст): пустую
+# переменную Windows не хранит (os.environ "" = удалить), а без переменной Qt
+# берёт свой список по умолчанию — d3d11va, и выключатель не выключал ничего.
+os.environ.setdefault("QT_FFMPEG_DECODING_HW_DEVICE_TYPES",
+                      _hw_decode_device_types() or "none")
+
+
+def hw_video_decode_enabled():
+    """Плееры QtMultimedia декодируют видео на GPU (см. выше)."""
+    return os.environ.get("QT_FFMPEG_DECODING_HW_DEVICE_TYPES", "").strip().lower() not in ("", "none")
 
 
 # Раз аппаратный AV1-декодер отсутствует на многих GPU (см. коммент выше),
@@ -514,7 +523,7 @@ AUDIO_BITRATES = ["auto", "8", "16", "24", "32", "48", "64", "96", "128", "160",
 
 # --- Идентификация приложения ---
 APP_NAME = "SI-HYX"
-APP_VERSION = "0.6.3"
+APP_VERSION = "0.6.4"
 APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 # Необязательное обновление: перед сборкой (build.bat) поставь True, если этот
 # релиз НЕ должен всплывать плашкой у уже установленных пользователей — сам

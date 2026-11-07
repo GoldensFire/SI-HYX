@@ -38,6 +38,53 @@ def _audio_args(out_path):
     return ["-c:a", "aac", "-b:a", "192k"] if codec == "aac" else ["-c:a", codec]
 
 
+def audio_copy_source(p):
+    """Звук итога без перекодирования (render --audio-copy): (файл, абсолютный
+    индекс потока или -1 — первый звуковой). Годится, только если весь звук
+    проекта — один клип, который звучит как есть: с начала проекта и с начала
+    исходника до конца проекта, скорость и громкость 1, без фейдов, реверса и
+    нормализации громкости. Иначе ToolError audio_copy_unavailable с причиной."""
+    def _no(why):
+        raise _api.ToolError("audio_copy_unavailable", f"звук не скопировать как есть: {why}")
+    parts = p.audio_parts()
+    if len(parts) != 1:
+        _no(f"звучащих клипов {len(parts)}, а нужен один")
+    c = parts[0]
+    frame = 1.0 / max(1.0, float(p.output_format()[2]))
+    if p.settings.loudness is not None:
+        _no("задана нормализация громкости (settings.loudness)")
+    if c.speed_curve or abs(c.play_speed - 1.0) > 1e-6 or c.reverse:
+        _no("скорость клипа не 1 или он задом наперёд")
+    if abs(c.volume - 1.0) > 1e-6 or c.fade_in > 0 or c.fade_out > 0:
+        _no("у клипа своя громкость или фейды")
+    if c.start > frame or c.in_s > frame:
+        _no("клип начинается не с начала проекта или исходника")
+    if c.end < p.duration() - frame:
+        _no("клип короче проекта")
+    return c.audio_path, c.audio_stream
+
+
+def _copy_audio_into(video_path, audio, out_path, dur):
+    """Картинка video_path + звук audio (audio_copy_source) без перекодирования
+    → out_path длиной dur. ToolError, если ffmpeg не смог (контейнер не
+    принимает кодек звука и т.п.)."""
+    src, stream = audio
+    amap = f"1:{int(stream)}" if stream is not None and int(stream) >= 0 else "1:a:0"
+    cmd = with_faststart([_api.FFMPEG, "-v", "error", "-nostdin", "-y", "-i", video_path,
+                          "-i", src, "-map", "0:v:0", "-map", amap, "-c", "copy",
+                          "-t", f"{dur:.6f}", out_path])
+    try:
+        r = _api.subprocess.run(cmd, stdin=_api.subprocess.DEVNULL, capture_output=True,
+                                text=True, encoding="utf-8", errors="replace",
+                                creationflags=_api.CREATE_NO_WINDOW, timeout=600)
+    except (OSError, _api.subprocess.SubprocessError) as e:
+        raise _api.ToolError("audio_copy_failed", f"звук не вложен: {e}") from e
+    if r.returncode != 0:
+        _remove(out_path)
+        raise _api.ToolError("audio_copy_failed", "звук не вложен без перекодирования",
+                             detail=(r.stderr or "").strip()[-2000:])
+
+
 # Аппаратные H.264 в порядке ffmpeg_env.gpu_h264_args. В сборке ffmpeg они
 # есть все, а работают только те, что есть у железа (ноутбук с Radeon —
 # amf и mf; nvenc/qsv падают), поэтому для «gpu» каждый пробуется кадром.
@@ -199,17 +246,20 @@ def _remove(path):
 
 
 def render(p, out_path, encoder="auto", overwrite=False, on_progress=None,
-           should_stop=None, encoders=None, subs=None):
+           should_stop=None, encoders=None, subs=None, audio_copy=False):
     """Собирает проект в out_path. Пишет во временный файл рядом и переносит
     его на место только при успехе. on_progress(доля 0..1, секунды, длина
     итога);
     should_stop() → True — отмена: ffmpeg убивается, временные файлы
-    удаляются, ToolError('cancelled'). Возвращает словарь итога."""
+    удаляются, ToolError('cancelled'). audio_copy — звук итога —
+    поток исходника песни как есть (audio_copy_source), без перекодирования.
+    Возвращает словарь итога."""
     missing = missing_files(p)
     if missing:
         raise _api.ToolError("missing_files", "не найдены файлы проекта",
                              problems=[{"path": m, "message": "нет файла"} for m in missing])
     out = check_output(p, out_path, overwrite)
+    audio = audio_copy_source(p) if audio_copy else None
     # Шейдеры Anime4K и кэш RIFE — до графа (граф только ссылается на файлы).
     enhance = _api.prepare_project(p, _api.Control.from_stop(should_stop))
     stem, ext = _api.os.path.splitext(out)
@@ -267,6 +317,13 @@ def render(p, out_path, encoder="auto", overwrite=False, on_progress=None,
         _remove(tmp)
         raise _api.ToolError("ffmpeg_failed", f"ffmpeg завершился с кодом {rc}",
                              detail="\n".join(tail))
+    if audio is not None:
+        copied = f"{stem}.sihyx_part_a{ext}"
+        try:
+            _copy_audio_into(tmp, audio, copied, dur)
+        finally:
+            _remove(tmp)
+        tmp = copied
     try:
         _api.os.replace(tmp, out)
     except OSError as e:
@@ -277,4 +334,5 @@ def render(p, out_path, encoder="auto", overwrite=False, on_progress=None,
     return {"output": out, "duration": round(dur, 6),
             "size": _api.os.path.getsize(out), "loudness_measured": measured,
             "elapsed": round(time.monotonic() - t_start, 3),
-            "graph_in_file": graph_file is not None, "enhance": enhance}
+            "graph_in_file": graph_file is not None, "enhance": enhance,
+            "audio_copied": audio[0] if audio is not None else None}

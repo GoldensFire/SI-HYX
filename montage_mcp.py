@@ -55,6 +55,10 @@ INSTRUCTIONS = (
     "формат проекта — montage_schema. Порядок: index (каталог серий, один раз) → music "
     "(карта песни) → autofill (черновик) → check_sync + beat_strip (числа и картинка) → "
     "edit (правки) → снова check_sync → render. Время — секунды; пути лучше абсолютные. "
+    "Любое видео для пользователя собирайте только montage_render (не ffmpeg напрямую): "
+    "render кладёт рядом проект <итог>.montage.json и открывает его на таймлайне вкладки "
+    "«Монтаж», где пользователь правит его сам; его правки сохраняются в этот же файл — "
+    "перед доработкой по его просьбе берите за основу <итог>.montage.json. "
     "Gemini (--gemini, ask) расходует бесплатную квоту пользователя — только по делу.")
 
 mcp = MCPServer("si-hyx-montage", instructions=INSTRUCTIONS, version="1")
@@ -402,7 +406,7 @@ async def montage_styles(
 @mcp.tool(annotations=WRITE, structured_output=False)
 async def montage_edit(
         project: Project,
-        ops: Annotated[list[dict[str, Any]], Field(description="операции: add/trim/split/swap/move/set/delete/text/effect/words/lyrics/voice/settings/card/strobe (см. montage_guide); время — число или ссылка на маркер (downbeat#18, section:chorus#2, slot#12.end, custom:pop#3); preset «стиль.роль» — роль текста или карточка стиля (montage_styles)")],
+        ops: Annotated[list[dict[str, Any]], Field(description="операции: add/trim/split/swap/move/set/delete/text/effect/words/lyrics/voice/settings/card/strobe/sequence/cutout/panels/snap_cuts/columns (см. montage_guide); время — число или ссылка на маркер (downbeat#18, section:chorus#2, slot#12.end, custom:pop#3); preset «стиль.роль» — роль текста или карточка стиля (montage_styles)")],
         db: str = "", dry_run: bool = False, lenient: bool = False) -> str:
     """Точечные правки проекта списком операций; ошибка в любой — проект не меняется."""
     ops_file = _json_file(ops, "ops")
@@ -502,7 +506,9 @@ async def montage_render(ctx: Context, project: Project, output: Path, encoder: 
                          overwrite: bool = False,
                          preview: Annotated[bool, Field(description="превью: 540p и кодировщик видеокарты")] = False) -> str:
     """Сборка проекта в видео (прогресс — уведомлениями; отмена вызова — отмена сборки).
-    preview — быстрое превью 540p на видеокарте, проект на диске не меняется."""
+    preview — быстрое превью 540p на видеокарте, проект на диске не меняется.
+    Проект видео ложится рядом (<итог>.montage.json, поле montage_project ответа)
+    и уходит на таймлайн вкладки «Монтаж» — пользователь может поправить его сам."""
     return _text(await _run(ctx, "render", project, output, "--encoder", encoder,
                             *_opt("--overwrite", overwrite), *_opt("--preview", preview),
                             progress=True))

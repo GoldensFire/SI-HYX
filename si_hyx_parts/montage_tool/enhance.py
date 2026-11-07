@@ -20,7 +20,14 @@ speed. Пропуски неравные (двойки и тройки впер�
 Кэш персонажа без фона (Clip.matte): кусок исходника кадр в кадр (тот же
 входной seek, что у графа) → маска по кадру (anime — ISNet anime-seg на
 1024², rmbg — RMBG-2.0 приложения); кадр, почти равный прошлому (аниме
-«на двойках»), берёт его маску → mkv FFV1 yuva420p с частотой исходника."""
+«на двойках»), берёт его маску → mkv FFV1 yuva420p с частотой исходника.
+
+Кэш апскейла Anime4K (upscale клипа или проекта): тот же кусок кадр в кадр,
+что у кэша персонажа, — из исходника (HDR — уже в SDR) или из готового кэша
+персонажа / RIFE → libplacebo 2× в своём процессе ffmpeg (в одном графе
+больше ~21 экземпляра libplacebo роняют ffmpeg на iGPU) → mkv H.264 все
+кадры ключевые; с альфой вырезки — FFV1 yuva420p, альфа масштабируется
+мимо libplacebo."""
 import math
 import zipfile
 
@@ -236,9 +243,47 @@ def build_matte(c, ctl):
     return path
 
 
+def build_upscale(base, preset, deband, alpha, ctl, clip_id=""):
+    """Кэш апскейла куска base (клип или его кэш персонажа / RIFE, см.
+    модуль); alpha — у base альфа вырезки. Путь готового файла."""
+    import itertools
+    mp = _api.montage_project
+    path = mp.upscale_path(base, preset, deband)
+    if _api.os.path.isfile(path):
+        return path
+    _shader(preset, ctl)
+    n = itertools.count()
+    up = mp.upscale_vf(preset, deband, alpha, lambda prefix: f"{prefix}{next(n)}")
+    if not up:
+        raise _api.ToolError("upscale_failed", "нет Vulkan или шейдера Anime4K")
+    fps = float(base.fps or 0.0) or 24.0
+    a, b = mp.matte_span(base)
+    first = math.floor(a * fps + 1e-3)
+    count = max(1, int(math.ceil((b - a) * fps - 1e-3)) + 1)
+    tone = _api.hdr_tonemap.tonemap_filter(base.src, _api.escape_filter_path)
+    rate = mp.fps_expr(fps)
+    vf = ((tone + "," if tone else "") + up
+          + f"setpts=N/({rate})/TB,format={'yuva420p' if alpha else 'yuv420p'}")
+    codec = (["-c:v", "ffv1"] if alpha else
+             ["-c:v", "libx264", "-preset", "veryfast", "-crf", "12", "-g", "1"])
+    ctl.stage("upscale", clip=clip_id, preset=preset, frames=count)
+    _api.os.makedirs(_api.os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp.mkv"
+    try:
+        _run([_api.FFMPEG, "-v", "error", "-nostdin", "-y"] + list(mp.VULKAN_DEVICE_ARGS)
+             + ["-ss", f"{max(0.0, (first - 0.25) / fps):.6f}", "-i", base.src, "-map", "0:v:0",
+                "-vf", vf, "-frames:v", str(count), "-r", rate] + codec + ["-an", tmp], ctl)
+        _api.os.replace(tmp, path)
+    finally:
+        if _api.os.path.exists(tmp):
+            _api.os.remove(tmp)
+    return path
+
+
 def prepare_project(p, ctl=None, run=True, gpu=0):
-    """Готовит шейдеры апскейла и кэш RIFE для проекта p. run=False —
-    только отчёт, чего не хватает (dry-run). {'upscale', 'rife', 'errors'}."""
+    """Готовит шейдеры апскейла, кэш персонажа, RIFE и апскейла для проекта
+    p. run=False — только отчёт, чего не хватает (dry-run). {'upscale',
+    'matte', 'rife', 'upscale_cache', 'errors'}."""
     ctl = ctl or _api.NO_CONTROL
     mp = _api.montage_project
     _w, h, fps = p.output_format()
@@ -290,4 +335,25 @@ def prepare_project(p, ctl=None, run=True, gpu=0):
                 out["errors"].append({"what": f"rife {c.id}", "message": e.message,
                                       "detail": (e.detail or "")[-300:]})
         out["rife"].append(item)
+    # Апскейл — после персонажа и RIFE: кэш берёт их готовый кусок, как граф.
+    out["upscale_cache"] = []
+    for c in p.clips:
+        preset = mp.upscale_wanted(p, c, h)
+        if not preset or not out["upscale"].get(preset, {}).get("ready"):
+            continue
+        px = mp.matte_source(c) if c.matte else mp.interp_source(c, fps)
+        base = px or c
+        path = mp.upscale_path(base, preset, p.settings.deband)
+        item = {"clip": c.id, "preset": preset, "cache": path, "ready": _api.os.path.isfile(path)}
+        if run and not item["ready"]:
+            try:
+                build_upscale(base, preset, p.settings.deband, bool(c.matte and px is not None),
+                              ctl, c.id)
+                item["ready"] = True
+            except _api.ToolError as e:
+                if e.code == "cancelled":
+                    raise
+                out["errors"].append({"what": f"upscale {c.id}", "message": e.message,
+                                      "detail": (e.detail or "")[-300:]})
+        out["upscale_cache"].append(item)
     return out

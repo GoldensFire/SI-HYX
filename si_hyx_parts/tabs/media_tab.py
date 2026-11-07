@@ -146,7 +146,10 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
         b1 = _api._icon_btn("Добавить файлы", 'fa5s.plus'); b1.clicked.connect(self.add)
         b2 = _api._icon_btn("Удалить", 'fa5s.times'); b2.clicked.connect(self.rem)
         b3 = _api._icon_btn("Очистить", 'fa5s.trash'); b3.clicked.connect(self.clear)
-        for b in (b1, b2, b3): b.setMaximumWidth(120)
+        # «Добавить файлы» не ограничиваем: в 120 px надпись резалась
+        # («Добавить фай.»). Место отдаёт подпись папки экспорта — она
+        # сокращается «…».
+        for b in (b2, b3): b.setMaximumWidth(120)
         b4 = _api._icon_btn("", 'fa5s.columns')
         b4.setFixedWidth(36)
         b4.setToolTip("Сравнить любые два файла с диска (картинки или видео)")
@@ -160,10 +163,11 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
         self.btn_export_reset.setToolTip("Сбросить — экспортировать в папку исходника")
         self.btn_export_reset.clicked.connect(self._reset_export_dir)
         self.btn_export_reset.setEnabled(False)
-        self.lbl_export_dir = _api.QLabel("По умолчанию экспорт в папку исходника")
+        self.lbl_export_dir = _api.ElidedLabel()
         self.lbl_export_dir.setStyleSheet("color:#a6adc8; font-size:11px;")
-        h.addWidget(b1); h.addWidget(b2); h.addWidget(b3); h.addWidget(b4); h.addWidget(self.btn_export_dir); h.addWidget(self.btn_export_reset); h.addWidget(self.lbl_export_dir)
-        h.addStretch()
+        self.lbl_export_dir.set_full_text("Экспорт рядом с исходником")
+        h.addWidget(b1); h.addWidget(b2); h.addWidget(b3); h.addWidget(b4); h.addWidget(self.btn_export_dir); h.addWidget(self.btn_export_reset)
+        h.addWidget(self.lbl_export_dir, 1)
 
         # Левая часть может ужиматься (растяжимая, маленький минимум),
         # чтобы правая панель всегда полностью помещалась по горизонтали.
@@ -668,6 +672,7 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
                 'aspd': int(self.sl_aspd.value()),
                 'cq': int(self.s_cq.value()),
                 'overwrite_src': bool(self.ck_overwrite_src.isChecked()),
+                'gemini_wm': bool(self.ck_gemini_wm.isChecked()),
                 'fit_passes': int(self.s_passes.value()),
                 'img_fmt': _api.strip_default_tag(self.c_img_fmt.currentText()),
                 'chroma': _api.strip_default_tag(self.c_chroma.currentText()).replace(':', '')

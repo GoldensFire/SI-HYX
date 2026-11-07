@@ -91,8 +91,17 @@ def extract_ass(src, rel_idx, codec=""):
     try:
         tf = _api.tempfile.NamedTemporaryFile(delete=False, suffix=".ass")
         tmp = tf.name; tf.close()
-        _run_ffmpeg([_api.FFMPEG, "-y", "-i", str(src), "-map", f"0:s:{int(rel_idx)}",
-                     "-c:s", "ass", tmp])
+        cmd = [_api.FFMPEG, "-y"]
+        ext = _api.os.path.splitext(str(src))[1].lower()
+        if ext in ('.ass', '.ssa'):
+            # Внешний ASS/SSA бывает в cp1251 — ffmpeg без sub_charenc читает
+            # его как UTF-8 и портит кириллицу (или вовсе отказывается).
+            try:
+                cmd += ["-sub_charenc", _api.subtitle_text_encoding(src)]
+            except Exception:
+                pass
+        cmd += ["-i", str(src), "-map", f"0:s:{int(rel_idx)}", "-c:s", "ass", tmp]
+        _run_ffmpeg(cmd)
         if not _api.os.path.exists(tmp) or _api.os.path.getsize(tmp) <= 0:
             return None
         with open(tmp, "r", encoding="utf-8", errors="replace") as f:

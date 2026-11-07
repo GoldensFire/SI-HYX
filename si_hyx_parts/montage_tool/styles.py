@@ -98,8 +98,9 @@ def _installed(name):
         return False
     if low in _ty._FONT_FILES or low == "karaoke rounded":
         return True
-    fonts = _ty._installed_fonts()
-    return any(low + s in fonts for s in ("", " regular", " bold", " обычный", " полужирный"))
+    suffixes = ("", " regular", " bold", " обычный", " полужирный")
+    return any(low + s in fonts for fonts in (_ty._bundled_fonts(), _ty._installed_fonts())
+               for s in suffixes)
 
 
 def _glyph(f, ch):
@@ -164,10 +165,18 @@ def style_role(ref, section="text", sample=""):
     if section == "text":
         out["style"] = _resolved(out.get("style"), sample)
         for k, v in list((out.get("emphasis") or {}).items()):
-            out["emphasis"][k] = _resolved(v, sample)
+            out["emphasis"][k] = _emphasis_style(v, sample)
     else:
         out["_style"] = m.group(1)
     return out
+
+
+def _emphasis_style(v, sample=""):
+    """Стиль выделенного слова: словарь стиля или ссылка «стиль.роль» —
+    стиль этой роли целиком (слово другим кеглем и шрифтом: aeta.bold)."""
+    if isinstance(v, str):
+        return dict(style_role(v, sample=sample).get("style") or {})
+    return _resolved(v, sample)
 
 
 def apply_preset(op, sample=""):
@@ -175,6 +184,10 @@ def apply_preset(op, sample=""):
     под своими: style и emphasis — слиянием, остальное — ключ операции важнее.
     sample — текст операции: шрифт из списка роли — с его знаками."""
     if "preset" not in op:
+        emph = op.get("emphasis")
+        if isinstance(emph, dict) and any(isinstance(v, str) for v in emph.values()):
+            op = dict(op, emphasis={k: _emphasis_style(v, sample) if isinstance(v, str) else v
+                                    for k, v in emph.items()})
         return op
     spec = style_role(op["preset"], sample=sample)
     out = {k: v for k, v in spec.items() if k not in ("style", "emphasis")}
@@ -182,7 +195,9 @@ def apply_preset(op, sample=""):
     out["style"] = dict(spec.get("style") or {}, **_resolved(op.get("style"), sample))
     emph = dict(spec.get("emphasis") or {})
     for k, v in (op.get("emphasis") or {}).items():
-        emph[k] = dict(emph.get(k) or {}, **_resolved(v, sample))
+        # Ссылка на роль заменяет стиль слова целиком, словарь — дополняет.
+        emph[k] = (_emphasis_style(v, sample) if isinstance(v, str)
+                   else dict(emph.get(k) or {}, **_resolved(v, sample)))
     if emph:
         out["emphasis"] = emph
     if op.get("op") == "text" and "pos" in out and "pos_x" not in out:

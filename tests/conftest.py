@@ -174,6 +174,12 @@ def isolate_settings(tmp_path, monkeypatch):
         if mod is not None and hasattr(mod, "EDITOR_SETTINGS_PATH"):
             monkeypatch.setattr(mod, "EDITOR_SETTINGS_PATH",
                                 str(tmp_path / "editor_settings.json"), raising=True)
+    # Журнал проектов нейросети: вкладка открыла бы из него настоящий проект
+    # пользователя и писала бы правки в его файл, render — дописывал бы журнал.
+    handoff = sys.modules.get("montage_handoff")
+    if handoff is not None:
+        monkeypatch.setattr(handoff, "JOURNAL_PATH",
+                            str(tmp_path / "montage_ai_projects.json"), raising=True)
     # Генератор аниме-паков держит рядом с настройками кэш каталога Shikimori и
     # память о показанных кадрах — они тоже в настоящем %APPDATA%.
     animepack = sys.modules.get("animepack")

@@ -13,11 +13,16 @@ from si_hyx_parts.edit_tab.effects import EditTabEffectsMixin
 from si_hyx_parts.edit_tab.export import EditTabExportMixin
 from si_hyx_parts.edit_tab.entrance_actions import EditTabEntranceMixin
 from si_hyx_parts.edit_tab.project import EditTabProjectMixin
+from si_hyx_parts.edit_tab.project_link import EditTabProjectLinkMixin
+from si_hyx_parts.edit_tab.project_texts import EditTabProjectTextsMixin
+from si_hyx_parts.edit_tab.project_fx import EditTabProjectFxMixin
+from si_hyx_parts.edit_tab.project_props import EditTabProjectPropsMixin
 from si_hyx_parts.edit_tab.timeline_seek import EditTabTimelineSeekMixin
 from si_hyx_parts.edit_tab.subtitle_sync import EditTabSubtitleSyncMixin
 from si_hyx_parts.edit_tab.project_audio import EditTabProjectAudioMixin
 from si_hyx_parts.edit_tab.splice_bridge import EditTabSpliceBridgeMixin
 from si_hyx_parts.edit_tab.project_sound import EditTabProjectSoundMixin
+from si_hyx_parts.edit_tab.project_decks import EditTabProjectDecksMixin
 from si_hyx_parts.edit_tab.session_state import EditTabSessionMixin
 
 
@@ -34,9 +39,14 @@ class EditTab(
     EditTabExportMixin,
     EditTabEntranceMixin,
     EditTabProjectMixin,
+    EditTabProjectLinkMixin,
+    EditTabProjectTextsMixin,
+    EditTabProjectFxMixin,
+    EditTabProjectPropsMixin,
     EditTabProjectAudioMixin,
     EditTabSpliceBridgeMixin,
     EditTabProjectSoundMixin,
+    EditTabProjectDecksMixin,
     EditTabSessionMixin,
     _api.QWidget,
 ):
@@ -724,6 +734,7 @@ class EditTab(
                 'subtitle_style': dict(getattr(self, '_last_subtitle_style', None) or {}) or None,
                 'project_collapsed': bool(getattr(self, '_proj_collapsed', False)),
                 'session': self._session_settings(),
+                'amv_markup': dict(getattr(self, '_amv_markup_prefs', None) or {}),
             }
             # Атомарно (временный файл + подмена): прямая запись обрезала файл
             # ДО того, как в него ляжет новое содержимое, и жёсткое завершение
@@ -776,9 +787,11 @@ class EditTab(
             # Последние настройки стиля «Создать субтитры» (шрифт/размер/цвет/…) —
             # см. create_subtitles/SubtitleCreatorDialog.default_style.
             self._last_subtitle_style = settings.get('subtitle_style') or None
+            self._amv_markup_prefs = dict(settings.get('amv_markup') or {})
             self._proj_collapsed = bool(settings.get('project_collapsed', False))
             self._project_apply_collapsed()
             self._session_load(settings.get('session'))
+            self._project_update_ui()
         except Exception:
             pass
 
@@ -799,6 +812,11 @@ class EditTab(
         except Exception:
             pass
         self._project_shutdown()
+        try:
+            if getattr(self, '_amv_markup', None) is not None:
+                self._amv_markup.shutdown()
+        except Exception:
+            pass
         # Останавливаем звук покадровой перемотки: устройство вывода и фоновый
         # декодер окон PCM (он держит запущенный ffmpeg).
         try:

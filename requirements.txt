@@ -6,15 +6,15 @@
 # build.bat перед сборкой сверяет окружение с этим файлом.
 
 # --- Ядро: GUI, значки, изображения, сеть ---
-PyQt6==6.11.0
+PyQt6==6.12.0
 qtawesome==1.4.2
 Pillow==13.0.0             # ниже 13.0.0 — 41 CVE (см. dependabot), не откатывать
 pillow-heif==1.8.1
 requests==2.34.2
 httpx[http2]==0.28.1        # MangaLib public API; supported HTTP/2 transport
-google-auth==2.62.0        # OAuth service account / ADC для Google Chirp 3 HD
+google-auth==2.62.1        # OAuth service account / ADC для Google Chirp 3 HD
 PixivPy3==3.7.5           # поиск артов Pixiv по refresh token пользователя
-tzdata==2026.5             # суточная квота Gemini сбрасывается по Pacific Time
+tzdata==2026.6             # суточная квота Gemini сбрасывается по Pacific Time
 certifi==2026.10.23          # корневые сертификаты; освежать при каждом релизе
 
 # --- Загрузчик ---

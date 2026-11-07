@@ -133,16 +133,45 @@ C = {
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
+_FFPROBE_CACHE = {}         # (путь, размер, mtime) → вывод ffprobe (JSON-текст)
+_FFPROBE_CACHE_MAX = 64
+
+
 def run_ffprobe(path):
-    cmd = [FFPROBE, "-v", "quiet", "-print_format", "json",
-           "-show_format", "-show_streams", str(path)]
+    """Разбор файла ffprobe (format + streams) или None.
+
+    Ответ запоминается по размеру и времени изменения файла: просмотр проекта
+    Монтажа на каждом стыке кусков из разных файлов открывает файл заново, и
+    ffprobe держал GUI-поток 80–110 мс (картинка стояла). Хранится текст —
+    каждый вызов получает свою копию разбора."""
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, check=True,
-                           encoding="utf-8", errors="replace",
-                           creationflags=CREATE_NO_WINDOW)
-        return json.loads(p.stdout)
+        st = os.stat(path)
+        key = (os.path.normcase(os.path.abspath(str(path))), st.st_size, st.st_mtime_ns)
+    except (OSError, ValueError):
+        key = None
+    text = _FFPROBE_CACHE.get(key) if key is not None else None
+    if text is None:
+        cmd = [FFPROBE, "-v", "quiet", "-print_format", "json",
+               "-show_format", "-show_streams", str(path)]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, check=True,
+                               encoding="utf-8", errors="replace",
+                               creationflags=CREATE_NO_WINDOW)
+        except Exception:
+            return None
+        text = p.stdout
+    try:
+        data = json.loads(text)
     except Exception:
         return None
+    if key is not None and key not in _FFPROBE_CACHE:
+        try:                    # заранее разбирает и фоновый поток (проект)
+            while len(_FFPROBE_CACHE) >= _FFPROBE_CACHE_MAX:
+                _FFPROBE_CACHE.pop(next(iter(_FFPROBE_CACHE)), None)
+        except (RuntimeError, StopIteration):
+            pass
+        _FFPROBE_CACHE[key] = text
+    return data
 
 def time_to_s(hms_str: str) -> float:
     parts = [p for p in hms_str.split(':') if p]
@@ -391,6 +420,70 @@ def _parse_srt(text):
             cues.append((start, end, body))
     cues.sort(key=lambda c: c[0])
     return cues
+
+
+# ── Кодировки текстовых субтитров ───────────────────────────────────────────
+# SRT/VTT с русских трекеров часто в cp1251, а ffmpeg и Qt читают их как
+# UTF-8 — кириллица превращалась в «�» (в окне правки — ромбики). Кодировку
+# определяем по самому тексту: UTF-8/UTF-16 с BOM, иначе cp1251 или cp932 по
+# доле букв нужного письма.
+_SUB_SCRIPT_PUNCT = set(
+    " \t\r\n.,!?;:'\"()-–—…«»„“”‘’[]{}<>/\\|_+*=@#%&№、。！？「」『』【】・〜ー")
+
+
+def _subtitle_script_score(text):
+    """Насколько правдоподобно text выглядит как субтитры: буквы русского
+    письма, катаканы/хираганы и иероглифы — плюс, всё остальное — минус."""
+    good = bad = 0
+    for ch in text:
+        code = ord(ch)
+        if ch.isspace() or ch in _SUB_SCRIPT_PUNCT or ch.isdigit():
+            continue
+        low = ch.lower()
+        if ("а" <= low <= "я") or low == "ё":
+            good += 1
+        elif (0x3040 <= code <= 0x30FF or 0x4E00 <= code <= 0x9FFF
+              or 0x3000 <= code <= 0x303F):
+            good += 1
+        elif code < 128 and ch.isalpha():
+            good += 1
+        else:
+            # Полуширинные катаканы, нерусская кириллица, символы из чужой
+            # кодировки и «�» — признак неверного декодирования.
+            bad += 1
+    return good - 2 * bad
+
+
+def _decode_subtitle_bytes(data):
+    """(текст, кодировка) содержимого файла текстовых субтитров."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace"), "utf-16"
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data.decode("utf-8-sig", errors="replace"), "utf-8"
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+    best = None
+    for encoding in ("utf-8", "cp1251", "cp932"):
+        text = data.decode(encoding, errors="replace")
+        score = _subtitle_script_score(text)
+        if best is None or score > best[0]:
+            best = (score, text, encoding)
+    return best[1], best[2]
+
+
+def read_subtitle_text(path):
+    """Текст файла текстовых субтитров (SRT/VTT/ASS) в Unicode."""
+    with open(path, "rb") as f:
+        return _decode_subtitle_bytes(f.read())[0]
+
+
+def subtitle_text_encoding(path):
+    """Кодировка файла субтитров для ffmpeg `subtitles=…:charenc=…`."""
+    with open(path, "rb") as f:
+        return _decode_subtitle_bytes(f.read())[1]
+
 
 # ── Программный стиль субтитров — как у караоке в генерации паков ────────────
 # Текстовые субтитры без собственного стиля Монтаж рисует сам: шрифт Karaoke

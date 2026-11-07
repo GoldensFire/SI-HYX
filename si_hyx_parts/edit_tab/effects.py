@@ -60,17 +60,24 @@ class EditTabEffectsMixin:
                 pass
 
     def _toggle_pixelize(self, on):
-        """Вкл/выкл эффект «проявление из пикселей». При включении открывается
-        диалог с параметрами (число шагов, стартовый блок); отмена снимает чек.
+        """Вкл/выкл эффект проявления: пикселизация или любой другой эффект
+        кадров генератора аниме-паков. При включении открывается диалог с
+        параметрами (эффект, число шагов, стартовый блок); отмена снимает чек.
         Эффект применяется при «Экспорт» и виден только в итоговом файле (живого
-        превью нет — мозаика считается при перекодировке)."""
+        превью нет — он считается при перекодировке)."""
         if on:
             is_image = bool(getattr(self, "is_still_image", False))
             dlg = _api._PixelizeDialog(self._pixelize_steps, self._pixelize_block, self,
                                   image_mode=is_image, duration=self._still_duration,
-                                  fps=self._still_fps)
+                                  fps=self._still_fps,
+                                  effect=getattr(self, "_pixelize_effect", "pixelize"),
+                                  extra_images=getattr(self, "_still_batch", []),
+                                  dvd_folder=self._dvd_folder())
             if dlg.exec():
                 self._pixelize_steps, self._pixelize_block = dlg.values()
+                self._pixelize_effect = dlg.effect()
+                if is_image:
+                    self._still_batch = dlg.extra_images()
                 self._pixelize_active = True
                 if is_image:
                     self._still_duration, self._still_fps = dlg.image_values()
@@ -83,10 +90,19 @@ class EditTabEffectsMixin:
                     except Exception:
                         pass
                 try:
-                    if self.main is not None and hasattr(self.main, "log"):
+                    extra = (f", {self._still_duration}с @ {self._still_fps}fps"
+                             if is_image else "")
+                    batch = len(getattr(self, "_still_batch", []) or []) if is_image else 0
+                    if batch:
+                        extra += f", видео: {batch + 1} (ещё картинок: {batch})"
+                    if self._pixelize_effect != "pixelize":
+                        if self.main is not None and hasattr(self.main, "log"):
+                            self.main.log(
+                                f"Эффект «{self._reveal_effect_label()}» задан "
+                                f"({self._pixelize_steps} шаг(ов){extra}) — "
+                                "применится при «Экспорт».")
+                    elif self.main is not None and hasattr(self.main, "log"):
                         seq = _api._pixelize_block_sequence(self._pixelize_block, self._pixelize_steps)
-                        extra = (f", {self._still_duration}с @ {self._still_fps}fps"
-                                 if is_image else "")
                         self.main.log(
                             f"Пикселизация задана ({self._pixelize_steps} шаг(ов), "
                             f"старт {self._pixelize_block}px{extra}) — применится при "
@@ -103,7 +119,7 @@ class EditTabEffectsMixin:
             self._pixelize_active = False
             try:
                 if self.main is not None and hasattr(self.main, "log"):
-                    self.main.log("Пикселизация отключена.")
+                    self.main.log(f"Эффект «{self._reveal_effect_label()}» отключён.")
             except Exception:
                 pass
         self._sync_pixelize_icon()
@@ -135,12 +151,46 @@ class EditTabEffectsMixin:
         """
         if not getattr(self, "_pixelize_active", False) or dur is None or dur <= 0:
             return None
+        if self._reveal_video_effect() is not None:
+            return None         # другой эффект — кадрами, см. _reveal_video_effect
         # Сама цепочка собирается общим модулем pixelize (им же пользуется
         # генератор аниме-паков) — эффект в обеих вкладках один и тот же.
         return _api._pixelize_filter(dur,
                                 max(1, int(getattr(self, "_pixelize_steps", 6))),
                                 max(2, int(getattr(self, "_pixelize_block", 64))),
                                 offset)
+
+    def _reveal_video_effect(self):
+        """Ключ включённого эффекта проявления, который накладывается кадрами
+        (RevealVideoWorker), или None — эффект выключен либо это пикселизация
+        (она идёт фильтром ffmpeg, _video_pixelize_filter)."""
+        if not getattr(self, "_pixelize_active", False):
+            return None
+        effect = getattr(self, "_pixelize_effect", "pixelize")
+        return None if effect == "pixelize" else effect
+
+    def _dvd_folder(self):
+        """«Папка DVD» генератора аниме-паков — картинки и видео, что летают в
+        прямоугольнике DVD-заставки; "" — не задана. Берётся из открытой
+        вкладки генератора, иначе из её сохранённых настроек."""
+        main = getattr(self, "main", None)
+        tab = getattr(main, "tab_animepack", None)
+        try:
+            if tab is not None and hasattr(tab, "ed_dvd_folder"):
+                return tab.ed_dvd_folder.text().strip()
+        except Exception:
+            pass
+        saved = getattr(main, "_animepack_settings", None) or {}
+        try:
+            return str(saved.get("frame_dvd_folder", "") or "").strip()
+        except Exception:
+            return ""
+
+    def _reveal_effect_label(self):
+        """Название выбранного эффекта проявления для сообщений."""
+        from frame_reveal import EFFECT_LABELS
+        return EFFECT_LABELS.get(getattr(self, "_pixelize_effect", "pixelize"),
+                                 "Пикселизация")
 
     def _on_crop_applied(self):
         """Холст: нажата «Применить» — снимаем чек с кнопки (режим правки закрыт),
@@ -885,7 +935,7 @@ class EditTabEffectsMixin:
             _api.msgbox_information(
                 self, "Только накладка",
                 "Сейчас в файл уйдёт видео с привязанной накладкой — "
-                "кадрирование и пикселизация в этот экспорт не попадут. "
+                "кадрирование и эффект проявления в этот экспорт не попадут. "
                 "Сначала сохраните их обычной обрезкой, а привязку сделайте "
                 "уже по готовому файлу.")
 

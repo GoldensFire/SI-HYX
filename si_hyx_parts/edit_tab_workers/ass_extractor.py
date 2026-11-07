@@ -23,13 +23,21 @@ class AssExtractor(_api.QThread):
         try:
             tf = _api.tempfile.NamedTemporaryFile(delete=False, suffix=".ass")
             out = tf.name; tf.close()
-            cmd = [_api.FFMPEG, "-y", "-i", self.src,
-                   "-map", f"0:s:{self.sub_index}", "-c:s", "ass", out]
-            kw = {}
-            if _api.os.name == 'nt':
-                kw['creationflags'] = _api.CREATE_NO_WINDOW
-            _api.subprocess.run(cmd, stdout=_api.subprocess.DEVNULL,
-                           stderr=_api.subprocess.DEVNULL, timeout=120, **kw)
+            ext = _api.os.path.splitext(self.src)[1].lower()
+            if self.sub_index == 0 and ext in ('.ass', '.ssa'):
+                # Внешний ASS/SSA бывает в cp1251: ffmpeg читает его как UTF-8
+                # и заменяет кириллицу на «�». Декодируем сами и отдаём libass
+                # уже UTF-8 — стили, теги и события не меняются.
+                with open(out, "w", encoding="utf-8", newline="") as f:
+                    f.write(_api.read_subtitle_text(self.src))
+            else:
+                cmd = [_api.FFMPEG, "-y", "-i", self.src,
+                       "-map", f"0:s:{self.sub_index}", "-c:s", "ass", out]
+                kw = {}
+                if _api.os.name == 'nt':
+                    kw['creationflags'] = _api.CREATE_NO_WINDOW
+                _api.subprocess.run(cmd, stdout=_api.subprocess.DEVNULL,
+                               stderr=_api.subprocess.DEVNULL, timeout=120, **kw)
             if not (_api.os.path.exists(out) and _api.os.path.getsize(out) > 0):
                 try: _api.os.remove(out)
                 except Exception: pass

@@ -27,7 +27,8 @@ _CLIP_FIELDS = {
     # v3
     "keyframes": dict, "effects": list, "speed_curve": list, "curve_audio": bool,
     "interpolate": str, "upscale": str,
-    "crop": list, "box": list, "mask": dict, "stroke": dict, "blend": str, "matte": str,
+    "crop": list, "box": list, "mask": dict, "stroke": dict, "shadow": dict, "blend": str,
+    "matte": str,
 }
 # Пределы значений ключевых кадров (strict).
 _KEYFRAME_RANGE = {"pos_x": (-1.0, 2.0), "pos_y": (-1.0, 2.0), "scale": (0.02, 8.0),
@@ -123,13 +124,19 @@ def describe_schema():
         "effect": {"keys": list(_api.EFFECT_KEYS),
                    "limits": {k: list(v) for k, v in _api.EFFECT_LIMITS.items()},
                    "on": "вид маркера проекта или список времён проекта; без on — на весь "
-                         "клип (glow, motion_blur, vignette, color) или в начале клипа"},
+                         "клип (glow, motion_blur, vignette, color, invert, threshold, sketch, "
+                         "hue, letterbox, strobe, viewfinder) или в начале клипа (zoom_punch, "
+                         "shake, flash, rgb_shift, glitch, blur, streak, zoom_blur)",
+                   "label": "надпись viewfinder: латиница, цифры, пробел, / . - (до 40)",
+                   "hold": "true — разовый эффект на весь клип с полной силой",
+                   "colors": "[тени, света] у threshold; [фон, линии] у sketch"},
         "speed_curve_point": {"at": "number 0…1 (доля куска исходника)", "speed": "number"},
         "limits": {"speed": [_api.MIN_SPEED, _api.MAX_SPEED], "min_clip_s": _api.MIN_CLIP_S,
                    "scale": [_api.MIN_SCALE, _api.MAX_SCALE], "opacity": [0.0, 1.0],
                    "duck": [0.0, 1.0], "loudness": list(_LOUDNESS_RANGE),
                    "frame_side": [16, _MAX_SIDE], "fps": [1.0, _MAX_FPS],
-                   "reverse_max_s": _api.MAX_REVERSE_S, "text_max_chars": _TEXT_MAX},
+                   "reverse_max_s": _api.MAX_REVERSE_S, "text_max_chars": _TEXT_MAX,
+                   "shadow": {k: [lo, hi, d] for k, lo, hi, d in _api.SHADOW_FIELDS}},
         "notes": [
             "Время — секунды. start — место клипа на шкале проекта, in_s/out_s — кусок исходника.",
             "Дорожка 0-го вида video — основная и магнитная: клипы встают вплотную по порядку "
@@ -155,13 +162,18 @@ def describe_schema():
             "[w,h] — прямоугольник в долях кадра (вместо scale), mask {shape: rect (rect, "
             "radius) | ellipse | strip (angle°, width, offset) | polygon (points), feather, "
             "invert} — форма в долях прямоугольника, stroke {width — доля высоты кадра, color, "
-            "style solid|torn}, blend — режим смешения, matte rmbg — персонаж без фона "
+            "style solid|torn}, shadow {size — размытие, x, y — сдвиг (доли высоты кадра), "
+            "opacity, color} — мягкая тень окна, blend — режим смешения, matte rmbg — "
+            "персонаж без фона "
             "(кэш готовят render/still/preview).",
             "v3 текст: layer — индекс видеодорожки, над которой лежит текст (под "
             "наложениями выше: «текст за персонажем»); style: анимации blur_in, slide_blur, "
             "grow, drop, zoom_out, typewriter, flash; in_s/out_s, out fade|blur, blur, glow + "
             "glow_color, rotation, skew, scale_x/scale_y, alpha; font — имя или псевдоним "
-            "(enums.font_alias).",
+            "(enums.font_alias). window (+ window_light, window_saturation, window_tint) — "
+            "буквы-окно: в буквах тот же кадр со своим светом; window_invert — в буквах "
+            "негатив кадра (белый текст в режиме «разница»); out letters — уход по "
+            "буквам; dropout — буквы ненадолго пропадают.",
             "v3 settings.finish — эффекты всего кадра после текста: grain, scanlines, "
             "halftone (amount, period), vignette, color, glow.",
         ],
@@ -332,8 +344,10 @@ def _style_value_ok(key, v):
         return v in _TEXT_ANIMATIONS
     if key == "out":
         return v in _tfx.OUT_ANIMATIONS
-    if key == "glow_color":
+    if key in _tfx.COLOR_KEYS:
         return bool(_COLOR_RX.fullmatch(v))
+    if key == "letter_colors":
+        return 1 <= len(v) <= 16 and all(isinstance(c, str) and _COLOR_RX.fullmatch(c) for c in v)
     if key in _tfx.STYLE_KEYS:
         lo, hi = _tfx.STYLE_KEYS[key][1:]
         return lo is None or lo <= v <= hi
@@ -565,7 +579,7 @@ def _check_clip(raw, i, kinds, main, strict, check_files, problems):
         elif check_files and not os.path.isfile(p):
             problems.append({"path": f"{path}.{name}", "message": "нет файла"})
     if track == main:
-        for name in ("matte", "mask", "stroke", "blend"):
+        for name in ("matte", "mask", "stroke", "shadow", "blend"):
             if raw.get(name) not in (None, "", {}, "normal"):
                 problems.append({"path": f"{path}.{name}",
                                  "message": "только у наложения (верхняя видеодорожка)"})
@@ -657,6 +671,11 @@ def _check_effect(e, ep, check_files, problems):
                                  "message": "вид маркера или список времён проекта"})
         elif k in ("color", "tint") and not (isinstance(v, str) and _COLOR_RX.fullmatch(v)):
             problems.append({"path": f"{ep}.{k}", "message": "цвет вида #RRGGBB"})
+        elif k == "colors" and not (isinstance(v, list) and len(v) == 2 and all(
+                isinstance(c, str) and _COLOR_RX.fullmatch(c) for c in v)):
+            problems.append({"path": f"{ep}.colors", "message": "два цвета #RRGGBB"})
+        elif k == "hold" and not isinstance(v, bool):
+            problems.append({"path": f"{ep}.hold", "message": "true или false"})
         elif k == "curves" and v not in _api.CURVES_PRESETS:
             problems.append({"path": f"{ep}.curves",
                              "message": f"одно из {', '.join(_api.CURVES_PRESETS)}"})
@@ -677,6 +696,8 @@ def _check_layers(raw, path, problems):
               ("mask", _api.sanitize_mask, f"shape: {', '.join(_api.MASK_SHAPES)} и поля формы"),
               ("stroke", _api.sanitize_stroke, "width (доля высоты 0.001…0.08), color, "
                                                f"style: {', '.join(_api.STROKE_STYLES)}"),
+              ("shadow", _api.sanitize_shadow, "size, x, y (доли высоты кадра), opacity > 0, "
+                                               "color #RRGGBB"),
               ("blend", _api.sanitize_blend, f"одно из {', '.join(_api.BLEND_MODES)}"),
               ("matte", _api.sanitize_matte, f"одно из {', '.join(_api.MATTE_MODELS)} или пусто"))
     for name, fn, hint in checks:

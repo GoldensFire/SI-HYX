@@ -400,15 +400,21 @@ class EditTabExportMixin:
             # неприменимы).
             subs_lost = burn_subs and (audio_only
                                        or not self._process_tab_encodes_video())
-            # Остальных своих видеофильтров путь не знает — если что-то из них
-            # включено, спрашиваем, а не выкидываем молча. В аудио-режиме
-            # спрашивать нечего: видеоряда на выходе нет по определению самого
-            # режима — просто честно пишем в лог, что эффекты картинки к нему
-            # не применяются.
-            if subs_lost or crop_active or pix_active or ovl_lost:
+            # Кадрирование и эффект проявления путь тоже умеет: они едут в
+            # item['reveal'] и ложатся в то же единственное кодирование
+            # «Обработки» (process_reveal). Теряются там же, где накладки.
+            crop_lost = crop_active and (audio_only
+                                         or not self._process_tab_encodes_video())
+            pix_lost = pix_active and (audio_only
+                                       or not self._process_tab_encodes_video())
+            # Если что-то всё же теряется — спрашиваем, а не выкидываем молча.
+            # В аудио-режиме спрашивать нечего: видеоряда на выходе нет по
+            # определению самого режима — просто честно пишем в лог, что
+            # эффекты картинки к нему не применяются.
+            if subs_lost or crop_lost or pix_lost or ovl_lost:
                 what = ", ".join(n for n, on in (
-                    ("вшивание субтитров", subs_lost), ("кадрирование", crop_active),
-                    ("пикселизация", pix_active),
+                    ("вшивание субтитров", subs_lost), ("кадрирование", crop_lost),
+                    (pix_lost and f"эффект «{self._reveal_effect_label()}»", pix_lost),
                     ("наложенные картинки", ovl_lost)) if on)
                 if audio_only:
                     self.log_label.setText(
@@ -450,35 +456,73 @@ class EditTabExportMixin:
             mode = 1  # быстрый copy не умеет crop/pixelize/накладки → перекодируем
         self._execute_cut(in_s, out_s, mode, burn_subs)
 
-    def _export_still_pixelize(self):
+    def _export_still_pixelize(self, src=None, queue=None, batch_total=1):
         """Собирает ВИДЕО-проявление из загруженной картинки: кадр зацикливается
         (-loop 1) на заданную длительность, по нему идёт цепочка пикселизации
         (offset=0 — фильтрграф стартует с нуля) и, при наличии, кадрирование.
-        Требует включённой пикселизации — в этом весь смысл режима картинки."""
-        src = self.still_image_path or self.actual_source_file
-        if not src or not _api.os.path.exists(str(src)):
-            _api.msgbox_warning(self, "Внимание", "Картинка не загружена.")
-            return
-        if not getattr(self, "_pixelize_active", False):
-            _api.msgbox_information(
-                self, "Пикселизация",
-                "Включите «Пикселизацию» (кнопка с сеткой) — для картинки именно она "
-                "и создаёт видео-проявление.")
-            return
+        Другой эффект проявления накладывается по кадрам в том же кодировании
+        (RevealVideoWorker). Требует включённого эффекта — в этом весь смысл
+        режима картинки.
+
+        Пакет: картинки из «+ Файлы» диалога эффекта (_still_batch) идут
+        следом, по одной, с тем же эффектом — каждая в своё видео. `src` и
+        `queue` задаёт сам пакет (следующая картинка и оставшиеся)."""
+        first = src is None
+        if first:
+            src = self.still_image_path or self.actual_source_file
+            if not src or not _api.os.path.exists(str(src)):
+                _api.msgbox_warning(self, "Внимание", "Картинка не загружена.")
+                return
+            if not getattr(self, "_pixelize_active", False):
+                _api.msgbox_information(
+                    self, "Эффект проявления",
+                    "Включите эффект проявления (кнопка с сеткой) — для картинки именно он "
+                    "и создаёт видео-проявление.")
+                return
+            main_path = _api.os.path.normcase(_api.os.path.abspath(str(src)))
+            queue = [p for p in (getattr(self, "_still_batch", None) or [])
+                     if _api.os.path.isfile(p)
+                     and _api.os.path.normcase(_api.os.path.abspath(p)) != main_path]
+            batch_total = 1 + len(queue)
+        queue = list(queue or [])
+        batch_index = batch_total - len(queue)
         src = _api.Path(src)
         dur = max(1.0, float(self._still_duration))
         fps = max(1, int(self._still_fps))
+        fx = self._reveal_video_effect()
+        # Режим экспорта «Перекодировать настройками «Обработки»» — картинку
+        # кодирует «Обработка» её настройками, тем же единственным проходом
+        # (item['still'], process_reveal). Копировать картинку нельзя, поэтому
+        # с выключенным «Перекодировать видео» её кодирует Монтаж. Пакет идёт
+        # тем же путём: каждая картинка — своим элементом «Обработки», следующая
+        # уходит, когда готова предыдущая.
+        if self.cmb_mode.currentIndex() == 4:
+            if self._process_tab_encodes_video():
+                nxt = ((lambda _q=queue, _t=batch_total:
+                        self._export_still_pixelize(_q[0], _q[1:], _t))
+                       if queue else None)
+                self._execute_cut_and_process(
+                    0.0, dur, src=src, still_fps=fps,
+                    cut_tag="_проявление" if fx else "_пиксель",
+                    batch_next=nxt, with_overlays=first,
+                    batch_step=(batch_index, batch_total))
+                return
+            if self.main is not None and hasattr(self.main, "log"):
+                self.main.log("Монтаж: в «Обработке» выключено «Перекодировать видео» — "
+                              "видео из картинки кодирует Монтаж.")
         # Цепочка: кадрирование (если есть) → пикселизация (offset=0) → чётные
         # размеры под yuv420p/h264.
         crop_vf = self._video_crop_filter()
         pix_vf = self._video_pixelize_filter(dur, 0.0)
         chain = [p for p in (crop_vf, pix_vf) if p]
         chain.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
-        vf = self._wrap_vf(",".join(chain), src)
+        # Накладки расставлены по открытой картинке — к остальным картинкам
+        # пакета (другой размер) их не прикладываем.
+        vf = self._wrap_vf(",".join(chain), src) if first else ",".join(chain)
 
         out_dir = (_api.Path(self.export_dir) if (self.export_dir and _api.os.path.isdir(self.export_dir))
                    else src.parent)
-        final_out = str(out_dir / f"{src.stem}_пиксель.mp4")
+        final_out =str(out_dir / f"{src.stem}_{'проявление' if fx else 'пиксель'}.mp4")
         if _api.os.path.exists(final_out):
             final_out = _api._unique_output(final_out)
 
@@ -486,20 +530,38 @@ class EditTabExportMixin:
         cmd = [_api.FFMPEG, "-y", "-loop", "1", "-framerate", str(fps), "-i", str(src),
                "-t", _api.s_to_time(dur), "-vf", vf] + venc \
               + ["-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an", final_out]
+        if fx:
+            # Другой эффект — кадрами по трубе в тот же единственный кодировщик.
+            dec_cmd = ([_api.FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error",
+                        "-loop", "1", "-framerate", str(fps), "-i", str(src),
+                        "-t", _api.s_to_time(dur), "-vf",
+                        f"{vf},{_api.reveal_pipe.rgb_filter(str(src), self._escape_filter_path, True)}"]
+                       + _api.reveal_pipe.PPM_ARGS + ["-"])
+            enc_cmd = ([_api.FFMPEG, "-y"] + _api.reveal_pipe.PPM_ARGS
+                       + ["-framerate", str(fps), "-i", "-", "-vf", _api.reveal_pipe.ENCODE_VF]
+                       + venc + _api.reveal_pipe.COLOR_ARGS + ["-an", final_out])
 
-        self._report_progress(0, "Создание видео…")
-        self.log_label.setText("Создание видео из картинки…")
+        step = f" {batch_index}/{batch_total}" if batch_total > 1 else ""
+        self._report_progress(0, f"Создание видео{step}…")
+        self.log_label.setText(f"Создание видео из картинки{step}…")
         self._set_cut_btn_cancel(True)
-        self._start_cut_phase("Пикселизация…")
+        self._start_cut_phase(f"{self._reveal_effect_label()}…")
         if getattr(self, "_cut_ticker", None) is None:
             self._cut_ticker = _api.QTimer(self); self._cut_ticker.setInterval(500)
             self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
         self._cut_ticker.start()
 
-        self.ffmpeg_thread = _api.FfmpegWorker(cmd, duration=dur)
+        if fx:
+            self.ffmpeg_thread = _api.RevealVideoWorker(
+                dec_cmd, enc_cmd, fx, self._pixelize_steps, fps,
+                duration=dur, still=True,
+                dvd_media=self._dvd_folder())
+        else:
+            self.ffmpeg_thread = _api.FfmpegWorker(cmd, duration=dur)
         self.ffmpeg_thread.progress.connect(self._on_cut_progress)
 
-        def _on_finished(success, message, _final=final_out):
+        def _on_finished(success, message, _final=final_out, _queue=queue,
+                         _total=batch_total, _step=step):
             try:
                 if getattr(self, "_cut_ticker", None) is not None:
                     self._cut_ticker.stop()
@@ -509,9 +571,20 @@ class EditTabExportMixin:
             if success and _api.os.path.exists(_final):
                 try:
                     if self.main is not None and hasattr(self.main, "log"):
-                        self.main.log(f"Видео-проявление из картинки готово: {_final}")
+                        self.main.log(f"Видео-проявление из картинки{_step} готово: {_final}")
                 except Exception:
                     pass
+                if _queue and not getattr(self, "_cut_cancelled", False):
+                    # Следующая картинка пакета — когда поток этой уже вышел
+                    # из run(): ссылку на живой QThread терять нельзя.
+                    done = self.ffmpeg_thread
+                    try:
+                        done.wait(5000)
+                    except Exception:
+                        pass
+                    _api.QTimer.singleShot(0, lambda: self._export_still_pixelize(
+                        _queue[0], _queue[1:], _total))
+                    return
                 self._progress_result_path = _final
                 self.on_ffmpeg_finished(True, message)
             else:
@@ -612,6 +685,12 @@ class EditTabExportMixin:
         # Наложенные картинки (логотип/водяной знак) — тоже фильтр: copy их не
         # умеет, поэтому при активных слоях идём перекодировкой, как с crop.
         ovl_on = self.has_image_overlays()
+        # Остальные эффекты проявления (не пикселизация) кладутся на кадры в
+        # том же единственном кодировании: декодер → эффект → кодировщик
+        # (_reveal_cut_cmds, RevealVideoWorker).
+        fx = self._reveal_video_effect() if mode != 2 else None
+        if fx:
+            pix_on = True
         if (pix_on or ovl_on) and mode == 0:
             mode = 1
         # Любой видеофильтр (crop/pixelize/накладка) — это перекодировка, а не
@@ -771,6 +850,11 @@ class EditTabExportMixin:
 
         if audio_off:
             cmd = drop_audio(cmd, temp_out)
+        reveal_cmds = None
+        if fx:
+            reveal_cmds = self._reveal_cut_cmds(
+                src, in_s, dur_cut, burn_subs, ext_audio, audio_off,
+                sel_a if pick_audio else None, venc, temp_out)
 
         self._report_progress(0, "Обрезка…")
         self.log_label.setText("Обрезка...")
@@ -779,14 +863,20 @@ class EditTabExportMixin:
         # Прогресс с ETA. Тикер раз в 0.5с обновляет «прошло/ETA», чтобы строка
         # не выглядела зависшей, даже если ffmpeg редко шлёт time= (короткие
         # отрезки или фаза перемотки декодером до точки реза).
-        self._start_cut_phase("Обрезка…")
+        self._start_cut_phase(f"Обрезка и эффект «{self._reveal_effect_label()}»…"
+                              if reveal_cmds else "Обрезка…")
         if getattr(self, "_cut_ticker", None) is None:
             self._cut_ticker = _api.QTimer(self)
             self._cut_ticker.setInterval(500)
             self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
         self._cut_ticker.start()
 
-        self.ffmpeg_thread = _api.FfmpegWorker(cmd, duration=dur_cut)
+        if reveal_cmds:
+            self.ffmpeg_thread = _api.RevealVideoWorker(
+                *reveal_cmds, fx, self._pixelize_steps, self.fps, duration=dur_cut,
+                dvd_media=self._dvd_folder())
+        else:
+            self.ffmpeg_thread = _api.FfmpegWorker(cmd, duration=dur_cut)
         self.ffmpeg_thread.progress.connect(self._on_cut_progress)
 
         def _on_finished(success, message, _temp=temp_out, _final=final_out,
@@ -896,6 +986,51 @@ class EditTabExportMixin:
 
         self.ffmpeg_thread.finished.connect(_on_finished)
         self.ffmpeg_thread.start()
+
+    def _reveal_cut_cmds(self, src, in_s, dur, burn_subs, ext_audio, audio_off,
+                         audio_index, venc, out):
+        """(декодер, кодировщик) обрезки с покадровым эффектом проявления —
+        одно кодирование без промежуточного файла (reveal_pipe).
+
+        Декодер делает с кадром всё то же, что обычная перекодировка: рез,
+        накладки, кадрирование, субтитры (эффект ложится поверх них) — и отдаёт
+        его в RGB. Кодировщик берёт кадры с эффектом из трубы, а звук — вторым
+        входом из того же отрезка (входной -ss/-t: выходной срезал бы и кадры
+        из трубы)."""
+        rp = _api.reveal_pipe
+        in_str, dur_str = _api.s_to_time(in_s), _api.s_to_time(dur)
+        chain = [c for c in (self._video_crop_filter(),) if c]
+        sub_vf = (self._subtitles_vf(src, self.selected_sub_ext_path,
+                                     self.cmb_subs.currentIndex() - 1)
+                  if burn_subs else None)
+        if sub_vf:
+            # Выходной seek от начала: время субтитров = время файла.
+            chain.append(sub_vf)
+            seek = ["-i", str(src), "-ss", in_str, "-t", dur_str]
+        elif in_s > 6.0:
+            # Быстрый входной pre-seek + точный выходной -ss (как в _execute_cut).
+            pre = _api.s_to_time(in_s - 3.0)
+            seek = ["-ss", pre, "-i", str(src),
+                    "-ss", _api.s_to_time(in_s - _api.time_to_s(pre)), "-t", dur_str]
+        else:
+            seek = ["-i", str(src), "-ss", in_str, "-t", dur_str]
+        vf = ",".join(c for c in (self._wrap_vf(",".join(chain), src),
+                                  rp.rgb_filter(str(src), self._escape_filter_path, True)) if c)
+        dec = ([_api.FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error"] + seek
+               + ["-map", "0:v:0", "-vf", vf, "-an", "-sn", "-dn"] + rp.PPM_ARGS + ["-"])
+        rate, _fps = rp.probe_rate(_api.FFPROBE, src, _api.CREATE_NO_WINDOW)
+        enc = [_api.FFMPEG, "-y"] + rp.PPM_ARGS + ["-framerate", rate, "-i", "-"]
+        if audio_off:
+            enc += ["-map", "0:v:0", "-an"]
+        elif ext_audio:
+            enc += ["-ss", in_str, "-t", dur_str, "-i", ext_audio,
+                    "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "192k"]
+        else:
+            amap = f"1:{audio_index}" if audio_index is not None else "1:a:0?"
+            enc += ["-ss", in_str, "-t", dur_str, "-i", str(src),
+                    "-map", "0:v:0", "-map", amap, "-c:a", "copy"]
+        enc += ["-vf", rp.ENCODE_VF] + list(venc) + rp.COLOR_ARGS + ["-sn", out]
+        return dec, enc
 
     def _smartcut_status(self, s):
         """Этап от воркера: становится подписью общей строки (_report_cut), а не
@@ -1048,7 +1183,10 @@ class EditTabExportMixin:
 
     def _execute_cut_and_process(self, in_s, out_s, out_path=None, src=None,
                                  audio_only=False, burn_subs=False,
-                                 project=None, name_stem=None):
+                                 project=None, name_stem=None,
+                                 still_fps=None, cut_tag="_обрез",
+                                 batch_next=None, with_overlays=True,
+                                 batch_step=None):
         """Кнопка «Обрезать и обработать»: режет диапазон [in_s,out_s) И сразу
         применяет вкладку «Обработка» ЕЁ ТЕКУЩИМИ настройками (CRF/preset/
         скорость/loudnorm/fps/…) — одним ffmpeg-проходом внутри
@@ -1084,7 +1222,17 @@ class EditTabExportMixin:
         склейку и «Обработку» ProcessWorker делает ОДНИМ кодированием (см.
         ProcessProjectMixin). src тогда — первый файл проекта (папка по
         умолчанию), а дорожки, накладки и субтитры открытого файла к проекту
-        не относятся. Итог называется name_stem + суффиксы «Обработки»."""
+        не относятся. Итог называется name_stem + суффиксы «Обработки».
+
+        still_fps — src это картинка (режим «картинка → видео»): [in_s, out_s)
+        задаёт длину ролика, кадры с частотой still_fps «Обработка» получает
+        трубой (item['still'], process_reveal). cut_tag — что дописать к имени
+        вместо «_обрез».
+
+        Пакет картинок (_export_still_pixelize): batch_next — запуск следующей
+        картинки после удачного сохранения этой (вместо итогового «Готово»),
+        batch_step — (номер, всего) для подписи, with_overlays=False — не
+        класть накладки, расставленные по открытой картинке."""
         src = _api.Path(src) if src else self.actual_source_file
         if not src or not src.exists():
             _api.msgbox_warning(self, "Внимание", "Файл не загружен.")
@@ -1117,6 +1265,8 @@ class EditTabExportMixin:
         force_overwrite = bool(out_path)
 
         phase = "Обработка звука…" if audio_only else "Обработка…"
+        if batch_step and batch_step[1] > 1:
+            phase = f"Обработка {batch_step[0]}/{batch_step[1]}…"
         # run['worker'] — воркер этой обрезки, пока она не дождалась очереди — None;
         # run['entry'] — её место в очереди «Обработки» (для отмены).
         run = {'worker': None, 'entry': None}
@@ -1147,11 +1297,16 @@ class EditTabExportMixin:
                     # «Перекодировать видео» его кодирует кодер Монтажа.
                     'fallback_venc': self._video_encoder_args()}
             if burn_subs and not audio_only:
-                # Субтитры открытого файла — в его куски проекта (как и звук,
-                # см. _project_retarget_audio); куски других файлов без них.
+                # Субтитры каждого файла — в его куски проекта, дорожкой,
+                # выбранной для этого файла (_project_burn_subs).
                 subs = self._project_burn_subs()
                 if subs:
                     item['project_subs'] = subs
+        elif still_fps:
+            item = {'iid': iid, 'path': str(src), 'type': 'MEDIA',
+                    'dur': max(0.0, out_s - in_s), 'is_done': False,
+                    'still': {'fps': int(still_fps)}, 'audio_only': False,
+                    'remove_audio': True}     # у картинки звука нет
         else:
             item = {'iid': iid, 'path': str(src), 'type': 'MEDIA',
                     'dur': max(0.0, out_s - in_s), 'is_done': False,
@@ -1169,7 +1324,7 @@ class EditTabExportMixin:
         # кадру с картинкой — ровно как это видно в плеере Монтажа. Аудио-режим
         # видеоряда не выводит, поэтому там накладки не рендерим вовсе.
         if not audio_only and project is None:
-            ovl = self._render_export_overlays()
+            ovl = self._render_export_overlays() if with_overlays else None
             if ovl:
                 item['overlays'] = ovl
                 item['overlay_format'] = self._overlay_pix_fmt(src)
@@ -1181,6 +1336,25 @@ class EditTabExportMixin:
                 spec = self._burn_subs_spec(src, in_s)
                 if spec:
                     item['burn_subs'] = spec
+            # Кадрирование и эффект проявления — тем же кодированием
+            # «Обработки» (см. si_hyx_parts/workers/process_reveal.py).
+            crop_fn = getattr(self, "_video_crop_filter", None)
+            crop = crop_fn() if crop_fn is not None else None
+            pix_on = getattr(self, "_pixelize_active", False)
+            if (crop or pix_on) and self._process_tab_encodes_video():
+                reveal = {}
+                if crop:
+                    reveal['crop'] = crop
+                if pix_on:
+                    fx = self._reveal_video_effect()
+                    if fx:
+                        reveal.update(effect=fx, steps=int(self._pixelize_steps),
+                                      dvd_media=self._dvd_folder())
+                    else:
+                        reveal['pixelize'] = (int(self._pixelize_steps),
+                                              int(self._pixelize_block))
+                if reveal:
+                    item['reveal'] = reveal
         def _on_progress(p_iid, pct, _iid=iid):
             if p_iid == _iid:
                 self._on_cut_progress(pct)
@@ -1223,7 +1397,7 @@ class EditTabExportMixin:
                 # всегда .mp4, даже если источник .mkv).
                 temp_stem, temp_ext = _api.os.path.splitext(_api.os.path.basename(temp_out))
                 tail = temp_stem[len(stem):] if temp_stem.startswith(stem) else ("_" + temp_stem)
-                final_out = str(out_dir / f"{stem if name_stem else stem + '_обрез'}{tail}{temp_ext}")
+                final_out = str(out_dir / f"{stem if name_stem else stem + cut_tag}{tail}{temp_ext}")
                 # Второй отрезок ИЗ ТОГО ЖЕ файла с теми же настройками даёт
                 # ровно то же имя — и раньше «Перезаписать файл» (галочка
                 # включена по умолчанию) молча стирала первый клип. Правило
@@ -1254,6 +1428,12 @@ class EditTabExportMixin:
                                  _api.os.path.normpath(final_out))
                 if is_loaded:
                     self.load_file(final_out)
+                if batch_next is not None and not getattr(self, "_cut_cancelled", False):
+                    if self.main is not None and hasattr(self.main, "log"):
+                        step = f" {batch_step[0]}/{batch_step[1]}" if batch_step else ""
+                        self.main.log(f"Видео-проявление из картинки{step} готово: {final_out}")
+                    _api.QTimer.singleShot(0, batch_next)
+                    return
                 self._progress_result_path = final_out
                 self.on_ffmpeg_finished(True, "Готово (Обработка)")
             except Exception as e:

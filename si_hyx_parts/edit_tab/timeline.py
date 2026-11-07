@@ -920,7 +920,7 @@ class EditTabTimelineMixin:
         # Формат HDR-кадров плеера (P010 у аппаратного декодера, YUV420P10 у
         # программного) до его первого кадра угадываем по настройке; первый
         # же кадр плеера уточнит (_on_player_frame_format).
-        hw = bool(_api.os.environ.get("QT_FFMPEG_DECODING_HW_DEVICE_TYPES"))
+        hw = _api.hw_video_decode_enabled()
         eng.set_source(src, self.fps or 0.0, hw_decode=hw)
         vw = getattr(self, "video_widget", None)
         if isinstance(vw, _api.VideoCanvas):
@@ -1251,6 +1251,10 @@ class EditTabTimelineMixin:
         # Прогрев вернётся, когда серия шагов утихнет (см. _end_scrub_painted).
         if getattr(self, "_prerolling", False):
             self._preroll_cancel()
+        # Шаг во время просмотра на деках (основной плеер стоит на прошлом
+        # куске) — сначала стоп просмотра: шаг идёт от кадра на экране.
+        if getattr(self, "_deck_on", False):
+            self.project_stop()
         playing = (self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState)
         # Куда идём — туда и греется буфер кадров, в том числе у прогрева и
         # точного кадра после серии (см. _show_exact_frame).

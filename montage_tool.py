@@ -20,7 +20,11 @@
   dry-run <проект.json> <выход>   команда ffmpeg и граф без запуска;
   render <проект.json> <выход>    сборка: прогресс (-progress), отмена,
                              длинный граф — файлом, +faststart; --preview —
-                             540p и кодировщик видеокарты;
+                             540p и кодировщик видеокарты; проект видео —
+                             рядом (<итог>.montage.json) и во вкладку
+                             «Монтаж» (montage_handoff; --no-project — нет);
+                             --audio-copy — звук песни как есть, без
+                             перекодирования (audio_copy_source);
   still <проект.json> <t> <кадр.png>        кадр проекта на времени t;
   contact-sheet <проект.json> <t0> <t1> <n> <лист.png>   n кадров сеткой
                              с временем проекта и id клипа под каждым;
@@ -65,8 +69,9 @@ MCP-сервер с этими командами как инструмента�
 Долгие команды (music, analyze с видами карты песни) пишут этапы строками
 JSON в stderr (--progress) и отменяются файлом (--cancel-file). Кэш, модели
 по требованию с SHA-256 и обработчики — si_hyx_parts/montage_tool/jobs.py.
-render, still, preview и contact-sheet перед графом готовят шейдеры Anime4K
-и кэш замедления RIFE (enhance.py; dry-run — только отчёт enhance).
+render, still, preview и contact-sheet перед графом готовят шейдеры Anime4K,
+кэш вырезки, замедления RIFE и апскейла (enhance.py; dry-run — только отчёт
+enhance).
 
 Модуль не импортирует PyQt6 (config, utils, edit_tab): ffmpeg ищет
 ffmpeg_env, свойства файлов — media_probe, граф — montage_project.build_export,
@@ -93,6 +98,7 @@ import tempfile
 import ffmpeg_env
 import hdr_tonemap
 import media_probe
+import montage_handoff
 import montage_project
 from ffmpeg_env import CREATE_NO_WINDOW, FFMPEG, FFPROBE, escape_filter_path
 
@@ -126,8 +132,8 @@ from si_hyx_parts.montage_tool.project_io import (  # noqa: E402,F401
     load_project_file, project_from_data, read_project_json)
 from si_hyx_parts.montage_tool.timeline import describe_project  # noqa: E402,F401
 from si_hyx_parts.montage_tool.render import (  # noqa: E402,F401
-    PREVIEW_SHORT, check_output, dry_run, export_command, missing_files, preview_settings,
-    render, working_encoders)
+    PREVIEW_SHORT, audio_copy_source, check_output, dry_run, export_command, missing_files,
+    preview_settings, render, working_encoders)
 from si_hyx_parts.montage_tool.inspection import (  # noqa: E402,F401
     SHEET_MAX, ask_model, contact_sheet, draw_sheet, gemini_key, preview, sheet_times, still)
 from si_hyx_parts.montage_tool.jobs import (  # noqa: E402,F401
@@ -141,14 +147,17 @@ from si_hyx_parts.montage_tool.music import (  # noqa: E402,F401
     clip_mapper, cut_segment, drum_hits, map_markers, music_file, music_project, shift_map,
     snap_frame, snap_slots, song_map, song_segment)
 from si_hyx_parts.montage_tool.library import (  # noqa: E402,F401
-    CAPTION_GPU_LAYERS, INDEX_VERSION, caption_shots, connect, default_db, detect_oped,
+    CAPTION_GPU_LAYERS, CAPTION_PARALLEL, INDEX_VERSION, caption_shots, connect, default_db,
+    detect_oped,
     index_library, library_stats, match_runs, recluster_characters, rename_character, search,
     shot_sheet)
 from si_hyx_parts.montage_tool.dialogue import (  # noqa: E402,F401
     DEFAULT_SPEECH_MODEL, find_lines, group_lines, transcribe_file)
 from si_hyx_parts.montage_tool.typography import (  # noqa: E402,F401
     LAYOUTS, REVEALS, add_lyrics, add_words, align_lyrics, fit_size, lyric_items, project_words,
-    read_lyrics, text_canvas, text_width, word_items)
+    read_lyrics, syllables, text_canvas, text_width, word_items)
+from si_hyx_parts.montage_tool.text_color import (  # noqa: E402,F401
+    auto_text_color, frame_rgb, resolve_auto_colors, text_color)
 from si_hyx_parts.montage_tool.styles import (  # noqa: E402,F401
     apply_preset, list_styles, load_style, pick_font, style_report, style_role, styles_dir)
 from si_hyx_parts.montage_tool.cards import (  # noqa: E402,F401

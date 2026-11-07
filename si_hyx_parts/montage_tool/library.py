@@ -7,20 +7,23 @@ Public namespace: montage_tool.
 SQLite (по умолчанию ~/.cache/si-hyx-montage/index/library.sqlite) и
 миниатюры в кэше. Файл переиндексируется, только если изменились размер или
 время правки (или версия индекса); перенесённый файл узнаётся по хэшу
-(размер + первые и последние 4 МБ). Один файл — по очереди этапами, каждая
-модель грузится на свой этап и выгружается (память общая с видеокартой):
-декод и планы (shots.py), миниатюры, лица/головы/фигуры → крупность плана,
-CCIP по фигурам → персонажи, теги WD, текст, цвета, речь, отпечаток звука;
+(размер + первые и последние 4 МБ). Один файл — этапами, каждая модель
+грузится на свой этап и выгружается (память общая с видеокартой):
+отпечаток звука (опенинг и эндинг, уже встреченные в папке, дальше не
+разбираются), декод и планы (shots.py), миниатюры; затем двумя потоками —
+на iGPU лица/головы/фигуры → крупность плана и теги WD, на CPU текст и
+CCIP по фигурам → персонажи; потом речь;
 по запросу — подписи планов локальной моделью зрения (caption_shots).
-После файлов — кластеры персонажей по всей библиотеке (имена, данные
-characters --rename, переходят к новому кластеру по большинству) и
-повторы звука ≥ 60 с между файлами (chromaprint) → опенинг/эндинг; такие
-планы по умолчанию не ищутся. Процесс идёт с пониженным приоритетом и под
-общим замком моделей (chiptune.gate.model_slot)."""
+После файлов — повторы звука ≥ 60 с между файлами (chromaprint) →
+опенинг/эндинг (такие планы по умолчанию не ищутся) и кластеры персонажей
+по папкам (имена, данные characters --rename, переходят к новому кластеру
+по большинству). Процесс идёт с пониженным приоритетом и под общим замком
+моделей (chiptune.gate.model_slot)."""
 import collections
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 
 import numpy as np
@@ -180,6 +183,31 @@ def _chromaprint(path):
     return np.frombuffer(raw[: len(raw) // 4 * 4], dtype="<u4")
 
 
+def _known_oped(con, path, fpr):
+    """Куски файла, чей звук ≥ 60 с повторяет уже размеченный файл той же
+    папки (опенинг и эндинг серии): [(t0, t1)] в секундах. Такие планы не
+    разбираются — их по умолчанию не ищут, а у каждой серии они те же."""
+    if len(fpr) < 50:
+        return []
+    folder = _api.os.path.dirname(path)
+    out = []
+    for r in con.execute("SELECT f.path, p.data FROM prints p JOIN files f ON f.id=p.file_id"):
+        if r["path"] == path or _api.os.path.dirname(r["path"]) != folder:
+            continue
+        for a0, a1, _b0, _b1 in match_runs(fpr, np.frombuffer(r["data"], "<u4")):
+            if not any(min(a1, t1) - max(a0, t0) > 0 for t0, t1 in out):
+                out.append((a0, a1))
+    return sorted(out)
+
+
+def _oped_kind(t0, t1, ranges, duration):
+    """op/ed, если план больше чем наполовину внутри куска ranges, иначе ""."""
+    for a, b in ranges:
+        if min(t1, b) - max(t0, a) > 0.5 * (t1 - t0):
+            return "op" if (a + b) / 2 < 0.5 * (duration or 1) else "ed"
+    return ""
+
+
 def _speech(path, shots_t):
     """Доля речи в каждом плане (speech_sync.speech_activity, как analyze)."""
     try:
@@ -200,7 +228,31 @@ def _speech(path, shots_t):
     return out
 
 
-def _index_file(con, path, st, fhash, ctl, tagger_kind, timing):
+class _Lane(threading.Thread):
+    """Этап файла своим потоком рядом с основным; fn(quit) бросает работу,
+    когда quit поднят. result() — секунды этапа; ошибка потока — там же."""
+
+    def __init__(self, fn):
+        super().__init__(daemon=True)
+        self.fn, self.error, self.seconds = fn, None, 0.0
+        self.quit = threading.Event()
+
+    def run(self):
+        t = time.monotonic()
+        try:
+            self.fn(self.quit)
+        except Exception as e:           # noqa: BLE001 — отдаётся в result()
+            self.error = e
+        self.seconds = round(time.monotonic() - t, 2)
+
+    def result(self):
+        self.join()
+        if self.error is not None:
+            raise self.error
+        return self.seconds
+
+
+def _index_file(con, path, st, fhash, ctl, tagger_kind, timing, gpu=True):
     import cv2
     tmp_root = _api.cache_dir("index", "tmp")
     tmp = _api.tempfile.mkdtemp(prefix="f", dir=tmp_root)
@@ -213,12 +265,23 @@ def _index_file(con, path, st, fhash, ctl, tagger_kind, timing):
         clock[0] = now
 
     try:
+        # Отпечаток звука — первым (секунды): по нему опенинг и эндинг серии
+        # известны до разбора кадров, их планы дальше не разбираются.
+        ctl.stage("fingerprint")
+        try:
+            fpr = _chromaprint(path)
+        except _api.ToolError:
+            fpr = np.zeros(0, "<u4")
+        oped_ranges = _known_oped(con, path, fpr)
+        lap("fingerprint")
         fp = _shots.FramePass(path, tmp, ctl, _api.os.path.join(tmp, "scdet.txt"))
         ctl.stage("decode", path=path, frames=fp.frames_est)
         stats = _shots.FrameStats(fp.frames_est)
         # TransNetV2 — в своём потоке по мере декода (onnxruntime отпускает GIL).
-        tns = _shots.TransNetStream(stats, _vision.session(
-            _api.asset("shots/transnetv2.onnx", ctl), threads=6), ctl)
+        tn_model = _api.asset("shots/transnetv2.onnx", ctl)
+        # Хвост окон после декода — ещё и на CPU, он к этому времени свободен.
+        tns = _shots.TransNetStream(stats, _vision.session(tn_model, threads=6, dml=gpu, worker=True),
+                                    ctl, tail=lambda: _vision.session(tn_model, threads=6, dml=False))
         tns.start()
         try:
             for i, frame in enumerate(fp):
@@ -245,7 +308,9 @@ def _index_file(con, path, st, fhash, ctl, tagger_kind, timing):
             keys = [_sample_index(t, t0, t1, count) for t in (t0 + 0.15 * L, t0 + 0.5 * L,
                                                                t1 - 0.15 * L)]
             rows.append(dict(feat, idx=i, kind=kind, f0=a, f1=b, t0=round(t0, 4), t1=round(t1, 4),
-                             keys=keys, mid=_api.os.path.join(tmp, f"{keys[1]:06d}.jpg")))
+                             keys=keys, mid=_api.os.path.join(tmp, f"{keys[1]:06d}.jpg"),
+                             oped=_oped_kind(t0, t1, oped_ranges, fp.duration)))
+        timing["oped_shots"] = sum(1 for r in rows if r["oped"])
         # Миниатюры 320 px: три ключевых кадра плана.
         for r in rows:
             paths = []
@@ -262,22 +327,26 @@ def _index_file(con, path, st, fhash, ctl, tagger_kind, timing):
         lap("thumbs")
 
         def mids():
+            """Средние кадры планов вне опенинга и эндинга."""
             for r in rows:
+                if r["oped"]:
+                    continue
                 img = cv2.imread(r["mid"])
                 yield r, (cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else None)
 
         # Почти тот же средний кадр, что у прошлого плана серии (диалог
         # «восьмёркой»: A-B-A-B), — его теги, текст и персонажи не считаются
         # заново, а копируются (twin): тегам ~0,8 с и CCIP ~0,4 с на кадр.
-        sigs = []
+        sigs = [None] * len(rows)           # опенинг и эндинг в близнецы не идут
+        H = W = 0
         for r, img in mids():
             if img is None:
-                sigs.append(None)
                 continue
+            H, W = img.shape[:2]
             g = cv2.resize(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY), (32, 18),
                            interpolation=cv2.INTER_AREA).astype(np.float32).ravel()
             g -= g.mean()
-            sigs.append(g / (np.linalg.norm(g) + 1e-6))
+            sigs[r["idx"]] = g / (np.linalg.norm(g) + 1e-6)
         for i, r in enumerate(rows):
             r["twin"] = None
             if sigs[i] is None:
@@ -287,81 +356,136 @@ def _index_file(con, path, st, fhash, ctl, tagger_kind, timing):
                     r["twin"] = j
                     break
 
-        det = {}
-        for kind in ("face", "head", "person"):
-            ctl.stage("detect", model=kind)
-            d = _vision.Detector(kind, ctl)
+        # Теги — из общей очереди планов: полоса тегов (на iGPU, если есть
+        # обработчик DirectML) берёт по пачке, а основной поток, кончив свои
+        # этапы, помогает ей на CPU, чтобы не ждать.
+        to_tag = [r for r in rows if r["twin"] is None and not r["oped"]]
+        taken = [0]
+        take_lock = threading.Lock()
+        detected = threading.Event()
+
+        def detect_shots(quit_, worker):
+            """Лица, головы и фигуры средних кадров, затем крупность и цвета."""
+            for kind in ("face", "head", "person"):
+                ctl.stage("detect", model=kind)
+                d = _vision.Detector(kind, ctl, worker=worker)
+                for r, img in mids():
+                    if quit_.is_set():
+                        return
+                    ctl.check()
+                    r[kind] = d.detect(img) if img is not None else []
+                if isinstance(d.sess, _vision.WorkerSession):
+                    d.sess.close()
+                del d
+            for r, img in mids():
+                if img is None:
+                    r.update(scale="none", face_frac=0.0, colors=[])
+                    continue
+                r["scale"], r["face_frac"] = _scale_of(r["face"], r["head"], r["person"], H)
+                r["colors"] = _colors(img)
+            detected.set()
+
+        def tag_shots(quit_, worker=gpu):
+            tg = _vision.Tagger(tagger_kind, ctl, worker=worker)
+            while not quit_.is_set():
+                ctl.check()
+                with take_lock:
+                    part = to_tag[taken[0]:taken[0] + tg.step]
+                    taken[0] += len(part)
+                if not part:
+                    return
+                imgs = [(r, cv2.imread(r["mid"])) for r in part]
+                imgs = [(r, cv2.cvtColor(img, cv2.COLOR_BGR2RGB)) for r, img in imgs if img is not None]
+                for (r, _img), res in zip(imgs, tg.tag_batch([img for _r, img in imgs])):
+                    r["general"], r["chars"], r["rating"] = res
+
+        def gpu_lane(quit_):
+            # С видеокартой полоса сначала гонит детекторы на iGPU, а процессор
+            # тем временем читает текст; без неё детекторы — в основном потоке.
+            if gpu:
+                detect_shots(quit_, True)
+                timing["detect_gpu"] = round(time.monotonic() - lane_t0, 2)
+            if not quit_.is_set():
+                ctl.stage("tags", model=tagger_kind)
+                tag_shots(quit_)
+
+        def ocr_shots():
+            ctl.stage("ocr")
+            ocr = _vision.OCR()
             for r, img in mids():
                 ctl.check()
-                r[kind] = d.detect(img) if img is not None else []
-            det[kind] = d
-            del d
-        H = W = 0
-        for r, img in mids():
-            if img is None:
-                r.update(scale="none", face_frac=0.0, colors=[])
-                continue
-            H, W = img.shape[:2]
-            r["scale"], r["face_frac"] = _scale_of(r["face"], r["head"], r["person"], H)
-            r["colors"] = _colors(img)
-        lap("detect")
-        ctl.stage("characters")
-        ccip = _vision.CCIP(ctl)
-        crops = []
-        for r, img in mids():
-            if img is None or r["twin"] is not None:
-                continue
-            # Персонажи — по главной фигуре; вторая — если не меньше 60 % первой
-            # (CCIP ~0,4 с на фигуру на CPU).
-            boxes = sorted(r["person"], key=lambda b: -(b[2] - b[0]) * (b[3] - b[1]))[:2]
-            if len(boxes) == 2 and ((boxes[1][2] - boxes[1][0]) * (boxes[1][3] - boxes[1][1])
-                                    < 0.6 * (boxes[0][2] - boxes[0][0]) * (boxes[0][3] - boxes[0][1])):
-                boxes = boxes[:1]
-            if not boxes:                     # без фигуры — голова с плечами
-                boxes = [(max(0, b[0] - 0.4 * (b[2] - b[0])), b[1],
-                          min(W, b[2] + 0.4 * (b[2] - b[0])), min(H, b[3] + 1.2 * (b[3] - b[1])), b[4])
-                         for b in sorted(r["head"], key=lambda b: -(b[3] - b[1]))[:2]]
-            for b in boxes:
-                x0, y0, x1, y1 = (int(v) for v in b[:4])
-                if y1 - y0 >= 48 and x1 - x0 >= 24:
-                    crops.append((r["idx"], [x0, y0, x1, y1], img[y0:y1, x0:x1]))
-        feats = ccip.features([c for _i, _b, c in crops]) if crops else np.zeros((0, 768), np.float32)
-        del ccip
-        own = collections.defaultdict(list)
-        for k, (i, b, _c) in enumerate(crops):
-            own[i].append((b, k))
-        for r in rows:                        # близнецу — фигуры его образца
-            if r["twin"] is not None:
-                for b, k in own.get(rows[r["twin"]]["idx"], []):
-                    crops.append((r["idx"], b, None))
-                    feats = np.concatenate([feats, feats[k:k + 1]])
-        lap("ccip")
-        ctl.stage("tags", model=tagger_kind)
-        tg = _vision.Tagger(tagger_kind, ctl)
-        batch, owners = [], []
-        for r, img in mids():
-            if img is not None and r["twin"] is None:
-                batch.append(img)
-                owners.append(r)
-            if len(batch) >= 8:
-                for o, res in zip(owners, tg.tag_batch(batch)):
-                    o["general"], o["chars"], o["rating"] = res
-                batch, owners = [], []
-            ctl.check()
-        for o, res in zip(owners, tg.tag_batch(batch)):
-            o["general"], o["chars"], o["rating"] = res
-        del tg
-        lap("tags")
-        ctl.stage("ocr")
-        ocr = _vision.OCR()
-        for r, img in mids():
-            ctl.check()
-            if img is None:
-                r.update(text="", has_text=False, hardsub=False)
-                continue
-            if r["twin"] is None:
-                r["text"], r["has_text"], r["hardsub"] = _text_info(ocr.read(img), W, H)
-        del ocr
+                if img is None:
+                    r.update(text="", has_text=False, hardsub=False)
+                    continue
+                if r["twin"] is None:
+                    r["text"], r["has_text"], r["hardsub"] = _text_info(ocr.read(img), W, H)
+            del ocr
+            lap("ocr")
+
+        # Теги WD (треть времени файла) — своим потоком рядом с CCIP и текстом:
+        # те от тегов не зависят, а onnxruntime отпускает GIL. Замер Gate 07
+        # (411 планов): теги на iGPU параллельно с CPU — файл 492 с против 1129
+        # по очереди на CPU. Арслан 17 (438 планов): детекторы, CCIP и OCR на
+        # CPU шли 7 мин, теги на iGPU кончали на 3 мин раньше — поэтому
+        # детекторы ушли в полосу видеокарты, а процессор начинает с текста.
+        lane_t0 = time.monotonic()
+        tags_lane = _Lane(gpu_lane)
+        tags_lane.start()
+        try:
+            if gpu:
+                ocr_shots()
+                while not detected.wait(0.2):
+                    ctl.check()
+                    if not tags_lane.is_alive():
+                        tags_lane.result()           # ошибка полосы — здесь
+                        raise _api.ToolError("internal", "детекторы не завершились")
+                lap("detect_wait")
+            else:
+                detect_shots(threading.Event(), False)
+                lap("detect")
+            ctl.stage("characters")
+            ccip = _vision.CCIP(ctl)
+            crops = []
+            for r, img in mids():
+                if img is None or r["twin"] is not None:
+                    continue
+                # Персонажи — по главной фигуре; вторая — если не меньше 60 % первой
+                # (CCIP ~0,4 с на фигуру на CPU).
+                boxes = sorted(r["person"], key=lambda b: -(b[2] - b[0]) * (b[3] - b[1]))[:2]
+                if len(boxes) == 2 and ((boxes[1][2] - boxes[1][0]) * (boxes[1][3] - boxes[1][1])
+                                        < 0.6 * (boxes[0][2] - boxes[0][0]) * (boxes[0][3] - boxes[0][1])):
+                    boxes = boxes[:1]
+                if not boxes:                     # без фигуры — голова с плечами
+                    boxes = [(max(0, b[0] - 0.4 * (b[2] - b[0])), b[1],
+                              min(W, b[2] + 0.4 * (b[2] - b[0])), min(H, b[3] + 1.2 * (b[3] - b[1])), b[4])
+                             for b in sorted(r["head"], key=lambda b: -(b[3] - b[1]))[:2]]
+                for b in boxes:
+                    x0, y0, x1, y1 = (int(v) for v in b[:4])
+                    if y1 - y0 >= 48 and x1 - x0 >= 24:
+                        crops.append((r["idx"], [x0, y0, x1, y1], img[y0:y1, x0:x1]))
+            feats = ccip.features([c for _i, _b, c in crops]) if crops else np.zeros((0, 768), np.float32)
+            del ccip
+            own = collections.defaultdict(list)
+            for k, (i, b, _c) in enumerate(crops):
+                own[i].append((b, k))
+            for r in rows:                        # близнецу — фигуры его образца
+                if r["twin"] is not None:
+                    for b, k in own.get(rows[r["twin"]]["idx"], []):
+                        crops.append((r["idx"], b, None))
+                        feats = np.concatenate([feats, feats[k:k + 1]])
+            lap("ccip")
+            if not gpu:
+                ocr_shots()
+            if tags_lane.is_alive() and len(to_tag) - taken[0] > 8:
+                ctl.stage("tags", model=tagger_kind, helper="cpu")
+                tag_shots(tags_lane.quit, worker=False)
+                lap("tags_cpu")
+        except BaseException:
+            tags_lane.quit.set()
+            tags_lane.join()
+            raise
+        timing["tags"] = tags_lane.result()
+        lap("tags_wait")
         for r in rows:
             if r["twin"] is not None:
                 src = rows[r["twin"]]
@@ -369,16 +493,9 @@ def _index_file(con, path, st, fhash, ctl, tagger_kind, timing):
                     if k in src:
                         r[k] = src[k]
         timing["twins"] = sum(1 for r in rows if r["twin"] is not None)
-        lap("ocr")
         ctl.stage("speech")
         speech = _speech(path, [(r["t0"], r["t1"]) for r in rows])
         lap("speech")
-        ctl.stage("fingerprint")
-        try:
-            fpr = _chromaprint(path)
-        except _api.ToolError:
-            fpr = np.zeros(0, "<u4")
-        lap("fingerprint")
         # Запись — одной транзакцией.
         old = con.execute("SELECT id FROM files WHERE path=?", (path,)).fetchone()
         with con:
@@ -403,7 +520,7 @@ def _index_file(con, path, st, fhash, ctl, tagger_kind, timing):
                      json.dumps(r["accents"]), len(r.get("face", [])), len(r.get("head", [])),
                      len(r.get("person", [])), r.get("scale", "none"), round(r.get("face_frac", 0.0), 3),
                      r.get("rating", ""), r.get("text", ""), int(r.get("has_text", False)),
-                     int(r.get("hardsub", False)), sp, "", json.dumps(r["keyframes"]), "", ""))
+                     int(r.get("hardsub", False)), sp, r["oped"], json.dumps(r["keyframes"]), "", ""))
                 ids[r["idx"]] = cur.lastrowid
                 tags = [(ids[r["idx"]], t, s, 0) for t, s in r.get("general", {}).items()]
                 tags += [(ids[r["idx"]], t, s, 4) for t, s in r.get("chars", {}).items()]
@@ -430,25 +547,75 @@ def _drop_file(con, fid):
 
 
 # ── Персонажи ────────────────────────────────────────────────────────────────
+CHAR_LINK = 0.15                       # средняя разница CCIP внутри кластера
+CHAR_MIN = 3                           # меньше фигур — не персонаж
+CHAR_GROUP_MAX = 10000                 # фигур на одну кластеризацию: пары — 0,4 ГБ и копия у scipy
+
+
+def _char_labels(ccip, feats, ctl):
+    """Кластеры фигур одной группы: средняя связь (UPGMA) по разнице CCIP с
+    порогом CHAR_LINK. DBSCAN из ccip_cluster.json сцеплял всё: на кадрах
+    серии у фигуры сотни соседей ближе eps, и цепочка собирала 98 % фигур
+    библиотеки (и Zipang с Арсланом) в одного «персонажа»; средняя связь
+    цепочек не строит. Метки 0…; мелкие кластеры — -1."""
+    from scipy.cluster.hierarchy import fcluster, linkage
+    n = len(feats)
+    if n < CHAR_MIN:
+        return np.full(n, -1, int)
+    cond = np.empty(n * (n - 1) // 2, np.float64)    # пары i<j построчно, как у scipy
+    step = 1024
+    for i in range(0, n, step):
+        ctl.check()
+        a = feats[i:i + step]
+        rows = np.full((len(a), n), np.inf, np.float32)
+        for j in range(i, n, step):
+            b = feats[j:j + step]
+            rows[:, j:j + len(b)] = ccip.differences(a) if j == i else ccip.differences(a, b)
+        for k in range(len(a)):
+            r = i + k
+            start = r * n - r * (r + 1) // 2
+            cond[start:start + n - r - 1] = rows[k, r + 1:]
+    labels = fcluster(linkage(cond, "average"), CHAR_LINK, criterion="distance") - 1
+    sizes = np.bincount(labels)
+    keep = {lab: k for k, lab in enumerate(np.flatnonzero(sizes >= CHAR_MIN))}
+    return np.array([keep.get(lab, -1) for lab in labels], int)
+
+
 def recluster_characters(con, ctl=None):
-    """Кластеры CCIP по всем фигурам библиотеки. Имя старого кластера
-    переходит к новому, где оказалось большинство его фигур."""
+    """Кластеры CCIP по фигурам библиотеки — отдельно для каждой папки
+    (серии одного тайтла): между тайтлами персонажи не сливаются, а пар
+    не n² на всю библиотеку. Имя старого кластера переходит к новому, где
+    оказалось большинство его фигур."""
     ctl = ctl or _api.NO_CONTROL
-    rows = con.execute("SELECT id, feat, char_id FROM crops ORDER BY id").fetchall()
+    rows = con.execute("SELECT k.id, k.feat, k.char_id, f.path FROM crops k "
+                       "JOIN shots s ON s.id=k.shot_id JOIN files f ON f.id=s.file_id "
+                       "WHERE COALESCE(s.oped,'')='' ORDER BY f.path, k.id").fetchall()
     if not rows:
         return 0
     ctl.stage("characters", crops=len(rows))
     feats = np.stack([np.frombuffer(r["feat"], np.float16).astype(np.float32) for r in rows])
     ccip = _vision.CCIP(ctl)
-    dist = ccip.differences(feats)
-    params = ccip.cluster.get("dbscan_2") or {"eps": ccip.threshold, "min_samples": 2}
-    labels = _vision.dbscan(dist, float(params["eps"]), int(params["min_samples"]))
+    groups = collections.defaultdict(list)
+    for k, r in enumerate(rows):
+        groups[_api.os.path.dirname(r["path"])].append(k)
+    labels = np.full(len(rows), -1, int)
+    base = 0
+    for idx in groups.values():
+        for p in range(0, len(idx), CHAR_GROUP_MAX):          # очень длинная папка — частями
+            part = np.array(idx[p:p + CHAR_GROUP_MAX])
+            lab = _char_labels(ccip, feats[part], ctl)
+            labels[part[lab >= 0]] = lab[lab >= 0] + base
+            base += int(lab.max()) + 1 if (lab >= 0).any() else 0
+    del ccip
     names = {r["id"]: r["name"] for r in con.execute("SELECT id, name FROM characters")}
-    old = [r["char_id"] for r in rows]
+    votes_of = collections.defaultdict(collections.Counter)
+    for r, l_ in zip(rows, labels):
+        if l_ >= 0 and r["char_id"] is not None:
+            votes_of[int(l_)][r["char_id"]] += 1
+    sizes = collections.Counter(int(l_) for l_ in labels if l_ >= 0)
     new_ids, taken = {}, set()
-    for lab in sorted(set(labels) - {-1}, key=lambda x: -int((labels == x).sum())):
-        votes = collections.Counter(o for o, l_ in zip(old, labels) if l_ == lab and o is not None)
-        pick = next((o for o, _n in votes.most_common() if o not in taken), None)
+    for lab, _n in sizes.most_common():
+        pick = next((o for o, _n in votes_of[lab].most_common() if o not in taken), None)
         new_ids[lab] = pick
         if pick is not None:
             taken.add(pick)
@@ -461,7 +628,8 @@ def recluster_characters(con, ctl=None):
         con.execute("DELETE FROM characters")
         for lab, cid in new_ids.items():
             con.execute("INSERT INTO characters(id,name,size) VALUES(?,?,?)",
-                        (cid, names.get(cid) or "", int((labels == lab).sum())))
+                        (cid, names.get(cid) or "", sizes[lab]))
+        con.execute("UPDATE crops SET char_id=NULL")       # фигуры опенингов — без персонажа
         con.executemany("UPDATE crops SET char_id=? WHERE id=?",
                         [(new_ids.get(int(l_)) if l_ >= 0 else None, r["id"])
                          for r, l_ in zip(rows, labels)])
@@ -664,41 +832,60 @@ CAPTION_PROMPT = ("One anime frame. In one English sentence of at most 20 words 
                   "shown (look, clothes), what they do and where, and the mood. No names.")
 CAPTION_TOKENS = 48
 CAPTION_GPU_LAYERS = 99
+# Слоты сервера (-np): несколько ответов за шаг генерации. Замер на Vega 7:
+# серия Арслана одна на iGPU — 2,3 с на план при -np 1, 2,05 с при 4 (упор
+# не в генерацию, а в картинку и подсказку: подпись в 12 слов вместо 20 —
+# лишь −13 %, текст на CPU — вдвое медленнее). Рядом с разметкой на
+# DirectML план подписывался 17 с — поэтому подписи идут после разметки
+# файла, а не одновременно с разметкой следующего.
+CAPTION_PARALLEL = 4
 
 
-def caption_shots(con, file_ids, ctl=None, gpu_layers=CAPTION_GPU_LAYERS, limit=None):
+def caption_shots(con, file_ids, ctl=None, gpu_layers=CAPTION_GPU_LAYERS, limit=None,
+                  parallel=CAPTION_PARALLEL, gpu=True):
     """Подписи планов (shots.caption) без подписи у файлов file_ids: один
-    запуск llama-server на все. {captions: {file_id: число}, время на план}."""
+    запуск llama-server на все, parallel вопросов одновременно. Опенинг и
+    эндинг не подписываются — их не ищут. {captions: {file_id: число},
+    время на план}."""
+    from concurrent.futures import ThreadPoolExecutor
     from si_hyx_parts.montage_tool import vision_local as _vl
     ctl = ctl or _api.NO_CONTROL
     todo = []
     for fid in file_ids:
         todo += con.execute("SELECT id, file_id, keyframes FROM shots WHERE file_id=? AND "
-                            "kind='shot' AND COALESCE(caption,'')='' ORDER BY idx",
-                            (fid,)).fetchall()
+                            "kind='shot' AND COALESCE(caption,'')='' AND COALESCE(oped,'')='' "
+                            "ORDER BY idx", (fid,)).fetchall()
     if limit is not None:
         todo = todo[:int(limit)]
     if not todo:
         return {"captions": {}, "seconds_per_shot": None}
     done = collections.Counter()
     t0 = time.monotonic()
-    with _vl.LlamaServer(_vl.DEFAULT_LOOK_MODEL, gpu_layers, ctl) as srv:
+    with _vl.LlamaServer(_vl.DEFAULT_LOOK_MODEL, gpu_layers, ctl, parallel=parallel, gpu=gpu) as srv:
         t_load = time.monotonic()
-        for k, r in enumerate(todo):
-            ctl.check()
+
+        def one(r):
             keys = [k for k in json.loads(r["keyframes"] or "[]") if _api.os.path.isfile(k)]
             if not keys:
-                continue
+                return r, ""
             url = _vl._image_url(keys[len(keys) // 2])
-            if k % 25 == 0:
-                ctl.stage("captions", shot=k + 1, total=len(todo))
             text = _vl.answer_text(srv.ask(_vl.chat_body([url], CAPTION_PROMPT,
                                                          max_tokens=CAPTION_TOKENS)))
-            text = " ".join(text.split())[:300]
-            if text:
-                with con:
-                    con.execute("UPDATE shots SET caption=? WHERE id=?", (text, r["id"]))
-                done[r["file_id"]] += 1
+            return r, " ".join(text.split())[:300]
+
+        # Ответы — потоками, запись — здесь (соединение SQLite одного потока).
+        pool = ThreadPoolExecutor(max(1, int(parallel)))
+        try:
+            for k, (r, text) in enumerate(pool.map(one, todo)):
+                ctl.check()
+                if k % 25 == 0:
+                    ctl.stage("captions", shot=k + 1, total=len(todo))
+                if text:
+                    with con:
+                        con.execute("UPDATE shots SET caption=? WHERE id=?", (text, r["id"]))
+                    done[r["file_id"]] += 1
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
     n = sum(done.values())
     return {"captions": {str(k): v for k, v in done.items()}, "load_s": round(t_load - t0, 1),
             "seconds_per_shot": round((time.monotonic() - t_load) / max(1, n), 2)}
@@ -707,12 +894,18 @@ def caption_shots(con, file_ids, ctl=None, gpu_layers=CAPTION_GPU_LAYERS, limit=
 # ── Индекс ───────────────────────────────────────────────────────────────────
 def index_library(target, db=None, ctl=None, force=False, tagger="vit", gemini=False,
                   gemini_model="", speech=None, captions=False,
-                  caption_gpu_layers=CAPTION_GPU_LAYERS):
+                  caption_gpu_layers=CAPTION_GPU_LAYERS, gpu=True, recluster=True):
     """Индекс файла или папки; новые и изменённые файлы — заново. gemini —
     ещё и описания сцен (describe_scenes) у файлов, где их нет; speech —
     {model, language, python}: реплики (dialogue.transcribe_file) у файлов,
     где их нет; captions — подписи планов локальной моделью (caption_shots)
-    у планов без подписи."""
+    у планов без подписи. gpu=False — без iGPU (ни DirectML, ни Vulkan
+    подписей): она же рисует экран, и её не уступить приоритетом процесса —
+    команда модели держит её по 0,6 с, и всё окно дёргается.
+    recluster=False — без пересчёта персонажей (очередь «Разметки AMV»
+    пересчитывает их один раз в конце: characters --recluster)."""
+    if not gpu:
+        caption_gpu_layers = 0
     ctl = ctl or _api.NO_CONTROL
     if tagger not in _vision.TAGGERS:
         raise _api.ToolError("usage", f"теггер: {', '.join(_vision.TAGGERS)}")
@@ -747,7 +940,7 @@ def index_library(target, db=None, ctl=None, force=False, tagger="vit", gemini=F
             timing = {}
             t = time.monotonic()
             with model_slot(ctl.stop):
-                res = _index_file(con, path, st, fhash, ctl, tagger, timing)
+                res = _index_file(con, path, st, fhash, ctl, tagger, timing, gpu)
             res["seconds"] = round(time.monotonic() - t, 1)
             results.append(res)
             changed.append(res["file_id"])
@@ -783,18 +976,19 @@ def index_library(target, db=None, ctl=None, force=False, tagger="vit", gemini=F
                     if e.code == "cancelled":
                         raise
                     out["speech"][str(fid)] = {"error": e.code, "message": e.message}
+        if changed:                          # до подписей: опенинги и эндинги не подписываются
+            out["oped"] = {str(k): v for k, v in detect_oped(con, ctl, changed).items()}
         if captions:
             ids = [res["file_id"] for res in results if res.get("file_id") is not None]
             try:
-                out["captions"] = caption_shots(con, ids, ctl, caption_gpu_layers)
+                out["captions"] = caption_shots(con, ids, ctl, caption_gpu_layers, gpu=gpu)
             except _api.ToolError as e:      # нет модели или сервер не поднялся — без подписей
                 if e.code == "cancelled":
                     raise
                 out["captions"] = {"error": e.code, "message": e.message}
-        if changed:
+        if changed and recluster:
             with model_slot(ctl.stop):
                 out["characters"] = recluster_characters(con, ctl)
-            out["oped"] = {str(k): v for k, v in detect_oped(con, ctl, changed).items()}
         out["totals"] = library_stats(con)
         return out
     except QualityError as e:

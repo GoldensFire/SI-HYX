@@ -180,17 +180,7 @@ class FullscreenVideo(_api.QWidget):
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(int(self.edit.vol_slider.value()))
         self.vol_slider.setFixedWidth(120)
-        # Прозрачный жёлоб (а не тёмный surface3) и белый бегунок без чёрной
-        # окантовки — чтобы за ползунком громкости не было чёрного прямоугольника.
-        self.vol_slider.setStyleSheet(
-            "QSlider { background: transparent; }"
-            "QSlider::groove:horizontal { background: rgba(255,255,255,0.22);"
-            " height: 6px; border-radius: 3px; }"
-            "QSlider::sub-page:horizontal { background: #cdd6f4; border-radius: 3px; }"
-            "QSlider::add-page:horizontal { background: rgba(255,255,255,0.22);"
-            " border-radius: 3px; }"
-            "QSlider::handle:horizontal { background: #ffffff; width: 13px;"
-            " height: 13px; margin: -4px 0; border-radius: 7px; }")
+        self.vol_slider.setStyleSheet(_api.VolumeSlider.bar_style())
         self.vol_slider.setFocusPolicy(_api.Qt.FocusPolicy.NoFocus)
         self.vol_slider.valueChanged.connect(self._on_volume_changed)
         row.addWidget(self.vol_slider)

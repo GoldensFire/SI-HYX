@@ -2,12 +2,14 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 """Меню дополнительных действий и экспорт появления в монтаже."""
 import edit_tab as _api
+from .amv_markup import AmvMarkupDialog
 from .entrance_dialog import EntranceDialog
 from .entrance_worker import EntranceWorker
 
 
 class EditTabEntranceMixin:
-    """Монтаж: меню «⋯» — появление картинки и удаление исходного файла."""
+    """Монтаж: меню «⋯» — появление картинки, разметка AMV, просмотр проекта
+    с эффектами (FX) и удаление исходного файла."""
 
     def _build_more_actions(self):
         self.btn_more_actions = _api.make_icon_btn("")
@@ -16,11 +18,19 @@ class EditTabEntranceMixin:
         self.btn_more_actions.setStyleSheet(self.btn_more_actions.styleSheet()
                                           + "\nQPushButton::menu-indicator { image: none; width: 0px; }")
         self._relax_width(self.btn_more_actions)
-        self.btn_more_actions.setToolTip("Дополнительно: появление, удаление исходного файла")
+        self.btn_more_actions.setToolTip(
+            "Дополнительно: появление, разметка AMV, удаление исходного файла")
         self.more_actions_menu = _api.QMenu(self.btn_more_actions)
         self.action_entrance = self.more_actions_menu.addAction(
             _api.get_icon("fa5s.magic"), "Появление")
         self.action_entrance.triggered.connect(self.create_entrance)
+        self.amv_menu = self.more_actions_menu.addMenu(_api.get_icon("fa5s.music"), "AMV")
+        self.action_amv_markup = self.amv_menu.addAction(
+            _api.get_icon("fa5s.tags"), "Разметка видео…")
+        self.action_amv_markup.setToolTip(
+            "Очередь разметки: планы, резы, персонажи и теги для сборки AMV")
+        self.action_amv_markup.triggered.connect(self.show_amv_markup)
+        self.more_actions_menu.setToolTipsVisible(True)
         self.more_actions_menu.addSeparator()
         self.action_delete_source = self.more_actions_menu.addAction(
             _api.get_icon("fa5s.trash-alt"), "Удалить исходный файл")
@@ -43,9 +53,29 @@ class EditTabEntranceMixin:
                   or (getattr(self, "video_stream_index", None) is not None
                       and getattr(self, "duration", 0) > 0.1))
         busy = self._entrance_busy()
-        self.btn_more_actions.setEnabled(has_file and not busy)
+        # Разметка AMV не зависит от открытого файла — меню доступно всегда.
+        self.btn_more_actions.setEnabled(True)
         self.action_delete_source.setEnabled(has_file and not busy)
         self.action_entrance.setEnabled(has_file and visual and not busy)
+
+    def show_amv_markup(self):
+        dialog = getattr(self, "_amv_markup", None)
+        if dialog is None:
+            self._amv_markup = dialog = AmvMarkupDialog(self)
+            dialog.progressChanged.connect(self._on_amv_markup_progress)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_amv_markup_progress(self, short):
+        """Прогресс разметки виден и при закрытом окне: в меню и подсказке «⋯»."""
+        self.amv_menu.setTitle(f"AMV — разметка {short}" if short else "AMV")
+        self.action_amv_markup.setText(
+            f"Разметка видео… ({short})" if short else "Разметка видео…")
+        tip = "Дополнительно: появление, разметка AMV, просмотр с эффектами, удаление исходного файла"
+        if short:
+            tip += f"\nИдёт разметка AMV: {short}"
+        self.btn_more_actions.setToolTip(tip)
 
     def create_entrance(self):
         self._refresh_more_actions()

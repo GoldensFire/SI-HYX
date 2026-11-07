@@ -2,7 +2,8 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """Слои кадра: обрезка исходника, прямоугольник наложения, маска формы,
-обводка, режим наложения и вырезанный персонаж. Public namespace: montage_project.
+обводка, тень, режим наложения и вырезанный персонаж. Public namespace:
+montage_project.
 
 Поля клипа (v3, пустые — как раньше):
   crop   [x0, y0, x1, y1] — кусок кадра исходника (доли), до вписывания: у
@@ -20,6 +21,11 @@
          обводка по альфе наложения (вырезанный персонаж, панель): альфа
          размывается и режется порогом (расширение), torn — край «рваной
          бумаги» неподвижным geq-смещением; цвет — lut, сам клип — поверх;
+  shadow {size — размытие, x, y — сдвиг (доли высоты кадра), opacity,
+         color} — мягкая тень по альфе наложения (окна-вставки, колонки):
+         силуэт цвета color размывается gblur и сдвигается, клип — поверх.
+         Тень кладётся после эффектов клипа: вспышка входа окна белит
+         окно, а не его тень;
   blend  normal|screen|add|lighten|multiply|darken|overlay|softlight —
          как наложение смешивается с нижними слоями: клип кладётся на
          нейтральный холст (чёрный, белый или серый) и смешивается blend в
@@ -47,6 +53,9 @@ _NEUTRAL = {"screen": "black", "add": "black", "lighten": "black", "multiply": "
             "darken": "white", "overlay": "0x808080", "softlight": "0x808080"}
 MASK_SHAPES = ("rect", "ellipse", "strip", "polygon")
 STROKE_STYLES = ("solid", "torn")
+# Тень наложения: (ключ, нижний предел, верхний, по умолчанию) — доли высоты кадра.
+SHADOW_FIELDS = (("size", 0.0, 0.08, 0.015), ("x", -0.05, 0.05, 0.0),
+                 ("y", -0.05, 0.05, 0.008), ("opacity", 0.0, 1.0, 0.6))
 MATTE_MODELS = ("anime", "rmbg")
 _MATTE_VERSION = 1
 _COLOR_RX = re.compile(r"#[0-9A-Fa-f]{6}")
@@ -139,6 +148,23 @@ def sanitize_stroke(raw):
     op = _num(raw.get("opacity"))
     if op is not None and op < 1.0:
         out["opacity"] = round(_clamp(op, 0.0, 1.0), 6)
+    return out
+
+
+def sanitize_shadow(raw):
+    """Тень под наложением: {size — размытие (sigma) в долях высоты кадра,
+    x, y — сдвиг в долях высоты, opacity, color}; пусто или opacity 0 —
+    тени нет, недостающие ключи — по умолчанию."""
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    out = {}
+    for k, lo, hi, dflt in SHADOW_FIELDS:
+        v = _num(raw.get(k))
+        out[k] = round(_clamp(dflt if v is None else v, lo, hi), 6)
+    if out["opacity"] <= 0:
+        return {}
+    color = raw.get("color", "#000000")
+    out["color"] = color.lower() if isinstance(color, str) and _COLOR_RX.fullmatch(color) else "#000000"
     return out
 
 
@@ -279,6 +305,30 @@ def stroke_chain(g, stroke, h, label):
             # стыке (цветность пары строк читала альфу соседнего среза) —
             # пиксели обводки плавали от сборки к сборке.
             f"[{sil}][{s0}]overlay=format=yuv420:threads=1")
+
+
+# ── Тень ─────────────────────────────────────────────────────────────────────
+def shadow_chain(g, shadow, h, label):
+    """Тень по альфе наложения: силуэт цвета color, размытый на size и
+    сдвинутый на x, y (доли высоты кадра h). Вход — [label], выход — без
+    метки. Запас кадра одинаков со всех сторон: центр наложения остаётся
+    на месте (overlay ставит его по overlay_w/2)."""
+    sig = shadow["size"] * h
+    dx = int(round(shadow["x"] * h / 2.0)) * 2
+    dy = int(round(shadow["y"] * h / 2.0)) * 2
+    pad = int(math.ceil((max(abs(dx), abs(dy)) + 3.0 * sig + 2.0) / 2.0)) * 2
+    y, u, v = _yuv(shadow["color"])
+    s0, s1, sh, fg = (g.label(x) for x in ("ha", "hb", "hc", "hd"))
+    op = shadow["opacity"]
+    fade = f":a='val*{_api._num(op)}'" if op < 1.0 else ""
+    blur = f",gblur=sigma={_api._num(sig)}:planes=8" if sig >= 0.3 else ""
+    return (f"[{label}]format=yuva420p,split[{s0}][{s1}];"
+            f"[{s1}]pad=iw+{2 * pad}:ih+{2 * pad}:{pad + dx}:{pad + dy}:color=black@0,"
+            f"lut=y={y}:u={u}:v={v}{fade}{blur}[{sh}];"
+            f"[{s0}]pad=iw+{2 * pad}:ih+{2 * pad}:{pad}:{pad}:color=black@0[{fg}];"
+            # Один поток — как у обводки: overlay по срезам на кадре с альфой
+            # гоняется на их стыке.
+            f"[{sh}][{fg}]overlay=format=yuv420:threads=1")
 
 
 # ── Режим наложения ──────────────────────────────────────────────────────────

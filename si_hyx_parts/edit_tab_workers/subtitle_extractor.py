@@ -20,18 +20,32 @@ class SubtitleExtractor(_api.QThread):
         cues = None
         tmp = None
         try:
-            tf = _api.tempfile.NamedTemporaryFile(delete=False, suffix=".srt")
-            tmp = tf.name; tf.close()
-            cmd = [_api.FFMPEG, "-y", "-i", self.src,
-                   "-map", f"0:s:{self.sub_index}", tmp]
-            kw = {}
-            if _api.os.name == 'nt':
-                kw['creationflags'] = _api.CREATE_NO_WINDOW
-            _api.subprocess.run(cmd, stdout=_api.subprocess.DEVNULL,
-                           stderr=_api.subprocess.DEVNULL, timeout=90, **kw)
-            if _api.os.path.exists(tmp) and _api.os.path.getsize(tmp) > 0:
-                with open(tmp, 'r', encoding='utf-8', errors='replace') as f:
-                    cues = _api._parse_srt(f.read())
+            ext = _api.os.path.splitext(self.src)[1].lower()
+            if self.sub_index == 0 and ext == '.srt':
+                # Внешний SRT читаем сами: ffmpeg считает его UTF-8 и
+                # заменяет кириллицу из cp1251 на «�» (см. read_subtitle_text).
+                cues = _api._parse_srt(_api.read_subtitle_text(self.src))
+            else:
+                tf = _api.tempfile.NamedTemporaryFile(delete=False, suffix=".srt")
+                tmp = tf.name; tf.close()
+                cmd = [_api.FFMPEG, "-y"]
+                if self.sub_index == 0 and ext in ('.ass', '.ssa'):
+                    # Внешний ASS/SSA в cp1251: без sub_charenc ffmpeg либо
+                    # отказывается его читать, либо заменяет кириллицу на «�».
+                    try:
+                        cmd += ["-sub_charenc", _api.subtitle_text_encoding(self.src)]
+                    except Exception:
+                        pass
+                cmd += ["-i", self.src,
+                        "-map", f"0:s:{self.sub_index}", tmp]
+                kw = {}
+                if _api.os.name == 'nt':
+                    kw['creationflags'] = _api.CREATE_NO_WINDOW
+                _api.subprocess.run(cmd, stdout=_api.subprocess.DEVNULL,
+                               stderr=_api.subprocess.DEVNULL, timeout=90, **kw)
+                if _api.os.path.exists(tmp) and _api.os.path.getsize(tmp) > 0:
+                    with open(tmp, 'r', encoding='utf-8', errors='replace') as f:
+                        cues = _api._parse_srt(f.read())
         except Exception:
             cues = None
         finally:

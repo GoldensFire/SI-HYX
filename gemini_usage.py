@@ -40,6 +40,15 @@ def _digest(api_key):
     return "v2-" + value.hex()
 
 
+def prewarm(api_key):
+    """Считает отпечаток ключа заранее, в фоновом потоке: PBKDF2 занимает
+    ~0,3 с, и hashlib на это время отпускает GIL. Иначе первая подпись квоты
+    на вкладке «Аниме-пак» считала его в главном потоке при запуске."""
+    if api_key:
+        threading.Thread(target=_digest, args=(api_key,), daemon=True,
+                         name="gemini-digest").start()
+
+
 def _stored(data, key, default=0):
     """При смене отпечатка не забываем уже потраченную суточную квоту.
 

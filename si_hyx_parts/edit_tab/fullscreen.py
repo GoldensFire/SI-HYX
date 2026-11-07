@@ -20,6 +20,7 @@ class EditTabFullscreenMixin:
             return
         if self.duration <= 0.1:   # нет загруженного видео
             return
+        self._fx_leave()           # полный экран играет прежний плеер
         try:
             fs = _api.FullscreenVideo(self)
             # fs — самостоятельное окно без родителя (иначе showFullScreen на
@@ -54,8 +55,7 @@ class EditTabFullscreenMixin:
             fs.setFocus(_api.Qt.FocusReason.OtherFocusReason)
             fs.sync_from_player()
             fs.sync_volume()
-            fs.update_play_icon(
-                self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState)
+            fs.update_play_icon(self._view_playing())
             # Холст переехал в другое окно, а с ним и его сцена Qt Quick:
             # графический контекст пересоздан, и показанный кадр в нём не
             # переживает переезд. На паузе кадров от плеера больше не будет —
@@ -63,7 +63,7 @@ class EditTabFullscreenMixin:
             # делает: там следующий кадр приедет через ~16 мс).
             _api.QTimer.singleShot(0, self._restore_canvas_frame)
             try:
-                self._update_subtitle(self._ui_time_s())
+                self._update_subtitle(self._sub_now_s())
                 _api.QTimer.singleShot(0, self._position_overlay)
             except Exception:
                 pass
@@ -100,6 +100,8 @@ class EditTabFullscreenMixin:
             _api.QTimer.singleShot(0, self._position_overlay)
             # Обратный переезд — та же история, что и при входе (см. там).
             _api.QTimer.singleShot(0, self._restore_canvas_frame)
+            # Проект с эффектами — снова просмотром с эффектами (project_fx).
+            _api.QTimer.singleShot(0, self._fx_update_mode)
         except Exception:
             pass
 

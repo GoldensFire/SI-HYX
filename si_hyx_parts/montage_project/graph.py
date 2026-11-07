@@ -35,6 +35,7 @@ window=(t0, t1) — выдержка по полному проекту, а не
 срезается), затухание идёт с той же фазой."""
 import hashlib
 import os
+import threading
 
 import montage_project as _api
 from si_hyx_parts.montage_project import effects as _fx
@@ -79,11 +80,18 @@ def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap, project=
     и разворачивается уже в размере проекта: reverse держит все кадры."""
     up = ""
     if project is not None:
-        up = _vfx.upscale_filter(project, c, out_h)
         # Персонаж без фона (layers.matte_source) или замедление RIFE
         # (vulkan_fx.interp_source): исходник — готовый кэш, время — от
-        # начала куска.
+        # начала куска. Anime4K — кэш апскейла поверх него
+        # (vulkan_fx.upscale_source), без кэша — libplacebo в графе. Кусок
+        # с вшитыми субтитрами кэш не берёт: они рисуются до апскейла.
         px = _ly.matte_source(c) if c.matte else _vfx.interp_source(c, fps)
+        burned = px is None and not c.is_image and (subs or {}).get(_api.source_key(c.src))
+        ux = None if burned else _vfx.upscale_source(project, c, px or c, out_h)
+        if ux is None:
+            up = _vfx.upscale_filter(project, c, out_h, alpha=bool(c.matte and px is not None),
+                                     lab=g.label)
+        px = ux or px
         if px is not None:
             c = px
             tonemap = subs = None        # кэш уже в SDR и без субтитров
@@ -157,7 +165,8 @@ def _fx_main(g, project, c, f0, f1, a, b, rate, fit, fps, w, h, subs, tonemap):
 def _fx_overlay(g, project, c, f0, f1, a, b, rate, fit, fps, w, h, subs, tonemap, box=None):
     """То же для наложения: размер, поворот и прозрачность по ключевым
     кадрам и эффекты — во времени клипа, затем кусок окна. Маска и обводка
-    — раньше эффектов: в прямоугольнике клипа, до ключевых кадров размера."""
+    — раньше эффектов: в прямоугольнике клипа, до ключевых кадров размера;
+    тень — после них."""
     n = f1 - f0
     chain = _source_chain(g, c, c.start, c.end, n, rate, fit, "yuva420p", subs, tonemap,
                           project, fps, h)
@@ -165,6 +174,7 @@ def _fx_overlay(g, project, c, f0, f1, a, b, rate, fit, fps, w, h, subs, tonemap
     fx = _fx.main_fx_chain(project, c, n, fps, w, h, False, g.label)
     if fx:
         chain += "," + fx + ",format=yuva420p"
+    chain = _drop_shadow(g, c, chain, h)
     if (a, b) != (f0, f1):
         chain += f",trim=start_frame={a - f0}:end_frame={b - f0},setpts=PTS-STARTPTS"
     return chain
@@ -179,6 +189,14 @@ def _shape(g, c, chain, box, n, rate, h):
         lab = g.label("ol")
         chain = f"{chain}[{lab}];" + _ly.stroke_chain(g, c.stroke, h, lab)
     return chain
+
+
+def _drop_shadow(g, c, chain, h):
+    """Тень наложения — после его эффектов (layers.shadow_chain)."""
+    if not c.shadow:
+        return chain
+    lab = g.label("ol")
+    return f"{chain}[{lab}];" + _ly.shadow_chain(g, c.shadow, h, lab)
 
 
 def _box_fit(mode, bw, bh):
@@ -274,6 +292,21 @@ def _join(g, seq, fps):
     return lab
 
 
+def _has_overlay(project, r0, r1, fps):
+    """Есть ли на кадрах [r0, r1) видимое наложение верхней видеодорожки."""
+    main = project.main_track
+    for ti in project.tracks_of('video'):
+        if ti == main or not project.tracks[ti].enabled:
+            continue
+        for c in project.clips_on(ti):
+            if not c.has_video or c.length <= _api._EPS or c.opacity <= 0:
+                continue
+            f0, f1 = _fr(c.start, fps), _fr(c.end, fps)
+            if max(f0, r0) < min(f1, r1):
+                return True
+    return False
+
+
 def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items, texts=None):
     """База (основная дорожка) на кадрах [r0, r1) и наложения; метка итога.
     texts(дорожка, метка) — текст над этой дорожкой (TextItem.layer); метка."""
@@ -317,6 +350,17 @@ def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items, texts=
     # Наложения: верхние видеодорожки снизу вверх.
     main = project.main_track
     cur = texts(main, cur)
+    if _has_overlay(project, r0, r1, fps):
+        # После concat метки базы — в 1/1000000 с (кадр округлён до
+        # микросекунды), а кадры наложения — в 1/fps. framesync overlay берёт
+        # кадр с меткой ≤ метки базы: округление базы вниз выбирало кадр на
+        # один позже, и наложение отставало на кадр. Точная сетка 1/fps
+        # ставит метки базы ровно на номера кадров. Без наложений граф не
+        # меняется.
+        num, den = _api.fps_expr(fps).split("/")
+        lab = g.label("tb")
+        g.chains.append(f"[{cur}]settb={den}/{num}[{lab}]")
+        cur = lab
     for ti in project.tracks_of('video'):
         if ti == main or not project.tracks[ti].enabled:
             continue
@@ -338,7 +382,7 @@ def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items, texts=
                 t_a, t_b = _span_times(c, a, b, f0, f1, fps)
                 body = _source_chain(g, c, t_a, t_b, b - a, rate, fit, "yuva420p", subs, tonemap,
                                      project, fps, h)
-                body = _shape(g, c, body, (bw, bh), b - a, rate, h)
+                body = _drop_shadow(g, c, _shape(g, c, body, (bw, bh), b - a, rate, h), h)
             # Метки кадров — в долях 1/fps (их ставит fps=): сдвиг на целое
             # число кадров, без округления секунд.
             g.chains.append(body + f"{alpha},setpts=PTS+{a - r0}[{lab}]")
@@ -358,13 +402,14 @@ def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items, texts=
     return cur
 
 
-def text_cues(project, t0, t1, play_res, layer=None):
+def text_cues(project, t0, t1, play_res, layer=None, window=None):
     """Реплики ASS (для subtitle_ass._cues_to_ass) текста проекта,
     задевающего [t0, t1), во времени ПРОЕКТА: вшивание идёт по меткам
     проекта, и у окна анимация текста (fade, slide) в той же фазе, что и в
     полной сборке. Текст экранируется: фигурные скобки и
     переводы строк — внутри _cues_to_ass, обратная черта — здесь (\\N и \\h
-    libass читает и вне скобок)."""
+    libass читает и вне скобок). window — вид букв-окна (text_fx.window_spec):
+    только реплики с ним, белыми буквами маски (window_mask_style)."""
     import subtitle_ass
     res_x, res_y = play_res
     cues = []
@@ -374,6 +419,10 @@ def text_cues(project, t0, t1, play_res, layer=None):
         style = dict(subtitle_ass.DEFAULT_SUBTITLE_STYLE)
         style.update(item.style or {})
         start, end = item.start, item.end
+        if window is not None:
+            if not _tfx.is_kinetic(item.style or {}) or _tfx.window_spec(style) != window:
+                continue
+            style = _tfx.window_mask_style(style)
         if _tfx.is_kinetic(item.style or {}):
             align = int(style.get('align') or 2)
             if item.pos_x is not None and item.pos_y is not None:
@@ -405,29 +454,62 @@ def text_cues(project, t0, t1, play_res, layer=None):
     return cues
 
 
-def _text_file(project, t0, t1, w, h, layer=None):
+def _text_file(project, t0, t1, w, h, layer=None, window=None):
     """Путь .ass текста проекта (слоя layer) на [t0, t1) или None. Файл — в
     TEMP по хэшу содержимого (как таблицы lut3d у hdr_tonemap): тот же
-    текст — тот же файл, удалять его после сборки не нужно."""
+    текст — тот же файл, удалять его после сборки не нужно. window — маска
+    букв-окна этого вида (text_cues)."""
     import subtitle_ass
     from ffmpeg_env import TEMP_DIR
     play_res = (max(16, int(round(_TEXT_RES_Y * w / float(h)))), _TEXT_RES_Y)
-    cues = text_cues(project, t0, t1, play_res, layer)
+    cues = text_cues(project, t0, t1, play_res, layer, window)
     if not cues:
         return None
     text = subtitle_ass._cues_to_ass(cues, play_res=play_res)
     digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
     path = os.path.join(TEMP_DIR, f"sihyx_text_{digest}.ass")
     if not os.path.isfile(path):
-        tmp = f"{path}.{os.getpid()}.tmp"
+        # Свой временный файл у каждого потока: кадры листа (contact-sheet)
+        # собираются параллельно и пишут тот же текст под тем же именем.
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
-        os.replace(tmp, path)
+        try:
+            os.replace(tmp, path)
+        except PermissionError:
+            # Windows: файл уже записал соседний поток и его читает ffmpeg —
+            # содержимое то же (имя — хэш текста).
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            if not os.path.isfile(path):
+                raise
     return path
 
 
+def _window_specs(project, t0, t1, layer):
+    """Виды букв-окна (text_fx.window_spec) текста слоя layer на [t0, t1)."""
+    import subtitle_ass
+    out = []
+    for item in project.texts:
+        if (item.end <= t0 or item.start >= t1 or item.layer != layer
+                or not _tfx.is_kinetic(item.style or {})):
+            continue
+        style = dict(subtitle_ass.DEFAULT_SUBTITLE_STYLE)
+        style.update(item.style or {})
+        spec = _tfx.window_spec(style)
+        if spec is not None and spec not in out:
+            out.append(spec)
+    return out
+
+
 def _burn_text(g, project, cur, r0, r1, fps, w, h, layer):
-    """Текст слоя layer (None — поверх всего) на [cur] кадров [r0, r1); метка."""
+    """Текст слоя layer (None — поверх всего) на [cur] кадров [r0, r1); метка.
+    Буквы-окно: кадр до текста (свой свет, насыщенность, тон, негатив)
+    накладывается поверх вшитого текста с альфой из маски — тех же букв
+    белым на чёрном;
+    маска и кадр — копии [cur], метки у всех веток одни и те же."""
     if not project.texts:
         return cur
     ass = _text_file(project, r0 / fps, r1 / fps, w, h, layer)
@@ -435,16 +517,42 @@ def _burn_text(g, project, cur, r0, r1, fps, w, h, layer):
         return cur
     from ffmpeg_env import escape_filter_path
     import karaoke.style
-    out = g.label("t")
+    fonts = escape_filter_path(karaoke.style.FONT_DIR)
     # Метки — время проекта на время вшивания (текст в ASS — в нём же),
     # затем снова с нуля. Сдвиг окна — round: setpts отбрасывает дробь, и
     # 0.667333/TB при 24000/1001 давал 15.99999 → кадр 15 — текст окна
     # шёл на кадр раньше полной сборки.
     shift = f"round({_api._num(r0 / fps)}/TB)" if r0 else f"{_api._num(r0 / fps)}/TB"
-    g.chains.append(f"[{cur}]setpts=PTS-STARTPTS+{shift},"
+    masks = [(s, _text_file(project, r0 / fps, r1 / fps, w, h, layer, s))
+             for s in _window_specs(project, r0 / fps, r1 / fps, layer)]
+    masks = [(s, m) for s, m in masks if m]
+    heads = [cur]
+    if masks:
+        heads = [g.label("wn") for _k in range(1 + 2 * len(masks))]
+        g.chains.append(f"[{cur}]setpts=PTS-STARTPTS,split={len(heads)}"
+                        + "".join(f"[{x}]" for x in heads))
+    out = g.label("t")
+    g.chains.append(f"[{heads[0]}]setpts=PTS-STARTPTS+{shift},"
                     f"subtitles=filename={escape_filter_path(ass)}:"
-                    f"fontsdir={escape_filter_path(karaoke.style.FONT_DIR)},"
+                    f"fontsdir={fonts},"
                     f"setpts=PTS-STARTPTS[{out}]")
+    for k, ((_amount, light, sat, tint, invert), mask) in enumerate(masks):
+        pic, hole = heads[1 + 2 * k], heads[2 + 2 * k]
+        look = ["negate"] if invert else []
+        if light != 0 or sat != 1:
+            look.append(f"eq=brightness={_api._num(light)}:saturation={_api._num(sat)}")
+        if tint:
+            look.append(_fx._tint(tint, 0.7, g.label))
+        look = ",".join(look) or "null"
+        lit, alpha, win, nxt = g.label("wg"), g.label("wm"), g.label("wa"), g.label("t")
+        g.chains.append(f"[{pic}]{look},format=yuva420p[{lit}]")
+        g.chains.append(f"[{hole}]format=rgb24,drawbox=x=0:y=0:w=iw:h=ih:t=fill:color=black,"
+                        f"setpts=PTS-STARTPTS+{shift},"
+                        f"subtitles=filename={escape_filter_path(mask)}:fontsdir={fonts},"
+                        f"setpts=PTS-STARTPTS,format=gray[{alpha}]")
+        g.chains.append(f"[{lit}][{alpha}]alphamerge[{win}]")
+        g.chains.append(f"[{out}][{win}]overlay=eof_action=pass:format=yuv420[{nxt}]")
+        out = nxt
     return out
 
 

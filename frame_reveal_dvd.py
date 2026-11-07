@@ -179,26 +179,38 @@ class DvdAnimation:
 
     def frame(self) -> np.ndarray:
         """Текущий кадр ролика: открытый след и прямоугольник поверх."""
-        out = self.canvas.copy()
-        if self.clip is not None:
-            rw, rh = self.rw, self.rh
-            x0, y0 = round(self.x), round(self.y)
-            # На вылете прямоугольник частично (или целиком) за краем кадра.
-            cx0, cy0 = max(0, x0), max(0, y0)
-            cx1, cy1 = min(self.w, x0 + rw), min(self.h, y0 + rh)
-            if cx1 <= cx0 or cy1 <= cy0:
-                return out
-            seg = self.path[self.index]
-            # Клип декодируется в итоговом размере отрезка; пока форма
-            # плавно меняется, кадр лишь масштабируется.
-            picture = self.clip.frame(seg.w, seg.h)
-            if picture is not None and picture.shape[:2] != (rh, rw):
-                picture = np.asarray(Image.fromarray(picture).resize(
-                    (rw, rh), Image.Resampling.BILINEAR))
-            if picture is not None:
-                out[cy0:cy1, cx0:cx1] = picture[cy0 - y0:cy1 - y0,
-                                                cx0 - x0:cx1 - x0]
+        return self._paste_clip(self.canvas.copy())
+
+    def _paste_clip(self, out: np.ndarray) -> np.ndarray:
+        """Содержимое прямоугольника (картинка/видео клипа) поверх out."""
+        if self.clip is None:
+            return out
+        rw, rh = self.rw, self.rh
+        x0, y0 = round(self.x), round(self.y)
+        # На вылете прямоугольник частично (или целиком) за краем кадра.
+        cx0, cy0 = max(0, x0), max(0, y0)
+        cx1, cy1 = min(self.w, x0 + rw), min(self.h, y0 + rh)
+        if cx1 <= cx0 or cy1 <= cy0:
+            return out
+        seg = self.path[self.index]
+        # Клип декодируется в итоговом размере отрезка; пока форма
+        # плавно меняется, кадр лишь масштабируется.
+        picture = self.clip.frame(seg.w, seg.h)
+        if picture is not None and picture.shape[:2] != (rh, rw):
+            picture = np.asarray(Image.fromarray(picture).resize(
+                (rw, rh), Image.Resampling.BILINEAR))
+        if picture is not None:
+            out[cy0:cy1, cx0:cx1] = picture[cy0 - y0:cy1 - y0,
+                                            cx0 - x0:cx1 - x0]
         return out
+
+    def reveal(self, pixels: np.ndarray, moving: bool = True) -> np.ndarray:
+        """Открытый след поверх живого кадра видео (Монтаж): маска та же, что
+        у frame(), но в окне идёт текущий кадр, а не снимок на момент пролёта.
+        Пока прямоугольник летит (moving), его картинка — поверх следа."""
+        out = ((pixels.astype(np.uint16) * self.mask[..., None] + 127) // 255
+               ).astype(np.uint8)
+        return self._paste_clip(out) if moving else out
 
     def close(self) -> None:
         """Гасит все клипы (процессы ffmpeg видео, кеши картинок)."""

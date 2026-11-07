@@ -19,6 +19,20 @@ class VolumeSlider(_api.QSlider):
         self.setProperty("wheelAlways", True)
         self._dragging = False
 
+    @staticmethod
+    def bar_style():
+        """Вид ползунка — один во вкладке и в полноэкранном режиме: прозрачный
+        жёлоб (а не тёмный surface3) и белый бегунок без чёрной окантовки —
+        чтобы за ползунком не было чёрного прямоугольника."""
+        return ("QSlider { background: transparent; }"
+                "QSlider::groove:horizontal { background: rgba(255,255,255,0.22);"
+                " height: 6px; border-radius: 3px; }"
+                "QSlider::sub-page:horizontal { background: #cdd6f4; border-radius: 3px; }"
+                "QSlider::add-page:horizontal { background: rgba(255,255,255,0.22);"
+                " border-radius: 3px; }"
+                "QSlider::handle:horizontal { background: #ffffff; width: 13px;"
+                " height: 13px; margin: -4px 0; border-radius: 7px; }")
+
     def wheelEvent(self, ev):
         step = 5 if ev.angleDelta().y() > 0 else -5
         self.setValue(max(self.minimum(), min(self.maximum(), self.value() + step)))

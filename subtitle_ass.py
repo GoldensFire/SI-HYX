@@ -17,6 +17,8 @@ montage_project (вшивается после склейки, во времен
 шрифт Karaoke Rounded, почти белый текст, тёмная обводка и полупрозрачная
 тень; размеры — в единицах ASS при PlayResY 288 (холст, на котором ffmpeg
 вшивает SRT)."""
+import math
+
 from karaoke import style as _karaoke_style
 
 PROG_SUB_FONTSIZE = 21          # кегль ASS: em ≈ 5.3 % высоты кадра
@@ -77,10 +79,15 @@ def prog_sub_force_style(play_res_y=None, play_res_x=None, keep_layout=False):
 
 
 def _ass_timestamp(t):
-    """Секунды → таймкод ASS «H:MM:SS.cc» (сотые доли, без ведущего нуля у часов)."""
+    """Секунды → таймкод ASS «H:MM:SS.cc» (сотые доли, без ведущего нуля у часов).
+    Сотые — вниз: округление 9.426 → 9.43 ставило реплику на кадр позже
+    (кадр 226 начинается в 9.426 и ждёт метку ≤ своего времени)."""
     t = max(0.0, float(t))
-    h = int(t // 3600); m = int((t % 3600) // 60); s = t - h * 3600 - m * 60
-    return f"{h:d}:{m:02d}:{s:05.2f}"
+    cs = int(math.floor(t * 100.0 + 1e-6))
+    h, cs = divmod(cs, 360000)
+    m, cs = divmod(cs, 6000)
+    s, cs = divmod(cs, 100)
+    return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
 
 def _hex_to_ass_color(hex_color, alpha=0x00):
     """«#RRGGBB» → цвет ASS «&HAABBGGRR» (порядок байт обратный HTML)."""

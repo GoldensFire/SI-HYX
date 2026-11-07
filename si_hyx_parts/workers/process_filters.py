@@ -5,12 +5,21 @@
 import hdr_tonemap
 
 import workers as _api
+from si_hyx_parts.workers.process_reveal import burn_subs_filters, montage_fx_vf
 
 # Наименьший CRF, который libsvtav1 действительно применяет. «-crf 0» ffmpeg
 # считает «не задано» и оставляет SVT его значение по умолчанию: в логе SVT
 # «BRC mode / rate factor : CRF / 35.00», файл байт в байт как при -crf 35.
 SVT_CRF_MIN = 1
 SVT_CRF_MAX = 63
+
+# Потолок битрейта Opus в режиме «auto», кбит/с. auto берёт битрейт звука
+# источника, а у несжатого он огромный (WAV 1411–1536, FLAC 842–1543 кбит/с):
+# прежний потолок 512 раздувал итог в 2,5–2,7 раза против 192 и ломал моно —
+# libopus принимает не больше 256 кбит/с на канал, и моно-WAV 48 кГц
+# (768 → 512k) не кодировался вовсе. 192 — как AUDIO_BITRATE генератора паков;
+# выше списка ручного выбора (256) auto тоже больше не выходит (AAC 261 → 261k).
+AUTO_AUDIO_KBPS_MAX = 192
 
 
 class ProcessFiltersMixin:
@@ -423,16 +432,23 @@ class ProcessFiltersMixin:
         _cleanup_sample()
         return best_crf, best_info
 
-    def run_ffmpeg_capture(self, cmd, total_est_sec, percent_callback, label=None, eta_calc=None, cancel_check=None):
+    def run_ffmpeg_capture(self, cmd, total_est_sec, percent_callback, label=None, eta_calc=None, cancel_check=None,
+                           feeder=None):
+        """feeder — источник кадров на stdin ffmpeg (RevealFeed, эффект
+        проявления из Монтажа): start(stdin) / stop() / join() / error."""
         from ffmpeg_faststart import with_faststart
         cmd = with_faststart(cmd)
         si = _api.subprocess.STARTUPINFO() if _api.IS_WIN else None
         if _api.IS_WIN and si is not None: si.dwFlags |= _api.subprocess.STARTF_USESHOWWINDOW
         buf = _api.deque(maxlen=8000)
         try:
-            p = _api.subprocess.Popen(cmd, stderr=_api.subprocess.PIPE, stdout=_api.subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=_api.CREATE_NO_WINDOW | getattr(self, '_priority_flag', 0), startupinfo=si)
+            p = _api.subprocess.Popen(cmd, stderr=_api.subprocess.PIPE, stdout=_api.subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=_api.CREATE_NO_WINDOW | getattr(self, '_priority_flag', 0), startupinfo=si,
+                                      stdin=_api.subprocess.PIPE if feeder is not None else None)
         except Exception as e:
             raise Exception(f"Не удалось запустить ffmpeg: {e}")
+        if feeder is not None:
+            # Кадры пишутся байтами: у текстового stdin берём его буфер.
+            feeder.start(p.stdin.buffer)
         start = _api.time.time()
         last_pct = -1
         last_eta = None          # последнее посчитанное ETA (с)
@@ -446,6 +462,8 @@ class ProcessFiltersMixin:
                 if self.stop_flag or (cancel_check is not None and cancel_check()):
                     try: p.kill()
                     except Exception: pass
+                    if feeder is not None:
+                        feeder.stop()
                     try:
                         tail = p.stderr.read() or ""
                         for L in tail.splitlines(): buf.append(L + "\n")
@@ -517,12 +535,19 @@ class ProcessFiltersMixin:
         except Exception:
             try: p.kill()
             except Exception: pass
+            if feeder is not None:
+                feeder.stop()
             raise
+        if feeder is not None:
+            feeder.join()
+            if feeder.error:
+                raise Exception(f"Эффект проявления: {feeder.error}")
         if p.returncode != 0:
             stderr_tail = ''.join(buf)
             raise _api.subprocess.CalledProcessError(p.returncode, cmd, output=None, stderr=stderr_tail)
 
-    def _estimate_total_frames(self, src_path, speed_factor, cmd, dur_override=None):
+    def _estimate_total_frames(self, src_path, speed_factor, cmd, dur_override=None,
+                               src_fps=None):
         """Оценка числа ВЫХОДНЫХ кадров видео для знаменателя ETA.
         Учитывает изменение скорости (setpts) и принудительный -r из cmd.
         Возвращает 0, если оценить не удалось (тогда ETA-калькулятор не создаётся
@@ -530,7 +555,9 @@ class ProcessFiltersMixin:
 
         dur_override — длительность ВХОДА в секундах, если она уже известна и НЕ
         равна полной длительности src_path (обрезка: кодируем не весь файл, а
-        отрезок [in_s,out_s) — иначе ETA считало бы кадры на весь исходник)."""
+        отрезок [in_s,out_s) — иначе ETA считало бы кадры на весь исходник).
+        src_fps — частота входа, если она известна заранее (картинка из
+        Монтажа: у файла-картинки своей частоты нет)."""
         try:
             dur = float(dur_override) if dur_override and dur_override > 0 else 0.0
             if not dur:
@@ -548,7 +575,7 @@ class ProcessFiltersMixin:
             except Exception:
                 out_fps = 0.0
             if out_fps <= 0:
-                out_fps = _api.get_fps_float(src_path) or 0.0
+                out_fps = src_fps or _api.get_fps_float(src_path) or 0.0
             if out_fps <= 0:
                 return 0
             return max(1, int(out_dur * out_fps))
@@ -562,8 +589,7 @@ class ProcessFiltersMixin:
                 if a_br_str and a_br_str != "-":
                     m = _api._RE_DIGITS.findall(a_br_str)
                     if m:
-                        val = int(m[0])
-                        if val > 512: val = 512
+                        val = min(int(m[0]), AUTO_AUDIO_KBPS_MAX)
                         return f"{val}k"
             except Exception: pass
             return "128k"
@@ -644,7 +670,7 @@ class ProcessFiltersMixin:
         return suffix
 
     @staticmethod
-    def _build_audio_filters(sa, t0, fade_out_dur, speed_factor):
+    def _build_audio_filters(sa, t0, fade_out_dur, speed_factor, measured=None):
         """Цепочка аудиофильтров для ffmpeg `-af` из настроек звука.
 
         Порядок (сохранён 1:1 с прежним инлайн-кодом process_media): loudnorm →
@@ -653,13 +679,19 @@ class ProcessFiltersMixin:
         клипа в шкале фильтров) и fade_out_dur (длительность отрезка/файла, нужна
         только ветке fade-out) передаются уже вычисленными — ffprobe тут не
         вызывается, поэтому логику легко покрыть тестами. Вызывать только когда
-        звук сохраняется (не remove_audio) — как и раньше."""
+        звук сохраняется (не remove_audio) — как и раньше.
+
+        measured — замер громкости ровно той дорожки и того отрезка, что
+        кодируются (utils.loudnorm_stats), или None. С ним loudnorm идёт вторым
+        проходом с постоянным усилением, если линейный режим гарантирован
+        (utils.loudnorm_linear_opts); иначе — прежний одиночный проход."""
         filters = []
         if sa.get('norm'):
             tgt_i = float(sa.get('tgt', -20.0))
             lra = float(sa.get('lra', 11.0))
             tp = float(sa.get('tp', -1.5))
-            filters.append(f"loudnorm=I={tgt_i}:LRA={lra}:TP={tp}")
+            linear = _api.loudnorm_linear_opts(measured, tgt_i, lra, tp) if measured else ""
+            filters.append(f"loudnorm=I={tgt_i}:LRA={lra}:TP={tp}{linear}")
         if sa.get('fade_in'):
             fade_in_d = sa.get('fade_in_d', 1.0)
             # st=t0: при обрезке (trim) seek не обнуляет PTS — фильтр видит
@@ -774,6 +806,12 @@ class ProcessFiltersMixin:
         Не чистая: определение чёрных полос и длительность/fps источника
         требуют чтения файла."""
         vf_list = []
+        # Кадр из трубы эффекта проявления (RevealFeed) — RGB: сперва в YUV.
+        if item.get('reveal_rgb'):
+            vf_list.append(item['reveal_rgb'])
+        # Кадрирование Монтажа — первым: так его видно в плеере Монтажа.
+        fx_before, fx_after = montage_fx_vf(item, t0)
+        vf_list += fx_before
 
         if sv.get('crop_black'):
             crop = self._detect_crop(current_input, item.get('dur') or 0.0,
@@ -788,21 +826,10 @@ class ProcessFiltersMixin:
         # Стоит ПОСЛЕ crop чёрных полос (текст рисуется на уже обрезанном кадре,
         # как и в собственной перекодировке Монтажа) и ДО setpts: фильтр subtitles
         # ищет реплики по времени, а setpts это время меняет.
-        burn = item.get('burn_subs') or {}
-        if burn.get('vf'):
-            # Отрезок вырезается быстрым ВХОДНЫМ pre-seek'ом, а он обнуляет
-            # тайминги в своей точке — время фильтрграфа идёт не от начала файла,
-            # а от t0 (см. _trim_seek_args). Фильтр же subtitles сопоставляет
-            # реплики со временем САМОГО файла субтитров, поэтому на время его
-            # работы возвращаем исходную шкалу и сразу возвращаем обратно; иначе
-            # текст уехал бы ровно на pre-seek.
-            off = float(burn.get('src_in') or 0.0) - float(t0 or 0.0)
-            if off > 0.001:
-                vf_list.append(f"setpts=PTS+{off:.6f}/TB")
-                vf_list.append(burn['vf'])
-                vf_list.append(f"setpts=PTS-{off:.6f}/TB")
-            else:
-                vf_list.append(burn['vf'])
+        vf_list += burn_subs_filters(item, t0)
+        # Пикселизация Монтажа — ПОСЛЕ субтитров (текст не размывается) и ДО
+        # setpts: её окна считаны в исходной шкале фильтрграфа.
+        vf_list += fx_after
 
         if abs(speed_factor - 1.0) > 0.01:
             vf_list.append(f"setpts={1.0/speed_factor}*PTS")

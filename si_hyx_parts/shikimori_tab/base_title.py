@@ -2,9 +2,12 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """_base_title. Public namespace: shikimori_tab."""
+from functools import lru_cache
+
 import shikimori_tab as _api
 
 
+@lru_cache(maxsize=1 << 17)
 def _base_title(s: str) -> str:
     """«Базовое» название без хвостовых сезонных маркеров (для сопоставления
     разных сезонов одного тайтла). Применяет _SEASON_TAIL_RX многократно:

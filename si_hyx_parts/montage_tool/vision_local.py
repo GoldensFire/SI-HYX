@@ -15,7 +15,10 @@ llama.cpp. Рассуждение модели выключено (--reasoning o
 генерация 2B медленнее (~7 т/с), чем на 6 ядрах (~10 т/с); на дискретной
 карте — gpu_layers=99. Сервер — по одному на машину (model_slot, как у
 обработчиков), приоритет пониженный. LlamaServer держит один сервер на
-много вопросов (подписи планов index --captions)."""
+много вопросов (подписи планов index --captions): parallel — слоты для
+одновременных вопросов, gpu=False — совсем без видеокарты (и кодировщик
+картинки на процессоре). Кэш подсказок в памяти выключен (--cache-ram 0):
+по умолчанию он копит до 8 ГБ, а у каждой подписи своя картинка — попаданий нет."""
 import base64
 import io
 import socket
@@ -121,10 +124,11 @@ class LlamaServer:
     """llama-server на время блока with: под model_slot, с пониженным
     приоритетом; ask(body) — один запрос chat/completions с отменой."""
 
-    def __init__(self, model=DEFAULT_LOOK_MODEL, gpu_layers=0, ctl=None):
+    def __init__(self, model=DEFAULT_LOOK_MODEL, gpu_layers=0, ctl=None, parallel=1, gpu=True):
         if model not in LOOK_MODELS:
             raise _api.ToolError("usage", f"модель: {', '.join(LOOK_MODELS)}")
         self.model, self.gpu_layers = model, int(gpu_layers)
+        self.parallel, self.gpu = max(1, int(parallel)), bool(gpu)
         self.ctl = ctl or _api.NO_CONTROL
         self.proc = self.log = self._slot = None
         self.load_s = 0.0
@@ -138,8 +142,12 @@ class LlamaServer:
         port = _free_port()
         self.base = f"http://127.0.0.1:{port}"
         cmd = [_api.os.path.join(root, "llama-server.exe"), "-m", weights, "--mmproj", mmproj,
-               "--host", "127.0.0.1", "--port", str(port), "-ngl", str(self.gpu_layers),
-               "-c", "8192", "-np", "1", "--reasoning", "off", "--no-webui"]
+               "--host", "127.0.0.1", "--port", str(port),
+               "-ngl", str(self.gpu_layers if self.gpu else 0),
+               "-c", "8192", "-np", str(self.parallel), "--cache-ram", "0",
+               "--reasoning", "off", "--no-webui"]
+        if not self.gpu:
+            cmd += ["--device", "none", "--no-mmproj-offload"]
         self._slot = model_slot(ctl.stop)
         try:
             self._slot.__enter__()

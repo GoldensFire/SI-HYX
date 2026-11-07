@@ -35,6 +35,7 @@ if __name__ in ("__main__", "__mp_main__"):
 import tempfile
 import time
 import uuid
+import reveal_pipe
 from collections import deque
 from functools import partial
 from pathlib import Path
@@ -44,9 +45,9 @@ from config import (
     QFontMetrics, QFrame, QHBoxLayout, QKeySequence, QLabel, QLineEdit,
     QMenu, QMessageBox, QPoint, QProgressBar, QPushButton, QRectF, QScrollArea,
     QSize, QSlider, QSpinBox, QTimer, QVBoxLayout, QWidget, Qt, get_icon,
-    icon_html
+    hw_video_decode_enabled, icon_html
 )
-from widgets import (info_badge)
+from widgets import (ElidedLabel, info_badge)
 from utils import get_pix_fmt, save_json_atomic
 from msgbox import (
     msgbox_critical, msgbox_information, msgbox_question, msgbox_warning
@@ -60,23 +61,25 @@ from edit_tab_base import (
     _karaoke_style, _libass, _parse_srt, _pixelize_block_sequence,
     _pixelize_filter, _unique_output,
     format_fps, make_divider, make_icon_btn, prog_sub_force_style,
-    run_ffprobe, s_to_time, time_to_s
+    read_subtitle_text, run_ffprobe, s_to_time, subtitle_text_encoding,
+    time_to_s
 )
 from edit_tab_workers import (
     AssExtractor, AudioSegmentWaveformLoader, AudioWaveformLoader,
-    FfmpegWorker, ProjectSoundEngine, ProjectThumbWorker, ProxyWorker,
-    ShareDeleteIODevice,
+    FfmpegWorker, FxPreview, ProjectSoundEngine, ProjectThumbWorker, ProxyWorker,
+    RevealVideoWorker, ShareDeleteIODevice, VideoDeck,
     SmartCutWorker, SubtitleExtractor, TrackOverlayWorker, TrackPathWorker,
     VideoInpaintWorker, open_share_delete_file
 )
 from edit_tab_widgets import (
-    AudioMeter, FullscreenVideo, InfoCard, ProjectTimeline, SeekPreview,
+    AudioMeter, FullscreenVideo, FxPreviewView, InfoCard, ProjectTimeline, SeekPreview,
     SeekSlider, SubtitleOverlay, TimecodeLabel, VideoCanvas, VolumeLabel,
     VolumeSlider,
     WaveformWidget
 )
 from edit_tab_dialogs import (
-    SubtitleCreatorDialog, _ExportSettingsDialog,
+    ClipPropsDialog, ProjectSettingsDialog, SubtitleCreatorDialog, TextPropsDialog,
+    _ExportSettingsDialog,
     _PixelizeDialog, _TrackAttachDialog, _VideoMaskDialog
 )
 from edit_tab_frames import (AudioScrubber, FrameGrid, FramePrefetcher,
