@@ -2,9 +2,10 @@
 """Режим обрезки «Перекодировать настройками «Обработки»» (пункт 4 cmb_mode).
 
 start_cut обязан уводить этот режим в _execute_cut_and_process (один проход
-ProcessWorker текущими настройками вкладки «Обработка»), а при включённых
-эффектах Монтажа (вшивание субтитров / кадрирование / пикселизация), которых тот
-путь не знает, — спрашивать, а не выкидывать их молча.
+ProcessWorker текущими настройками вкладки «Обработка»). Вшивание субтитров,
+кадрирование и эффект проявления этот путь умеет, пока «Обработка»
+перекодирует видео; с выключенным «Перекодировать видео» они теряются — тогда
+start_cut обязан спрашивать, а не выкидывать их молча.
 """
 from types import SimpleNamespace
 
@@ -36,6 +37,7 @@ def _stub(tmp_path, mode=4, **over):
         cmb_sub_style=SimpleNamespace(currentIndex=lambda: 0),
         selected_sub_ext_path=None,
         _pixelize_active=False,
+        _reveal_effect_label=lambda: "Пикселизация",
         _video_crop_filter=lambda: None,
         has_image_overlays=lambda: False,
         _subs_present_in_range=lambda *a: True,
@@ -65,9 +67,11 @@ def test_mode_4_goes_to_processing_settings(tmp_path):
 
 
 def test_mode_4_with_crop_asks_and_falls_back(tmp_path, monkeypatch):
-    """Ответ «Нет» — обычная перекодировка средствами Монтажа (mode 1) со всеми
-    эффектами, а не тихая потеря кадрирования."""
-    st, calls = _stub(tmp_path, _video_crop_filter=lambda: "crop=100:100:0:0")
+    """Видео в «Обработке» копируется — кадрирование там теряется. Ответ «Нет» —
+    обычная перекодировка средствами Монтажа (mode 1) со всеми эффектами, а не
+    тихая потеря кадрирования."""
+    st, calls = _stub(tmp_path, _video_crop_filter=lambda: "crop=100:100:0:0",
+                      _process_tab_encodes_video=lambda: False)
     asked = []
     monkeypatch.setattr(edit_tab, "msgbox_question",
                         lambda *a, **k: (asked.append(a[2]),
@@ -79,13 +83,14 @@ def test_mode_4_with_crop_asks_and_falls_back(tmp_path, monkeypatch):
 
 
 def test_mode_4_with_pixelize_continues_on_yes(tmp_path, monkeypatch):
-    st, calls = _stub(tmp_path, _pixelize_active=True)
+    st, calls = _stub(tmp_path, _pixelize_active=True,
+                      _process_tab_encodes_video=lambda: False)
     asked = []
     monkeypatch.setattr(edit_tab, "msgbox_question",
                         lambda *a, **k: (asked.append(a[2]),
                                          edit_tab.QMessageBox.StandardButton.Yes)[1])
     EditTab.start_cut(st)
-    assert asked and "пикселизация" in asked[0]
+    assert asked and "пикселизация" in asked[0].lower()
     assert len(calls['process']) == 1 and calls['cut'] == []
 
 
@@ -100,7 +105,8 @@ def test_other_modes_untouched(tmp_path):
 def test_closing_dialog_cancels_instead_of_encoding(tmp_path, monkeypatch):
     """Крестик и Esc — ОТМЕНА. Раньше «всё, что не Да» считалось за «Нет», и
     закрытое окно молча запускало полную перекодировку."""
-    st, calls = _stub(tmp_path, _video_crop_filter=lambda: "crop=100:100:0:0")
+    st, calls = _stub(tmp_path, _video_crop_filter=lambda: "crop=100:100:0:0",
+                      _process_tab_encodes_video=lambda: False)
     monkeypatch.setattr(edit_tab, "msgbox_question",
                         lambda *a, **k: edit_tab.QMessageBox.StandardButton.NoButton)
     EditTab.start_cut(st)
@@ -108,7 +114,8 @@ def test_closing_dialog_cancels_instead_of_encoding(tmp_path, monkeypatch):
 
 
 def test_cancel_button_cancels(tmp_path, monkeypatch):
-    st, calls = _stub(tmp_path, _pixelize_active=True)
+    st, calls = _stub(tmp_path, _pixelize_active=True,
+                      _process_tab_encodes_video=lambda: False)
     monkeypatch.setattr(edit_tab, "msgbox_question",
                         lambda *a, **k: edit_tab.QMessageBox.StandardButton.Cancel)
     EditTab.start_cut(st)

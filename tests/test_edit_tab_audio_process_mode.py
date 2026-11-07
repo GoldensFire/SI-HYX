@@ -37,6 +37,7 @@ def _stub(tmp_path, mode=5, **over):
         cmb_subs=SimpleNamespace(currentIndex=lambda: 0),
         selected_sub_ext_path=None,
         _pixelize_active=False,
+        _reveal_effect_label=lambda: "Пикселизация",
         _video_crop_filter=lambda: None,
         has_image_overlays=lambda: False,
         _subs_present_in_range=lambda *a: True,
@@ -88,7 +89,7 @@ def test_mode_5_with_pixelize_does_not_ask(tmp_path, monkeypatch):
     assert asked == []
     assert calls['cut'] == []
     assert len(calls['process']) == 1 and calls['process'][0][1]['audio_only'] is True
-    assert logged and "пикселизация" in logged[0]
+    assert logged and "пикселизация" in logged[0].lower()
 
 
 # ── process_media: аудио-онли ветка ──────────────────────────────────────────

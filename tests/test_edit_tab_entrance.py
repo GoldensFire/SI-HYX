@@ -29,6 +29,7 @@ def _menu(qapp, source):
         _relax_width=lambda button: None)
     stub.delete_source_file = lambda: stub.deleted.append(True)
     stub.create_entrance = lambda: stub.opened.append(True)
+    stub.show_amv_markup = lambda: None
     stub._entrance_busy = lambda: editor.EditTab._entrance_busy(stub)
     stub._refresh_more_actions = lambda: editor.EditTab._refresh_more_actions(stub)
     editor.EditTab._build_more_actions(stub)
@@ -42,7 +43,7 @@ def test_more_menu_actions_and_media_availability(qapp, tmp_path):
     stub, widget = _menu(qapp, source)
     try:
         assert [a.text() for a in stub.more_actions_menu.actions() if not a.isSeparator()] == [
-            "Появление", "Удалить исходный файл"]
+            "Появление", "AMV", "Удалить исходный файл"]
         assert stub.btn_more_actions.menu() is stub.more_actions_menu
         stub.action_entrance.trigger()
         stub.action_delete_source.trigger()
@@ -61,7 +62,10 @@ def test_more_menu_actions_and_media_availability(qapp, tmp_path):
         stub._entrance_running = False
         stub.actual_source_file = stub.filepath = None
         stub._refresh_more_actions()
-        assert not stub.btn_more_actions.isEnabled()
+        # Разметка AMV не зависит от файла — «⋯» доступна и без него.
+        assert stub.btn_more_actions.isEnabled()
+        assert not stub.action_entrance.isEnabled()
+        assert not stub.action_delete_source.isEnabled()
     finally:
         widget.close()
         widget.deleteLater()
@@ -169,7 +173,9 @@ def test_create_entrance_from_initialized_editor(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(entrance_actions, "EntranceDialog", AcceptedDialog)
     try:
         assert tab.btn_more_actions in tab._montage_side_btns
-        assert not tab.btn_more_actions.isEnabled()
+        # Без файла «⋯» доступна (разметка AMV), но действия над файлом — нет.
+        assert tab.btn_more_actions.isEnabled()
+        assert not tab.action_entrance.isEnabled()
         tab.load_file(str(source))
         assert tab.action_entrance.isEnabled()
         tab.action_entrance.trigger()
