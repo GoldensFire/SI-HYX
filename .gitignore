@@ -99,6 +99,11 @@ YouTubecookies.txt
 
 # Отдельные локальные страницы, не входящие в приложение.
 /anime_genre_game.html
+/anime-scene-3d.html
+
+# Локальные данные и скрипты разовых проверок (Letterboxd-экспорт и т.п.)
+*.csv
+/find_anime_matches.py
 
 # Временные папки ручных проверок (.tmp_pixiv_live_check и т.п.)
 .tmp*/
