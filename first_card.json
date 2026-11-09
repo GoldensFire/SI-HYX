@@ -1,0 +1,105 @@
+{
+  "id": "60226",
+  "malId": "60226",
+  "url": "https://shikimori.io/animes/60226-isekai-no-sata-wa-shachiku-shidai",
+  "name": "Isekai no Sata wa Shachiku Shidai",
+  "russian": "Судьба параллельного мира в руках трудоголика",
+  "english": "Isekai Office Worker: The Other World's Books Depend on the Bean Counter",
+  "japanese": "異世界の沙汰は社畜次第",
+  "synonyms": [
+    "The Affairs of the Other World Depend on the Corporate Slave",
+    "Iseshachi"
+  ],
+  "licenseNameRu": null,
+  "franchise": null,
+  "score": 7.13,
+  "kind": "tv",
+  "episodes": 12,
+  "studios": [
+    {
+      "id": "37",
+      "name": "Studio Deen"
+    }
+  ],
+  "related": [
+    {
+      "relationKind": "adaptation",
+      "anime": null
+    },
+    {
+      "relationKind": "adaptation",
+      "anime": null
+    },
+    {
+      "relationKind": "side_story",
+      "anime": {
+        "id": "63503",
+        "kind": "special"
+      }
+    }
+  ],
+  "genres": [
+    {
+      "id": "10",
+      "name": "Fantasy",
+      "russian": "Фэнтези",
+      "kind": "genre"
+    },
+    {
+      "id": "33",
+      "name": "Yaoi",
+      "russian": "Яой",
+      "kind": "genre"
+    },
+    {
+      "id": "104",
+      "name": "Adult Cast",
+      "russian": "Взрослые персонажи",
+      "kind": "theme"
+    },
+    {
+      "id": "130",
+      "name": "Isekai",
+      "russian": "Исэкай",
+      "kind": "theme"
+    }
+  ],
+  "poster": {
+    "originalUrl": "https://shikimori.io/uploads/poster/animes/60226/47269a34cd0d7f27687dbe2c7773753e.jpeg",
+    "mainUrl": "https://shikimori.io/uploads/poster/animes/60226/main-269fb2e703c43092595924484e891c2c.webp"
+  },
+  "screenshots": [],
+  "airedOn": {
+    "year": 2026,
+    "month": 1,
+    "day": 6
+  },
+  "releasedOn": {
+    "year": 2026,
+    "month": 3,
+    "day": 24
+  },
+  "status": "released",
+  "statusesStats": [
+    {
+      "status": "planned",
+      "count": 1695
+    },
+    {
+      "status": "completed",
+      "count": 705
+    },
+    {
+      "status": "watching",
+      "count": 448
+    },
+    {
+      "status": "dropped",
+      "count": 296
+    },
+    {
+      "status": "on_hold",
+      "count": 79
+    }
+  ]
+}

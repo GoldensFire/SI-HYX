@@ -501,6 +501,8 @@ class AnimePackTabOptionsMixin:
         self.chk_compress_audio = _api.QCheckBox("Сжимать аудио")
         self.chk_compress_audio.setChecked(True)
         self.chk_compress_audio.setToolTip(COMPRESS_TIP)
+        from .video_encoder_controls import build_controls as build_encoder
+        build_encoder(self)
 
         r = 0
         g.addWidget(self.chk_compress_images, r, 0, 1, 4)
@@ -518,6 +520,9 @@ class AnimePackTabOptionsMixin:
         g.addWidget(self.box_img_opts, r, 0, 1, 4)
         r += 1
         g.addWidget(self.chk_compress_audio, r, 0, 1, 4)
+        r += 1
+        g.addWidget(self._lab("Кодирование видео"), r, 0, 1, 2)
+        g.addWidget(self.cb_video_encoder, r, 2, 1, 2)
         r += 1
         self.chk_shuffle = _api.QCheckBox("Вопросы в разнобой")
         self.chk_shuffle.setToolTip(
@@ -904,6 +909,8 @@ class AnimePackTabOptionsMixin:
         s.pct_pixiv_art = shares["pixiv_art"]
         s.pack_pixiv_art = self.chk_pixiv_art.isChecked()
         s.pixiv_refresh_token = self._api_key("pixiv")
+        s.pixiv_art_source = self.cb_pixiv_source.currentData() or "pixiv"
+        s.gelbooru_api_key = self._api_key("gelbooru")
         s.pixiv_r18_mode = self.cb_pixiv_r18.currentData() or "exclude"
         s.pixiv_ai_mode = self.cb_pixiv_ai.currentData() or "exclude"
         # Старые галочки пишем рядом: прежние сборки читают только их.
@@ -1030,6 +1037,7 @@ class AnimePackTabOptionsMixin:
         s.shuffle_questions = self.chk_shuffle.isChecked()
         s.audio_cut = self.sp_cut.value()
         s.parallel = self.sp_parallel.value()
+        s.video_encoder = self.cb_video_encoder.currentData() or "auto"
         s.generation_priority = self.cb_generation_priority.currentData() or "normal"
         s.out_dir = self._out_dir
         return s
@@ -1044,6 +1052,7 @@ class AnimePackTabOptionsMixin:
         # копии при следующем запуске.
         for k in ("gemini_key", "elevenlabs_key", "jimaku_key", "subdl_key", "tmdb_key",
                   "cloudflare_token",
-                  "cloudflare_account_id", "pixiv_refresh_token", "animelib_token"):
+                  "cloudflare_account_id", "pixiv_refresh_token",
+                  "gelbooru_api_key", "animelib_token"):
             data.pop(k, None)
         return self._templates_to_settings(data)

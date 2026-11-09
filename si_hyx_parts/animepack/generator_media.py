@@ -841,10 +841,14 @@ class GeneratorMediaMixin:
         crf = max(1, min(63, int(self.s.video_crf if crf is None else crf)))
         preset = max(0, min(13, int(self.s.video_preset if preset is None
                                     else preset)))
+        scale = ["-vf", f"scale=-2:{_api.VIDEO_HEIGHT}:flags=bicubic"]
+        gpu = getattr(self, "_gpu_video", None)
+        if gpu is not None:
+            # Видеокарта: качество — эквивалент того же CRF (gpu_video_encoder).
+            return gpu.args(crf) + scale
         return ["-c:v", "libsvtav1", "-crf", str(crf), "-preset", str(preset),
                 "-svtav1-params", f"tune={_api.VIDEO_TUNE}:keyint=-1:scd=1",
-                "-pix_fmt", "yuv420p10le",
-                "-vf", f"scale=-2:{_api.VIDEO_HEIGHT}:flags=bicubic"]
+                "-pix_fmt", "yuv420p10le"] + scale
 
     def _video_seconds(self, url: str) -> float:
         """Длительность местного файла или совместимого последовательного HTTP-чтения.
@@ -992,6 +996,9 @@ class GeneratorMediaMixin:
         """Флаги раскрытия кадра: свой пресет, общий с роликами CRF."""
         crf = max(1, min(63, int(self.s.video_crf)))
         preset = max(0, min(13, int(self.s.frame_preset)))
+        gpu = getattr(self, "_gpu_video", None)
+        if gpu is not None:
+            return gpu.args(crf) + ["-vf", vf, "-an"]
         return ["-c:v", "libsvtav1", "-crf", str(crf), "-preset", str(preset),
                 "-svtav1-params", f"tune={_api.VIDEO_TUNE}:keyint=-1:scd=1",
                 "-pix_fmt", "yuv420p10le", "-vf", vf, "-an"]

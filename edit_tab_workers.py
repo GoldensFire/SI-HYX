@@ -70,6 +70,8 @@ from si_hyx_parts.edit_tab_workers.subtitle_extractor import SubtitleExtractor
 
 from si_hyx_parts.edit_tab_workers.ass_extractor import AssExtractor, _SeekThumbnailer
 
+from si_hyx_parts.edit_tab_workers.pgs_extractor import PgsExtractor
+
 from si_hyx_parts.edit_tab_workers.project_thumbs import ProjectThumbWorker
 
 from si_hyx_parts.edit_tab_workers.project_sound import ProjectSoundEngine

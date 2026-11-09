@@ -36,6 +36,28 @@ def views_from_stats(card: dict) -> int:
     return total
 
 
+def franchise_peaks(content_type: str) -> dict:
+    """{франшиза Shikimori: (просмотры, id)} самой просматриваемой части во
+    всей базе генератора — без учёта фильтров вкладки."""
+    import animepack as ap
+    peaks = {}
+    for card in ap.ShikimoriDbCache().all_cards(target_for(content_type)):
+        if not isinstance(card, dict):
+            continue
+        franchise = str(card.get("franchise") or "").strip()
+        if not franchise:
+            continue
+        try:
+            aid = int(card.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        views = views_from_stats(card)
+        best = peaks.get(franchise)
+        if aid and (best is None or views > best[0]):
+            peaks[franchise] = (views, aid)
+    return peaks
+
+
 def _cards_by_shiki(cache, target: str) -> dict:
     out = {}
     for card in cache.all_cards(target):

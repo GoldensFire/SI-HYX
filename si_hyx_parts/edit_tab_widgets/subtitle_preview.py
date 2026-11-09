@@ -97,6 +97,15 @@ class _SubtitlePreview(_api.QWidget):
         self.player.setAudioOutput(self.audio_output)
         self._audio_dev_watch = _api.install_audio_device_recovery(self.audio_output, self)
         self.player.setVideoSink(self.canvas.videoSink())
+        # Субтитры — по каждому пришедшему кадру: на паузе кадр после seek
+        # приезжает позже позиции, и реплика иначе считалась бы по старому.
+        # Холст подписан на sink раньше — к этому слоту часы кадра уже новые.
+        self._ass_provider = None
+        self._ass_shown = None
+        self.canvas.videoSink().videoFrameChanged.connect(self._on_canvas_frame)
+        # Конец отрезка — как у Монтажа (set_play_bound): кадр за OUT не
+        # показывается, плеер встаёт на последнем кадре отрезка.
+        self.canvas.boundaryReached.connect(self._on_boundary)
         self.player.positionChanged.connect(self._on_position)
         self.player.durationChanged.connect(self._on_duration)
         self.player.mediaStatusChanged.connect(self._on_media_status)
@@ -111,8 +120,55 @@ class _SubtitlePreview(_api.QWidget):
 
     def set_active_cue_provider(self, fn):
         """fn(pos_s) -> (text, style_dict) | None — диалог передаёт свою логику
-        поиска активной реплики (учитывает live-правки в списке реплик)."""
+        поиска активной реплики (учитывает live-правки в списке реплик).
+        Запасной путь, когда libass-рендера нет (set_ass_provider)."""
         self._active_cue_getter = fn
+
+    def set_ass_provider(self, fn):
+        """fn() -> AssRenderer|None — рендер того .ass, что сохранит окно.
+        Есть рендер — субтитры рисует libass на холсте тем же путём, что в
+        Монтаже (set_subtitle_image), по времени показанного кадра."""
+        self._ass_provider = fn
+        self._ass_shown = None
+        if fn is None:
+            self.canvas.clear_subtitle()
+        self.refresh_subtitle()
+
+    def refresh_subtitle(self):
+        """Перерисовать субтитры на текущем кадре (реплики изменились)."""
+        self._ass_shown = None
+        rs, re_ = self._range_bounds()
+        self._refresh_subtitle(max(rs, min(re_, self.position())))
+
+    def _sub_time(self, pos_s):
+        """Время для субтитров — начало показанного кадра, как у Монтажа
+        (_sub_now_s) и у ffmpeg при вшивании. По позиции плеера реплика,
+        кончающаяся внутри последнего кадра, в окне пропадала, а в Монтаже
+        и в итоговом файле на этом кадре была."""
+        pts = self.canvas.last_frame_pts()
+        if pts is not None and abs(pts - pos_s) < 0.5:
+            return pts
+        return pos_s
+
+    def _on_canvas_frame(self, _frame):
+        # Пришёл кадр — метка, плейхед и субтитры встают на него.
+        self._on_position(self.player.position())
+
+    def _on_boundary(self):
+        """Кадр за OUT пришёл раньше, чем позиция плеера дошла до конца
+        (плеер отдаёт кадры с упреждением): пауза и снап на конец отрезка —
+        как Монтаж (_on_play_boundary). Без снапа время, ползунок и плейхед
+        таймлайна застревали за 0.05 с до конца, будто видео не доиграло.
+        Позиция — на последний кадр отрезка (seek жмёт к OUT − 1 мс), и
+        _on_position сам выставит метку на конец."""
+        if self.player.playbackState() != _api.QMediaPlayer.PlaybackState.PlayingState:
+            return   # чужой кадр на паузе — снап уже сделан
+        self.player.pause()
+        if self._ext_audio_player is not None:
+            self._ext_audio_player.pause()
+        self._sync_play_icon()
+        _rs, re_ = self._range_bounds()
+        self.seek(re_)
 
     def set_audio_selection(self, track_index=None, ext_path=None):
         """Звук превью — та же дорожка, что выбрана в Монтаже (cmb_audio), а
@@ -173,6 +229,10 @@ class _SubtitlePreview(_api.QWidget):
         self._range_start = max(0.0, float(start_s))
         self._range_end = (max(self._range_start + 0.05, float(end_s))
                             if end_s is not None else None)
+        # Чуть раньше OUT: кадр, начинающийся ровно на OUT, уже за отрезком
+        # (округление pts в мкс не должно пропустить его на экран).
+        self.canvas.set_play_bound(self._range_end - 0.0005
+                                   if self._range_end is not None else None)
         self.seek(self._range_start)
 
     def _range_bounds(self):
@@ -238,10 +298,16 @@ class _SubtitlePreview(_api.QWidget):
     def _on_position(self, pos_ms):
         pos_s = pos_ms / 1000.0
         rs, re_ = self._range_bounds()
+        sub_s = self._sub_time(pos_s)
         if pos_s >= re_ - 0.02:
             if self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState:
                 self.player.pause(); self._sync_play_icon()
             pos_s = re_
+        else:
+            # Метка и плейхед — на НАЧАЛЕ показанного кадра, как в Монтаже:
+            # блоки реплик на таймлайне тоже стоят по кадрам, и плейхед внутри
+            # блока = реплика на экране. В конце отрезка — снап на OUT.
+            pos_s = max(rs, sub_s)
         span = max(0.001, re_ - rs)
         if not self.slider.is_user_seeking():
             self.slider.blockSignals(True)
@@ -250,10 +316,18 @@ class _SubtitlePreview(_api.QWidget):
         # Время внутри отрезка из Монтажа, а не от начала исходника: иначе у
         # трёхсекундного отрезка в конце файла счётчик показывал «/ 00:00:52».
         self.lbl_time.setText(f"{_api.s_to_clock(pos_s - rs)} / {_api.s_to_clock(span)}")
-        self._refresh_subtitle(pos_s)
+        self._refresh_subtitle(sub_s)
         self.positionChanged.emit(pos_s)
 
     def _refresh_subtitle(self, pos_s):
+        r = self._ass_provider() if self._ass_provider is not None else None
+        if r is not None:
+            self._overlay.set_content("", None)
+            self._render_ass(r, self._sub_time(pos_s))
+            return
+        if self._ass_shown is not None:
+            self._ass_shown = None
+            self.canvas.clear_subtitle()
         text, style = "", None
         if self._active_cue_getter is not None:
             found = self._active_cue_getter(pos_s)
@@ -262,9 +336,38 @@ class _SubtitlePreview(_api.QWidget):
         self._sync_overlay_geometry()
         self._overlay.set_content(text, style)
 
-    def _sync_overlay_geometry(self):
+    def _render_ass(self, r, t_s):
+        """Кадр libass на холст — как EditTab._update_subtitle: область кадра
+        холста, картинка по ограничивающему прямоугольнику, без перерисовки,
+        когда libass говорит, что ничего не изменилось."""
         try:
-            self._overlay.setGeometry(self.canvas.video_rect())
+            w, h = self.canvas.subtitle_area_size()
+        except Exception:
+            return
+        if w <= 0 or h <= 0:
+            return
+        try:
+            r.set_frame_size(w, h)
+            arr, ax, ay, changed = r.render(t_s * 1000.0)
+        except Exception:
+            arr, ax, ay, changed = None, 0, 0, True
+        key = (id(r), w, h)
+        if not changed and self._ass_shown == key:
+            return
+        self._ass_shown = key
+        if arr is None:
+            self.canvas.clear_subtitle()
+            return
+        ih, iw = int(arr.shape[0]), int(arr.shape[1])
+        qimg = _api.QImage(arr.data, iw, ih, iw * 4,
+                           _api.QImage.Format.Format_RGBA8888_Premultiplied).copy()
+        self.canvas.set_subtitle_image(qimg, ax, ay)
+
+    def _sync_overlay_geometry(self):
+        # Оверлей — на весь холст; область кадра он берёт сам при отрисовке
+        # (_StyledSubtitleOverlay._frame_rect), так текст не отстаёт от кадра.
+        try:
+            self._overlay.setGeometry(self.canvas.rect())
         except Exception:
             pass
 
@@ -273,7 +376,9 @@ class _SubtitlePreview(_api.QWidget):
         # на его начало, а не на кадр, которого нет ни на таймлайне, ни в итоге.
         pos_s = max(self._range_start, float(pos_s))
         if self._range_end is not None:
-            pos_s = min(pos_s, self._range_end)
+            # На последний кадр отрезка, а не на OUT: кадр на OUT уже за
+            # отрезком, холст его не покажет (set_play_bound).
+            pos_s = min(pos_s, max(self._range_start, self._range_end - 0.001))
         # Пока пайплайн не готов (см. _on_media_status), setPosition() молча
         # роняется/переопределяется бэкендом — копим цель, применяем позже.
         if not self._media_ready:

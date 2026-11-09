@@ -852,7 +852,9 @@ class GeneratorSelectionMixin:
             self._diagnostics.wrap(guarded_fetch(self), _api.KIND_TITLES))
         self.log(f"Параллелизм: запрошено {self.s.parallel}, "
                  f"действующий лимит {workers} задач.")
-        self.log(f"Кодирование AV1: лимит {runtime.encoder_limit} процессов одновременно.")
+        from .video_encoder_choice import choose_video_encoder
+        choose_video_encoder(self)
+        self.log(f"Кодирование видео: лимит {runtime.encoder_limit} процессов одновременно.")
         pending: dict = {}
         self._selection_state = ()
         # Кандидат, которому место в паке есть, но прямо сейчас оно занято

@@ -40,6 +40,55 @@ class _SubtitleTimeline(_api.QWidget):
         self.drag_start_x = None
         self.orig_start = 0.0
         self.orig_end = 0.0
+        self.fps = 0.0          # сетка кадров исходника (set_fps); 0 — без неё
+
+    # ── Сетка кадров ────────────────────────────────────────────────────────
+    # Реплику видно на кадре k, если start ≤ t_k < end, где t_k — начало
+    # кадра в целых мс (так libass рисует её в Монтаже, превью окна и при
+    # вшивании). Поэтому блок рисуется от первого до конца последнего кадра,
+    # где реплика видна, а края тянутся по границам кадров. Раньше блок
+    # кончался на точном времени (56.73), а кадр 56.723–56.765 ещё показывал
+    # реплику: на видео она стояла дальше, чем на таймлайне.
+    def set_fps(self, fps):
+        try:
+            self.fps = max(0.0, float(fps or 0.0))
+        except Exception:
+            self.fps = 0.0
+        self.update()
+
+    def _frame_ms(self, k):
+        return int(k / self.fps * 1000.0)
+
+    def frame_index(self, t):
+        """Граница по кадрам, которую задаёт время t: номер первого кадра,
+        чьё начало (мс) не раньше t. Для начала реплики это её первый кадр,
+        для конца — первый кадр уже без неё."""
+        t_ms = int(round(max(0.0, float(t)) * 1000.0))
+        k = max(0, int(_api.math.ceil(t_ms / 1000.0 * self.fps)) - 1)
+        while self._frame_ms(k) < t_ms:
+            k += 1
+        return k
+
+    def frame_edge(self, k):
+        """Время края реплики на границе кадра k. Не ровно начало кадра: время
+        в .ass хранится в сотых и округляется — край лёг бы по другую сторону
+        кадра. Сотые с запасом 2 мс до начала кадра k: после округления
+        граница та же (при fps до ~80; выше — середина между кадрами)."""
+        k = max(0, int(k))
+        if k == 0:
+            return 0.0
+        start = k / self.fps
+        v = _api.math.floor((start - 0.002) * 100.0 + 1e-6) / 100.0
+        if v * 1000.0 <= self._frame_ms(k - 1):
+            v = (k - 0.5) / self.fps
+        return max(0.0, v)
+
+    def shown_time(self, t):
+        """Начало кадра, на котором край t реально срабатывает (для подписей
+        и рисования). Без сетки кадров — само t."""
+        if self.fps <= 0:
+            return float(t)
+        return self.frame_index(t) / self.fps
 
     # ── Данные ──────────────────────────────────────────────────────────────
     def set_cues(self, cues):
@@ -115,11 +164,40 @@ class _SubtitleTimeline(_api.QWidget):
             k += 1
             t = rs + k * step
 
+    # ── Реплики в пределах отрезка ──────────────────────────────────────────
+    # Таймлайн показывает только отрезок, выделенный в Монтаже (там же
+    # кончается видео превью). Реплика, вылезающая за его край, обрезается
+    # по границе, и её край тянется прямо у границы. Реплики целиком за
+    # отрезком (их нет и в списке окна) не рисуются и не ловят клики: раньше
+    # такая лежала поверх края соседней, и подрезать ту было нельзя.
+    def _range_end(self):
+        return self.range_start + self.duration
+
+    def _in_range(self, s, e):
+        """Как SubtitleCreatorDialog._cue_in_range: реплика задевает отрезок."""
+        return e >= self.range_start and s <= self._range_end()
+
+    def _cue_xs(self, s, e):
+        """X краёв блока реплики — по кадрам, где она видна (shown_time), —
+        обрезанного по границам отрезка."""
+        return (self.time_to_x(max(self.shown_time(s), self.range_start)),
+                self.time_to_x(min(self.shown_time(e), self._range_end())))
+
+    def _draw_order(self):
+        """Реплики отрезка в порядке рисования: выделенная — последней, поверх
+        соседей внахлёст. Hit-test идёт в обратном порядке — попадает в тот
+        блок, что виден сверху."""
+        order = [i for i, (s, e) in enumerate(self.cues)
+                 if i != self.selected and self._in_range(s, e)]
+        if 0 <= self.selected < len(self.cues) and self._in_range(*self.cues[self.selected]):
+            order.append(self.selected)
+        return order
+
     def _draw_cues(self, p):
         y = self.RULER_H + self._ROW_GAP
         w = max(1, self.width())
-        for i, (s, e) in enumerate(self.cues):
-            x0 = self.time_to_x(s); x1 = self.time_to_x(e)
+        for i in self._draw_order():
+            x0, x1 = self._cue_xs(*self.cues[i])
             if x1 < 0 or x0 > w:
                 continue
             r = _api.QRect(int(x0), y, max(2, int(x1 - x0)), self._ROW_H)
@@ -129,6 +207,29 @@ class _SubtitleTimeline(_api.QWidget):
             p.fillRect(r, bg)
             p.setPen(_api.QPen(_api.QColor(_api.C['accent'] if selected else _api.C['border2'])))
             p.drawRect(r)
+            s, e = self.cues[i]
+            self._draw_cut_marks(p, r, self.shown_time(s) < self.range_start - 0.005,
+                                 self.shown_time(e) > self._range_end() + 0.005)
+
+    def _draw_cut_marks(self, p, r, left, right):
+        """Стрелка у края блока, обрезанного границей отрезка: реплика идёт
+        дальше, за начало/конец видео. После подрезки внутрь — пропадает."""
+        if not (left or right) or r.width() < 14:
+            return
+        cy = r.center().y()
+        p.save()
+        p.setRenderHint(_api.QPainter.RenderHint.Antialiasing, True)
+        p.setPen(_api.Qt.PenStyle.NoPen)
+        p.setBrush(_api.QColor(255, 255, 255, 200))
+        for on, tip, base in ((left, r.left() + 3, r.left() + 9),
+                              (right, r.right() - 3, r.right() - 9)):
+            if on:
+                tri = _api.QPainterPath(_api.QPointF(tip, cy))
+                tri.lineTo(base, cy - 5)
+                tri.lineTo(base, cy + 5)
+                tri.closeSubpath()
+                p.drawPath(tri)
+        p.restore()
 
     def _draw_playhead(self, p):
         if self.duration <= 0:
@@ -160,8 +261,8 @@ class _SubtitleTimeline(_api.QWidget):
         # короткую реплику нельзя было сдвинуть. Из краёв берётся ближайший, а
         # при общем крае соседей — тот блок, на чьей стороне курсор.
         edge = None
-        for i, (s, e) in enumerate(self.cues):
-            x0 = self.time_to_x(s); x1 = self.time_to_x(e)
+        for i in reversed(self._draw_order()):
+            x0, x1 = self._cue_xs(*self.cues[i])
             tol = min(self._EDGE_TOL, max(2.0, (x1 - x0) / 4.0))
             if x0 + tol < x < x1 - tol:
                 return i, 'move'
@@ -224,20 +325,28 @@ class _SubtitleTimeline(_api.QWidget):
             i = self.drag_index
             lo, hi = self._neighbor_bounds(i)
             s0, e0 = self.cues[i]
-            if self.dragging == 'start':
-                t = max(lo, min(self.x_to_time(x), e0 - 0.05))
-                self.cues[i] = (t, e0)
+            # Реплики из файла бывают внахлёст с соседями (и вылезают за
+            # отрезок): упор не дальше исходного края — нахлёст можно
+            # уменьшать, но не растить, а край не перескакивает через другой.
+            if self.fps > 0:
+                self._drag_on_frames(i, x, lo, hi, s0, e0)
+            elif self.dragging == 'start':
+                t = max(min(lo, self.orig_start), self.x_to_time(x))
+                self.cues[i] = (min(t, e0 - 0.05), e0)
             elif self.dragging == 'end':
-                t = min(hi, max(self.x_to_time(x), s0 + 0.05))
-                self.cues[i] = (s0, t)
+                t = min(max(hi, self.orig_end), self.x_to_time(x))
+                self.cues[i] = (s0, max(t, s0 + 0.05))
             elif self.dragging == 'move':
                 shift = self.x_to_time(x) - self.x_to_time(self.drag_start_x)
-                ns = self.orig_start + shift; ne = self.orig_end + shift
-                if ns < lo:
-                    d = lo - ns; ns += d; ne += d
-                if ne > hi:
-                    d = ne - hi; ns -= d; ne -= d
-                self.cues[i] = (ns, ne)
+                s_min = lo - self.orig_start; s_max = hi - self.orig_end
+                if s_min <= s_max:
+                    shift = max(s_min, min(shift, s_max))
+                else:
+                    # Длиннее зазора между соседями: раньше второй упор
+                    # сдвигал её поверх левого соседа — теперь только туда и
+                    # настолько, чтобы нахлёст не рос.
+                    shift = max(min(s_min, 0.0), min(shift, max(s_max, 0.0)))
+                self.cues[i] = (self.orig_start + shift, self.orig_end + shift)
             s, e = self.cues[i]
             self.cueChanged.emit(i, s, e)
             self.update()
@@ -249,6 +358,37 @@ class _SubtitleTimeline(_api.QWidget):
             self.setCursor(cur)
         else:
             self.unsetCursor()
+
+    def _drag_on_frames(self, i, x, lo, hi, s0, e0):
+        """Тяга края/перенос реплики по границам кадров (frame_index/
+        frame_edge): блок на таймлайне кончается там же, где реплика пропадает
+        с видео. Упоры — как без сетки: у соседей не дальше исходного края
+        (нахлёст не растёт), реплика не короче кадра."""
+        k_at = int(round(self.x_to_time(x) * self.fps))
+        k_lo = self.frame_index(min(lo, self.orig_start))
+        k_hi = self.frame_index(max(hi, self.orig_end))
+        ks, ke = self.frame_index(s0), self.frame_index(e0)
+        if self.dragging == 'start':
+            ks = max(k_lo, min(k_at, ke - 1))
+            self.cues[i] = (self.frame_edge(ks), e0)
+        elif self.dragging == 'end':
+            ke = min(k_hi, max(k_at, ks + 1))
+            self.cues[i] = (s0, self.frame_edge(ke))
+        elif self.dragging == 'move':
+            ks0 = self.frame_index(self.orig_start)
+            ke0 = self.frame_index(self.orig_end)
+            dk = int(round((self.x_to_time(x) - self.x_to_time(self.drag_start_x)) * self.fps))
+            d_min, d_max = k_lo - ks0, k_hi - ke0
+            if d_min <= d_max:
+                dk = max(d_min, min(dk, d_max))
+            else:
+                # Длиннее зазора между соседями — только туда и настолько,
+                # чтобы нахлёст не рос (см. перенос без сетки).
+                dk = max(min(d_min, 0), min(dk, max(d_max, 0)))
+            if dk == 0:
+                self.cues[i] = (self.orig_start, self.orig_end)
+            else:
+                self.cues[i] = (self.frame_edge(ks0 + dk), self.frame_edge(ke0 + dk))
 
     def mouseReleaseEvent(self, ev):
         self.dragging = None; self.drag_index = -1; self.drag_start_x = None

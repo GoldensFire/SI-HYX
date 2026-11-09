@@ -585,6 +585,20 @@ class UnifiedWindowSettingsMixin:
         add_row(sec_api, grp_pixiv,
                 "pixiv пиксив арт аниме oauth refresh token ключ api картинки")
 
+        grp_gelbooru = _api.QGroupBox("Gelbooru — арты аниме")
+        vgb = _api.QVBoxLayout(grp_gelbooru)
+        _key_row(vgb,
+                 '<a href="https://gelbooru.com/index.php?page=account&amp;s=options" '
+                 'style="color:#89b4fa;">gelbooru.com → My Account → Options</a>',
+                 "&api_key=…&user_id=…", "gelbooru",
+                 "Нужен для вопросов «Арты Pixiv / Gelbooru» с источником "
+                 "Gelbooru: без ключа API Gelbooru не отвечает. Скопируйте строку "
+                 "«&api_key=…&user_id=…» из раздела API Access Credentials "
+                 "целиком. Отбор артов (R-18, ИИ, лайки, исключаемые теги) — "
+                 "тот же, что у Pixiv, во вкладке генератора.")
+        add_row(sec_api, grp_gelbooru,
+                "gelbooru гелбуру booru арт аниме ключ api user id картинки")
+
         grp_cloudflare = _api.QGroupBox("Cloudflare — ИИ-арты")
         vc = _api.QVBoxLayout(grp_cloudflare)
         account = _key_row(vc, "Account ID", "32 символа из кабинета Cloudflare",

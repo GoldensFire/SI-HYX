@@ -51,6 +51,7 @@ class ShikimoriTab(ShikimoriSearchMixin, _api.QWidget):
         self._collapse_franchise = True   # схлопывать сезоны/части одной франшизы
         self._seen_franchises: set = set()  # уже показанные франшизы (для схлопывания)
         self._franchise_of: dict = {}  # anime_id -> ключ франшизы Shikimori (из базы)
+        self._franchise_peaks = None   # франшиза -> (просмотры, id) главной части
         self._fkeys: dict = {}         # anime_id -> ключи франшизы по названиям
         self._page = 0                 # открытая страница списка (_PAGE_SIZE строк)
         # Просмотры и индекс берутся из базы генератора аниме-паков (pack_index):
@@ -437,8 +438,9 @@ class ShikimoriTab(ShikimoriSearchMixin, _api.QWidget):
                     aid = idx.data(_api.Qt.ItemDataRole.UserRole + 1)
                     main_r = self._views_delegate._copy_rects.get(aid)
                     orig_r = self._views_delegate._copy_orig_rects.get(aid)
-                    over = (bool(main_r) and main_r.contains(pos)) or (
-                        bool(orig_r) and not orig_r.isNull() and orig_r.contains(pos))
+                    link_r = self._views_delegate._link_rects.get(aid)
+                    over = any(r is not None and not r.isNull() and r.contains(pos)
+                               for r in (main_r, orig_r, link_r))
                 except Exception:
                     over = False
             if over != self._copy_hover:

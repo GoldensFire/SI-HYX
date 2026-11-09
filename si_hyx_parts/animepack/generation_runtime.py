@@ -7,12 +7,15 @@ import os
 import threading
 import time
 
+from gpu_video_encoder import ENCODER_NAMES
 from .generation_priority import (
     apply_process_priority, current_thread_level, parallel_limit,
     set_thread_level, thread_level)
 
 
 YIELD_THREADS = 6
+# Кодировщики, которые держат слот: AVIF, SVT-AV1 и кодировщики видеокарты.
+HEAVY_ENCODERS = frozenset({"libaom-av1", "libsvtav1"}) | ENCODER_NAMES
 
 
 class GenerationRuntime:
@@ -231,10 +234,9 @@ def encoding_operation(function):
     def run(generator, *args, **kwargs):
         runtime = getattr(generator, "_runtime", None)
         command = args[0] if args else kwargs.get("cmd")
-        # ffprobe, скачивание и Opus не должны занимать слот AV1.
+        # ffprobe, скачивание и Opus не должны занимать слот кодировщика.
         heavy = (function.__name__ != "_run_capture" or
-                 any(value in {"libaom-av1", "libsvtav1"}
-                     for value in (command or [])))
+                 any(value in HEAVY_ENCODERS for value in (command or [])))
         deadline = None
         if function.__name__ == "_run_capture":
             seconds = args[1] if len(args) > 1 else kwargs.get("timeout", 180)

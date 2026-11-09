@@ -445,6 +445,8 @@ class AnimePackTab(
         self.chk_shuffle.setChecked(s.shuffle_questions)
         self.sp_cut.setValue(int(s.audio_cut))
         self.sp_parallel.setValue(int(s.parallel))
+        self.cb_video_encoder.setCurrentIndex(max(0, self.cb_video_encoder.findData(
+            str(getattr(s, "video_encoder", "auto") or "auto"))))
         priority_index = self.cb_generation_priority.findData(s.generation_priority)
         self.cb_generation_priority.setCurrentIndex(
             priority_index if priority_index >= 0 else 1)

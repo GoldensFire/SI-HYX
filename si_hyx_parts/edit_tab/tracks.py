@@ -5,6 +5,7 @@
 import re
 
 import edit_tab as _api
+import pgs_subtitles
 from sip_notify import prime_disconnect_notify
 from si_hyx_parts.edit_tab import subtitle_style
 
@@ -842,6 +843,18 @@ class EditTabTracksMixin:
                 kind, ref = self._audio_entries[aidx]
                 if kind == 'emb':
                     audio_track_index = ref
+
+        def ass_preview(cues, original=original):
+            # Превью окна рисует libass тот самый .ass, который сохранится, с
+            # теми же настройками, что Монтаж (_new_ass_renderer), — реплики в
+            # окне выглядят и стоят так же, как потом в Монтаже и экспорте.
+            text = self._edited_ass_text(original, cues)
+            r = self._new_ass_renderer('ass', text)
+            if not r.load_ass_bytes(text.encode('utf-8')):
+                r.close()
+                return None
+            return r
+
         dlg = _api.SubtitleCreatorDialog(source_path=source_path, cues=cues_arg,
                                     start_hint=start_hint,
                                     range_start=range_start, range_end=range_end,
@@ -850,6 +863,8 @@ class EditTabTracksMixin:
                                     audio_track_index=audio_track_index,
                                     audio_ext_path=audio_ext_path,
                                     title="Редактировать субтитры" if editing else None,
+                                    ass_preview=ass_preview,
+                                    fps=self._grid.fps if self._grid.valid else 0.0,
                                     parent=self)
         # Диалог декодирует ТОТ ЖЕ файл вторым, независимым QMediaPlayer — на
         # некоторых GPU аппаратный декодер (d3d11va/dxva2, см. video_hw_decode)
@@ -861,12 +876,22 @@ class EditTabTracksMixin:
         # позиция и воспроизведение восстанавливаются простым seek()'ом после.
         was_playing = self.player.playbackState() == _api.QMediaPlayer.PlaybackState.PlayingState
         resume_pos_ms = self.player.position()
+        try:
+            resume_s = self._ui_time_s()     # начало показанного кадра
+        except Exception:
+            resume_s = resume_pos_ms / 1000.0
         self.player.stop()
         try:
             result = dlg.exec()
         finally:
+            # Плеер остался в StoppedState: раньше ему лишь возвращали позицию,
+            # и после окна часы Монтажа стояли на кадре 0 (картинка — на месте,
+            # а субтитры, плейхед и шаг считались от начала файла). pause()
+            # возвращает его на паузу, seek_to — кадр, пин и часы интерфейса.
             try:
                 self.player.setPosition(resume_pos_ms)
+                self.player.pause()
+                self.seek_to(resume_s)
                 if was_playing:
                     self.player.play()
             except Exception:
@@ -892,9 +917,7 @@ class EditTabTracksMixin:
                 pass
         if not cues:
             return
-        ass_text = subtitle_style.rebuild_ass(original, cues) if original else None
-        if ass_text is None:
-            ass_text = _api._cues_to_ass(cues)
+        ass_text = self._edited_ass_text(original, cues)
         suffix = "_edited" if editing else "_created"
         try:
             _api.os.makedirs(_api.CONFIG_DIR, exist_ok=True)
@@ -1102,12 +1125,16 @@ class EditTabTracksMixin:
 
         is_bitmap = codec in self._BITMAP_SUB_CODECS
         if is_bitmap or not src:
-            # Битмап-дорожка (или нет источника) → встроенный рендер. Для внешних
-            # файлов битмап-кодеков нет, поэтому это только встроенные дорожки.
-            # Дека даёт только картинку — битмап-субтитров её файла не показать.
-            if kind == 'emb' and not on_deck:
-                try: self.player.setActiveSubtitleTrack(sub_i)
+            # Битмап-дорожка (или нет источника). Плееру Qt её НЕ отдаём: он
+            # рисует только текст, а картинку PGS Qt 6.12 читает как текст по
+            # нулевому указателю и роняет процесс (ffmpegmediaplugin.dll).
+            # PGS рисуем сами — из файла дорожек, так что и на деке; DVD/DVB
+            # в превью не видны. Внешних файлов битмап-кодеков нет.
+            if not on_deck:
+                try: self.player.setActiveSubtitleTrack(-1)
                 except Exception: pass
+            if src and codec in pgs_subtitles.PGS_CODECS:
+                self._start_pgs(src, sub_i)
             return
 
         # Текстовые субтитры → свой рендер; встроенный (с плашкой) гасим.
@@ -1171,7 +1198,9 @@ class EditTabTracksMixin:
             self._sub_extractor = None
 
     def _stop_ass(self):
-        """Останавливает ASS-рендер: таймер, libass, временный .ass и картинку."""
+        """Останавливает ASS-рендер: таймер, libass, временный .ass и картинку.
+        Заодно и показ PGS (_stop_pgs) — картинку субтитров они делят."""
+        self._stop_pgs()
         self._sub_use_ass = False
         ex = getattr(self, "_ass_extractor", None)
         if ex is not None:
@@ -1244,23 +1273,10 @@ class EditTabTracksMixin:
                 ex.start()
             return
         try:
-            # «Как в программе» поверх ASS — тот же force_style, что получит
-            # ffmpeg при вшивании (_subtitles_vf): libass применяет его при
-            # чтении дорожки. Раньше превью рисовало оригинальный стиль, а
-            # экспорт — программный.
-            overrides = ()
             codec = getattr(self, "_cur_sub_codec", "")
-            if codec in ('ass', 'ssa') and self._sub_prog_style(codec):
-                with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                    res = subtitle_style.play_res(f.read())
-                overrides = _api.prog_sub_force_style(
-                    res[1], play_res_x=res[0], keep_layout=True).split(",")
-            # Шрифт караоке — у реплик, созданных в «Создать субтитры» стилем
-            # по умолчанию, и у стиля программы (системным провайдером libass
-            # он не виден).
-            self._ass = _api._libass.AssRenderer(
-                fonts=[str(_api._karaoke_style.FONT_FILE)],
-                style_overrides=overrides)
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                ass_text = f.read()
+            self._ass = self._new_ass_renderer(codec, ass_text)
             if not self._ass.load_ass_file(path):
                 raise RuntimeError("load_ass_file failed")
             self._ass_path = path
@@ -1276,6 +1292,100 @@ class EditTabTracksMixin:
                 self._ass = None
             try: _api.os.remove(path)
             except Exception: pass
+
+    def _new_ass_renderer(self, codec, ass_text):
+        """libass-рендер дорожки (без загруженного трека) — так, как её рисует
+        превью Монтажа и вшивает экспорт. Один на Монтаж и окно правки
+        субтитров: иначе окно показывало реплики по-своему.
+
+        «Как в программе» поверх ASS — тот же force_style, что получит ffmpeg
+        при вшивании (_subtitles_vf): libass применяет его при чтении дорожки.
+        Шрифт караоке — у реплик, созданных в «Создать субтитры» стилем по
+        умолчанию, и у стиля программы (системным провайдером libass он не
+        виден)."""
+        overrides = ()
+        if codec in ('ass', 'ssa') and self._sub_prog_style(codec):
+            res = subtitle_style.play_res(ass_text)
+            overrides = _api.prog_sub_force_style(
+                res[1], play_res_x=res[0], keep_layout=True).split(",")
+        return _api._libass.AssRenderer(
+            fonts=[str(_api._karaoke_style.FONT_FILE)],
+            style_overrides=overrides)
+
+    @staticmethod
+    def _edited_ass_text(original, cues):
+        """Текст .ass, который сохранит окно субтитров: правка по событиям
+        исходной дорожки ASS или новый файл из реплик."""
+        ass_text = subtitle_style.rebuild_ass(original, cues) if original else None
+        return ass_text if ass_text is not None else _api._cues_to_ass(cues)
+
+    def _start_pgs(self, src, sub_i):
+        """PGS → своё извлечение (PgsExtractor в фоне) и показ картинок дорожки
+        через _update_subtitle — тем же путём, что кадры libass."""
+        self._prepare_sub_display()
+        self._sub_token += 1
+        ex = _api.PgsExtractor(src, sub_i, self._sub_token)
+        ex.done.connect(self._on_pgs_extracted)
+        ex.finished.connect(lambda e=ex: self._sub_threads.remove(e)
+                            if e in self._sub_threads else None)
+        self._sub_threads.append(ex)
+        self._pgs_extractor = ex
+        ex.start()
+
+    def _stop_pgs(self):
+        """Снимает показ PGS; саму картинку с экрана убирает _stop_ass."""
+        self._sub_use_pgs = False
+        ex = getattr(self, "_pgs_extractor", None)
+        if ex is not None:
+            try: ex.done.disconnect()
+            except Exception: pass
+            self._pgs_extractor = None
+        self._pgs = None
+        self._pgs_key = None
+
+    def _on_pgs_extracted(self, token, track):
+        if token != self._sub_token or track is None:
+            return
+        self._pgs_extractor = None
+        self._pgs = track
+        self._pgs_key = None
+        self._sub_use_pgs = True
+        self._prepare_sub_display()
+        try:
+            self._update_subtitle(self._sub_now_s())
+        except Exception:
+            pass
+
+    def _show_pgs(self, tgt, pos_s):
+        """Картинка PGS в момент pos_s, вписанная в область кадра цели (холст
+        дорожки — кадр видео). Перерисовываем, только когда сменилось событие,
+        цель или её размер: на каждом тике sync_ui картинка та же."""
+        try:
+            w, h = tgt.subtitle_area_size()
+        except Exception:
+            return
+        if w <= 0 or h <= 0:
+            return
+        ev = self._pgs.event_at(pos_s * 1000.0)
+        key = (ev, id(tgt), w, h)
+        if key == self._pgs_key:
+            return
+        self._pgs_key = key
+        shown = self._pgs.image(ev)
+        if shown is None:
+            tgt.clear_subtitle()
+            return
+        arr, x, y, cw, ch = shown
+        s = min(w / cw, h / ch)
+        ih, iw = int(arr.shape[0]), int(arr.shape[1])
+        qimg = _api.QImage(arr.data, iw, ih, iw * 4,
+                           _api.QImage.Format.Format_RGBA8888_Premultiplied).copy()
+        sw, sh = max(1, round(iw * s)), max(1, round(ih * s))
+        if (sw, sh) != (iw, ih):
+            qimg = qimg.scaled(sw, sh, _api.Qt.AspectRatioMode.IgnoreAspectRatio,
+                               _api.Qt.TransformationMode.SmoothTransformation)
+        tgt.set_subtitle_image(qimg, round((w - cw * s) / 2.0 + x * s),
+                               round((h - ch * s) / 2.0 + y * s))
 
     def _on_sub_cues(self, token, cues):
         if token != self._sub_token:
@@ -1298,6 +1408,9 @@ class EditTabTracksMixin:
         # Цель показа: сам холст (frame-режим) или окно-оверлей (overlay-режим).
         tgt = self.video_widget if self._subs_in_frame else self.sub_overlay
         if tgt is None or not hasattr(tgt, "set_subtitle_text"):
+            return
+        if self._sub_use_pgs and self._pgs is not None:
+            self._show_pgs(tgt, pos_s)
             return
         if self._sub_use_ass and self._ass is not None:
             try:
@@ -1339,17 +1452,13 @@ class EditTabTracksMixin:
                 self.player.setActiveAudioTrack(ai)
         except Exception:
             pass
-        # Субтитры плееру — только битмап-дорожка, как в on_sub_track_changed:
-        # текстовые рисует свой рендер, а включённые и в плеере легли бы вторым
-        # слоем (дорожку выбирают ещё до загрузки — session_state).
+        # Субтитры плеер Qt не показывает никогда, как в on_sub_track_changed:
+        # текстовые рисует свой рендер (включённые и в плеере легли бы вторым
+        # слоем), PGS — pgs_subtitles. Картиночную дорожку плееру отдавать
+        # нельзя: Qt 6.12 читает её как текст и роняет процесс, а выбор
+        # дорожки восстанавливается ещё до загрузки файла (session_state).
         try:
-            sel = getattr(self, "_sub_sel_entry", None)
-            track = -1
-            if sel is not None and sel[0] == 'emb':
-                codec = (self._sub_streams[sel[1]].get('codec_name') or '').lower()
-                if codec in self._BITMAP_SUB_CODECS:
-                    track = sel[1]
-            self.player.setActiveSubtitleTrack(track)
+            self.player.setActiveSubtitleTrack(-1)
         except Exception:
             pass
 

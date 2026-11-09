@@ -5,17 +5,92 @@ from __future__ import annotations
 
 import animepack as _api
 from .generation_diagnostics import locked, operation
+from gelbooru_art_api import GelbooruArtClient
+from gelbooru_art_api import validate_settings as gelbooru_problems
 from pixiv_art_api import PixivArtClient, PixivArtError, PixivArtUnavailable
+from pixiv_art_api import validate_settings as pixiv_problems
 
 
-def init_pixiv_service(self, client=None):
-    self.pixiv = None
-    if not self.s.mix_shares.get(_api.PIXIV_ART_KIND):
-        return
-    self.pixiv = client or PixivArtClient(
-        self.s.pixiv_refresh_token, stopped=self.stopped, rng=self.rng,
-        exclude_r18=self.s.pixiv_exclude_r18,
-        exclude_ai=self.s.pixiv_exclude_ai,
+class ArtSourceMix:
+    """Pixiv и Gelbooru вместе: источник для каждого арта выбирается
+    случайно, а если у него арта нет — пробуется второй. Недоступный
+    источник (ключ, сеть) выпадает до конца прогона, род вопросов живёт,
+    пока жив хоть один."""
+
+    def __init__(self, clients, rng):
+        self.clients = list(clients)
+        self.rng = rng
+        self.current = self.clients[0]
+
+    def __getattr__(self, name):
+        # r18_mode, ai_mode, last_card, stats — как у текущего клиента.
+        current = self.__dict__.get("current")
+        if current is None:
+            raise AttributeError(name)
+        return getattr(current, name)
+
+    @property
+    def source_name(self) -> str:
+        return " + ".join(c.source_name for c in self.clients)
+
+    def fetch(self, anime, excluded=(), *, also=(), skip_links=()):
+        _url, load = self.choose(anime, excluded, also=also,
+                                 skip_links=skip_links)
+        return load()
+
+    def choose(self, anime, excluded=(), *, also=(), skip_links=()):
+        """Выбор без загрузки, как у GelbooruArtClient.choose; Pixiv качает
+        сразу, и его load() лишь отдаёт готовое."""
+        order = list(self.clients)
+        self.rng.shuffle(order)
+        last = None
+        for client in order:
+            try:
+                if hasattr(type(client), "choose"):
+                    result = client.choose(anime, excluded, also=also,
+                                           skip_links=skip_links)
+                else:
+                    done = client.fetch(anime, excluded, also=also,
+                                        skip_links=skip_links)
+                    result = done[2], (lambda done=done: done)
+            except PixivArtUnavailable as exc:
+                if len(self.clients) == 1:
+                    raise
+                self.clients.remove(client)
+                last = PixivArtError(f"{client.source_name} выпал: {exc}")
+                continue
+            except PixivArtError as exc:
+                last = exc
+                continue
+            self.current = client
+            return result
+        raise last or PixivArtError("подходящих артов не найдено")
+
+    def summary(self) -> str:
+        return " ".join(n for n in (str(c.summary() or "")
+                                    for c in self.clients) if n)
+
+
+def _franchise_titles(self):
+    """«Карточка → названия всех частей её франшизы»; индекс один на прогон
+    и собирается только к первому арту."""
+    index = {}
+    lock = _api.threading.Lock()
+
+    def lookup(card) -> set:
+        key = str((card or {}).get("franchise") or "").strip()
+        if not key:
+            return set()
+        with lock:
+            if not index:
+                index.update(self.db_cache.franchise_title_index() or {"": set()})
+        return index.get(key) or set()
+    return lookup
+
+
+def _art_client(self, source):
+    common = dict(
+        stopped=self.stopped, rng=self.rng,
         r18_mode=str(getattr(self.s, "pixiv_r18_mode", "") or ""),
         ai_mode=str(getattr(self.s, "pixiv_ai_mode", "") or ""),
         allow_same_sex=bool(getattr(self.s, "pixiv_allow_same_sex", False)),
@@ -24,17 +99,48 @@ def init_pixiv_service(self, client=None):
         # нескольким сериалам. Функцией, а не набором: собирать его до
         # первого арта незачем.
         known_titles=lambda: self.db_cache.title_index(),
+        # Метки соседних частей франшизы (osomatsu-kun ↔ osomatsu-san) — тот
+        # же тайтл, а не сборка по нескольким сериалам.
+        franchise_titles=_franchise_titles(self),
         # Списки меток-исключений — из настроек пака целиком: их правит сам
         # пользователь (окно «Исключаемые теги»).
         settings=self.s)
+    if source == "gelbooru":
+        return GelbooruArtClient(
+            str(getattr(self.s, "gelbooru_api_key", "") or ""), **common)
+    return PixivArtClient(
+        self.s.pixiv_refresh_token, exclude_r18=self.s.pixiv_exclude_r18,
+        exclude_ai=self.s.pixiv_exclude_ai, **common)
+
+
+def init_pixiv_service(self, client=None):
+    self.pixiv = None
+    if not self.s.mix_shares.get(_api.PIXIV_ART_KIND):
+        return
+    if client is None:
+        source = str(getattr(self.s, "pixiv_art_source", "pixiv") or "pixiv")
+        if source == "both":
+            # С одним ключом «оба» работают как один источник.
+            sources = [name for name, problems in (
+                ("pixiv", pixiv_problems(self.s.pixiv_refresh_token)),
+                ("gelbooru", gelbooru_problems(
+                    getattr(self.s, "gelbooru_api_key", ""))))
+                if not problems] or ["pixiv"]
+        else:
+            sources = ["gelbooru" if source == "gelbooru" else "pixiv"]
+        clients = [_art_client(self, name) for name in sources]
+        client = (clients[0] if len(clients) == 1
+                  else ArtSourceMix(clients, self.rng))
+    self.pixiv = client
+    name = str(getattr(client, "source_name", "Pixiv") or "Pixiv")
     # Сразу говорим, во что обойдётся узкий режим: «только R-18» и «только
     # ИИ» вместе оставляют одну работу из сотни, и весь прогон может уйти в
     # «подходящих артов по тегу не найдено» (просьба пользователя).
-    narrow = [name for name, mode in
+    narrow = [label for label, mode in
               (("только R-18", self.pixiv.r18_mode),
                ("только ИИ-арты", self.pixiv.ai_mode)) if mode == "only"]
     if narrow:
-        self.log("Арты Pixiv: включено «" + "» и «".join(narrow) + "». Под "
+        self.log(f"Арты {name}: включено «" + "» и «".join(narrow) + "». Под "
                  "такой отбор подходит малая часть работ: тайтлов на пак "
                  "уйдёт во много раз больше обычного, а сам прогон будет "
                  "заметно дольше. Не набирается пак — ослабьте один из "
@@ -166,7 +272,7 @@ class PixivArtMixin:
             cand.frame_name = name
             cand.art_link = art_link
             cand.has_frame = True
-            self.log(f"Pixiv-арт «{cand.title_ru}»: добавлен.")
+            self.log(f"{_source(self)}-арт «{cand.title_ru}»: добавлен.")
             return True
         except PixivArtUnavailable as exc:
             self.log(str(exc))
@@ -178,8 +284,15 @@ class PixivArtMixin:
             if isinstance(exc, PixivNetworkError):
                 from .media_transfer import trouble_mark
                 trouble_mark()
-            self._log_rare("Pixiv-арты", f"Pixiv-арт «{searched}»: {exc}")
+            self._log_rare("Pixiv-арты", f"{_source(self)}-арт «{searched}»: {exc}")
             return False
+
+
+def _source(self) -> str:
+    """Откуда последний арт: Pixiv, Gelbooru (у смеси — текущий источник)."""
+    client = getattr(self, "pixiv", None)
+    client = getattr(client, "current", client)
+    return str(getattr(client, "source_name", "Pixiv") or "Pixiv")
 
 
 def _searched_title(first: dict, cand) -> str:
@@ -203,25 +316,36 @@ def _searched_title(first: dict, cand) -> str:
 VISUAL_TRIES = 3
 
 
-@operation("поиск и загрузка Pixiv")
+@operation("поиск и загрузка артов")
 def _pick_art(self, first, also):
     """Один арт по тегу тайтла: данные, расширение, адрес и его карточка.
 
     Поиск идёт под общим замком вместе с бронью адреса, чтобы параллельные
     потоки не взяли одну и ту же работу. Отвергнутая работа остаётся в
     брони — следующий поиск её уже не предложит."""
+    # Метки тайтла Gelbooru ищет до замка: отказ «метки нет» — самый частый,
+    # и ждать ради него очереди за чужими поисками незачем.
+    if hasattr(type(self.pixiv), "prepare"):
+        self.pixiv.prepare(first, also)
     with locked(self, self._pixiv_lock):
         with self._frames_lock:
             excluded = set(self._frames_used)
         # Работы, уже бывшие в выбранных паках («не повторять сами
         # вопросы»), отсеиваются ДО выбора: поздний отказ по отпечатку
         # стоил бы загрузки, проверки Gemini и самого тайтла.
-        from .exact_repeat import pixiv_links
+        from .exact_repeat import art_links
         with self._exact_lock:
-            skip = pixiv_links(self._exact_keys | self._exact_seen
+            skip = art_links(self._exact_keys | self._exact_seen
                                | set(self._exact_pending))
-        data, ext, url = self.pixiv.fetch(first, excluded, also=also,
+        # Gelbooru (и смесь источников) выбирает арт под замком, а качает
+        # уже без него — см. GelbooruArtClient.choose. Pixiv качает сразу.
+        load = None
+        if hasattr(type(self.pixiv), "choose"):
+            url, load = self.pixiv.choose(first, excluded, also=also,
                                           skip_links=skip)
+        else:
+            data, ext, url = self.pixiv.fetch(first, excluded, also=also,
+                                              skip_links=skip)
         # И карточка, и ссылка на работу читаются ЗДЕСЬ, под тем же
         # замком: это поля одного общего клиента, и следующий поток
         # перепишет их своим артом. Раньше ссылку брали уже после
@@ -234,6 +358,8 @@ def _pick_art(self, first, also):
         illust = getattr(self.pixiv, "last_illust", None)
         with self._frames_lock:
             self._frames_used.add(_api.frame_url_key(url))
+    if load is not None:
+        data, ext, url = load()
     return data, ext, url, matched, art_link, illust
 
 

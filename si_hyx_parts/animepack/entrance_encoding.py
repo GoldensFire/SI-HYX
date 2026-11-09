@@ -14,7 +14,8 @@ def _encoder(generator):
         stopped=generator.stopped, fps=settings.entrance_fps,
         seconds=settings.entrance_seconds, strength=settings.entrance_strength,
         preset=settings.entrance_preset, crf=settings.video_crf,
-        max_height=_api.PIXEL_HEIGHT, tune=_api.VIDEO_TUNE)
+        max_height=_api.PIXEL_HEIGHT, tune=_api.VIDEO_TUNE,
+        gpu=getattr(generator, "_gpu_video", None))
 
 
 @encoding_operation

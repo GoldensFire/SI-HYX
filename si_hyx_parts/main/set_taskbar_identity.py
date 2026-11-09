@@ -163,7 +163,28 @@ def main():
     # свойства после этого уже не перечитывает (см. _set_taskbar_identity).
     _api._set_taskbar_identity(int(w.winId()))
     w.show()
-    _api.sys.exit(app.exec())
+    code = app.exec()
+    _release_main_window(w)
+    _api.sys.exit(code)
+
+
+def _release_main_window(w):
+    """Разрушает главное окно сразу после выхода из цикла событий.
+
+    Иначе окно доживало до финализации интерпретатора (кадр main() держит
+    трейсбек SystemExit), и его удалял выходной обработчик PyQt: он обходит
+    все обёртки sip и прямо во время обхода делает delete каждому QObject без
+    родителя, которым владеет Python. Каскад деструкторов окна создавал новые
+    обёртки, хеш-таблица sip росла и переезжала, а обход дочитывал старую —
+    0xC0000005 в sip.pyd (visit_wrappers) после каждого закрытия, дамп и
+    отчёт WER. Настройки к этому моменту уже сохранены closeEvent-ом."""
+    try:
+        w.deleteLater()
+        _api.QApplication.sendPostedEvents(None, _api.QEvent.Type.DeferredDelete.value)
+    except Exception:
+        pass
 
 main.__module__ = _api.__name__
 _api.main = main
+_release_main_window.__module__ = _api.__name__
+_api._release_main_window = _release_main_window

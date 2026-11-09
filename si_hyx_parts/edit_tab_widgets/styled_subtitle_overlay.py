@@ -15,15 +15,39 @@ class _StyledSubtitleOverlay(_api.QWidget):
         self.setAttribute(_api.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self._text = ""
         self._style = None
+        # Оверлей покрывает весь холст и следует за его размером, а область
+        # кадра (letterbox) берёт у холста при каждой отрисовке. Раньше ему
+        # задавали геометрию video_rect() снаружи — до первого кадра это весь
+        # холст, и на паузе (позиция больше не менялась) текст так и
+        # оставался в чёрной полосе под кадром.
+        if parent is not None:
+            parent.installEventFilter(self)
+            self.setGeometry(parent.rect())
+
+    def eventFilter(self, obj, ev):
+        if obj is self.parentWidget() and ev.type() == _api.QEvent.Type.Resize:
+            self.setGeometry(obj.rect())
+        return False
 
     def set_content(self, text, style):
         self._text = text or ""
         self._style = style
         self.update()
 
+    def _frame_rect(self):
+        """Область кадра в координатах оверлея (он стоит в (0,0) холста)."""
+        par = self.parentWidget()
+        try:
+            r = par.video_rect()
+            if r.width() > 0 and r.height() > 0:
+                return r.translated(-self.x(), -self.y())
+        except Exception:
+            pass
+        return self.rect()
+
     def paintEvent(self, ev):
         p = _api.QPainter(self)
-        _api._paint_subtitle_styled(p, self.rect(), self._text, self._style)
+        _api._paint_subtitle_styled(p, self._frame_rect(), self._text, self._style)
         p.end()
 
 _StyledSubtitleOverlay.__module__ = _api.__name__

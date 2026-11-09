@@ -10,6 +10,7 @@ from image_entrance import PACK_EFFECT_LABELS as ENTRANCE_EFFECT_LABELS
 from gemini_api import THINKING_LEVEL as GEMINI_THINKING_LEVEL
 from cloudflare_art_api import validate_settings
 from pixiv_art_api import validate_settings as validate_pixiv_settings
+from gelbooru_art_api import validate_settings as validate_gelbooru_settings
 from frame_reveal import clean_effects
 from cover_meta_rules import LANGUAGE_KEYS as COVER_LANGUAGE_KEYS
 from cover_meta_rules import TYPE_LABELS as COVER_TYPE_LABELS
@@ -192,6 +193,11 @@ class PackSettings:
     # Средняя узнаваемость песенной части, отдельным счётом. 0 — не следить.
     song_level_avg: int = 0
     pixiv_refresh_token: str = _api.field(default="", repr=False)
+    # Откуда брать арты: pixiv | gelbooru | both. Отбор у всех общий (режимы,
+    # лайки, исключаемые метки, проверка Gemini) — меняется только источник.
+    pixiv_art_source: str = "pixiv"
+    # Строка «&api_key=…&user_id=…» Gelbooru (Настройки → Ключи API).
+    gelbooru_api_key: str = _api.field(default="", repr=False)
     pixiv_gemini_check: bool = True
     pixiv_gemini_model: str = ""
     pixiv_title_check_mode: str = "gemini"  # gemini | local
@@ -319,6 +325,11 @@ class PackSettings:
     video_cut: int = _api.VIDEO_CUT
     video_crf: int = _api.VIDEO_CRF
     video_preset: int = _api.VIDEO_PRESET
+    # Чем кодировать всё видео пака: auto | cpu (gpu_video_encoder). Кодек
+    # всегда AV1: «Авто» берёт видеокарту, только если она нативно кодирует
+    # AV1, иначе SVT-AV1. Качество — эквивалент video_crf (и CRF сакуги,
+    # караоке и прочих). Прежнее «gpu» читается как «auto».
+    video_encoder: str = "auto"
     # Какие типы песен вообще брать. Снятая галочка = типа в паке нет, сколько
     # бы ни стояло в его счётчике.
     pick_openings: bool = True
@@ -808,8 +819,22 @@ class PackSettings:
             problems.extend(validate_settings(self.cloudflare_account_id,
                                              self.cloudflare_token,
                                              self.cloudflare_model))
+        if self.video_encoder not in ("auto", "cpu", "gpu"):
+            problems.append("Неизвестный способ кодирования видео.")
         if self.mix_shares.get(_api.PIXIV_ART_KIND):
-            problems.extend(validate_pixiv_settings(self.pixiv_refresh_token))
+            source = self.pixiv_art_source
+            if source not in ("pixiv", "gelbooru", "both"):
+                problems.append("Неизвестный источник артов.")
+            pixiv_problems = validate_pixiv_settings(self.pixiv_refresh_token)
+            gelbooru_problems = validate_gelbooru_settings(self.gelbooru_api_key)
+            if source == "pixiv":
+                problems.extend(pixiv_problems)
+            elif source == "gelbooru":
+                problems.extend(gelbooru_problems)
+            elif pixiv_problems and gelbooru_problems:
+                # «Оба источника» работают и с одним ключом.
+                problems.append("Арты Pixiv и Gelbooru: добавьте хотя бы один "
+                                "ключ (Pixiv или Gelbooru) в Настройках → Ключи API.")
             if self.pixiv_title_check_mode not in ("gemini", "local"):
                 problems.append("Неизвестный способ проверки названия артов Pixiv.")
             if (getattr(self, "pixiv_gemini_check", True) and not ocr_visual

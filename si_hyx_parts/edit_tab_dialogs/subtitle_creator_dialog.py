@@ -134,9 +134,19 @@ class SubtitleCreatorDialog(_api.QDialog):
     def __init__(self, source_path=None, cues=None, start_hint=0.0,
                  range_start=0.0, range_end=None, ignore_media_duration=False,
                  default_style=None, audio_track_index=None, audio_ext_path=None,
-                 title=None, parent=None):
+                 title=None, ass_preview=None, fps=0.0, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title or "Создать субтитры")
+        # Сетка кадров исходника (FrameGrid Монтажа): таймлайн рисует и тянет
+        # края реплик по кадрам — как их показывают Монтаж и экспорт.
+        self._fps = fps
+        # ass_preview(cues) -> AssRenderer|None (EditTab.create_subtitles):
+        # превью рисует libass тот .ass, что сохранится, с настройками Монтажа.
+        # Пересборка — по таймеру, когда реплики/стиль изменились (_poll_ass).
+        self._ass_preview_fn = ass_preview
+        self._ass_r = None
+        self._ass_sig = None
+        self._ass_failed = False
         self.resize(1060, 700)
         self._source_path = source_path
         self._audio_track_index = audio_track_index
@@ -253,6 +263,14 @@ class SubtitleCreatorDialog(_api.QDialog):
         left.addLayout(self._build_toolbar())
         self.preview = _api._SubtitlePreview()
         self.preview.set_active_cue_provider(self._active_cue_at)
+        if ass_preview is not None:
+            self.preview.set_ass_provider(lambda: self._ass_r)
+            self._ass_timer = _api.QTimer(self)
+            self._ass_timer.setInterval(150)
+            self._ass_timer.timeout.connect(self._poll_ass)
+            self._ass_timer.start()
+            _api.QTimer.singleShot(0, self._poll_ass)   # реплики уже разобраны
+            self.finished.connect(self._release_ass)
         left.addWidget(self.preview, 1)
         mid.addLayout(left, 3)
 
@@ -294,6 +312,7 @@ class SubtitleCreatorDialog(_api.QDialog):
         lay.addLayout(tl_top)
 
         self.timeline = _api._SubtitleTimeline()
+        self.timeline.set_fps(self._fps)
         self.timeline.setFixedHeight(90)
         lay.addWidget(self.timeline)
 
@@ -744,6 +763,11 @@ class SubtitleCreatorDialog(_api.QDialog):
         """Время реплики в строке списка — от начала отрезка Монтажа, как на
         линейке таймлайна и в счётчике превью (тайминги хранятся абсолютными)."""
         rs = self._range_start
+        # По кадрам, как блок на таймлайне: начало кадра, с которого реплика
+        # видна, и кадра, на котором она уже пропала (_SubtitleTimeline.shown_time).
+        tl = getattr(self, "timeline", None)
+        if tl is not None:
+            start, end = tl.shown_time(start), tl.shown_time(end)
         return f"{_api.s_to_clock(start - rs)}\n{_api.s_to_clock(end - rs)}"
 
     def _fit_row(self, row_w):
@@ -1135,6 +1159,41 @@ class SubtitleCreatorDialog(_api.QDialog):
         self.timeline.set_view_offset(self.timeline.range_start + v / 1000.0 * maxv)
 
     # ── Превью: активная реплика под плейхедом ──────────────────────────────
+    # ── Превью libass: тот же .ass и рендер, что у Монтажа ──────────────────
+    def _poll_ass(self):
+        """Реплики/стиль изменились — пересобрать .ass и рендер превью. Иначе
+        ничего: сверка дешёвая, сборка — только по факту правки."""
+        if self._ass_preview_fn is None or self._ass_failed:
+            return
+        cues = self.cues()
+        sig = repr([(c['start'], c['end'], c['text'], sorted(c['style'].items()),
+                     c['src'], c['tmpl'], c['restyled']) for c in cues])
+        if sig == self._ass_sig:
+            return
+        self._ass_sig = sig
+        try:
+            r = self._ass_preview_fn(cues) if cues else None
+        except Exception:
+            # libass недоступна — превью остаётся на своём рисовании текста.
+            self._ass_failed = True
+            self.preview.set_ass_provider(None)
+            return
+        old, self._ass_r = self._ass_r, r
+        if old is not None:
+            try: old.close()
+            except Exception: pass
+        self.preview.refresh_subtitle()
+
+    def _release_ass(self, *_args):
+        timer = getattr(self, "_ass_timer", None)
+        if timer is not None:
+            timer.stop()
+        self.preview.set_ass_provider(None)
+        if self._ass_r is not None:
+            try: self._ass_r.close()
+            except Exception: pass
+            self._ass_r = None
+
     def _active_cue_at(self, pos_s):
         for i, c in enumerate(self._cues):
             if c['start'] <= pos_s < c['end']:

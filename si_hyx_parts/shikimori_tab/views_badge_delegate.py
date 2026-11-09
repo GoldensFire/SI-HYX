@@ -9,10 +9,12 @@ from si_hyx_parts.widgets.info_tip_frame import source_is_current
 class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
     """Дорисовывает к строке тайтла настоящий SVG-значок «глаз» (qtawesome
     fa5s.eye) и число просмотров у правого края, а также кнопку «копировать»
-    название (fa5s.copy) сразу справа от самого названия. «Глаз» — вместо emoji 👁
+    название (fa5s.copy) сразу справа от самого названия, а за ней — ссылку на
+    страницу тайтла на Shikimori (fa5s.external-link-alt). «Глаз» — вместо emoji 👁
     (одинаково на всех ОС/темах); число берётся из кеша просмотров вкладки (тот же,
     что и для сортировки) и рисуется, когда дозагружено. Клик по «копировать»
-    (editorEvent) кладёт название в буфер обмена и на 1.5 с показывает «галочку»."""
+    (editorEvent) кладёт название в буфер обмена и на 1.5 с показывает «галочку»;
+    клик по ссылке открывает тайтл в браузере."""
 
     def __init__(self, tab: '_api.ShikimoriTab'):
         super().__init__(tab)
@@ -23,6 +25,7 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
         self._ok_icon = _api.get_icon('fa5s.check', color=_api.C.get('green', '#a6e3a1'))
         self._copy_orig_icon = _api.get_icon('fa5s.copy', color=_api.C['text2'])
         self._ok_orig_icon = _api.get_icon('fa5s.check', color=_api.C.get('green', '#a6e3a1'))
+        self._link_icon = _api.get_icon('fa5s.external-link-alt', color=_api.C['text2'])
         self._copied_id = None          # id строки с активной «галочкой» (рус. название)
         self._copied_orig_id = None     # id строки с активной «галочкой» (ориг. название)
         self._index_rects = {}          # aid -> QRect значка индекса (для подсказки)
@@ -32,6 +35,7 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
         # уезжал и курсор-«рука» не появлялся над реально видимым значком.
         self._copy_rects = {}
         self._copy_orig_rects = {}
+        self._link_rects = {}           # aid -> QRect кнопки «открыть на Shikimori»
         self._reset_timer = _api.QTimer(self)
         self._reset_timer.setSingleShot(True)
         self._reset_timer.timeout.connect(self._clear_copied)
@@ -61,9 +65,9 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
         title = (index.data(_api.Qt.ItemDataRole.UserRole + 2) or "").split("\n")[0]
         tw = fm.horizontalAdvance(title)
         # X — сразу за концом названия, но не за правым краем ТЕКСТОВОЙ области
-        # (справа оставлено место под значки индекса/просмотров).
+        # (справа оставлено место под значки индекса/просмотров и под ссылку).
         x = tr.left() + tw + _api._COPY_TITLE_GAP
-        x = min(x, tr.right() + 1 - _api._COPY_ICON_SZ)
+        x = min(x, tr.right() + 1 - 2 * _api._COPY_ICON_SZ - _api._COPY_TITLE_GAP)
         x = max(x, tr.left())
         # Y — по центру ПЕРВОЙ строки названия. Текст в ячейке выровнен по вертикали
         # по центру (Qt.AlignVCenter), т.е. блок из нескольких строк начинается не от
@@ -76,6 +80,14 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
         block_top = tr.top() + max(0, (tr.height() - block_h) // 2)
         y = block_top + max(0, (fm.lineSpacing() - _api._COPY_ICON_SZ) // 2)
         return _api.QRect(int(x), int(y), _api._COPY_ICON_SZ, _api._COPY_ICON_SZ)
+
+    def _link_rect(self, option, index) -> _api.QRect:
+        """Кнопка «открыть на Shikimori» — сразу справа от «копировать» у
+        названия. Без ссылки у тайтла — null QRect() (не рисуется)."""
+        if not index.data(_api.Qt.ItemDataRole.UserRole):
+            return _api.QRect()
+        copy = self._copy_rect(option, index)
+        return copy.translated(_api._COPY_ICON_SZ + _api._COPY_TITLE_GAP, 0)
 
     def _copy_orig_rect(self, option, index) -> _api.QRect:
         """Прямоугольник кнопки «копировать» для ОРИГИНАЛЬНОГО названия (вторая строка).
@@ -129,6 +141,11 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
         self._copy_rects[aid] = _api.QRect(main_rect)   # запоминаем точную область для hover
         painter.drawPixmap(main_rect,
                            icon.pixmap(_api._COPY_ICON_SZ, _api._COPY_ICON_SZ))
+        link_rect = self._link_rect(option, index)
+        self._link_rects[aid] = _api.QRect(link_rect)
+        if not link_rect.isNull():
+            painter.drawPixmap(link_rect, self._link_icon.pixmap(
+                _api._COPY_ICON_SZ, _api._COPY_ICON_SZ))
         painter.restore()
         # Кнопка «копировать» для ОРИГИНАЛЬНОГО названия (вторая строка, если есть).
         orig_rect = self._copy_orig_rect(option, index)
@@ -234,6 +251,15 @@ class _ViewsBadgeDelegate(_api.QStyledItemDelegate):
                     self._reset_timer.start(_api._COPY_FEEDBACK_MS)
                     self._tab.list.viewport().update()
                 return True  # клик по кнопке — не выделяем/не открываем строку
+            link_rect = self._link_rect(option, index)
+            if not link_rect.isNull() and link_rect.contains(pos):
+                url = index.data(_api.Qt.ItemDataRole.UserRole) or ""
+                if url:
+                    try:
+                        _api.webbrowser.open(url)
+                    except Exception:  # noqa: BLE001 — нет браузера: просто ничего
+                        pass
+                return True
             # Кнопка оригинального названия.
             orig_rect = self._copy_orig_rect(option, index)
             if not orig_rect.isNull() and orig_rect.contains(pos):

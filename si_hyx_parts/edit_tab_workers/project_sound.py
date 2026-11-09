@@ -616,6 +616,11 @@ class ProjectSoundEngine(_api.QObject):
 
     def shutdown(self):
         self._stop_render()
+        # Рендер, упёршийся в полную очередь, ждёт в _Fifo.push, пока
+        # поколение то же, — флаг stopped он там не видит. Новое поколение
+        # отпускает его, иначе поток доживал до финализации интерпретатора.
+        self._gen += 1
+        self._fifo.reset(self._gen)
         if self._worker is not None:
             self._sig_shutdown.emit()
             self._thread.wait(2000)

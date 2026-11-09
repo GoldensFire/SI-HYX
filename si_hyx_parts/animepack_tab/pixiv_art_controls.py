@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
-"""Controls for downloaded Pixiv art questions."""
+"""Controls for downloaded art questions (Pixiv and Gelbooru)."""
 from __future__ import annotations
 
 import animepack_tab as _api
@@ -16,21 +16,59 @@ def _mode_box(tab, tip):
     return box
 
 
+# Откуда брать арты. Отбор у всех общий — меняется только источник.
+SOURCES = (("pixiv", "Pixiv"), ("gelbooru", "Gelbooru"),
+           ("both", "Pixiv и Gelbooru"))
+
+
+def _key_row(tab, name, title, label, tip):
+    """Строка «подпись — кнопка ключа» в своём контейнере: его прячет выбор
+    источника, а саму кнопку — наличие ключа (_refresh_api_key_buttons)."""
+    box = _api.QWidget(tab)
+    grid = _api.QGridLayout(box)
+    grid.setContentsMargins(0, 0, 0, 0)
+    grid.setHorizontalSpacing(8)
+    button = tab._api_key_button(name, title)
+    button.setToolTip(tip)
+    grid.addWidget(tab._lab(label), 0, 0)
+    grid.addWidget(button, 0, 1)
+    grid.setColumnStretch(1, 1)
+    return box, button
+
+
 def build_controls(tab):
-    tab.chk_pixiv_art = _api.QCheckBox("Арты Pixiv")
+    tab.chk_pixiv_art = _api.QCheckBox("Арты Pixiv / Gelbooru")
     tab.chk_pixiv_art.setToolTip(
-        "Ищет по названию аниме арты на Pixiv и добавляет их как вопросы. "
-        "R-18 и ИИ-работы можно разрешить или, наоборот, брать только их; "
-        "шок-контент пропускается всегда. Картинка сжимается как обычный кадр.")
+        "Ищет по названию аниме арты на Pixiv или Gelbooru и добавляет их как "
+        "вопросы. R-18 и ИИ-работы можно разрешить или, наоборот, брать только "
+        "их; шок-контент пропускается всегда. Картинка сжимается как обычный кадр.")
     tab.box_pixiv_art = _api.SettingsBox()
     layout = _api.QGridLayout(tab.box_pixiv_art)
     layout.setContentsMargins(16, 0, 0, 0)
     layout.setHorizontalSpacing(8)
-    tab.btn_pixiv_key = tab._api_key_button("pixiv", "Refresh token Pixiv")
-    tab.btn_pixiv_key.setToolTip(
+    tab.cb_pixiv_source = _api.QComboBox()
+    for key, label in SOURCES:
+        tab.cb_pixiv_source.addItem(label, key)
+    tab.cb_pixiv_source.setToolTip(
+        "Откуда брать арты. Все настройки ниже (R-18, ИИ, лайки, однополые "
+        "пары, исключаемые теги, проверка Gemini) действуют на оба источника.\n"
+        "Gelbooru: «лайк» — это score поста, R-18 — рейтинг questionable и "
+        "explicit, ИИ — метка ai-generated. Тайтл ищется по метке-копирайту "
+        "(ромадзи-название: kimetsu_no_yaiba).\n"
+        "«Pixiv и Gelbooru» — источник выбирается случайно для каждого арта, "
+        "а если там арта нет, пробуется второй; хватит и одного ключа.")
+    layout.addWidget(tab._lab("Источник"), 0, 0)
+    layout.addWidget(tab.cb_pixiv_source, 0, 1)
+    tab.row_pixiv_key, tab.btn_pixiv_key = _key_row(
+        tab, "pixiv", "Refresh token Pixiv", "Pixiv API",
         "Откройте Настройки → Ключи API и добавьте refresh token Pixiv.")
-    layout.addWidget(tab._lab("Pixiv API"), 0, 0)
-    layout.addWidget(tab.btn_pixiv_key, 0, 1)
+    layout.addWidget(tab.row_pixiv_key, 1, 0, 1, 2)
+    tab.row_gelbooru_key, tab.btn_gelbooru_key = _key_row(
+        tab, "gelbooru", "Ключ API Gelbooru", "Gelbooru API",
+        "Откройте Настройки → Ключи API и вставьте строку «&api_key=…&user_id=…» "
+        "со страницы gelbooru.com → My Account → Options.")
+    layout.addWidget(tab.row_gelbooru_key, 2, 0, 1, 2)
+    tab.cb_pixiv_source.currentIndexChanged.connect(lambda _i: _show_source(tab))
     tab.cb_pixiv_r18 = _mode_box(tab, (
         "Что делать со взрослыми работами (R-18).\n"
         "«Только их» соберёт пак ровно из таких артов — арт без метки R-18 "
@@ -42,10 +80,10 @@ def build_controls(tab):
         "и отбор идёт по этой метке.\n"
         "Чем уже режим, тем чаще подходящего арта у тайтла не находится — "
         "тогда вопрос достаётся следующему тайтлу."))
-    layout.addWidget(tab._lab("R-18"), 1, 0)
-    layout.addWidget(tab.cb_pixiv_r18, 1, 1)
-    layout.addWidget(tab._lab("ИИ-арты"), 2, 0)
-    layout.addWidget(tab.cb_pixiv_ai, 2, 1)
+    layout.addWidget(tab._lab("R-18"), 3, 0)
+    layout.addWidget(tab.cb_pixiv_r18, 3, 1)
+    layout.addWidget(tab._lab("ИИ-арты"), 4, 0)
+    layout.addWidget(tab.cb_pixiv_ai, 4, 1)
     # Планка лайков (закладок Pixiv): по ней и отбирается пул, из которого
     # тянется случайная работа (просьба пользователя).
     tab.sp_pixiv_likes = _api.QSpinBox()
@@ -60,14 +98,16 @@ def build_controls(tab):
         f"открытый API не отдаёт. По умолчанию {_api.PIXIV_MIN_LIKES}.\n"
         "Планка строгая: если ей не отвечает ни одна работа ни по одному "
         "из названий тайтла, вопрос достанется другому тайтлу.\n"
-        "Ноль («без планки») снимает отбор по лайкам совсем.")
-    layout.addWidget(tab._lab("Лайков не меньше"), 3, 0)
-    layout.addWidget(tab.sp_pixiv_likes, 3, 1)
+        "Ноль («без планки») снимает отбор по лайкам совсем.\n"
+        "У Gelbooru «лайк» — это score поста, и планка там не выше 5: "
+        "score у Gelbooru гораздо скромнее закладок Pixiv.")
+    layout.addWidget(tab._lab("Лайков не меньше"), 5, 0)
+    layout.addWidget(tab.sp_pixiv_likes, 5, 1)
     tab.chk_pixiv_same_sex = _api.QCheckBox("Пускать работы про однополые пары")
     tab.chk_pixiv_same_sex.setToolTip(
         "BL/яой, GL/юри и подобные метки. По умолчанию такие арты в пак не "
         "идут вовсе (просьба пользователя) — снятая галочка их и отсекает.")
-    layout.addWidget(tab.chk_pixiv_same_sex, 4, 0, 1, 2)
+    layout.addWidget(tab.chk_pixiv_same_sex, 6, 0, 1, 2)
     tab.chk_pixiv_gemini = _api.QCheckBox("Проверять арт через Gemini")
     tab.chk_pixiv_gemini.setChecked(True)
     tab.chk_pixiv_gemini.setToolTip(
@@ -76,7 +116,7 @@ def build_controls(tab):
         "Если способ проверки "
         "названия — Gemini, он проверяет и видимые названия. "
         "До четырёх картинок с одинаковой моделью проверяются одним запросом.")
-    layout.addWidget(tab.chk_pixiv_gemini, 5, 0, 1, 2)
+    layout.addWidget(tab.chk_pixiv_gemini, 7, 0, 1, 2)
     tab.cb_pixiv_title_mode = _api.QComboBox()
     tab.cb_pixiv_title_mode.addItem("Название: Gemini", "gemini")
     tab.cb_pixiv_title_mode.addItem("Название: локальный OCR", "local")
@@ -84,13 +124,13 @@ def build_controls(tab):
         "В локальном режиме OCR проверяет видимое название. Gemini "
         "по-прежнему проверяет качество рисунка и персонажей других тайтлов, "
         "если галочка включена.")
-    layout.addWidget(tab.cb_pixiv_title_mode, 6, 0, 1, 2)
+    layout.addWidget(tab.cb_pixiv_title_mode, 8, 0, 1, 2)
     tab.cb_pixiv_gemini_model = _api.QComboBox()
     for model in _api.GEMINI_MODELS:
         tab.cb_pixiv_gemini_model.addItem(model, model)
     tab.cb_pixiv_gemini_model.setCurrentText(_api.GEMINI_DEFAULT_MODEL)
     tab.cb_pixiv_gemini_model.setToolTip(
-        "Модель Gemini, которая визуально проверяет арты Pixiv.")
+        "Модель Gemini, которая визуально проверяет арты Pixiv и Gelbooru.")
     # Галочки «Пускать комиксы Pixiv» больше нет (просьба пользователя):
     # записи типа «манга» — это кадры с репликами, а не рисунок, и вопросом
     # такая работа не бывает. Поле pixiv_allow_manga осталось только ради
@@ -106,10 +146,18 @@ def build_controls(tab):
         "солянки и прочее.\nГруппу можно выключить целиком, метку — снять по "
         "одной, а свои метки дописать. Они уходят минусом в сам запрос.")
     tab.btn_pixiv_tags.clicked.connect(lambda: edit_tags(tab))
-    layout.addWidget(tab.btn_pixiv_tags, 8, 0, 1, 2)
+    layout.addWidget(tab.btn_pixiv_tags, 10, 0, 1, 2)
     layout.setColumnStretch(1, 1)
     tab.box_pixiv_art.setVisible(False)
     tab.chk_pixiv_art.toggled.connect(lambda value: toggle(tab, value))
+    _show_source(tab)
+
+
+def _show_source(tab):
+    """Строки ключей — только у выбранных источников."""
+    source = tab.cb_pixiv_source.currentData() or "pixiv"
+    tab.row_pixiv_key.setVisible(source in ("pixiv", "both"))
+    tab.row_gelbooru_key.setVisible(source in ("gelbooru", "both"))
 
 
 def toggle(tab, checked):
@@ -126,6 +174,10 @@ def _apply_mode(box, mode, exclude):
 
 def apply_controls(tab, settings):
     tab._migrate_api_key("pixiv", settings.pixiv_refresh_token)
+    source = str(getattr(settings, "pixiv_art_source", "pixiv") or "pixiv")
+    tab.cb_pixiv_source.setCurrentIndex(
+        max(0, tab.cb_pixiv_source.findData(source)))
+    _show_source(tab)
     tab.chk_pixiv_same_sex.setChecked(
         bool(getattr(settings, "pixiv_allow_same_sex", False)))
     tab.chk_pixiv_gemini.setChecked(

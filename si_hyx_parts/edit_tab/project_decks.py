@@ -80,6 +80,7 @@ class EditTabProjectDecksMixin:
         self._deck_tinfo = {}          # файл → его дорожки и файлы рядом (_deck_tracks_scan)
         self._deck_tv = None           # панель о файле куска на деке: {'src', 'saved', 'main'}
         self._deck_sub_at = 0.0        # когда субтитры последний раз шли за кадром деки
+        self._deck_closed = False      # _deck_shutdown был: новых дек не заводить
 
     def _deck_canvas_ok(self):
         vw = getattr(self, "video_widget", None)
@@ -93,7 +94,7 @@ class EditTabProjectDecksMixin:
                 and not getattr(self, "_audio_only_mode", False))
 
     def _deck_pool(self):
-        if not self._decks:
+        if not self._decks and not self._deck_closed:
             for i in range(_DECKS):
                 d = _api.VideoDeck(f"MontageDeck{i + 1}", self)
                 d.ready.connect(self._deck_on_ready)
@@ -571,6 +572,9 @@ class EditTabProjectDecksMixin:
         self._deck_schedule_idle()
 
     def _deck_shutdown(self):
+        # Выход из программы: отложенные заказы после него дек не поднимают
+        # (см. _snd_shutdown).
+        self._deck_closed = True
         decks, self._decks = self._decks, []
         for d in decks:
             try:

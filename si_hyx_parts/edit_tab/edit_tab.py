@@ -112,8 +112,9 @@ class EditTab(
         self.selected_sub_ext_path = None      # путь к выбранному внешнему файлу субтитров
         self._loading_tracks = False
         # Субтитры в превью: для текстовых дорожек рисуем свой VLC-стиль оверлеем
-        # (QtMultimedia рисует их с плашкой и стиль не настраивается). Битмап-
-        # дорожки (PGS/DVD) показываем встроенным рендером.
+        # (QtMultimedia рисует их с плашкой и стиль не настраивается). Картиночные
+        # дорожки плееру Qt не отдаются вовсе (Qt 6.12 на них падает): PGS
+        # рисуем сами (pgs_subtitles), DVD/DVB в превью не показываются.
         self._sub_cues = []
         self._sub_extractor = None
         self._sub_threads = []        # живые QThread'ы извлечения (чтобы не собрал GC)
@@ -127,6 +128,11 @@ class EditTab(
         self._ass_extractor = None
         self._ass_path = None         # временный .ass-файл (удаляем при смене)
         self._ass_timer = None        # таймер перерисовки караоке во время игры
+        # PGS в превью: своя распаковка картинок дорожки (pgs_subtitles).
+        self._sub_use_pgs = False
+        self._pgs = None              # pgs_subtitles.PgsTrack выбранной дорожки
+        self._pgs_extractor = None
+        self._pgs_key = None          # (событие, цель, размер) показанной картинки
         # ── Покадровый движок (см. edit_tab_frames.py) ───────────────────────
         # Вся арифметика перемотки ведётся в НОМЕРАХ кадров, а не в миллисекундах:
         # плеер принимает мс, и при дробном fps (23.976/29.97) шаг «позиция ±
@@ -435,8 +441,9 @@ class EditTab(
     _SUB_FOLDER_NAMES = {'subs', 'sub', 'subtitles', 'subtitle', 'ass', 'srt',
                           'субтитры', 'сабы'}
 
-    # Битмап-субтитры (картинками) свой оверлей рисовать не умеет — для них
-    # оставляем встроенный рендер QtMultimedia.
+    # Битмап-субтитры (картинками): текстом их не извлечь. Плееру Qt их не
+    # отдаём — он рисует только текст, а дорожку PGS Qt 6.12 разбирает как текст
+    # и роняет процесс. PGS рисует pgs_subtitles, остальные в превью не видны.
     _BITMAP_SUB_CODECS = {
         'hdmv_pgs_subtitle', 'pgssub', 'dvd_subtitle', 'dvdsub',
         'dvb_subtitle', 'dvbsub', 'xsub',

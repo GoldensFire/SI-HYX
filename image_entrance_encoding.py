@@ -35,8 +35,12 @@ class EntranceEncoder:
     crf: int = 25
     max_height: int | None = 720
     tune: int = 0
+    # Кодировщик видеокарты (gpu_video_encoder.GpuEncoder) или None — SVT-AV1.
+    gpu: object = None
 
     def encoder_args(self):
+        if self.gpu is not None:
+            return self.gpu.args(self.crf)
         # CRF от 1: «-crf 0» libsvtav1 молча заменяет своим значением 35.
         return ["-c:v", "libsvtav1", "-crf", str(max(1, min(63, int(self.crf)))),
                 "-preset", str(self.preset), "-pix_fmt", "yuv420p10le",

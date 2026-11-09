@@ -40,11 +40,14 @@ class EditTabProjectSoundMixin:
         self._snd_wait_gen = 0
         self._snd_prep_timer = None
         self._snd_failed_msg = None     # отказ уже в журнале (до следующего успеха)
+        self._snd_closed = False        # вкладка закрыта (_snd_shutdown): тракт не поднимать
 
     # ── Тракт ────────────────────────────────────────────────────────────────
     def _snd_engine(self):
         eng = self._snd
         if eng is None:
+            if self._snd_closed:
+                return None
             try:
                 eng = _api.ProjectSoundEngine(self)
             except Exception:
@@ -293,6 +296,16 @@ class EditTabProjectSoundMixin:
         self._deck_prepare(ta)          # и картинка следующих кусков (project_decks)
 
     def _snd_shutdown(self):
+        """Выход из программы. Тракт после этого больше не поднимается: раньше
+        отложенная подготовка (_snd_prep_timer — player.stop() в shutdown
+        двигает плейхед) срабатывала уже после закрытия окна и заводила новый
+        ProjectSoundEngine с потоком ProjectSoundSink и ffmpeg, а за ним деки.
+        Они доживали до выхода: при разрушении окна (main._release_main_window)
+        Qt падал на «QThread: Destroyed while thread is still running»."""
+        self._snd_closed = True
+        t = self._snd_prep_timer
+        if t is not None:
+            t.stop()
         eng, self._snd = self._snd, None
         if eng is not None:
             try:

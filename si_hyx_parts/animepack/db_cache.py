@@ -321,6 +321,29 @@ class ShikimoriDbCache:
         out.discard("")
         return out
 
+    def franchise_title_index(self) -> dict:
+        """Названия всех частей каждой франшизы: {ключ франшизы: названия}.
+
+        Арт по «Осомацу-куну» на Gelbooru подписан и osomatsu-san — это та же
+        франшиза, а не сборка по нескольким сериалам. Части франшизы в кэше
+        (franchise()) хранят только русское название, поэтому названия берём
+        из полных карточек каталога по их полю franchise."""
+        from pixiv_art_api import card_titles
+        out: dict = {}
+        with self._lock:
+            groups = self._read().get("anime") or {}
+            rows = [card for bucket in groups.values()
+                    if isinstance(bucket, dict)
+                    for card in (bucket.get("cards") or {}).values()
+                    if isinstance(card, dict)]
+        for card in rows:
+            key = str(card.get("franchise") or "").strip()
+            if key:
+                out.setdefault(key, set()).update(card_titles(card))
+        for names in out.values():
+            names.discard("")
+        return out
+
     def all_cards(self, target: str) -> list[dict]:
         """Все карточки каталога, какие есть, независимо от набора фильтров.
 

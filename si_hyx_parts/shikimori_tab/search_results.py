@@ -81,6 +81,7 @@ class ShikimoriSearchMixin:
         self._page = 0
         self._update_pager()
         self._seen_franchises = set()
+        self._franchise_peaks = None
         self._set_actions_enabled(False)
         self._set_busy(True)
         if cache_only:
@@ -464,6 +465,9 @@ class ShikimoriSearchMixin:
         hidden = len(raw) - len(kept)
         seen = set()
         if self._collapse_franchise:
+            before = len(kept)
+            kept = self._drop_overshadowed_parts(raw, kept)
+            hidden += before - len(kept)
             views = self._views_cache
             order = sorted(kept, key=lambda a: (views.get(a.id, -1) < 0,
                                                 -views.get(a.id, -1)))
@@ -478,6 +482,42 @@ class ShikimoriSearchMixin:
             kept = [a for a in kept if a.id in keep_ids]
         self._seen_franchises = seen
         return kept, hidden
+
+    def _franchise_peak_map(self) -> dict:
+        """{франшиза: (просмотры, id)} главной части по всей базе генератора.
+        Считается один раз на поиск и только когда база уже прочитана (иначе
+        _franchise_of пуст и сравнивать не с чем)."""
+        if not self._franchise_of:
+            return {}
+        peaks = getattr(self, "_franchise_peaks", None)
+        if peaks is None:
+            from .pack_index import franchise_peaks
+            try:
+                peaks = franchise_peaks(self._content_type())
+            except Exception:  # noqa: BLE001 — без базы схлопываем как раньше
+                peaks = {}
+            self._franchise_peaks = peaks
+        return peaks
+
+    def _drop_overshadowed_parts(self, raw, kept) -> list:
+        """Убирает части франшиз, чья главная (самая просматриваемая) часть не
+        прошла фильтры. Франшизу представляет главная часть: при «год от 2018»
+        «Кафе из другого мира» (2017) отсеяна, и без этого правила вместо неё
+        оставалось «Кафе из другого мира 2» (2021) — как будто франшиза свежая."""
+        peaks = self._franchise_peak_map()
+        if not peaks:
+            return kept
+        raw_ids = {a.id for a in raw}
+        views = self._views_cache
+        out = []
+        for a in kept:
+            franchise = self._franchise_of.get(a.id)
+            peak = peaks.get(franchise) if franchise else None
+            if (peak is not None and peak[1] != a.id and peak[1] not in raw_ids
+                    and peak[0] > views.get(a.id, -1)):
+                continue
+            out.append(a)
+        return out
 
     def _on_collapse_toggled(self, on: bool):
         self._collapse_franchise = bool(on)

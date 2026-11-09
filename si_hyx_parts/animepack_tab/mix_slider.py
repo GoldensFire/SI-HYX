@@ -23,7 +23,7 @@ class _MixSlider(PercentageSliders, _api._ShareBar):
               "titles": "По названию", "dialogue": "Диалоги",
               "plot": "Сюжет", "description_audio": "Описание",
               "ai_art": "ИИ-арты",
-              "pixiv_art": "Арты Pixiv",
+              "pixiv_art": "Арты Pixiv/Gelbooru",
               "sakuga": "Сакуга", "studio": "Студия", "episode": "Отрывки серий",
               "synonyms": "Синонимы",
               "antonyms": "Антонимы", "ukrainian": "Название на украинском"}

@@ -53,8 +53,24 @@ def _song_key(answer: str) -> tuple | None:
     return ("song", _norm(title), _norm(match.group(1)))
 
 
+def _source_link(text: str) -> str:
+    """Ссылка на работу в сравнимом виде: без хвоста запроса.
+
+    У Gelbooru работа задаётся именно запросом (index.php?…&id=N): без него
+    все посты сводились к одному «gelbooru.com/index.php», и после первого
+    арта каждый следующий отсекался как точный повтор — пак из 18 артов
+    выходил с одним вопросом."""
+    url = text.strip()
+    if _host_matches(url, "gelbooru.com"):
+        from gelbooru_art_api import _post_link
+        post = re.search(r"[?&]id=(\d+)", url)
+        if post:
+            return _post_link(post.group(1)).casefold()
+    return url.split("?", 1)[0].casefold()
+
+
 def _source_keys(answers: list[str]) -> set[tuple]:
-    return {("source", text.strip().split("?", 1)[0].casefold())
+    return {("source", _source_link(text))
             for text in answers if str(text or "").startswith(("https://", "http://"))
             and not any(_host_matches(text, host) for host in
                         ("youtube.com", "youtu.be", "fandom.com"))}
@@ -189,7 +205,12 @@ def candidate_keys(cand, folder: str) -> set[tuple]:
     return keys
 
 
-def pixiv_links(keys) -> set[str]:
-    """Страницы работ Pixiv, уже спрошенные в выбранных паках."""
+def art_links(keys) -> set[str]:
+    """Страницы работ Pixiv и Gelbooru, уже спрошенные в выбранных паках."""
     return {key[1] for key in keys
-            if key[0] == "source" and _host_matches(key[1], "pixiv.net")}
+            if key[0] == "source" and (_host_matches(key[1], "pixiv.net")
+                                       or _host_matches(key[1], "gelbooru.com"))}
+
+
+# Прежнее имя: его зовут тесты.
+pixiv_links = art_links

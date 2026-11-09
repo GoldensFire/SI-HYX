@@ -26,7 +26,9 @@ def build_controls(tab):
     tab.sp_video_crf.setMinimumWidth(44)
     tab.sp_video_crf.setToolTip(
         "CRF libsvtav1: меньше — качественнее и тяжелее. "
-        "45 — заметно сжато, зато пак не раздувается.")
+        "45 — заметно сжато, зато пак не раздувается.\n"
+        "Если AV1 кодирует видеокарта («Кодирование видео»), качество "
+        "подбирается эквивалентным этому CRF; пресет там не используется.")
     tab.sp_video_preset = api.QSpinBox()
     tab.sp_video_preset.setRange(0, 13)
     tab.sp_video_preset.setValue(api.VIDEO_PRESET)

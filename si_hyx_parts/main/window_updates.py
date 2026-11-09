@@ -355,6 +355,7 @@ class UnifiedWindowUpdatesMixin:
             _api.os.makedirs(upd_dir, exist_ok=True)
             ps_path = _api.os.path.join(upd_dir, "apply_update.ps1")
             cmd_path = _api.os.path.join(upd_dir, "run_updater.cmd")
+            js_path = _api.os.path.join(upd_dir, "run_updater.js")
             log_path = _api.os.path.join(upd_dir, "update_log.txt")
             lock_path = _api.os.path.join(upd_dir, "updater.lock")
             for _p in (log_path, lock_path):
@@ -369,6 +370,7 @@ class UnifiedWindowUpdatesMixin:
             launch_task = task_name + "_Launch"
             relaunch_path = _api.os.path.join(upd_dir, "relaunch.cmd")
             register_path = _api.os.path.join(upd_dir, "register.cmd")
+            register_console_path = _api.os.path.join(upd_dir, "register_console.cmd")
             leaf = _api.os.path.basename(exe_path)
             src_exe = _api.os.path.join(src_root, leaf)
             # Время триггера задач (в будущем). Реально задачи запускаются через
@@ -422,7 +424,21 @@ class UnifiedWindowUpdatesMixin:
             )
             with open(ps_path, "w", encoding="utf-8-sig") as f:
                 f.write(hdr + body)
-            # run_updater.cmd — действие задачи-апдейтера (находит ps1 рядом, %~dp0)
+            # run_updater.js — действие задачи-апдейтера. Задача с /RL LIMITED
+            # идёт в сеансе пользователя, и консольное действие (cmd, powershell)
+            # показывало окно: -WindowStyle Hidden прячет его только после
+            # старта PowerShell — окно мелькало. wscript — оконная программа без
+            # консоли, PowerShell она запускает уже скрытым (0) и ждёт его (true):
+            # Планировщик снимает дерево процессов завершившейся задачи.
+            # JScript, а не VBScript: VBScript Windows убирает. ps1 — рядом.
+            with open(js_path, "w", encoding="ascii", errors="replace") as f:
+                f.write('var sh = new ActiveXObject("WScript.Shell");\r\n'
+                        'var dir = WScript.ScriptFullName.replace(/[^\\\\]+$/, "");\r\n'
+                        'WScript.Quit(sh.Run("powershell -NoProfile -ExecutionPolicy '
+                        'Bypass -WindowStyle Hidden -File \\"" + dir + '
+                        '"apply_update.ps1\\"", 0, true));\r\n')
+            # run_updater.cmd — запасное действие, если Windows Script Host
+            # выключен политикой (окно консоли мелькнёт, но обновление пройдёт).
             with open(cmd_path, "w", encoding="ascii", errors="replace") as f:
                 f.write("@echo off\r\n"
                         "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden "
@@ -438,14 +454,24 @@ class UnifiedWindowUpdatesMixin:
                         'schtasks /Create /F /TN "' + launch_task + '" /TR "\\"%EXE%\\"" '
                         '/SC ONCE /ST ' + st + ' /RL LIMITED >nul 2>&1\r\n'
                         'schtasks /Run /TN "' + launch_task + '" >nul 2>&1\r\n')
-            # register.cmd — регистрирует и запускает задачу-апдейтер (form2-кавычки)
-            with open(register_path, "w", encoding="ascii", errors="replace") as f:
-                f.write("@echo off\r\n"
-                        'schtasks /Create /F /TN "' + task_name + '" /TR "\\"' + cmd_path + '\\"" '
+            # register.cmd — регистрирует и запускает задачу-апдейтер (form2-кавычки).
+            # Пути — через %~dp0 (папка самого .cmd): cmd подставляет их в
+            # Юникоде, а записанные в ascii-файл пути с кириллицей портились.
+            def register_script(action):
+                return ("@echo off\r\n"
+                        'schtasks /Create /F /TN "' + task_name + '" /TR "' + action + '" '
                         '/SC ONCE /ST ' + st + ' /RL LIMITED >nul 2>&1\r\n'
                         'schtasks /Run /TN "' + task_name + '" >nul 2>&1\r\n')
 
-            if not self._spawn_updater(task_name, register_path, ps_path):
+            with open(register_path, "w", encoding="ascii", errors="replace") as f:
+                f.write(register_script(
+                    '\\"%SystemRoot%\\System32\\wscript.exe\\" //B //NoLogo '
+                    '\\"%~dp0run_updater.js\\"'))
+            with open(register_console_path, "w", encoding="ascii", errors="replace") as f:
+                f.write(register_script('\\"%~dp0run_updater.cmd\\"'))
+
+            if not self._spawn_updater(task_name, register_path, register_console_path,
+                                       ps_path, log_path):
                 self._updating = False
                 self.log("Не удалось запустить апдейтер. Обновите вручную из папки: " + src_root)
                 return
@@ -462,27 +488,48 @@ class UnifiedWindowUpdatesMixin:
             self._updating = False
             self.log(f"Ошибка применения обновления: {e}")
 
-    def _spawn_updater(self, task_name, register_cmd, ps_path):
+    def _spawn_updater(self, task_name, register_cmd, register_console_cmd,
+                       ps_path, log_path):
         """Запускает апдейтер ВНЕ job-объекта программы. Основной путь —
         Планировщик задач через register.cmd (служба исполняет задачу в своей
         сессии, job родителя на неё не влияет — работает даже в Win Sandbox).
+        Задача запускает PowerShell через wscript без окна консоли; если
+        апдейтер так и не начал лог (Windows Script Host выключен политикой) —
+        та же задача с действием-cmd (register_console_cmd), окно мелькнёт.
         Фолбэк — обычный detached Popen (+breakaway) для машин без жёсткого job."""
         flags = getattr(_api.subprocess, "CREATE_NO_WINDOW", 0)
-        # 1) Планировщик задач (register.cmd сам делает /Create и /Run)
-        try:
+
+        def run_task(register):
             # encoding задан явно, как и везде в проекте: без него Python берёт
             # кодировку системной локали (cp1251 на русской Windows, cp1252 на
             # английской) — поведение зависело бы от языка системы пользователя.
             # Вывод здесь не разбирается, важен только returncode; если он всё
             # же понадобится — учесть, что cmd/schtasks пишут в OEM-кодировку
             # консоли, и errors="replace" превратит кириллицу в «?».
-            _api.subprocess.run(["cmd", "/c", register_cmd], creationflags=flags,
+            _api.subprocess.run(["cmd", "/c", register], creationflags=flags,
                            capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=30)
             chk = _api.subprocess.run(["schtasks", "/Query", "/TN", task_name],
                                  creationflags=flags, capture_output=True, text=True,
                                  encoding="utf-8", errors="replace", timeout=15)
-            if chk.returncode == 0:
+            return chk.returncode == 0
+
+        def updater_started(wait_s):
+            # Первая строка лога («Updater started.») пишется сразу, ещё до
+            # ожидания выхода программы.
+            deadline = _api.time.monotonic() + wait_s
+            while _api.time.monotonic() < deadline:
+                if _api.os.path.exists(log_path):
+                    return True
+                _api.time.sleep(0.1)
+            return _api.os.path.exists(log_path)
+
+        # 1) Планировщик задач (register.cmd сам делает /Create и /Run)
+        try:
+            if run_task(register_cmd):
+                if not updater_started(6.0):
+                    self.log("Апдейтер через wscript не стартовал — запускаю через cmd.")
+                    run_task(register_console_cmd)
                 self.log("Апдейтер запущен через Планировщик задач (вне job-объекта).")
                 return True
             self.log("Планировщик: задача не зарегистрирована — пробую прямой запуск.")

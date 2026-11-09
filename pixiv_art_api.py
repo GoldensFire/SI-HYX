@@ -98,9 +98,9 @@ def _art_link(illust) -> str:
     return f"https://www.pixiv.net/artworks/{number}" if number > 0 else ""
 
 
-def _image_extension(data: bytes) -> str:
+def _image_extension(data: bytes, source: str = "Pixiv") -> str:
     if not data or len(data) > 32 * 1024 * 1024:
-        raise PixivArtError("Pixiv вернул пустую или слишком большую картинку.")
+        raise PixivArtError(f"{source} вернул пустую или слишком большую картинку.")
     try:
         with Image.open(io.BytesIO(data)) as image:
             ext = {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}.get(
@@ -110,16 +110,19 @@ def _image_extension(data: bytes) -> str:
             image.verify()
             return ext
     except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
-        raise PixivArtError("Pixiv вернул повреждённую картинку.") from exc
+        raise PixivArtError(f"{source} вернул повреждённую картинку.") from exc
 
 
 class PixivArtClient:
     """Authenticate lazily, filter Pixiv results, and return original bytes."""
 
+    # Имя источника для журнала генератора (у Gelbooru своё).
+    source_name = "Pixiv"
+
     def __init__(self, refresh_token: str, *, api=None, stopped=None, rng=None,
                  exclude_r18=True, exclude_ai=True, r18_mode="", ai_mode="",
                  allow_same_sex=False, allow_manga=False, min_likes=None,
-                 known_titles=None, settings=None):
+                 known_titles=None, franchise_titles=None, settings=None):
         self.refresh_token = str(refresh_token or "").strip()
         self.api = api
         self.stopped = stopped or (lambda: False)
@@ -163,6 +166,9 @@ class PixivArtClient:
         # функцией: собирать его заранее незачем, если артов в паке нет.
         self._known_titles = known_titles
         self._known_cache = None
+        # Названия соседних частей франшизы тайтла: функция «карточка →
+        # набор названий». Их метки на работе — тот же тайтл, не чужой.
+        self._franchise_titles = franchise_titles
 
     def _ensure_api(self):
         if self.stopped():
@@ -211,6 +217,18 @@ class PixivArtClient:
             self._known_cache = {name for name in (names or ())
                                  if len(name) >= MIN_TITLE_TAG}
         return self._known_cache
+
+    def own_titles(self, cards) -> set:
+        """Названия искомых тайтлов и всех частей их франшиз."""
+        own = set()
+        for card in cards:
+            own |= card_titles(card)
+            if self._franchise_titles is not None:
+                try:
+                    own |= set(self._franchise_titles(card) or ())
+                except Exception:  # noqa: BLE001 — без каталога как раньше
+                    pass
+        return own
 
     def _foreign_title(self, illust, own: set) -> bool:
         """Есть ли у работы метка с названием ДРУГОГО тайтла.
@@ -394,13 +412,11 @@ class PixivArtClient:
         """Пула для случайного выбора ещё не хватает?"""
         return sum(1 for row in rows if self._good_enough(row)) < MIN_CHOICES
 
-    @staticmethod
-    def _merge(rows: list, more: list) -> list:
+    def _merge(self, rows: list, more: list) -> list:
         """Добавляет работы, которых в списке ещё нет (сверяем по адресу)."""
-        known = {PixivArtClient._url(row) for row in rows}
+        known = {self._url(row) for row in rows}
         known.discard("")
-        return rows + [row for row in more
-                       if PixivArtClient._url(row) not in known]
+        return rows + [row for row in more if self._url(row) not in known]
 
     def fetch(self, anime: dict, excluded=(), *,
               also=(), skip_links=()) -> tuple[bytes, str, str]:
@@ -412,9 +428,7 @@ class PixivArtClient:
 
             # Названия тайтлов, по которым идёт этот поиск: их метки на
             # работе — норма, чужие — повод её выбросить (_foreign_title).
-            own = set()
-            for card in (anime,) + tuple(also):
-                own |= card_titles(card)
+            own = self.own_titles((anime,) + tuple(also))
 
             def keep(row) -> bool:
                 url = self._url(row)
