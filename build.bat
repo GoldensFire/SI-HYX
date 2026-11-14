@@ -10,6 +10,19 @@ REM все "pause" — иначе сборка, запущенная не из �
 REM CI), зависнет в ожидании нажатия клавиши.
 if not defined NONINTERACTIVE set "NONINTERACTIVE=0"
 
+REM GUI/CI: переводим консоль в UTF-8. Python-вывод и так UTF-8
+REM (build_gui.py задаёт PYTHONUTF8), а cmd echo с кириллицей иначе приходит
+REM в лог кракозябрами. Для интерактивной консоли кодовую страницу не трогаем.
+if "%NONINTERACTIVE%"=="1" chcp 65001 >nul 2>&1
+
+REM Уровень deflate для архивов релиза (см. tools\make_release_zip.py):
+REM   4 — почти размер Compress-Archive Optimal, но заметно быстрее;
+REM   1 — ещё быстрее, зато zip крупнее примерно на четверть.
+REM build_gui.py передаёт 1 для галочки «Быстрые архивы».
+if not defined SIHYX_ZIP_LEVEL set "SIHYX_ZIP_LEVEL=4"
+REM 1 — переносить неизменные bin/models из прошлого full-архива без сжатия.
+if not defined SIHYX_REUSE_ASSETS set "SIHYX_REUSE_ASSETS=1"
+
 REM 0) Read APP_VERSION from config.py so the output folder/zip carry the version
 for /f "usebackq delims=" %%V in (`python -c "import config,sys; sys.stdout.write(config.APP_VERSION)"`) do set "APP_VERSION=%%V"
 if not defined APP_VERSION (
@@ -29,9 +42,22 @@ REM Метки [STEP n/9] — по ним build_gui.py считает прогр
 REM Печатаются ПЕРЕД тем шагом, который сейчас начинается (см. STEP_WEIGHTS
 REM в build_gui.py). Не переставляй/не удаляй, если не готов поправить и там.
 
-REM 1) Install / upgrade PyInstaller
-echo [STEP 1/9] Installing/upgrading PyInstaller...
-python -m pip install --upgrade pyinstaller
+REM 1) PyInstaller: обновляем только по явному запросу (build_gui.py →
+REM    «Обновлять PyInstaller»). Иначе проверяем, что он уже стоит: pip
+REM    --upgrade каждый раз ходит в сеть и добавляет к сборке десятки секунд,
+REM    ничего не меняя. Если пакета нет — ставим.
+echo [STEP 1/9] Preparing PyInstaller...
+if /I "%UPDATE_PYINSTALLER%"=="1" (
+    python -m pip install --upgrade pyinstaller
+) else (
+    python -c "import PyInstaller" >nul 2>&1
+    if errorlevel 1 (
+        echo [INFO] PyInstaller is not installed — installing...
+        python -m pip install --upgrade pyinstaller
+    ) else (
+        echo [INFO] PyInstaller is already installed — update skipped.
+    )
+)
 if errorlevel 1 ( echo [ERROR] pip install pyinstaller failed. & if not "%NONINTERACTIVE%"=="1" pause & exit /b 1 )
 
 REM 2) Сверка окружения с requirements.txt ДО сборки: PyInstaller кладёт в exe
@@ -54,7 +80,9 @@ REM    они внешние ассеты (копируются ниже), по�
 REM    Запуск через `python -m PyInstaller`, а не голым `pyinstaller`: так сборка
 REM    гарантированно идёт тем же интерпретатором, чьё окружение проверил шаг 2.
 echo [STEP 3/9] Running PyInstaller (this takes a while)...
-python -m PyInstaller --noconfirm SI-HYX.spec
+REM -u: без буферизации. Иначе GUI получает лог PyInstaller пачками только
+REM в конце шага, и прогресс/ETA в build_gui.py выглядят «зависшими».
+python -u -m PyInstaller --log-level INFO --noconfirm SI-HYX.spec
 if errorlevel 1 (
     echo [ERROR] Build failed.
     if not "%NONINTERACTIVE%"=="1" pause
@@ -74,9 +102,10 @@ if errorlevel 1 (
 
 REM 5) update-архив — ТОЛЬКО код + _internal (без bin и без models). Качается при
 REM    обновлении, если внешние ассеты не менялись. Делаем ДО копирования bin/models.
+REM    tools\make_release_zip.py быстрее Compress-Archive, печатает прогресс для
+REM    build_gui.py и заменяет готовый архив только после успешной записи.
 echo [STEP 5/9] Creating update archive...
-if exist "dist\%UPDATE_ZIP%" del /Q "dist\%UPDATE_ZIP%"
-powershell -NoProfile -Command "Compress-Archive -Path 'dist\%RELEASE_NAME%' -DestinationPath 'dist\%UPDATE_ZIP%' -Force"
+python -u tools\make_release_zip.py "dist\%RELEASE_NAME%" "dist\%UPDATE_ZIP%" --step 5
 if errorlevel 1 (
     echo [ERROR] Could not create update archive.
     if not "%NONINTERACTIVE%"=="1" pause
@@ -106,9 +135,10 @@ if errorlevel 1 (
 
 REM 8) full-архив (код + bin + models + .binver). Для новых клиентов и при
 REM    изменённых внешних ассетах (новый bin или новая модель).
+REM    Если bin/.binver совпал с прошлым full-архивом, bin/models переносятся
+REM    из него как есть — их повторное сжатие и было основной потерей времени.
 echo [STEP 8/9] Creating full archive...
-if exist "dist\%FULL_ZIP%" del /Q "dist\%FULL_ZIP%"
-powershell -NoProfile -Command "Compress-Archive -Path 'dist\%RELEASE_NAME%' -DestinationPath 'dist\%FULL_ZIP%' -Force"
+python -u tools\make_release_zip.py "dist\%RELEASE_NAME%" "dist\%FULL_ZIP%" --step 8 --reuse-assets-from "dist"
 if errorlevel 1 (
     echo [ERROR] Could not create full archive.
     if not "%NONINTERACTIVE%"=="1" pause
@@ -119,7 +149,9 @@ REM 9) manifest.json {version, bin_sha, update_sha, full_sha, silent} — ПОС
 REM    архивов, чтобы записать их SHA256 для проверки целостности при загрузке.
 REM    silent берётся из config.SILENT_UPDATE (см. build_gui.py / make_manifest.py).
 echo [STEP 9/9] Writing manifest.json...
-python make_manifest.py manifest "dist\%RELEASE_NAME%" "dist" "dist\%UPDATE_ZIP%" "dist\%FULL_ZIP%"
+REM reuse-binver: шаг 7 только что посчитал bin_sha по bin+models. Без флага
+REM манифест читал бы эти же полтора гигабайта второй раз.
+python -u make_manifest.py manifest "dist\%RELEASE_NAME%" "dist" "dist\%UPDATE_ZIP%" "dist\%FULL_ZIP%" reuse-binver
 if errorlevel 1 (
     echo [ERROR] make_manifest.py manifest failed.
     if not "%NONINTERACTIVE%"=="1" pause

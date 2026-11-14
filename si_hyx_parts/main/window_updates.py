@@ -53,29 +53,7 @@ class UnifiedWindowUpdatesMixin:
         версии — эмитит update_available_sig (показ диалога на GUI-потоке)."""
         def _run():
             try:
-                # Берём СПИСОК релизов (а не /latest), чтобы учитывать и
-                # pre-release (beta), которые /latest пропускает.
-                api = (f"https://api.github.com/repos/{_api.GITHUB_OWNER}/{_api.GITHUB_REPO}"
-                       f"/releases?per_page=10")
-                with _api.http_get(api, headers={
-                    "User-Agent": _api.APP_NAME,
-                    "Accept": "application/vnd.github+json",
-                }, timeout=15, allow_insecure=False) as r:
-                    releases = _api.json.loads(r.read().decode("utf-8", "replace"))
-                if not isinstance(releases, list):
-                    releases = []
-
-                # Находим самый свежий не-черновик с zip-ассетом и наибольшей версией
-                best_tag, best_ver, best_rel = "", (0,), None
-                for rel in releases:
-                    if rel.get("draft"):
-                        continue
-                    tag = rel.get("tag_name") or rel.get("name") or ""
-                    ver = _api.parse_version(tag)
-                    has_zip = any(str(a.get("name", "")).lower().endswith(".zip")
-                                  for a in rel.get("assets", []))
-                    if has_zip and ver > best_ver:
-                        best_ver, best_tag, best_rel = ver, tag, rel
+                best_tag, best_ver, best_rel = self._fetch_latest_release()
 
                 if best_rel is not None and best_ver > _api.parse_version(_api.APP_VERSION):
                     # Выбираем ассет умно: только код (update-архив), если bin не
@@ -108,19 +86,107 @@ class UnifiedWindowUpdatesMixin:
         _api.threading.Thread(target=_run, daemon=True).start()
 
     @staticmethod
+    def _fetch_latest_release():
+        """(tag, version_tuple, release) самого свежего релиза с zip-ассетом.
+        Берём СПИСОК релизов (а не /latest), чтобы учитывать и pre-release
+        (beta), которые /latest пропускает. Ошибки сети пробрасываются."""
+        api = (f"https://api.github.com/repos/{_api.GITHUB_OWNER}/{_api.GITHUB_REPO}"
+               f"/releases?per_page=10")
+        with _api.http_get(api, headers={
+            "User-Agent": _api.APP_NAME,
+            "Accept": "application/vnd.github+json",
+        }, timeout=15, allow_insecure=False) as r:
+            releases = _api.json.loads(r.read().decode("utf-8", "replace"))
+        if not isinstance(releases, list):
+            releases = []
+        best_tag, best_ver, best_rel = "", (0,), None
+        for rel in releases:
+            if not isinstance(rel, dict) or rel.get("draft"):
+                continue
+            tag = rel.get("tag_name") or rel.get("name") or ""
+            ver = _api.parse_version(tag)
+            has_zip = any(str(a.get("name", "")).lower().endswith(".zip")
+                          for a in rel.get("assets", []))
+            if has_zip and ver > best_ver:
+                best_ver, best_tag, best_rel = ver, tag, rel
+        return best_tag, best_ver, best_rel
+
+    @staticmethod
     def _local_bin_sha() -> str:
         """Хеш текущего набора bin — читаем из bin/.binver рядом с программой.
         Пусто, если файла нет (старая установка без манифеста) → значит «bin
-        неизвестен», и обновление возьмёт полный zip."""
+        неизвестен», и обновление возьмёт полный zip. Пусто и тогда, когда
+        .binver есть, а самого ffmpeg нет (антивирус удалил, файлы растеряны):
+        иначе update-архив без bin так и оставил бы программу без ffmpeg."""
         try:
             if getattr(_api.sys, "frozen", False):
                 app_dir = _api.os.path.dirname(_api.os.path.abspath(_api.sys.executable))
             else:
                 app_dir = _api.os.path.dirname(_api.os.path.abspath(_api.__file__))
-            with open(_api.os.path.join(app_dir, "bin", ".binver"), encoding="ascii") as f:
+            bin_dir = _api.os.path.join(app_dir, "bin")
+            for tool in ("ffmpeg", "ffprobe"):
+                exe = tool + (".exe" if _api.IS_WIN else "")
+                if not _api.os.path.isfile(_api.os.path.join(bin_dir, exe)):
+                    return ""
+            with open(_api.os.path.join(bin_dir, ".binver"), encoding="ascii") as f:
                 return f.read().strip()
         except Exception:
             return ""
+
+    def _repair_bundled_tools(self):
+        """Ставит full-архив последнего релиза поверх программы: так
+        возвращаются bin (ffmpeg, ffprobe, yt-dlp) и models. Путь тот же, что
+        у автообновления: проверка sha256, распаковка, копирование, перезапуск."""
+        if getattr(self, "_updating", False):
+            self.log("Обновление уже идёт — дождитесь его окончания.")
+            return
+        if not getattr(_api.sys, "frozen", False):
+            self.log("Починка доступна только в собранной программе (.exe). "
+                     "Положите ffmpeg.exe и ffprobe.exe в папку bin или в PATH.")
+            return
+        self.log("Ищу полную версию программы, чтобы вернуть ffmpeg…")
+
+        def _run():
+            try:
+                tag, _ver, rel = self._fetch_latest_release()
+                if rel is None:
+                    self.log_signal.emit("Не нашёл на GitHub релиз с архивом программы.")
+                    return
+                assets = rel.get("assets", [])
+                full = next((a for a in assets
+                             if str(a.get("name", "")).lower().endswith("-full.zip")), None)
+                if full is None:
+                    self.log_signal.emit(f"В релизе {tag} нет полного архива (…-full.zip).")
+                    return
+                sha = ""
+                man = next((a for a in assets
+                            if str(a.get("name", "")).lower() == "manifest.json"), None)
+                if man is not None:
+                    try:
+                        with _api.http_get(man.get("browser_download_url", ""),
+                                           headers={"User-Agent": _api.APP_NAME},
+                                           timeout=15, allow_insecure=False) as r:
+                            data = _api.json.loads(r.read().decode("utf-8", "replace")) or {}
+                        sha = str(data.get("full_sha", "") or "")
+                    except Exception:
+                        sha = ""
+                size = int(full.get("size", 0) or 0)
+                if size:
+                    self.log_signal.emit(f"Полная версия {tag}: ~{size / 1024 / 1024:.0f} МБ.")
+                self.repair_download_sig.emit(tag, full.get("browser_download_url", ""), sha)
+            except Exception as e:
+                self.log_signal.emit(f"Не удалось найти полную версию: {e}")
+
+        _api.threading.Thread(target=_run, daemon=True).start()
+
+    def _on_repair_download_ready(self, version: str, url: str, sha: str):
+        """GUI-поток: найденный full-архив качаем обычным путём обновления."""
+        if not url or getattr(self, "_updating", False):
+            return
+        self._pending_update_url = url
+        self._pending_update_version = version
+        self._pending_update_sha = sha or ""
+        self._start_update_download(url)
 
     def _pick_update_asset(self, rel):
         """Решает, что качать из релиза, экономя трафик:

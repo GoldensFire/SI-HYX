@@ -49,8 +49,11 @@ pip install -r requirements.txt
 python main.py
 ```
 
-Сборка `.exe` — `build.bat` (по `SI-HYX.spec`). Папки `bin/` и `models/` в
-репозиторий не входят из-за размера: возьмите их из релиз-архива или соберите сами.
+Сборка `.exe` — `build.bat` (по `SI-HYX.spec`) или `python build_gui.py` —
+окно с версией, логом и прогрессом (он же дублируется на иконку в панели
+задач). В поле версии можно вписать любую, в том числе уже собранную. Папки
+`bin/` и `models/` в репозиторий не входят из-за размера: возьмите их из
+релиз-архива или соберите сами.
 
 - `bin/`: [ffmpeg/ffprobe](https://www.gyan.dev/ffmpeg/builds/),
   [yt-dlp](https://github.com/yt-dlp/yt-dlp/releases/latest),

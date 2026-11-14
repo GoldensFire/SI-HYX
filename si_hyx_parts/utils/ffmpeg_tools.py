@@ -18,13 +18,39 @@ parse_version.__module__ = _api.__name__
 _api.parse_version = parse_version
 
 
-def check_ffmpeg():
+def ffmpeg_problem():
+    """"" — ffmpeg запускается; иначе причина по-русски для окна ошибки.
+
+    Различает «файла нет» (скачан UpdateHYX-архив без bin, распакован один
+    .exe) и «файл есть, но не запускается» (антивирус, политика Windows, нет
+    DLL рядом). Долгий первый запуск (антивирус проверяет exe) ошибкой не
+    считаем: процесс же стартовал."""
+    exe = _api.FFMPEG
     try:
-        _api.subprocess.run([_api.FFMPEG, "-version"], stdout=_api.subprocess.DEVNULL, stderr=_api.subprocess.DEVNULL,
-                       creationflags=_api.CREATE_NO_WINDOW)
-        return True
-    except Exception:
-        return False
+        p = _api.subprocess.run([exe, "-version"], stdout=_api.subprocess.DEVNULL,
+                                stderr=_api.subprocess.DEVNULL,
+                                creationflags=_api.CREATE_NO_WINDOW, timeout=30)
+    except _api.subprocess.TimeoutExpired:
+        return ""
+    except FileNotFoundError:
+        return "missing"
+    except OSError as e:
+        return f"blocked: {e}"
+    except Exception as e:
+        return f"error: {e}"
+    code = getattr(p, "returncode", 0) or 0
+    if code:
+        if code < 0:
+            code &= 0xFFFFFFFF
+        return f"exit: 0x{code:08X}" if code > 0xFFFF else f"exit: {code}"
+    return ""
+
+ffmpeg_problem.__module__ = _api.__name__
+_api.ffmpeg_problem = ffmpeg_problem
+
+
+def check_ffmpeg():
+    return not ffmpeg_problem()
 
 check_ffmpeg.__module__ = _api.__name__
 _api.check_ffmpeg = check_ffmpeg

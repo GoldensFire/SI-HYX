@@ -92,7 +92,25 @@ def cmd_binver(app_dir: str):
     print(f"wrote   {os.path.join(bin_dir, BINVER_NAME)}")
 
 
-def cmd_manifest(app_dir: str, dist_dir: str, update_zip: str, full_zip: str):
+def _reused_binver(app_dir: str):
+    """Готовый bin_sha из <app>/bin/.binver, если он есть и валиден.
+
+    build.bat вызывает `binver` перед `manifest`, поэтому в конвейере хеш уже
+    посчитан по всем файлам bin+models. Повторно читать полтора гигабайта
+    незачем. Для ручного запуска без этого флага cmd_manifest, как и раньше,
+    пересчитывает хеш сам.
+    """
+    path = os.path.join(app_dir, "bin", BINVER_NAME)
+    try:
+        with open(path, encoding="ascii") as f:
+            value = f.read().strip()
+    except OSError:
+        return ""
+    return value if len(value) == 64 and all(c in "0123456789abcdef" for c in value) else ""
+
+
+def cmd_manifest(app_dir: str, dist_dir: str, update_zip: str, full_zip: str,
+                 reuse_binver: bool = False):
     # APP_VERSION берём из config.py (скрипт лежит рядом с ним)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import config
@@ -106,9 +124,15 @@ def cmd_manifest(app_dir: str, dist_dir: str, update_zip: str, full_zip: str):
             print(f"[ERROR] archive not found: {z}")
             sys.exit(1)
 
+    bin_sha = _reused_binver(app_dir) if reuse_binver else ""
+    if bin_sha:
+        print(f"bin_sha = {bin_sha} (reused from bin/.binver)")
+    else:
+        bin_sha = compute_bin_sha(app_dir)
+
     manifest = {
         "version": config.APP_VERSION,
-        "bin_sha": compute_bin_sha(app_dir),
+        "bin_sha": bin_sha,
         "update_sha": _sha256_file(update_zip),
         "full_sha": _sha256_file(full_zip),
         "silent": bool(getattr(config, "SILENT_UPDATE", False)),
@@ -128,11 +152,12 @@ def main():
         cmd_binver(args[1])
         return
     if len(args) >= 5 and args[0] == "manifest":
-        cmd_manifest(args[1], args[2], args[3], args[4])
+        cmd_manifest(args[1], args[2], args[3], args[4],
+                     reuse_binver=len(args) >= 6 and args[5] == "reuse-binver")
         return
     print("usage:")
     print("  make_manifest.py binver   <app_dir>")
-    print("  make_manifest.py manifest <app_dir> <dist_dir> <update_zip> <full_zip>")
+    print("  make_manifest.py manifest <app_dir> <dist_dir> <update_zip> <full_zip> [reuse-binver]")
     sys.exit(2)
 
 

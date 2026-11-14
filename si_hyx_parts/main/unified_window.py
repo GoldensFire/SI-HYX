@@ -36,7 +36,8 @@ class UnifiedWindow(
     log_signal = _api.pyqtSignal(str)              # потокобезопасный лог (из фоновых потоков → GUI)
     update_available_sig = _api.pyqtSignal(str, str, int, str, str)  # версия, ссылка на zip, размер (байт), sha256 архива ("" = не проверять), ченжлог
     update_ready_sig = _api.pyqtSignal(str)        # путь к распакованной новой версии (готово к установке)
-    ffmpeg_missing_sig = _api.pyqtSignal()         # проверка ffmpeg в фоне не прошла (из потока → GUI)
+    ffmpeg_missing_sig = _api.pyqtSignal(str)      # проверка ffmpeg в фоне не прошла: причина (из потока → GUI)
+    repair_download_sig = _api.pyqtSignal(str, str, str)  # починка bin: версия, ссылка на full-zip, sha256
 
     # ВНИМАНИЕ РАЗРАБОТЧИКА: В этом приложении категорически запрещено использовать
     # эмодзи. Все новые иконки добавлять строго через метод get_icon() из библиотеки
@@ -71,6 +72,7 @@ class UnifiedWindow(
         self.log_signal.connect(self.log)
         self.update_available_sig.connect(self._on_update_available)
         self.update_ready_sig.connect(self._apply_update)
+        self.repair_download_sig.connect(self._on_repair_download_ready)
 
         # Колёсико мыши: меняет ли значения в полях (по умолчанию — нет, только прокрутка)
         self._wheel_changes_values = False
@@ -500,20 +502,62 @@ class UnifiedWindow(
         """Запускает проверку ffmpeg в отдельном потоке (см. __init__): сам запуск
         процесса блокирующий, а держать на нём цикл событий незачем."""
         def worker():
-            ok = False
             try:
-                ok = _api.check_ffmpeg()
-            except Exception:
-                ok = False
-            if not ok:
+                problem = _api.ffmpeg_problem()
+            except Exception as e:
+                problem = f"error: {e}"
+            if problem:
                 try:
-                    self.ffmpeg_missing_sig.emit()
+                    self.ffmpeg_missing_sig.emit(problem)
                 except Exception:
                     pass
         _api.threading.Thread(target=worker, daemon=True).start()
 
-    def _on_ffmpeg_missing(self):
-        _api.msgbox_critical(self, "Error", "FFmpeg not found!")
+    def _on_ffmpeg_missing(self, problem=""):
+        """Окно «нет ffmpeg» с причиной и починкой.
+
+        Почти всегда это неполная установка: скачан UpdateHYX-архив (он только
+        для автообновления, в нём нет bin), из архива вытащен один .exe, или
+        антивирус убрал/заблокировал bin/ffmpeg.exe. Кнопка «Скачать и
+        починить» ставит full-архив последнего релиза тем же путём, что и
+        автообновление (распаковка поверх папки и перезапуск)."""
+        html = _api.html.escape
+        frozen = bool(getattr(_api.sys, "frozen", False))
+        if frozen:
+            app_dir = _api.os.path.dirname(_api.os.path.abspath(_api.sys.executable))
+        else:
+            app_dir = _api.os.path.dirname(_api.os.path.abspath(_api.__file__))
+        exe = _api.FFMPEG
+        if not _api.os.path.isabs(exe):
+            exe = _api.os.path.join(app_dir, "bin", "ffmpeg.exe" if _api.IS_WIN else "ffmpeg")
+        self.log(f"ffmpeg не работает ({problem or 'неизвестно'}): {exe}")
+        page = f"{_api.GITHUB_URL}/releases/latest"
+        if problem == "missing":
+            head = "Не найден ffmpeg."
+            why = ("Обычно это значит, что скачан архив <b>UpdateHYX-….zip</b> — он только "
+                   "для автообновления, в нём нет папки bin, — или из архива распакован "
+                   "один SI-HYX.exe. Нужен архив <b>SI-HYX-v…-full.zip</b>, распакованный "
+                   "целиком.")
+        elif problem.startswith("blocked"):
+            head = "ffmpeg найден, но Windows не даёт его запустить."
+            why = (f"Ошибка: {html(problem.partition(': ')[2])}<br>Скорее всего, его "
+                   "заблокировал антивирус. Добавьте папку программы в исключения "
+                   "антивируса или установите полную версию заново.")
+        else:
+            head = "ffmpeg найден, но не запускается."
+            why = (f"Причина: {html(problem.partition(': ')[2] or problem)}<br>Файлы в папке "
+                   "bin повреждены или неполные — установите полную версию заново.")
+        text = (f"<b>{head}</b><br>Без него не работают перекодирование, Монтаж, "
+                f"обрезка и скачивание видео.<br><br>Ожидается файл:<br>{html(exe)}"
+                f"<br><br>{why}<br><br>"
+                f'Полная версия: <a href="{page}" style="color:#89b4fa;">{page}</a>')
+        repair = "Скачать и починить"
+        actions = ([repair] if frozen else []) + ["Открыть страницу загрузки", "Закрыть"]
+        choice = _api.msgbox_actions(self, "Нет ffmpeg", text, actions)
+        if choice == repair:
+            self._repair_bundled_tools()
+        elif choice == "Открыть страницу загрузки":
+            _api.QDesktopServices.openUrl(_api.QUrl(page))
 
     def add_paths(self, paths):
         """Роутит файлы из общего стрипа в активную вкладку."""

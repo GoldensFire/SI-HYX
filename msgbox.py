@@ -9,7 +9,7 @@
 # стандартных статических методов QMessageBox.
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QGuiApplication
+from PyQt6.QtGui import QGuiApplication, QTextDocument
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 
@@ -17,6 +17,7 @@ class _CopyableBox(QMessageBox):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.copy_button = None
+        self.plain_text = ""      # что копировать вместо text() (у rich text)
         self._copy_requested = False
         self.buttonClicked.connect(self._remember_click)
 
@@ -26,7 +27,7 @@ class _CopyableBox(QMessageBox):
     def done(self, result):
         if self._copy_requested:
             self._copy_requested = False
-            QGuiApplication.clipboard().setText(self.text())
+            QGuiApplication.clipboard().setText(self.plain_text or self.text())
             return
         super().done(result)
 
@@ -71,6 +72,36 @@ def _selectable_box(icon, parent, title, text, buttons, default_button, copyable
     box.exec()
     clicked = box.clickedButton()
     return box.standardButton(clicked) if clicked is not None else QMessageBox.StandardButton.NoButton
+
+
+def msgbox_actions(parent, title, text, actions, icon=QMessageBox.Icon.Critical):
+    """Ошибка с кнопками-действиями и ссылками в тексте (rich text).
+
+    actions — подписи кнопок слева направо; последняя закрывает окно.
+    Возвращает подпись нажатой кнопки или None (окно закрыто крестиком).
+    «Копировать» кладёт в буфер текст без разметки и окно не закрывает."""
+    box = _CopyableBox(parent)
+    box.setIcon(icon)
+    box.setWindowTitle(title)
+    box.setTextFormat(Qt.TextFormat.RichText)
+    box.setText(text)
+    doc = QTextDocument()
+    doc.setHtml(text)
+    box.plain_text = doc.toPlainText()
+    box.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+    buttons = {}
+    for i, label in enumerate(actions):
+        last = i == len(actions) - 1
+        role = (QMessageBox.ButtonRole.RejectRole if last
+                else QMessageBox.ButtonRole.AcceptRole)
+        buttons[box.addButton(label, role)] = label
+    if actions:
+        box.setDefaultButton(next(iter(buttons)))
+    box.copy_button = box.addButton('Копировать', QMessageBox.ButtonRole.ActionRole)
+    box.copy_button.setAutoDefault(False)
+    _center_over_parent(box, parent)
+    box.exec()
+    return buttons.get(box.clickedButton())
 
 
 def msgbox_critical(parent, title, text,

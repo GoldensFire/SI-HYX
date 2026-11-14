@@ -231,7 +231,7 @@ from si_hyx_parts.utils.dreamerscast import (
     resolve_dreamerscast,
 )
 from si_hyx_parts.utils.kodik import resolve_kodik
-from si_hyx_parts.utils.ffmpeg_tools import parse_version, check_ffmpeg
+from si_hyx_parts.utils.ffmpeg_tools import parse_version, check_ffmpeg, ffmpeg_problem
 from si_hyx_parts.utils.web import default_download_dir, clean_url
 from si_hyx_parts.utils.media_info import pretty_audio_codec, fmt_bitrate_with_codec
 

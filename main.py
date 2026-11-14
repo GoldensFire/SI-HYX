@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from config import (
     APP_ICON, APP_NAME, APP_TITLE, APP_VERSION, CONFIG_DIR, OPEN_FILE_ICON,
-    CREATE_NO_WINDOW, DISCORD_URL, GITHUB_OWNER, GITHUB_REPO, GITHUB_URL,
+    CREATE_NO_WINDOW, DISCORD_URL, FFMPEG, GITHUB_OWNER, GITHUB_REPO, GITHUB_URL,
     GUIDE_URL, HTTP_PORT, IS_WIN, QAbstractSpinBox, QApplication,
     QCheckBox, QComboBox, QDialog, QEvent, QGroupBox, QHBoxLayout, QIcon,
     QKeySequence, QLabel, QLineEdit, QListWidget, QLocalServer,
@@ -35,20 +35,22 @@ from config import (
     get_icon, http_get, icon_html, pyqtSignal, strip_default_tag,
     ytdlp_base_cmd
 )
-from utils import (check_ffmpeg, load_settings_ex, parse_version,
+from utils import (check_ffmpeg, ffmpeg_problem, load_settings_ex, parse_version,
                    save_settings, settings_files_exist)
 from widgets import (
     LatinKeySequenceEdit, RecentFilesStrip, WheelBlocker, combo_set_value,
     info_badge, install_hover_tips
 )
-from msgbox import msgbox_critical
+from msgbox import msgbox_actions, msgbox_critical
 from tabs import (Base64Tab, MediaTab, PromptTab, YtdlpTab)
 from photo_tab import PhotoTab
 from edit_tab import EditTab
 from taskbar import TaskbarProgress
-from PyQt6.QtCore import qInstallMessageHandler, QSize, QTranslator, QLibraryInfo, QLocale
+from PyQt6.QtCore import qInstallMessageHandler, QSize, QTranslator, QLibraryInfo, QLocale, QUrl
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import QTabBar
 import hashlib
+import html
 from diagnostic_logging import install as install_diagnostic_logging
 
 install_diagnostic_logging()
