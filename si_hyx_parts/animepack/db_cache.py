@@ -590,7 +590,9 @@ def shiki_cache_signature(s: '_api.PackSettings', manga: bool = False) -> str:
     if manga:
         kinds = [k for k in _api.MANGA_KINDS if s.manga_kinds.get(k)]
     else:
-        kinds = [k for k in _api.ANIME_KINDS if s.kinds.get(k)]
+        # ANIME_DB_KINDS: у полной базы в ключе и виды сверх выбираемых в паке
+        # (tv_special, music…); у настроек генерации их нет — ключ прежний.
+        kinds = [k for k in _api.ANIME_DB_KINDS if s.kinds.get(k)]
     excl = ",".join(str(int(g)) for g in sorted(s.genres_exclude or []))
     return (f"{int(s.year_from)}-{int(s.year_to)}|{','.join(kinds)}"
             f"|{int(s.score_from)}|{excl}")

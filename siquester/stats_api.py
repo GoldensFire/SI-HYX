@@ -13,9 +13,12 @@ from __future__ import annotations
 import re
 import time
 import urllib.parse
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
-import requests
+# requests — лениво (в _query): модуль импортируется при запуске окна вместе с
+# вкладкой SiQuesterHYX, а сам requests грузится ~0,3–1 с.
+if TYPE_CHECKING:
+    import requests
 
 STATS_BASE = "https://vladimirkhil.com/sistatistics/api/v1"
 REQUEST_TIMEOUT = 60          # сек
@@ -53,6 +56,7 @@ def _query(session: requests.Session, name: str, authors_q: str) -> dict | None:
         f"{STATS_BASE}/games/packages/stats"
         f"?name={urllib.parse.quote(name)}&hash={authors_q}"
     )
+    import requests
     try:
         resp = session.get(url, timeout=REQUEST_TIMEOUT)
     except requests.RequestException:

@@ -686,6 +686,9 @@ class GeneratorSelectionMixin:
         Закрываем вместе со `_spend_kind`: иначе места умерших родов вопросов
         могли бы вернуться манге, которую больше неоткуда взять."""
         self._rest_anime_streams(quotas, counts)
+        # Издание книг кончилось в плане каталога — его места отдаются другим
+        # сразу, а не после перебора BOOK_SCAN_PER_SLOT карточек на место.
+        self._manga_mix.drop_dry(getattr(self, "_manga_plan", None), deferred)
         kind = _api.MANGA_KIND
         ended = getattr(self, "_manga_catalog_end", "")
         if (ended and getattr(self, "_manga_drawn", 0) >= getattr(self, "_manga_yielded", 0)

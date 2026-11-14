@@ -105,6 +105,17 @@ YouTubecookies.txt
 *.csv
 /find_anime_matches.py
 
+# Разовая сверка Letterboxd/Shikimori: скрипты поиска и их выгрузки.
+/check_lb_cache.py
+/find_specific_anime.py
+/parse_csv.py
+/search_scissor*.py
+/search_target_anime.py
+/cache_matches.json
+/found_anime.txt
+/matches_log.txt
+/target_anime_found.json
+
 # Временные папки ручных проверок (.tmp_pixiv_live_check и т.п.)
 .tmp*/
 *.tmp

@@ -48,6 +48,9 @@ class PackUpgrader:
         # Имена, выданные пережатым картинкам и дорожкам: в архиве их ещё нет, а
         # занимать их второй раз уже нельзя (картинки считаются раньше аудио).
         self._new_names: set[str] = set()
+        # «Ответ как в генераторе»: (вопрос, id тайтла, книга?, место) — автор и
+        # оценка спрашиваются пачками после обхода вопросов (fetch_info).
+        self._info_jobs: list[tuple] = []
 
     # ── мелочи ────────────────────────────────────────────────────────────
     def log(self, msg: str) -> None:
@@ -175,6 +178,8 @@ class PackUpgrader:
                 if self.s.add_titles:
                     self._do_titles(q, tag, rname, tname, price, i, result)
                 self._progress(i + 1, steps, f"вопрос {i + 1}/{len(questions)}")
+            if not result.cancelled:
+                self._finish_info(tag, result)
         finally:
             # Постеры готовятся фоном, пока идёт опрос базы названий, — тут они
             # догоняют. Даже если цикл сорвался, потоки надо закрыть.
@@ -315,6 +320,12 @@ class PackUpgrader:
         answers = _api.answers_of(q)
         if not answers:
             return
+        # «Ответ как в генераторе»: ответ должен быть записан ровно как на
+        # Shikimori — сам по себе или так, как его пишет генератор (год, тег,
+        # хвост «— 『…』», два имени через «/»). Вопрос с несколькими ответами
+        # получает только автора и рейтинг: варианты названий и год у него не
+        # трогаем — автор пака сам решил, что засчитывать.
+        gen = bool(getattr(self.s, "generator_answers", False))
         queries = _api.answer_queries([a.text for a in answers],
                                  use_others=self.s.use_other_answers,
                                  min_len=self.s.min_query_len)
@@ -342,6 +353,20 @@ class PackUpgrader:
             result.not_found += 1
             return
         title = str(card.get("russian") or card.get("name") or "")
+        place = dict(round_name=rname, theme_name=tname, price=price,
+                     title=title, order=order)
+        if gen:
+            # «Написано ровно то же самое» проверяем по КАЖДОМУ ответу:
+            # в вопросах-персонажах первый ответ — «Название — 『Имя』», а
+            # остальные — имена героя; тайтл всё равно должен опознаться.
+            if not any(_api.whole_exact(a.text or "", card)
+                       for a in answers):
+                return
+            if len(answers) > 1:
+                ident = str(card.get("id") or "").strip()
+                if ident.isdigit():
+                    self._info_jobs.append((q, ident, from_book, place))
+                return
         # Ответ мог быть именем героя, а не названием: тогда «Mumei» находит
         # одноимённый клип, и вопрос про персонажа обрастал бы чужими
         # названиями и постером. Переспрашиваем базу персонажей — но только
@@ -360,8 +385,10 @@ class PackUpgrader:
                 return
         # Постер и написание названия — только на точном совпадении: при
         # нестрогом поиске карточка может быть от сиквела, и подставлять ему
-        # чужой постер (или переписывать под него ответ) нельзя.
-        exact = _api.is_exact(hit, card)
+        # чужой постер (или переписывать под него ответ) нельзя. В режиме
+        # генератора точность уже доказал whole_exact — он пускает и
+        # «Название (год) — 『Песня』», где hit бывает строкой целиком.
+        exact = True if gen else _api.is_exact(hit, card)
         if exact:
             result.exact_titles += 1
             # Совпало не буква в букву, а с точностью до опечатки или пробела:
@@ -374,8 +401,6 @@ class PackUpgrader:
                          f"{self.s.source_name} — это «{title}», дописываю "
                          f"названия и ставлю постер.")
 
-        place = dict(round_name=rname, theme_name=tname, price=price,
-                     title=title, order=order)
         # Написание правим ДО дописывания вариантов: иначе «наруто» осталось бы
         # в паке рядом с только что дописанным правильным «Наруто», и проверка
         # «уже написано» посчитала бы их разными строками.
@@ -384,9 +409,31 @@ class PackUpgrader:
                 result.recased.append(_api.Change(kind="case", before=was, after=now,
                                              **place))
 
+        if gen:
+            # Год — в первый ответ ДО дописывания вариантов, как у генератора:
+            # «Скитальцы (2016)», а голое название уже в нём и написано.
+            changed = _api.add_year(answers[0], card)
+            if changed:
+                result.years.append(_api.Change(kind="year", before=changed[0],
+                                                after=changed[1], **place))
+            ident = str(card.get("id") or "").strip()
+            if ident.isdigit():
+                self._info_jobs.append((q, ident, from_book, place))
+
         first = (answers[0].text or "").strip()
-        variants = _api.title_variants(card)[:max(1, self.s.max_variants)]
-        added = _api.add_answers(q, tag, variants)
+        variants = _api.title_variants(card)
+        limit = max(1, int(self.s.max_variants))
+        if len(variants) > limit and limit > 1:
+            # Основное русское название — всегда последним (просьба
+            # пользователя), поэтому при упоре в лимит жертвуем предпоследним
+            # вариантом, а не последним.
+            variants = variants[:limit - 1] + variants[-1:]
+        else:
+            variants = variants[:limit]
+        # В режиме генератора основное русское название дописывается отдельной
+        # строкой, даже если уже стоит в первом ответе с годом («Игра друзей
+        # (2022)»): чистый вариант должен замыкать список ответов.
+        added = _api.add_answers(q, tag, variants, force_last=gen)
         if added:
             result.titles.append(_api.Change(
                 kind="title", before=first,
@@ -400,6 +447,29 @@ class PackUpgrader:
                          f"только аниме — обложку не ставлю.")
             else:
                 self._do_poster(q, tag, card, result, place, book=from_book)
+
+    def _finish_info(self, tag, result) -> None:
+        """Автор и оценка MAL устной репликой — пачками на весь пак."""
+        if not self._info_jobs:
+            return
+        info: dict[bool, dict] = {}
+        for book in (False, True):
+            ids = [ident for _q, ident, b, _p in self._info_jobs if b == book]
+            if ids and not self.stopped():
+                self.log(f"Ответ как в генераторе: спрашиваю авторов и оценки "
+                         f"{len(set(ids))} {'книг' if book else 'аниме'}…")
+                info[book] = _api.fetch_info(self.api, ids, book, self.log)
+        for q, ident, book, place in self._info_jobs:
+            row = (info.get(book) or {}).get(ident)
+            if row is None:
+                continue
+            lines = _api.info_lines(*row)
+            added = _api.add_info_replic(q, tag, lines)
+            if added:
+                # add_info_replic сам убирает автора, если в реплике уже
+                # назван исполнитель, — в отчёт идёт ровно то, что дописано.
+                result.infos.append(_api.Change(kind="info", before="",
+                                                after=added, **place))
 
     # ── постер в ответе ───────────────────────────────────────────────────
     def _do_poster(self, q, tag, card: dict, result, place: dict,
@@ -1234,6 +1304,17 @@ def example_lines(result: _api.UpgradeResult, limit: int = 3) -> list[str]:
         lines.append(f"  • пропущено как имена персонажей: "
                      f"{len(result.skipped_titles)} (например «{first.before}» "
                      f"— {_api._shorten(first.after, 60)})")
+
+    years = list(getattr(result, "years", []))
+    infos = list(getattr(result, "infos", []))
+    if years or infos:
+        lines.append(f"Ответ как в генераторе: год дописан в {len(years)}, "
+                     f"автор и оценка MAL — в {len(infos)} ответ(ов).")
+        for change in years[:limit]:
+            lines.append(f"  • {change.place}: «{_api._shorten(change.before)}» → "
+                         f"«{_api._shorten(change.after)}»")
+        for change in infos[:limit]:
+            lines.append(f"  • {change.place}: {_api._shorten(change.after, 90)}")
 
     lines.append(f"Названий переписано как на Shikimori: {len(result.recased)}.")
     for change in result.recased[:limit]:

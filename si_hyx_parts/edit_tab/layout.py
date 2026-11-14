@@ -952,6 +952,30 @@ class EditTabLayoutMixin:
         # Большой коэффициент: свободное место сперва дотягивает кнопку до
         # полной подписи (максимум ширины), остаток уходит распорке.
         row.addWidget(self.btn_cut, 1000)
+        # «В очередь» — видна, пока идёт экспорт (кнопка «Экспорт» тогда —
+        # «Отмена»): готовит экспорт того, что открыто сейчас, и ставит его за
+        # текущим. Стрелка — список ждущих: снять один или очистить всё
+        # (см. _sync_export_queue_ui).
+        from PyQt6.QtWidgets import QToolButton
+        self.btn_export_queue = QToolButton()
+        self.btn_export_queue.setText("В очередь")
+        self.btn_export_queue.setIcon(_api.get_icon('fa5s.plus'))
+        self.btn_export_queue.setIconSize(_api.QSize(14, 14))
+        self.btn_export_queue.setToolButtonStyle(
+            _api.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.btn_export_queue.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.btn_export_queue.setMenu(_api.QMenu(self.btn_export_queue))
+        self.btn_export_queue.setFocusPolicy(_api.Qt.FocusPolicy.NoFocus)
+        self.btn_export_queue.setFixedHeight(self.btn_cut.maximumHeight())
+        self.btn_export_queue.setToolTip(
+            "Добавить в очередь экспорта то, что открыто сейчас (файл, отрезок "
+            "или проект, с текущими настройками). Начнётся, когда закончится "
+            "текущий экспорт.\nСтрелка справа — что ждёт в очереди: снять или "
+            "очистить очередь.")
+        self.btn_export_queue.clicked.connect(self._enqueue_export)
+        self.btn_export_queue.setVisible(False)
+        row.addWidget(self.btn_export_queue)
         self.btn_export_settings.setFixedHeight(self.btn_cut.maximumHeight())
         row.addWidget(self.btn_export_settings)
         self._refresh_export_btn()

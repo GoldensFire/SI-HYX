@@ -722,6 +722,19 @@ class EditTabTracksMixin:
                 except Exception: pass
         return None
 
+    def _entry_is_bitmap(self, kind, ref) -> bool:
+        """Дорожка субтитров — картинки (PGS/DVD/DVB), а не текст."""
+        try:
+            if kind == 'emb':
+                codec = (self._sub_streams[ref].get('codec_name') or '').lower()
+            elif kind == 'ext':
+                codec = _api.os.path.splitext(str(ref))[1].lower().lstrip('.')
+            else:
+                return False
+        except Exception:
+            return False
+        return codec in self._BITMAP_SUB_CODECS or codec in ('sup', 'idx')
+
     def _entry_ass_text(self, kind, ref):
         """Исходный ASS дорожки со своими стилями (ASS/SSA/mov_text) для окна
         правки, или None — своего стиля у дорожки нет (SRT/VTT) либо прочитать
@@ -788,6 +801,17 @@ class EditTabTracksMixin:
         idx = self.cmb_subs.currentIndex()
         if 0 < idx <= len(self._sub_entries):
             kind, ref = self._sub_entries[idx - 1]
+            if kind != 'more' and self._entry_is_bitmap(kind, ref):
+                # PGS/DVD — картинки: текста нет, а попытка выгнать дорожку в SRT
+                # прогоняет ffmpeg по всему контейнеру и всё равно ничего не даёт.
+                _api.msgbox_information(
+                    self, "Субтитры",
+                    "Выбранная дорожка — субтитры-картинки (PGS/DVD): в ней нет "
+                    "текста, поэтому править её нельзя.\n\nПоложите рядом с видео "
+                    "текстовые субтитры (.srt/.ass) — они появятся в списке "
+                    "дорожек, и их можно будет редактировать. Или выберите "
+                    "«Выкл» и создайте субтитры с нуля.")
+                return
             if kind != 'more':
                 original = self._entry_ass_text(kind, ref)
                 cues_arg = subtitle_style.edit_cues(original) if original else None

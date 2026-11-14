@@ -2,7 +2,12 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """InpaintTab. Public namespace: photo_tab."""
+import tempfile
+import uuid
+
 import photo_tab as _api
+import photo_export
+import photo_handoff
 
 
 class InpaintTab(_api.QWidget):
@@ -34,6 +39,12 @@ class InpaintTab(_api.QWidget):
         self._device = "—"
         self._src_path = None       # путь исходника (для имени и папки сохранения)
         self._out_dir = None        # выбранная папка сохранения (None → рядом с исходником)
+        # Тип экспорта (шестерёнка у «Сохранить»): без потерь или сразу сжатым
+        # настройками «Обработки» (photo_export). Хранится в settings.json.
+        self.export_mode = photo_export.EXPORT_LOSSLESS
+        self._export_dlg = None
+        self._export_worker = None
+        self._export_tmp = None
         # Выгрузка моделей из ОЗУ при простое. Настройка «Не выгружать…» (по умолч.
         # выкл) держит их всегда. Иначе — таймер на минуту, сбрасывается при любом
         # взаимодействии; по срабатыванию убивает процессы LaMa/RMBG.
@@ -48,6 +59,15 @@ class InpaintTab(_api.QWidget):
             self._build_ui()
             self.setAcceptDrops(True)
             self.canvas.installEventFilter(self)   # взаимодействие → сброс таймера
+            # Картинки от нейросети (photo_tool open / MCP photo_open_in_app)
+            # приходят журналом photo_handoff: проверка — один stat раз в 1,5 с.
+            self._handoff_stamp = photo_handoff.journal_stamp()
+            entries = photo_handoff.read_journal()
+            self._handoff_seen = max((float(e.get("time") or 0) for e in entries), default=0.0)
+            self._handoff_timer = _api.QTimer(self)
+            self._handoff_timer.setInterval(1500)
+            self._handoff_timer.timeout.connect(self._check_handoff)
+            self._handoff_timer.start()
 
     # ── Заглушка при отсутствии зависимостей ─────────────────────────────────
     def _build_unavailable(self):
@@ -279,7 +299,24 @@ class InpaintTab(_api.QWidget):
         self.btn_save.setObjectName("b_run")
         self.btn_save.setToolTip("Сохранить <имя>_photo рядом с исходником (или в выбранную папку), без потерь")
         self.btn_save.clicked.connect(self._save)
-        sl.addWidget(self.btn_save)
+        # Шестерёнка рядом — тип экспорта и настройки «Обработки» для сжатого
+        # сохранения (PhotoExportDialog), как у «Экспорт» во вкладке «Монтаж».
+        self.btn_export_settings = _api._icon_btn("", 'fa5s.cog', size=16)
+        self.btn_export_settings.setFixedWidth(36)
+        self.btn_export_settings.setFocusPolicy(_api.Qt.FocusPolicy.NoFocus)
+        self.btn_export_settings.setToolTip(
+            "Настройки экспорта: без потерь или сразу сжатым файлом настройками "
+            "вкладки «Обработка» (формат, лимит размера, разрешение)")
+        self.btn_export_settings.clicked.connect(self._open_export_settings)
+        row_save = _api.QHBoxLayout(); row_save.setSpacing(6)
+        row_save.addWidget(self.btn_save, 1)
+        row_save.addWidget(self.btn_export_settings, 0)
+        sl.addLayout(row_save)
+        self.lbl_export_mode = _api.QLabel()
+        self.lbl_export_mode.setWordWrap(True)
+        self.lbl_export_mode.setStyleSheet("color:#7f849c; font-size:11px;")
+        sl.addWidget(self.lbl_export_mode)
+        self._refresh_export_label()
 
         # ── Статус ───────────────────────────────────────────────────────────
         # Подпись-инструкция убрана из панели (visible=False), но объект остаётся:
@@ -713,6 +750,8 @@ class InpaintTab(_api.QWidget):
                 or (self._bg_worker is not None and self._bg_worker.isRunning()))
         for b in (self.btn_run, self.btn_bg, self.btn_bars, self.btn_save, self.btn_fit):
             b.setEnabled(has and not busy)
+        exporting = self._export_worker is not None and self._export_worker.isRunning()
+        self.btn_save.setEnabled(has and not busy and not exporting)
         self.btn_open.setEnabled(not busy)
         self.btn_outdir.setEnabled(not busy)
         # «Ластик» стирает ТОЛЬКО ещё не вжатые мазки «Кисти» (см. _paint_image_to) —
@@ -806,27 +845,65 @@ class InpaintTab(_api.QWidget):
         сохраняем как есть, остальное (jpg/webp/avif/heic…) → png, чтобы не было
         повторного сжатия и потери качества. Если удалён фон (есть прозрачность) —
         формат обязан её хранить (png/webp/tiff), иначе принудительно png."""
+        src_ext = (_api.os.path.splitext(self._src_path)[1] if self._src_path else ".png")
+        ext = photo_export.lossless_ext(src_ext, has_alpha)
+        out_dir, stem = self._output_dir_stem()
+        return photo_export.unique_path(out_dir, stem, ext)
+
+    def _output_dir_stem(self):
+        """(папка, имя без расширения) сохранения: <имя_исходника>_photo в
+        выбранной папке или рядом с исходником."""
         if self._src_path:
             base = _api.os.path.splitext(_api.os.path.basename(self._src_path))[0]
-            src_ext = _api.os.path.splitext(self._src_path)[1].lower().lstrip('.')
             src_dir = _api.os.path.dirname(self._src_path)
         else:
-            base, src_ext, src_dir = "image", "png", _api.os.getcwd()
-        if has_alpha:
-            ext = src_ext if src_ext in ("png", "webp", "tif", "tiff") else "png"
+            base, src_dir = "image", ""
+        return self._out_dir or src_dir or _api.os.getcwd(), f"{base}_photo"
+
+    # ── Тип экспорта (шестерёнка у «Сохранить») ──────────────────────────────
+    def set_export_mode(self, mode, save=True):
+        """Без потерь или настройками «Обработки» (photo_export.EXPORT_*).
+        Зовётся из окна настроек экспорта и при загрузке settings.json — там
+        save=False: сохранять посреди загрузки нельзя, файл затёрся бы
+        недособранными настройками."""
+        mode = mode if mode in photo_export.EXPORT_MODE_KEYS else photo_export.EXPORT_LOSSLESS
+        changed = mode != self.export_mode
+        self.export_mode = mode
+        self._refresh_export_label()
+        if changed and save:
+            saver = getattr(self.main, "_save_settings_soon", None)
+            if callable(saver):
+                try:
+                    saver()
+                except Exception:
+                    pass
+
+    def _refresh_export_label(self):
+        lbl = getattr(self, "lbl_export_mode", None)
+        if lbl is None:
+            return
+        if self.export_mode == photo_export.EXPORT_PROCESS:
+            lbl.setText("Экспорт: настройками «Обработки» (сжатие)")
+            self.btn_save.setToolTip(
+                "Сохранить <имя>_photo сразу сжатым — формат, лимит размера и "
+                "разрешение из вкладки «Обработка» (шестерёнка рядом)")
         else:
-            ext = src_ext if src_ext in ("png", "bmp", "tif", "tiff") else "png"
-        out_dir = self._out_dir or src_dir or _api.os.getcwd()
-        stem = f"{base}_photo"
-        path = _api.os.path.join(out_dir, f"{stem}.{ext}")
-        if not _api.os.path.exists(path):
-            return path
-        n = 1
-        while True:
-            path = _api.os.path.join(out_dir, f"{stem}_{n}.{ext}")
-            if not _api.os.path.exists(path):
-                return path
-            n += 1
+            lbl.setText("Экспорт: без потерь")
+            self.btn_save.setToolTip(
+                "Сохранить <имя>_photo рядом с исходником (или в выбранную папку), без потерь")
+
+    def _open_export_settings(self):
+        tm = getattr(self.main, 'tab_media', None) if self.main is not None else None
+        if tm is None:
+            _api.msgbox_warning(self, "Внимание", "Вкладка «Обработка» недоступна.")
+            return
+        if self._export_dlg is None:
+            # Родитель — главное окно (общий стиль приложения), как у окна
+            # настроек экспорта Монтажа.
+            self._export_dlg = _api.PhotoExportDialog(self, tm, parent=self.main)
+        self._export_dlg.show()
+        self._export_dlg.raise_()
+        self._export_dlg.activateWindow()
 
     def _save(self):
         if not self.canvas.has_image():
@@ -837,6 +914,9 @@ class InpaintTab(_api.QWidget):
         # composited_bgra: BGRA, если фон удалён (прозрачность), иначе BGR.
         arr = self.canvas.composited_bgra()
         has_alpha = arr is not None and arr.ndim == 3 and arr.shape[2] == 4
+        if self.export_mode == photo_export.EXPORT_PROCESS:
+            self._save_processed(arr)
+            return
         out = self._output_path(has_alpha)
         try:
             _api.os.makedirs(_api.os.path.dirname(out) or ".", exist_ok=True)
@@ -852,6 +932,109 @@ class InpaintTab(_api.QWidget):
                 self._show_saved_toast(_api.os.path.basename(out))
         except Exception as exc:
             _api.msgbox_warning(self, "Ошибка", f"Не удалось сохранить:\n{exc}")
+
+    def _save_processed(self, arr):
+        """Сохранение настройками «Обработки»: картинка без потерь во
+        временный PNG, оттуда — кодирование тем же кодом, что у вкладки
+        «Обработка» (photo_export), в фоне. Исходник и папка не меняются."""
+        tm = getattr(self.main, 'tab_media', None) if self.main is not None else None
+        if tm is None or not hasattr(tm, "_collect_settings"):
+            _api.msgbox_warning(self, "Внимание", "Вкладка «Обработка» недоступна.")
+            return
+        if self._export_worker is not None and self._export_worker.isRunning():
+            return
+        try:
+            settings = tm._collect_settings()
+            tmp = _api.os.path.join(tempfile.gettempdir(),
+                                    f"photo_src_{uuid.uuid4().hex}.png")
+            _api.save_bgr(tmp, arr)
+        except Exception as exc:
+            _api.msgbox_warning(self, "Ошибка", f"Не удалось подготовить фото:\n{exc}")
+            return
+        self._export_tmp = tmp
+        out_dir, stem = self._output_dir_stem()
+        w = _api.PhotoExportWorker(tmp, out_dir, stem, settings, parent=self)
+        w.progress.connect(self._on_export_progress)
+        if hasattr(self.main, "log"):
+            w.log.connect(self.main.log)
+        w.done.connect(self._on_export_done)
+        w.failed.connect(self._on_export_failed)
+        w.finished.connect(self._on_export_finished)
+        self._export_worker = w
+        self._set_status(_api.status_html('fa5s.spinner', "Сжимаю настройками «Обработки»…",
+                                          '#89b4fa'))
+        if hasattr(self.main, "clear_global_result"):
+            self.main.clear_global_result()
+        if hasattr(self.main, "update_global_progress"):
+            self.main.update_global_progress(0, "Сжатие фото…",
+                                             started_at=_api.time.monotonic(), running=True)
+        w.start()
+        self._refresh_enabled()
+
+    def _on_export_progress(self, pct, label):
+        if hasattr(self.main, "update_global_progress"):
+            self.main.update_global_progress(int(pct), f"Фото: {label}")
+
+    def _on_export_done(self, out):
+        name = _api.os.path.basename(out)
+        try:
+            size = _api.os.path.getsize(out) // 1024
+        except OSError:
+            size = 0
+        self._set_status(_api.status_html('fa5s.check-circle',
+                         f"Сохранено: {name} ({size} КБ)", '#a6e3a1'))
+        self.lbl_status.setToolTip(out)
+        if hasattr(self.main, "update_global_progress"):
+            self.main.update_global_progress(100, f"Фото сохранено: {name}", running=False)
+        if hasattr(self.main, "set_global_result"):
+            self.main.set_global_result(out)
+        if hasattr(self.main, "log"):
+            self.main.log(f"[Фото] Сохранено настройками «Обработки»: {out} ({size} КБ)")
+        self._show_toast(f"✅  Файл сохранён: {name} ({size} КБ)")
+
+    def _on_export_failed(self, err):
+        self._set_status(_api.status_html('fa5s.times-circle', f"Ошибка: {err}", '#f38ba8'))
+        if hasattr(self.main, "update_global_progress"):
+            self.main.update_global_progress(0, "Ошибка сжатия фото", running=False)
+        _api.msgbox_warning(self, "Ошибка", f"Не удалось сохранить сжатым:\n{err[:1500]}")
+
+    def _on_export_finished(self):
+        tmp, self._export_tmp = self._export_tmp, None
+        if tmp:
+            try:
+                _api.os.remove(tmp)
+            except OSError:
+                pass
+        self._export_worker = None
+        self._refresh_enabled()
+
+    def _check_handoff(self):
+        """Новая картинка в журнале photo_handoff → открыть её на холсте
+        (прежняя уходит через «Очистить», её возвращает Ctrl+Z)."""
+        stamp = photo_handoff.journal_stamp()
+        if stamp == self._handoff_stamp:
+            return
+        busy = ((self._worker is not None and self._worker.isRunning())
+                or (self._bg_worker is not None and self._bg_worker.isRunning()))
+        if busy:
+            return                      # дождёмся конца обработки, журнал никуда не денется
+        self._handoff_stamp = stamp
+        fresh = [e for e in photo_handoff.read_journal()
+                 if float(e.get("time") or 0) > self._handoff_seen]
+        if not fresh:
+            return
+        self._handoff_seen = max(float(e.get("time") or 0) for e in fresh)
+        path = str(fresh[-1].get("path") or "")
+        if not _api.os.path.isfile(path):
+            return
+        if self.canvas.has_image():
+            self._clear_canvas()
+        self._load(path)
+        name = _api.os.path.basename(path)
+        self._show_toast(f"🤖  Нейросеть открыла: {name}", bg="rgba(137,180,250,0.94)")
+        if hasattr(self.main, "log"):
+            note = str(fresh[-1].get("note") or "")
+            self.main.log(f"[Фото] Нейросеть открыла {path}" + (f" — {note}" if note else ""))
 
     def _show_saved_toast(self, name: str):
         """Зелёный плавающий баннер «Файл сохранён» по центру сверху вкладки."""

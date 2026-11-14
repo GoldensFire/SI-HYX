@@ -35,6 +35,9 @@ RULES = "hd1080-sd480-ja-scene-sub-modes-v4"
 # релиз от этого не страдают.
 TTL = {"ok": 14 * 86400, "low": 7 * 86400, "pause": 10 * 60, "missing": 6 * 3600}
 TITLE_TTL = 3 * 86400
+# Тайтл, у которого ни один RU-каталог не дал японской дорожки с русскими
+# субтитрами. У онгоинга субтитры могут появиться — поэтому не навсегда.
+RU_MISSING_TTL = 3 * 86400
 SAVE_EVERY = 2.0
 
 
@@ -82,7 +85,10 @@ class Suitability:
                   if isinstance(v, (int, float)) and now - v < TITLE_TTL}
         players = {k: v for k, v in (data.get("players") or {}).items()
                    if isinstance(v, (int, float)) and now - v < TTL["low"]}
-        return {"rules": RULES, "streams": streams, "titles": titles, "players": players}
+        ru_missing = {k: v for k, v in (data.get("ru_missing") or {}).items()
+                      if isinstance(v, (int, float)) and now - v < RU_MISSING_TTL}
+        return {"rules": RULES, "streams": streams, "titles": titles, "players": players,
+                "ru_missing": ru_missing}
 
     def verdict(self, title, stream) -> str:
         key = f"{title}|{identity(stream)}"
@@ -130,6 +136,27 @@ class Suitability:
             return
         with self._lock:
             self.data.setdefault("players", {})[f"{title}|{variant}"] = time.time()
+            self._dirty = True
+            self._revision += 1
+        self.save(force=False)
+
+    def ru_missing(self, title) -> bool:
+        """RU-каталоги недавно ответили: японской дорожки с RU-субтитрами нет.
+
+        В прогоне 12.11 так отпадали две трети тайтлов («тайтл найден; в
+        плеерах нет RU-субтитров»), и каждый следующий пак снова спрашивал про
+        них AnimeLIB, AnimeGO и YummyAnime, разбирал плееры трёх серий."""
+        if not title:
+            return False
+        with self._lock:
+            when = self.data.setdefault("ru_missing", {}).get(str(title))
+        return bool(when) and time.time() - when < RU_MISSING_TTL
+
+    def mark_ru_missing(self, title) -> None:
+        if not title:
+            return
+        with self._lock:
+            self.data.setdefault("ru_missing", {})[str(title)] = time.time()
             self._dirty = True
             self._revision += 1
         self.save(force=False)

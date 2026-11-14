@@ -26,13 +26,15 @@ def title_variants(card: dict, s: _api.Optional[_api.UpgradeSettings] = None) ->
     Порядок — как у генератора. Иероглифику не берём вовсе: ведущему её не
     прочитать, игроку не набрать (то же правило, что в animepack._dedup_answers).
     Год отрезаем: в ответе он не нужен, а Shikimori держит его в названии у части
-    тайтлов."""
+    тайтлов.
+
+    Основное русское название — ВСЕГДА последним (просьба пользователя): на
+    Shikimori оно стоит первым в карточке, и в паке именно оно должно
+    замыкать список. Если русского нет, последним идёт основное имя карточки."""
     out: list[str] = [card.get("name"), card.get("english"),
                       card.get("licenseNameRu")]
     out.extend(card.get("synonyms") or [])
-    # Русское название дописываем последним: ответ мог быть записан ромадзи, и
-    # тогда именно оно — самый нужный вариант.
-    out.append(card.get("russian"))
+    main = _api.strip_year(card.get("russian") or card.get("name"))
     clean, seen = [], set()
     for name in out:
         text = _api.strip_year(name)
@@ -41,6 +43,14 @@ def title_variants(card: dict, s: _api.Optional[_api.UpgradeSettings] = None) ->
             continue
         seen.add(key)
         clean.append(text)
+    # Основное имя вынимаем из середины и ставим в самый конец: даже если оно
+    # уже совпало с ромадзи или лицензионным, последним должен быть именно
+    # русский вариант с карточки.
+    main_key = _api.norm_title(main)
+    if main_key and not _api.has_cjk(main):
+        clean = [text for text in clean
+                 if _api.norm_title(text) != main_key]
+        clean.append(main)
     return clean
 
 title_variants.__module__ = _api.__name__
@@ -72,16 +82,28 @@ def _already_written(existing: list[str], variant: str) -> bool:
 _already_written.__module__ = _api.__name__
 _api._already_written = _already_written
 
-def add_answers(q_el: _api.ET.Element, tag, variants: list[str]) -> list[str]:
+def add_answers(q_el: _api.ET.Element, tag, variants: list[str],
+                *, force_last: bool = False) -> list[str]:
     """Дописывает варианты в <right>. То, что в паке уже написано (пусть и
-    внутри другого ответа), не повторяет. Возвращает реально добавленное."""
+    внутри другого ответа), не повторяет. Возвращает реально добавленное.
+
+    force_last — последний вариант (основное название) дописывается отдельной
+    строкой, даже если те же слова уже есть внутри другого ответа: в режиме
+    генератора ответ выглядит как «Игра друзей (2022) — 『…』», и чистое
+    «Игра друзей» в конце нужно ведущему и игрокам как отдельный вариант.
+    Точную такую же отдельную строку второй раз всё равно не пишем."""
     right = _api.child(q_el, "right")
     if right is None:
         return []
     have = [(a.text or "") for a in _api.children(right, "answer")]
     added = []
-    for text in variants:
-        if _api._already_written(have, text):
+    last = len(variants) - 1
+    for index, text in enumerate(variants):
+        if force_last and index == last:
+            key = _api.norm_title(text)
+            if any(_api.norm_title(old) == key for old in have):
+                continue
+        elif _api._already_written(have, text):
             continue
         have.append(text)
         el = _api.ET.SubElement(right, tag("answer"))

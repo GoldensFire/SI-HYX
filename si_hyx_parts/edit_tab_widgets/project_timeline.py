@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import QMenu
 
 # Шаги делений линейки: подбирается первый, при котором подписи не теснее
 # _RULER_MIN_PX.
-_RULER_STEPS = (0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600)
+_RULER_STEPS = (0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600)
 _RULER_MIN_PX = 70
 
 
@@ -122,6 +122,10 @@ class ProjectTimeline(_api.QWidget):
     SNAP_PX = 8
     DRAG_PX = 4
     MIN_TEXT_S = 0.05
+    # Предел приближения, пикселей на секунду: ~125 px на кадр при 24 к/с.
+    # Прежние 400 не давали короткому проекту (клип меньше секунды) встать во
+    # всю ширину — за ним оставалось 2–3 с пустой шкалы.
+    MAX_PPS = 3000.0
 
     def __init__(self, project, parent=None):
         super().__init__(parent)
@@ -386,7 +390,9 @@ class ProjectTimeline(_api.QWidget):
         self.update()
 
     def _fit_pps(self):
-        return self.lane_width() * 0.92 / max(1.0, self.project.duration())
+        # Короткий проект — во всю ширину (до MAX_PPS); пустой — секунда.
+        dur = self.project.duration()
+        return self.lane_width() * 0.92 / (max(0.1, dur) if dur > 0 else 1.0)
 
     def min_pps(self):
         """Предел отдаления: 0.5 px/с, но длинный проект (серия, фильм в узком
@@ -394,7 +400,7 @@ class ProjectTimeline(_api.QWidget):
         return min(0.5, self._fit_pps())
 
     def zoom_to_fit(self):
-        self.pps = max(self.min_pps(), min(400.0, self._fit_pps()))
+        self.pps = max(self.min_pps(), min(self.MAX_PPS, self._fit_pps()))
         self.offset = 0.0
         self.viewChanged.emit()
         self.update()
@@ -431,7 +437,7 @@ class ProjectTimeline(_api.QWidget):
             x = ev.position().x()
             t_at = self.t_of(max(self.HEADER_W, x))
             factor = 1.2 if delta > 0 else 1 / 1.2
-            self.pps = max(self.min_pps(), min(400.0, self.pps * factor))
+            self.pps = max(self.min_pps(), min(self.MAX_PPS, self.pps * factor))
             self.set_offset(t_at - (max(self.HEADER_W, x) - self.HEADER_W) / self.pps)
         else:
             self.set_offset(self.offset - delta / 120.0 * self.visible_span() * 0.15)

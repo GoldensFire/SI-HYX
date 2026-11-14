@@ -120,6 +120,12 @@ def main():
         wanted = {"manga" if source == "shikimori" else source for source in args.sources}
         refresh_database_sources(generator, wanted,
                                  catalogs, lambda current: None)
+        # Уровни книг зависят от каталога и RU-снимков — заготовка пишется
+        # рядом с базой, как после «Обновить базу» в приложении.
+        if not generator.stopped():
+            from si_hyx_parts.animepack.catalog_levels import rebuild as rebuild_levels
+            generator.db_cache.save()
+            rebuild_levels(generator)
     # Verify what survived on disk, including failed writes, rather than
     # accepting snapshots that exist only in the collector's memory.
     result = audit(api.ShikimoriDbCache(cache.path), started, args.sources)

@@ -51,6 +51,18 @@ def _card_genres(card: dict) -> set:
     return out
 
 
+def is_hentai(card: dict) -> bool:
+    """Жанр Hentai. Полная база берёт и такие тайтлы (censored: false), но в
+    пак они не идут: раньше сервер не отдавал их генерации вовсе."""
+    for g in card.get("genres") or []:
+        try:
+            if str(g.get("name") or "").casefold() == "hentai":
+                return True
+        except AttributeError:
+            continue
+    return False
+
+
 def card_fits(card: dict, outer: dict, inner: dict) -> bool:
     """Прошла бы карточка из мешка outer через фильтры inner на сервере.
 
@@ -85,7 +97,7 @@ def cached_catalog(db_cache, target: str, sig: str) -> tuple[list, bool]:
     Полнота доказывается отдельно для каждого запрошенного типа: несколько
     полных выборок манги и манхвы могут вместе покрыть весь запрос."""
     inner = parse_signature(sig)
-    cards = list(db_cache.cards(target, sig))
+    cards = [card for card in db_cache.cards(target, sig) if not is_hentai(card)]
     complete = db_cache.is_complete(target, sig)
     if inner is None:
         return cards, complete
@@ -102,7 +114,8 @@ def cached_catalog(db_cache, target: str, sig: str) -> tuple[list, bool]:
             continue
         for card in rows:
             key = str(card.get("malId") or card.get("id") or "")
-            if key and key not in seen and card_fits(card, outer, inner):
+            if (key and key not in seen and not is_hentai(card)
+                    and card_fits(card, outer, inner)):
                 cards.append(card)
                 seen.add(key)
     return cards, complete or bool(inner["kinds"] <= covered)

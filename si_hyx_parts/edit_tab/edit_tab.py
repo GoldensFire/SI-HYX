@@ -259,6 +259,11 @@ class EditTab(
         self._play_past_out = False
 
         self.ffmpeg_thread = None
+        # Очередь экспорта («В очередь», EditTabExportMixin._launch_cut_worker):
+        # подготовленные, но не запущенные рабочие потоки экспорта.
+        self._export_queue = []
+        self._export_enqueue = False      # True — пока «В очередь» готовит экспорт
+        self._export_current_final = ""   # результат идущего экспорта
         self.proxy_thread = None
         self.audio_worker = None
         self._audio_partial_worker = None   # быстрый предпросмотр волны выделения при смене дорожки
@@ -806,6 +811,10 @@ class EditTab(
     def shutdown(self):
         if not self._ready:
             return
+        try:
+            self._clear_export_queue()   # временные файлы ждущих экспортов
+        except Exception:
+            pass
         try:
             self.save_settings()
         except Exception:

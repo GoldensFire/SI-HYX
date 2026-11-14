@@ -302,10 +302,12 @@ class UnifiedWindowSettingsMixin:
 
     def _notify_api_keys_changed(self):
         self._api_keys_notify_pending = False
-        refresh = getattr(getattr(self, "tab_animepack", None), "_refresh_api_key_buttons", None)
-        if refresh is not None:
-            try: refresh()
-            except Exception: pass
+        for tab_name, method in (("tab_animepack", "_refresh_api_key_buttons"),
+                                 ("tab_subsearch", "_refresh_sources")):
+            refresh = getattr(getattr(self, tab_name, None), method, None)
+            if refresh is not None:
+                try: refresh()
+                except Exception: pass
 
     def _open_settings_dialog(self, section=None):
         """section — имя раздела, к которому сразу перейти (например, «Ключи API»).
@@ -495,7 +497,8 @@ class UnifiedWindowSettingsMixin:
             ed.setClearButtonEnabled(True)
             ed.textChanged.connect(lambda t, n=name: self.set_api_key(n, t))
             box_layout.addWidget(ed)
-            box_layout.addWidget(hint(note))
+            if note:
+                box_layout.addWidget(hint(note))
             return ed
 
         grp_gemini = _api.QGroupBox("Gemini (Google AI Studio)")
@@ -529,10 +532,55 @@ class UnifiedWindowSettingsMixin:
                  "Ключ SubDL API", "subdl",
                  "Первый источник вопросов «Диалоги из аниме»: субтитры сразу на "
                  "русском, Gemini не нужен. Когда суточная квота ключа кончится, "
-                 "диалоги берутся из Jimaku. Ключ уходит только на api.subdl.com "
+                 "диалоги берутся из Jimaku. Вкладка «Поиск по сабам» берёт тем же "
+                 "ключом английские субтитры. Ключ уходит только на api.subdl.com "
                  "и в пак не попадает.")
         add_row(sec_api, grp_subdl,
-                "subdl сабдл субтитры русские диалоги аниме ключ api серии")
+                "subdl сабдл субтитры русские английские диалоги аниме ключ api серии "
+                "поиск по сабам фраза")
+
+        grp_os = _api.QGroupBox("OpenSubtitles — поиск по сабам")
+        vos = _api.QVBoxLayout(grp_os)
+        _key_row(vos,
+                 'Ключ приложения: <a href="https://www.opensubtitles.com/consumers" '
+                 'style="color:#89b4fa;">opensubtitles.com/consumers</a>',
+                 "Ключ OpenSubtitles API", "opensubtitles",
+                 "Необязательный источник вкладки «Поиск по сабам». Скачивание "
+                 "требует входа, поэтому ниже — логин и пароль аккаунта "
+                 "opensubtitles.com.")
+        os_user = _key_row(vos, "Логин", "Имя пользователя OpenSubtitles",
+                           "opensubtitles_user", "")
+        os_user.setEchoMode(_api.QLineEdit.EchoMode.Normal)
+        _key_row(vos, "Пароль", "Пароль OpenSubtitles", "opensubtitles_password",
+                 "Суточная квота скачиваний у бесплатного аккаунта — единицы файлов: "
+                 "вкладка тратит её на самые скачиваемые файлы тайтла. Логин и пароль "
+                 "уходят только на api.opensubtitles.com.")
+        add_row(sec_api, grp_os,
+                "opensubtitles опенсабтайтлс субтитры английские ключ api логин пароль "
+                "поиск по сабам фраза")
+
+        grp_ss = _api.QGroupBox("SubSource — английские субтитры")
+        _key_row(_api.QVBoxLayout(grp_ss),
+                 'Ключ — вкладка API в профиле subsource.net (<a href="https://subsource.net/api-docs" '
+                 'style="color:#89b4fa;">описание API</a>)',
+                 "Ключ SubSource API", "subsource",
+                 "Источник вкладки «Поиск по сабам». Бесплатный ключ: 60 запросов в "
+                 "минуту и 7200 в сутки. Ключ уходит только на api.subsource.net в "
+                 "заголовке запроса и в кэш не попадает.")
+        add_row(sec_api, grp_ss,
+                "subsource сабсорс субтитры английские ключ api поиск по сабам фраза")
+
+        grp_tsdb = _api.QGroupBox("TSDB — The Subtitle Database")
+        _key_row(_api.QVBoxLayout(grp_tsdb),
+                 'Ключ (необязательно): <a href="https://thesubtitledb.org/account" '
+                 'style="color:#89b4fa;">thesubtitledb.org/account</a>',
+                 "Ключ TSDB (sdb_…)", "tsdb",
+                 "Источник вкладки «Поиск по сабам». Без ключа — 1000 скачиваний в "
+                 "час, с ключом — 100 000 в сутки. Ключ уходит только на "
+                 "api.thesubtitledb.org.")
+        add_row(sec_api, grp_tsdb,
+                "tsdb thesubtitledb subtitle database субтитры английские ключ api "
+                "поиск по сабам фраза")
 
         grp_jimaku = _api.QGroupBox("Jimaku — субтитры аниме")
         vj = _api.QVBoxLayout(grp_jimaku)
@@ -648,6 +696,13 @@ class UnifiedWindowSettingsMixin:
         vexp.addWidget(chk_shiki)
         vexp.addWidget(hint(_api.icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
                             + " Поиск аниме на Shikimori с фильтрами."))
+        chk_subs = _api.QCheckBox("Включить вкладку «Поиск по сабам»")
+        chk_subs.setChecked(bool(getattr(self, "_subsearch_tab_enabled", False)))
+        chk_subs.toggled.connect(self._set_subsearch_tab_enabled)
+        vexp.addWidget(chk_subs)
+        vexp.addWidget(hint(_api.icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
+                            + " Аниме, в английских субтитрах которых звучит фраза "
+                              "(например, «six seven»): от лёгкого к сложному, с исключением паков."))
         chk_lb = _api.QCheckBox("Включить вкладку «ЛидербордHYX»")
         chk_lb.setChecked(bool(getattr(self, "_leaderboard_tab_enabled", False)))
         chk_lb.toggled.connect(self._set_leaderboard_tab_enabled)
@@ -679,6 +734,7 @@ class UnifiedWindowSettingsMixin:
                 "промпт prompt заготовки шаблоны "
                 "siquester сиквестер siq пакет вопросы статистика эксперимент вкладка просмотр sigame "
                 "shikimori шикимори аниме поиск оценка жанр год api "
+                "поиск по сабам субтитры фраза six seven английские "
                 "лидерборд leaderboard рекорды никнеймы firebase счёт ник "
                 "collab coop совместная работа пак напарник соавтор реалтайм темы вопросы ответы дубли синхронизация "
                 "генерация аниме пак опенинг эндинг песни amq anisongdb myanimelist shikimori aspg угадайка siq "
@@ -852,10 +908,15 @@ class UnifiedWindowSettingsMixin:
                 'wheel_changes_values': bool(getattr(self, '_wheel_changes_values', False)),
                 'video_hw_decode': bool(getattr(self, '_video_hw_decode', True)),
                 'keep_models_in_ram': bool(getattr(self, '_keep_models_in_ram', False)),
+                'photo_export_mode': str(getattr(getattr(getattr(self, 'tab_photo', None),
+                                                         'inpaint', None),
+                                                 'export_mode', 'lossless')),
                 'advanced_encode_visible': bool(getattr(self, '_show_advanced_encode', False)),
                 'siquester_tab_enabled': bool(getattr(self, '_siquester_tab_enabled', False)),
                 'shikimori_tab_enabled': bool(getattr(self, '_shikimori_tab_enabled', False)),
                 'shikimori': self._collect_shikimori_settings(),
+                'subsearch_tab_enabled': bool(getattr(self, '_subsearch_tab_enabled', False)),
+                'subsearch': self._collect_subsearch_settings(),
                 'leaderboard_tab_enabled': bool(getattr(self, '_leaderboard_tab_enabled', False)),
                 'coop_tab_enabled': bool(getattr(self, '_coop_tab_enabled', False)),
                 'coop': self._collect_coop_settings(),

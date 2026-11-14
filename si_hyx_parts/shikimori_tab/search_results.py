@@ -82,6 +82,8 @@ class ShikimoriSearchMixin:
         self._update_pager()
         self._seen_franchises = set()
         self._franchise_peaks = None
+        self._pack_hidden_ids = set()
+        self._update_excluded_button()
         self._set_actions_enabled(False)
         self._set_busy(True)
         if cache_only:
@@ -221,6 +223,8 @@ class ShikimoriSearchMixin:
         self._results = []
         self._page = 0
         self._update_pager()
+        self._pack_hidden_ids = set()
+        self._update_excluded_button()
         self._set_actions_enabled(False)
         self.lbl_status.setText("Список очищен.")
 
@@ -246,7 +250,9 @@ class ShikimoriSearchMixin:
         for a in items:
             self._raw_results.append(a)
             if self._is_excluded(a):
-                continue
+                self._pack_hidden_ids.add(a.id)
+                if not self._show_excluded:
+                    continue
             if self._collapse_franchise and self._franchise_seen(a):
                 continue
             self._results.append(a)
@@ -255,6 +261,7 @@ class ShikimoriSearchMixin:
             else:
                 self._anime_by_id[a.id] = a
         self._update_pager()
+        self._update_excluded_button()
         self._load_visible_thumbs()
         self._set_actions_enabled(bool(self._results))
         # Автостоп: набрали достаточно тайтлов ПОСЛЕ фильтрации — дальше искать
@@ -327,121 +334,6 @@ class ShikimoriSearchMixin:
         self.btn_export_csv.setEnabled(on)
 
     # ── Применение исключения паков и заполнение списка ────────────────────────
-    def _term_in_question_text(self, term: str) -> bool:
-        """Встречается ли название в тексте вопроса отдельным словом/фразой.
-
-        Простое `in` дало бы ложные срабатывания на коротких названиях внутри
-        других слов, поэтому проверяем границы слова (`\\w`). Результат кешируем:
-        в выдаче тысячи тайтлов, а названий у них заметно меньше.
-
-        Регулярку строим только для названий, которые есть в тексте простой
-        подстрокой: re.search компилирует новый шаблон на каждое название, и
-        на 20 тыс. тайтлах «По кэшу» это вешало вкладку на десятки секунд."""
-        cache = self._question_term_cache
-        if term in cache:
-            return cache[term]
-        found = False
-        haystack = self._excluded_question_haystack
-        if term and haystack and term in haystack:
-            found = bool(_api.re.search(
-                r"(?<!\w)" + _api.re.escape(term) + r"(?!\w)", haystack))
-        cache[term] = found
-        return found
-
-    def _question_mentions(self, nt: str, nn: str) -> bool:
-        """Название тайтла (или его корень) упомянуто в тексте вопроса."""
-        if not self._excluded_question_haystack:
-            return False
-        terms = []
-        for name in (nt, nn):
-            if not name:
-                continue
-            for term in (name, _api._base_title(name),
-                         _api._franchise_key(name)):
-                if term and term not in terms:
-                    terms.append(term)
-        return any(self._term_in_question_text(term) for term in terms)
-
-    def _name_excluded(self, a: '_api.Anime') -> bool:
-        """Совпало ли НАЗВАНИЕ тайтла с ответом/текстом вопроса из пака.
-
-        Ответ запоминается по id до смены паков (_rebuild_excluded_bases):
-        за один проход его спрашивают и _learn_excluded_franchises, и
-        _is_excluded, а потоковая выдача — ещё и на каждой странице."""
-        if not self._excluded and not self._excluded_question_haystack:
-            return False
-        memo = self._name_excluded_memo
-        hit = memo.get(a.id)
-        if hit is None:
-            hit = memo[a.id] = self._match_excluded_name(a)
-        return hit
-
-    def _match_excluded_name(self, a: '_api.Anime') -> bool:
-        nt, nn = _api._norm_title(a.title), _api._norm_title(a.name)
-        if nt in self._excluded or nn in self._excluded:
-            return True
-        # Сезонные варианты: пак с «Ванпанчмен» прячет и «Ванпанчмен 3» (и наоборот)
-        # — сравниваем «базовые» формы без хвостового номера/«сезон N».
-        if self._excluded_bases:
-            if _api._base_title(nt) in self._excluded_bases:
-                return True
-            if nn and _api._base_title(nn) in self._excluded_bases:
-                return True
-        # Название могло быть только в ТЕКСТЕ вопроса (ответ — имя героя,
-        # предмет или разгаданное слово), поэтому проверяем и его.
-        return self._question_mentions(nt, nn)
-
-    def _is_excluded(self, a: '_api.Anime') -> bool:
-        if (not self._excluded and not self._excluded_question_haystack
-                and not self._excluded_franchises):
-            return False
-        if self._name_excluded(a):
-            return True
-        # Франшиза целиком: пак с «Наруто» прячет «Наруто: Ураганные хроники».
-        if self._collapse_franchise and self._excluded_franchises:
-            keys = self._franchise_keys(a)
-            for k in keys:
-                if k in self._excluded_franchises:
-                    return True
-            # Длинные тайтлы одной франшизы, отличающиеся лишь последним словом
-            # («…мечту девочки зайки» vs «…девочки-мечтательницы»).
-            for k in keys:
-                if _api._matches_franchise_prefix(k, self._excluded_prefixes):
-                    return True
-        return False
-
-    def _learn_excluded_franchises(self, raw):
-        """Закрывает франшизы исключённых паками тайтлов, даже если у пака нет
-        манифеста.
-
-        «Атака титанов» из пака и «Атака! Титаны средней школы» из выдачи —
-        один franchise у Shikimori, хотя названия разные. В «По кэшу» карточки
-        уже приносят franchise (cache_search); в сетевом поиске — после
-        дозагрузки просмотров."""
-        if ((not self._excluded and not self._excluded_question_haystack)
-                or not self._franchise_of):
-            return
-        for a in raw:
-            franchise = self._franchise_of.get(a.id)
-            if not franchise or "#" + franchise in self._excluded_franchises:
-                continue
-            if self._name_excluded(a):
-                self._excluded_shiki_franchises.add(franchise)
-                self._excluded_franchises.add("#" + franchise)
-
-    def _franchise_keys(self, a) -> set:
-        """Ключи франшизы тайтла: по русскому названию, по ромадзи и, если тайтл
-        есть в базе генератора, — ключ франшизы самого Shikimori. Последний
-        ловит части, у которых название другое («Атака! Титаны средней школы»
-        у «Атаки титанов»)."""
-        keys = self._fkeys.get(a.id)
-        if keys is None:
-            keys = frozenset(k for k in (_api._franchise_key(a.title),
-                                         _api._franchise_key(a.name)) if k)
-            self._fkeys[a.id] = keys
-        franchise = self._franchise_of.get(a.id)
-        return keys | {"#" + franchise} if franchise else set(keys)
-
     def _franchise_seen(self, a) -> bool:
         """True (и запоминает), если франшиза этого тайтла уже показана в выдаче —
         для схлопывания сезонов/частей по ходу потоковой выдачи."""
@@ -461,7 +353,11 @@ class ShikimoriSearchMixin:
         тем, у кого они есть, а между собой идут в порядке выдачи."""
         raw = self._raw_results
         self._learn_excluded_franchises(raw)
-        kept = [a for a in raw if not self._is_excluded(a)]
+        # Скрытые паками запоминаем: кнопка «Показать исключённые» возвращает
+        # их в выдачу с пометкой — видно, что тайтл найден, но уже есть в паке.
+        self._pack_hidden_ids = {a.id for a in raw if self._is_excluded(a)}
+        kept = [a for a in raw
+                if self._show_excluded or a.id not in self._pack_hidden_ids]
         hidden = len(raw) - len(kept)
         seen = set()
         if self._collapse_franchise:
@@ -525,25 +421,11 @@ class ShikimoriSearchMixin:
         if self._raw_results:
             self._apply_exclusions()
 
-    def _rebuild_excluded_bases(self):
-        """Пересобирает «базовые» формы и «ключи франшиз» исключённых названий."""
-        self._excluded_bases = {b for b in (_api._base_title(x) for x in self._excluded) if b}
-        name_keys = {f for f in (_api._franchise_key(x) for x in self._excluded) if f}
-        # Ключ самого Shikimori живёт в отдельном пространстве имён («#konosuba»,
-        # «#shingeki_no_kyojin») и с названием «атака титанов» не совпадает.
-        # Он приходит из манифеста пака и ловит части с другим названием.
-        self._excluded_franchises = name_keys | {
-            "#" + f for f in self._excluded_shiki_franchises if f}
-        self._excluded_prefixes = _api._franchise_prefix_index(name_keys)
-        self._excluded_question_haystack = "\n".join(
-            self._excluded_question_texts)
-        self._question_term_cache = {}
-        self._name_excluded_memo = {}
-
     def _apply_exclusions(self):
         """Фильтрует «сырые» результаты по выбранным пакам и схлопывает франшизы."""
         raw = self._raw_results
         self._results, excluded_n = self._filtered()
+        self._update_excluded_button()
         self._display_results()
         n = len(self._results)
         self._set_actions_enabled(n > 0)
@@ -554,9 +436,29 @@ class ShikimoriSearchMixin:
                 msg += f" (скрыто: {excluded_n})"
             self.lbl_status.setText(msg)
         elif raw and excluded_n:
-            self.lbl_status.setText("Всё найденное уже есть в выбранных паках.")
+            self.lbl_status.setText("Всё найденное уже есть в выбранных паках — "
+                                    "кнопка «Показать исключённые» покажет их.")
         else:
             self.lbl_status.setText("Ничего не найдено под заданные фильтры.")
+
+    def _update_excluded_button(self):
+        """Кнопка «Показать исключённые»: видна, пока в выдаче есть тайтлы,
+        скрытые исключением паков (или пока они показаны)."""
+        btn = getattr(self, "btn_show_excluded", None)
+        if btn is None:
+            return
+        n = len(self._pack_hidden_ids)
+        btn.setText(f"Скрыть исключённые ({n})" if self._show_excluded
+                    else f"Показать исключённые ({n})")
+        btn.setVisible(bool(n))
+
+    def _on_show_excluded_toggled(self, on: bool):
+        """Показать/спрятать тайтлы, скрытые исключением паков, — без нового
+        запроса к Shikimori."""
+        self._show_excluded = bool(on)
+        self._update_excluded_button()
+        if self._raw_results and self._task is None:
+            self._apply_exclusions()
 
     # ── Сортировка по просмотрам (локально, с дозагрузкой карточек) ────────────
     def _views_sort_active(self) -> bool:
@@ -802,6 +704,8 @@ class ShikimoriSearchMixin:
             parts.append(date_lbl)
         if a.episodes:
             parts.append(f"{a.episodes} {unit}")
+        if a.id in self._pack_hidden_ids:
+            parts.append("в исключениях паков")
         sub = "  ·  ".join(parts)
         text = a.title
         if a.name and a.name != a.title:

@@ -93,5 +93,6 @@ from si_hyx_parts.photo_tab.photo_merger_tab import PhotoMergerTab
 from si_hyx_parts.photo_tab.inpaint_canvas import InpaintCanvas
 from si_hyx_parts.photo_tab.workers import _WarmupWorker, InpaintWorker, BgRemoveWorker
 
+from si_hyx_parts.photo_tab.export_dialog import PhotoExportDialog, PhotoExportWorker
 from si_hyx_parts.photo_tab.inpaint_tab import InpaintTab
 from si_hyx_parts.photo_tab.photo_tab import _PhotoModeSwitch, PhotoTab

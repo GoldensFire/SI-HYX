@@ -29,6 +29,12 @@ from .manga_editions import shares
 # пользователя — 39 149) и держала их в памяти весь прогон.
 BENCH_PER_SLOT = 20
 BENCH_MIN = 200
+# Сколько id каталога план должен выдать ПОСЛЕ того, как издание в нём
+# кончилось, прежде чем его места отдаются другим: столько успевают дойти до
+# отбора книги этого издания, ещё сидящие в пачке карточек и окне проверок
+# (CandidateSource.WINDOW). Раньше — отдать их было нельзя, они бы пришли
+# «лишними» и ушли на скамейку.
+DRY_TRANSIT = 60
 
 
 class MangaMix:
@@ -47,6 +53,9 @@ class MangaMix:
         # Вебтуны без Gemini не собрать (сцену с персонажами выбирает модель):
         # тогда закрываются только они, а не вся книжная доля.
         self.webtoons_off = ""
+        # Издания, которых в каталоге под рамку сложности больше нет: их
+        # недобранные места отданы другим (drop_dry).
+        self._dry: set[str] = set()
         self.sync(quota)
 
     # ── цели ──────────────────────────────────────────────────────────────
@@ -72,6 +81,68 @@ class MangaMix:
         if self.webtoons_off and not getattr(self.s, "manga_strict_targets", False):
             self.kind_target[""] += self.kind_target["manhwa"] + self.kind_target["manhua"]
             self.kind_target["manhwa"] = self.kind_target["manhua"] = 0
+        self._give_away_dry()
+
+    def _give_away_dry(self) -> int:
+        """Недобранные места кончившихся изданий — живому изданию с самой
+        большой долей. Пересчитывается при каждой sync: сорвавшаяся загрузка
+        снова открывает место, и оно опять уходит живым."""
+        values = shares(self.s)
+        receivers = sorted((k for k in self.kind_target
+                            if k not in self._dry and values.get(k or "manga")
+                            and not (k and self.webtoons_off)),
+                           key=lambda k: -self.kind_target[k])
+        moved = 0
+        if not receivers:
+            return moved
+        for key in sorted(self._dry):
+            spare = max(0, self.kind_target.get(key, 0) - self._used[("kind", key)])
+            if spare:
+                self.kind_target[key] -= spare
+                self.kind_target[receivers[0]] += spare
+                moved += spare
+        return moved
+
+    def drop_dry(self, plan, waiting=()) -> None:
+        """Отдаёт места издания, которого в плане каталога больше нет.
+
+        Паку нужны две маньхуа, а маньхуа уровня 1–5 в Shikimori — полтора
+        десятка, и половина не проходит проверку страниц. Раньше отбор после
+        этого перебирал по 100 карточек на книжное место (2400 на 24 книги),
+        откладывая каждую японскую мангу как «лишнюю», и только потом брал
+        отложенных: 7–20 минут на два последних вопроса (паки 11.11 и 12.11).
+        Теперь, как только план каталога (CatalogPlan.dry) не держит ни одной
+        группы издания в его рамке, а книги этого издания, выданные раньше,
+        успели дойти до отбора, недобранные места переходят другому изданию.
+
+        waiting — кандидаты, ждущие свободного потока (deferred): пока среди
+        них есть книга этого издания, его места ещё не пусты."""
+        dry = getattr(plan, "dry", None)
+        if (not dry or self.off or not self.quota
+                or getattr(self.s, "manga_strict_targets", False)):
+            return
+        served = getattr(plan, "served", 0)
+        for key, since in list(dry.items()):
+            if self._used[("kind", key)] >= self.kind_target.get(key, 0):
+                continue
+            if key in self._dry:
+                # Загрузка книги этого издания сорвалась уже после передачи
+                # мест — освободившееся место тоже уходит живым.
+                self._give_away_dry()
+                continue
+            if served - since < DRY_TRANSIT:
+                continue
+            if any(c.is_manga and self._edition(c) == key for c in waiting):
+                continue
+            self._dry.add(key)
+            moved = self._give_away_dry()
+            if moved:
+                names = {"": "японской манги", "manhwa": "манхвы",
+                         "manhua": "маньхуа"}
+                self._log(f"Доли манги: {names.get(key, key)} под рамку сложности "
+                          "в каталоге больше нет — её недобранные места "
+                          f"({moved} шт.) отдаю другим изданиям, не перебирая "
+                          "каталог дальше.")
 
     def close_webtoons(self, reason: str) -> bool:
         """Манхва и маньхуа больше не берутся; их места — японской манге.

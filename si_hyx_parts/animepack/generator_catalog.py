@@ -437,9 +437,13 @@ class GeneratorCatalogMixin:
             settings = replace(self.s, year_from=0, year_to=9999, score_from=0,
                                genres_exclude=[],
                                manga_kinds=dict.fromkeys(_api.MANGA_KINDS, True),
-                               kinds=dict.fromkeys(_api.ANIME_KINDS, True))
+                               kinds=dict.fromkeys(_api.ANIME_DB_KINDS, True))
         if manga:
             kinds = [k for k in _api.MANGA_KINDS if settings.manga_kinds.get(k)]
+        elif unfiltered:
+            # Без фильтра по виду: сервер отдаёт все виды, в том числе
+            # tv_special, music, pv и cm, которых нет среди ANIME_KINDS.
+            kinds = []
         else:
             kinds = [k for k in _api.ANIME_KINDS if settings.kinds.get(k)]
         season = "" if unfiltered else f"{int(settings.year_from)}_{int(settings.year_to)}"
@@ -472,7 +476,11 @@ class GeneratorCatalogMixin:
                     self.shikimori, self.FULL_MAX_PAGES, self.stopped, manga=manga,
                     start_page=start_page,
                     limit=50, season=season, kinds=kinds, score=int(settings.score_from),
-                    genres_exclude=settings.genres_exclude, order=self.FULL_ORDER):
+                    genres_exclude=settings.genres_exclude, order=self.FULL_ORDER,
+                    # Полная база — и тайтлы, которые Shikimori по умолчанию
+                    # прячет (жанры Erotica/Hentai): без этого в базе не было
+                    # 6,7 тыс. аниме, например «Nukitashi the Animation».
+                    censored=not unfiltered):
                 if not cards:
                     # Каталог по этим фильтрам кончился: генерация больше не
                     # полезет за ним на сервер (см. catalog_superset).
@@ -696,6 +704,8 @@ class GeneratorCatalogMixin:
         if built is None or built is PENDING:
             return
         pairs, plan = built
+        # План нужен и отбору: по нему MangaMix видит, что издание кончилось.
+        self._manga_plan = plan
         if not pairs:
             self._spend_kind(_api.MANGA_KIND, "в каталоге нет книг под эти фильтры")
             return

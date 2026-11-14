@@ -62,6 +62,17 @@ def _db_card_count(self) -> int:
     return int(counts["anime"]["count"]) + int(counts["manga"]["count"])
 
 
+def _rebuild_levels(self) -> None:
+    """Заготовка уровней по только что сохранённой базе (catalog_levels)."""
+    from .catalog_levels import rebuild
+    try:
+        with self._timed("заготовка уровней каталога"):
+            rebuild(self)
+    except Exception as error:  # noqa: BLE001 — база уже собрана и сохранена
+        self.log(f"Уровни каталога не заготовлены: {error} — генерация "
+                 "посчитает их на старте, как раньше.")
+
+
 def _prepare(self, out_path):
     problems = self.s.validate()
     from .generation_preflight import average_problems, describe
@@ -841,6 +852,12 @@ class AnimePackGenerator(
             _refresh_franchises(self, cards)
         from .db_refresh_report import finish_report
         report = finish_report(self, wanted, started)
+        # Уровни всего каталога — один раз здесь, а не на старте каждой
+        # генерации (см. catalog_levels). И при сбое части источников тоже:
+        # полученные карточки, франшизы и снимки уже сохранены, а заготовка
+        # иначе так и считала бы уровни по прежней базе.
+        if report.get("saved"):
+            _rebuild_levels(self)
         if report["status"] == "ERROR":
             detail = "Полученные данные сохранены." if report.get("saved") else "Не все данные записаны."
             raise _api.AnimePackError("Обновление базы не завершено. " + detail + "\n"
@@ -849,15 +866,6 @@ class AnimePackGenerator(
         self.log(f"Сбор базы: {report['status']}; {total} карточек, "
                  f"{len(self._fr_parts)} франшиз; недоступных счётчиков "
                  f"{report['restricted']}, неизвестных {report['unknown']}.")
-        # Уровни всего каталога — один раз здесь, а не на старте каждой
-        # генерации (см. catalog_levels).
-        from .catalog_levels import rebuild as rebuild_levels
-        try:
-            with self._timed("заготовка уровней каталога"):
-                rebuild_levels(self)
-        except Exception as error:  # noqa: BLE001 — база уже собрана и сохранена
-            self.log(f"Уровни каталога не заготовлены: {error} — генерация "
-                     "посчитает их на старте, как раньше.")
         return total
 
     # ── всё вместе ────────────────────────────────────────────────────────

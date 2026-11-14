@@ -3,7 +3,6 @@
 """Ступени раскрытия кадра: устойчивые маски, эффекты и общие настройки."""
 from __future__ import annotations
 
-import importlib
 import math
 import random
 
@@ -47,17 +46,38 @@ EFFECT_HINTS = {
 }
 # Эффекты, которые считаются отдельными модулями на numpy. Модуль грузится
 # только при первом раскрытии — запуск программы numpy не ждёт.
-_EXTERNAL = {
-    "dark": ("frame_reveal_tone", "DarknessReveal"),
-    "overexposed": ("frame_reveal_tone", "OverexposureReveal"),
-    "waves": ("frame_reveal_warp", "WaveReveal"),
-    "stripes": ("frame_reveal_warp", "StripesReveal"),
-    "swirl": ("frame_reveal_warp", "SwirlReveal"),
-    "thumbnail": ("frame_reveal_layout", "ThumbnailReveal"),
-    "puzzle": ("frame_reveal_layout", "PuzzleReveal"),
-    "puzzle_center": ("frame_reveal_layout", "PuzzleReveal"),
-    "dvd": ("frame_reveal_dvd", "DvdReveal"),
-}
+#
+# Импорты нарочно обычные, внутри функции: раньше модуль брался
+# importlib.import_module по строке, PyInstaller его не видел, и в exe
+# эффектов «тон», «искажение» и «раскладка» не было — у пользователя за
+# прогон падало до 126 проявлений с «No module named 'frame_reveal_warp'».
+def _external_class(effect: str):
+    """Класс эффекта из отдельного модуля или None для встроенных."""
+    if effect == "dark":
+        from frame_reveal_tone import DarknessReveal
+        return DarknessReveal
+    if effect == "overexposed":
+        from frame_reveal_tone import OverexposureReveal
+        return OverexposureReveal
+    if effect == "waves":
+        from frame_reveal_warp import WaveReveal
+        return WaveReveal
+    if effect == "stripes":
+        from frame_reveal_warp import StripesReveal
+        return StripesReveal
+    if effect == "swirl":
+        from frame_reveal_warp import SwirlReveal
+        return SwirlReveal
+    if effect == "thumbnail":
+        from frame_reveal_layout import ThumbnailReveal
+        return ThumbnailReveal
+    if effect in ("puzzle", "puzzle_center"):
+        from frame_reveal_layout import PuzzleReveal
+        return PuzzleReveal
+    if effect == "dvd":
+        from frame_reveal_dvd import DvdReveal
+        return DvdReveal
+    return None
 # Эффекты, которые кодируются покадровой анимацией (30/60 к/с), а не
 # ступенями: число ступеней и «кадров/с» из настроек их не касаются.
 ANIMATED_EFFECTS = ("dvd",)
@@ -134,9 +154,8 @@ class RevealRenderer:
             self.mask = self._tile_ranks()
         elif effect in ("window", "zoom"):
             self.anchor = self._detail_anchor()
-        if effect in _EXTERNAL:
-            module, name = _EXTERNAL[effect]
-            cls = getattr(importlib.import_module(module), name)
+        cls = _external_class(effect)
+        if cls is not None:
             extra = {"from_center": True} if effect == "puzzle_center" else {}
             self.external = cls(self.image, self.strength, self.rng, self.anchor, **extra)
 

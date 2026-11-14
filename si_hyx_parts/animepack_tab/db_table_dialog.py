@@ -17,11 +17,15 @@
 Считает панель в РАБОЧЕМ потоке: чтение базы с диска — четыре секунды, разбор
 каталога книг — ещё три, и раньше на это время замирало всё окно. Пока идёт
 счёт, вкладка так и говорит; таблица встаёт целиком и сразу.
+
+Полный счёт всех ~100 тысяч тайтлов на большой базе — минуты, поэтому его
+итог хранится снимком (db_snapshot): открытие показывает снимок сразу, а
+пересчитывает в фоне только при изменившейся базе или «Перечитать с диска».
 """
 from __future__ import annotations
 
 from PyQt6.QtCore import (
-    QCoreApplication, QObject, QRunnable, QThreadPool, pyqtSignal,
+    QCoreApplication, QObject, QRunnable, Qt, QThreadPool, pyqtSignal,
 )
 from PyQt6.QtWidgets import (
     QDialog, QHBoxLayout, QPushButton, QTabWidget, QToolButton, QVBoxLayout,
@@ -85,6 +89,8 @@ class DbTableDialog(QDialog):
         self._age = 0                     # счёт этого поколения, старые — вон
         self._counts: dict = {}
         self._title_rows: dict = {}
+        self._title_stamps: dict = {}
+        self._force = False
         self._filled: set = set()
         self._pending: set = set()
         from .db_view_filters import defaults
@@ -150,16 +156,44 @@ class DbTableDialog(QDialog):
             "свои кнопки.")
         self.btn_all.clicked.connect(lambda: self._on_part_action("all"))
         row.addWidget(self.btn_all)
+        # Отдельная «Стоп» для любого идущего обновления (просьба
+        # пользователя): у блоков кнопка тоже становится «Остановить», но
+        # только у собираемой части, и её легко не заметить.
+        self.btn_stop = QPushButton("Остановить обновление")
+        self.btn_stop.setObjectName("b_stop")
+        self.btn_stop.setIcon(api.get_icon("fa5s.stop"))
+        self.btn_stop.setToolTip("Прервать идущее обновление базы. Набранное "
+                                 "к этому моменту сохранится в базе.")
+        self.btn_stop.clicked.connect(self._stop_refresh)
+        self.btn_stop.setVisible(False)
+        row.addWidget(self.btn_stop)
         row.addStretch(1)
         refresh = QPushButton("Перечитать с диска")
-        refresh.setToolTip("Перечитать базу с диска и пересчитать таблицы.")
-        refresh.clicked.connect(self.refresh)
+        refresh.setToolTip("Перечитать базу с диска и пересчитать таблицы.\n"
+                           "Обычно панель показывает сохранённый снимок таблиц "
+                           "и пересчитывает их сама, только когда база менялась.")
+        refresh.clicked.connect(lambda: self.refresh(force=True))
         close = QPushButton("Закрыть")
         close.clicked.connect(self.close)
         row.addWidget(refresh)
         row.addWidget(close)
         layout.addLayout(row)
+        # В QDialog каждая QPushButton по умолчанию autoDefault: Enter в поле
+        # поиска таблицы «нажимал» первую из них — «Обновить» блока «Аниме», и
+        # база начинала обновляться сама. Кнопки жмутся только мышью/пробелом.
+        for button in self.findChildren(QPushButton):
+            button.setAutoDefault(False)
+            button.setDefault(False)
         self.refresh()
+
+    def keyPressEvent(self, event):          # noqa: N802 — имя из Qt
+        """Enter/Return панели ничего не запускает (см. autoDefault выше):
+        до QDialog он доходит, только если его не взял сам виджет — поле
+        поиска своё returnPressed получает раньше."""
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # ── обновление по частям ──────────────────────────────────────────────
     def _on_part_action(self, part: str) -> None:
@@ -175,9 +209,24 @@ class DbTableDialog(QDialog):
         self._tab._refresh_db(parts)
         self.sync_state()
 
+    def _stop_refresh(self) -> None:
+        """«Остановить обновление»: повторный вызов обновления у вкладки и
+        есть остановка (_refresh_db останавливает идущую задачу)."""
+        task = getattr(self._tab, "_db_task", None)
+        if task is None:
+            self.sync_state()
+            return
+        self._tab._refresh_db(getattr(self._tab, "_db_parts", None) or None)
+        self.sync_state()
+
     def sync_state(self) -> None:
         """Подписи блоков под то, что сейчас делает база."""
-        running = getattr(self._tab, "_db_task", None) is not None
+        task = getattr(self._tab, "_db_task", None)
+        running = task is not None
+        stopping = bool(getattr(task, "_stop", False))
+        self.btn_stop.setVisible(running)
+        self.btn_stop.setEnabled(running and not stopping)
+        self.btn_stop.setText("Останавливаю…" if stopping else "Остановить обновление")
         active = set(getattr(self._tab, "_db_parts", ()) or ())
         for part, block in self.blocks.items():
             row = self._counts.get(part) or {}
@@ -186,17 +235,23 @@ class DbTableDialog(QDialog):
                             running and collecting, running)
         self.btn_all.setEnabled(not running)
 
-    def refresh(self):
-        """Перечитать базу с диска и пересобрать таблицы."""
+    def refresh(self, force: bool = False):
+        """Перечитать базу с диска и пересобрать таблицы.
+
+        Сначала показывается снимок таблиц (db_snapshot) — за секунды, а не
+        минуты полного счёта. Пересчёт идёт следом в фоне, если база с тех пор
+        менялась; force — пересчитать в любом случае («Перечитать с диска»)."""
         self._age += 1
+        self._force = bool(force)
         self._counts = {}
         self._title_rows = {}             # разбор каталога, посчитанный разок
+        self._title_stamps = {}           # отметка базы, с которой его считали
         self._filled = set()              # какие вкладки уже наполнены
         self._pending = set()
         for page in (self.anime, self.manga, self.chars):
             page.set_busy("Читаю базу…")
         self.sync_state()
-        self._start(("counts", self._filters_snapshot()))
+        self._start(("counts", self._filters_snapshot(), not self._force))
         self._fill_current()
 
     def closeEvent(self, event):             # noqa: N802 — имя из Qt
@@ -205,9 +260,19 @@ class DbTableDialog(QDialog):
         super().closeEvent(event)
 
     def flush(self, timeout_ms: int = 60000) -> None:
-        """Дождаться всех расчётов панели (тесты и «покажи прямо сейчас»)."""
-        self._pool.waitForDone(int(timeout_ms))
-        QCoreApplication.processEvents()
+        """Дождаться всех расчётов панели (тесты и «покажи прямо сейчас»).
+
+        Расчёты идут цепочкой (снимок → полный счёт, устаревшие числа → свежие):
+        следующее звено ставится по ответу предыдущего, поэтому ждём, пока
+        после доставки ответов не останется ни одной задачи."""
+        import time
+        deadline = time.monotonic() + max(0, int(timeout_ms)) / 1000
+        while True:
+            left = max(0, int((deadline - time.monotonic()) * 1000))
+            self._pool.waitForDone(left)
+            QCoreApplication.processEvents()
+            if self._pool.waitForDone(0) or time.monotonic() >= deadline:
+                return
 
     # ── счёт в рабочем потоке ─────────────────────────────────────────────
     def _start(self, task) -> None:
@@ -228,7 +293,9 @@ class DbTableDialog(QDialog):
         gc.disable()
         try:
             if task[0] == "counts":
-                return self._read_counts(task[1])
+                return self._read_counts(task[1], len(task) > 2 and bool(task[2]))
+            if task[0] == "snap":
+                return self._read_snapshot(task[1])
             if task[0] == "title":
                 return self._read_title(task[1], task[2])
             if task[0] == "franchise":
@@ -245,8 +312,15 @@ class DbTableDialog(QDialog):
         if age != self._age:
             return
         if task[0] == "counts":
-            self._counts = result or {}
+            counts = dict(result or {})
+            # Числа из снимка устарели — показываем их, а свежие досчитаем.
+            if counts.pop("_stale", False):
+                self._start(("counts", self._filters_snapshot(), False))
+            self._counts = counts
             self.sync_state()
+            return
+        if task[0] == "snap":
+            self._snapshot_done(task[1], result)
             return
         if task[0] in ("title", "franchise"):
             self._pending.discard(task[:3])
@@ -285,6 +359,10 @@ class DbTableDialog(QDialog):
             return
         if task[0] == "counts":
             return
+        if task[0] == "snap":
+            # Снимок не прочёлся — считаем таблицу как раньше, целиком.
+            self._snapshot_done(task[1], None)
+            return
         if task[0] in ("title", "franchise", "character"):
             if task[0] == "character":
                 self._pending.discard(task)
@@ -320,39 +398,100 @@ class DbTableDialog(QDialog):
             return
         self._pending.add(target)
         page.set_busy("Собираю таблицу…")
-        self._start(("page", target, self._filters_snapshot()))
+        from .db_view_filters import active
+        filters = self._filters_snapshot()
+        # Снимок хранит только таблицу без фильтров: с фильтрами считаем.
+        use_snapshot = not getattr(self, "_force", False) and not active(filters)
+        self._start(("snap" if use_snapshot else "page", target, filters))
+
+    def _snapshot_done(self, target: str, result) -> None:
+        """Снимок вкладки прочитан: показать его и, если надо, пересчитать."""
+        page = self._page_for(target)
+        if page is None:
+            self._pending.discard(target)
+            return
+        if not result:
+            # Снимка нет (первое открытие) — полный счёт, как раньше.
+            self._start(("page", target, self._filters_snapshot()))
+            return
+        (rows, texts, sorts, hay, sort_by, *tail), stale = result
+        page.set_data(rows, texts, sorts, hay, sort_by,
+                      tail[0] if tail else None)
+        self._filled.add(page)
+        if not stale:
+            self._pending.discard(target)
+            return
+        # База с тех пор менялась: таблица уже на экране, а свежая заменит
+        # её с сохранением прокрутки и раскрытых веток.
+        page.count.setText(page.count.text() + " · из снимка, сверяю с базой…")
+        self._start(("page", target, self._filters_snapshot(), True))
 
     # ── разбор кэша (всё это идёт в рабочем потоке) ───────────────────────
-    def _read_counts(self, kinds) -> dict:
+    def _read_counts(self, kinds, use_snapshot: bool = False) -> dict:
+        from . import db_snapshot
+        if use_snapshot:
+            known = db_snapshot.load_counts(self._cache)
+            if known is not None:
+                counts, stale = known
+                return dict(counts, _stale=True) if stale else dict(counts)
+        made = db_snapshot.stamp(self._cache)
         self._cache.reload()              # базу собирает другой экземпляр кэша
         # Один рабочий поток: прежний расчёт уже завершился. Он мог вернуть
         # старые строки в кэш после refresh(), пока ещё читал прежнюю базу.
         self._title_rows = {}
+        self._title_stamps = {}
         # Блоки показывают всю базу; выбранные фильтры относятся к таблицам.
-        return dict(self._cache.part_counts())
+        counts = dict(self._cache.part_counts())
+        db_snapshot.save_counts(self._cache, made, counts)
+        return counts
+
+    def _read_snapshot(self, target: str):
+        """(готовые строки вкладки, устарел ли снимок) или None."""
+        from . import db_snapshot
+        known = db_snapshot.load_page(self._cache, target)
+        if known is None:
+            return None
+        rows, parents, sort_by, stale = known
+        if target == "chars":
+            texts, sorts, hay = build_cells(rows, _char_cells)
+            return (rows, texts, sorts, hay, sort_by), stale
+        texts, sorts, hay = build_cells(rows, _title_cells)
+        return (rows, texts, sorts, hay, sort_by, parents), stale
 
     def _read_page(self, target: str, kinds):
-        from . import db_rows
+        from . import db_rows, db_snapshot
+        from .db_view_filters import active
+        filtered = bool(kinds) and active(kinds)
         if target == "chars":
             levels = db_rows.title_levels(self._rows_for("anime", None),
                                           "anime")
             levels.update(db_rows.title_levels(
                 self._rows_for("manga", None), "manga"))
+            stamps = [self._title_stamps.get(t) for t in ("anime", "manga")]
+            # Тайтлы считали в разное время — такой снимок честно устаревший.
+            made = stamps[0] if stamps[0] == stamps[1] else []
             rows = db_rows.character_rows(self._cache, levels)
-            from .db_view_filters import active
-            if kinds and active(kinds):
+            if filtered:
                 visible = {(row["media"], row["id"])
                            for target in ("anime", "manga")
                            for row in self._rows_for(target, kinds)}
                 rows = [row for row in rows if (row["owner_media"], row["owner_id"]) in visible]
+            sort_by = CHAR_HEADERS.index("В избранном")
+            if not filtered:
+                db_snapshot.save_page(self._cache, "chars", made, rows,
+                                      None, sort_by)
             texts, sorts, hay = build_cells(rows, _char_cells)
-            return rows, texts, sorts, hay, CHAR_HEADERS.index("В избранном")
+            return rows, texts, sorts, hay, sort_by
         rows = self._rows_for(target, kinds)
         from .db_title_tree import group_title_rows
         rows, parents = group_title_rows(rows, self._cache.franchise)
+        sort_by = TITLE_HEADERS.index("Индекс")
+        if not filtered:
+            db_snapshot.save_page(self._cache, target,
+                                  self._title_stamps.get(target) or [],
+                                  rows, parents, sort_by)
         texts, sorts, hay = build_cells(rows, _title_cells)
-        return (rows, texts, sorts, hay, TITLE_HEADERS.index("Индекс"),
-                parents)
+        return (rows, texts, sorts, hay, sort_by, parents)
 
     def _refresh_title(self, row: dict) -> None:
         """Поставить точечное обновление карточки в рабочий поток."""
@@ -434,7 +573,10 @@ class DbTableDialog(QDialog):
 
         Аниме и книги используют собственные независимые фильтры типов."""
         if target not in self._title_rows:
-            from . import db_rows
+            from . import db_rows, db_snapshot
+            # Отметка базы ДО счёта: поменяется база по ходу — снимок с этими
+            # строками сразу окажется устаревшим и пересчитается.
+            self._title_stamps[target] = db_snapshot.stamp(self._cache)
             self._title_rows[target] = db_rows.title_rows(
                 self._cache, target)
         from .db_view_filters import title_rows

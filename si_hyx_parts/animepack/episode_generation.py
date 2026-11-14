@@ -132,17 +132,27 @@ def _download(self, candidate):
     scope = RequestScope(self.stopped, time.monotonic() + TITLE_TIMEOUT)
     tally = Counter()
     native_batches = None
+    ru_missing = self.episode_ru is not None and memory.ru_missing(title)
     try:
         aid, ctx = context(self, candidate)
         ctx["subtitle_mode"] = mode(self.s)
         ctx["animelib_token"] = str(getattr(self.s, "animelib_token", "") or "").removeprefix("Bearer ").strip()
+        if ru_missing and not _native_usable(self, aid, ctx):
+            # RU-каталоги недавно сказали «японской дорожки с RU-субтитрами
+            # нет», а зарубежным источникам взяться неоткуда — тайтл не
+            # стоит ни одного запроса.
+            self._log_rare("Отрывки серий", f"«{candidate.title_ru}»: недавно проверено — "
+                           "японской дорожки с RU-субтитрами нет")
+            return False
         if aid and isinstance(self.kuhi, KuhiClient):
             native_batches = self.kuhi.episode_batches(aid, ctx, scope)
         # Russian catalogues can match by MAL id even if AniZip has no AniList mapping.
         quality = ReleaseQuality()
-        if self.episode_ru is not None and _russian(self, candidate, aid, ctx, final, scope,
-                                                     tally, min_height, quality):
-            return True
+        if self.episode_ru is not None and not ru_missing:
+            if _russian(self, candidate, aid, ctx, final, scope, tally, min_height, quality):
+                return True
+            if _ru_surely_missing(self, scope, tally):
+                memory.mark_ru_missing(title)
         if not aid or self.kuhi is None:
             self._log_rare("Kuhi без AniList ID", f"«{candidate.title_ru}»: нет AniList ID")
             return False
@@ -190,6 +200,25 @@ def _download(self, candidate):
         memory.save()
     final.unlink(missing_ok=True)
     return False
+
+
+def _native_usable(generator, aid, ctx):
+    """Есть ли зарубежный источник, который ещё может дать этот тайтл."""
+    if not aid or not isinstance(generator.kuhi, KuhiClient):
+        return False
+    from si_hyx_parts.kuhi._race import RANKING
+    return any(enabled(name, ctx) and not HEALTH.is_disabled(name) for name in RANKING)
+
+
+def _ru_surely_missing(generator, scope, tally):
+    """RU-каталоги ответили полностью, и ни один плеер не дал дорожки.
+
+    Таймаут, «Стоп», сбой сети или плеер на паузе — ответ неполный, и
+    запоминать тайтл как «без RU-субтитров» нельзя."""
+    client = generator.episode_ru
+    return (isinstance(client, RuEpisodeClient) and not generator.stopped()
+            and time.monotonic() < scope.deadline
+            and not client.scope_unsure(scope) and not tally["ru_streams"])
 
 
 def _variant(row):
@@ -251,6 +280,9 @@ def _russian(self, candidate, aid, ctx, final, scope, tally, min_height, quality
                         try:
                             with measuring(self, "поиск источников"):
                                 sources = self.episode_ru.streams(batch, scope)
+                            if sources:
+                                # Дорожка нашлась — «без RU-субтитров» тайтл уже не запомнить.
+                                tally["ru_streams"] += 1
                             for row in batch:
                                 # Точный тип: KeyError (тоже LookupError) — сбой разбора, а не ответ плеера.
                                 if not sources and type(row.get("_resolve_error")) is LookupError:

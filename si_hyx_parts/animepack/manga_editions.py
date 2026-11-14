@@ -1,17 +1,36 @@
 # -*- coding: utf-8 -*-
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 """Three comic edition shares, including migration of older checkboxes."""
+from functools import lru_cache
+
 KEYS = ("manga", "manhwa", "manhua")
 LABELS = {"manga": "Манга", "manhwa": "Манхва", "manhua": "Маньхуа"}
 SUPPORTED = KEYS + ("one_shot", "doujin")
 
 
+def _shares_key(settings) -> tuple:
+    """Всё, от чего зависят доли изданий, — ключ их кэша."""
+    kinds = settings.manga_kinds or {}
+    return (settings.manga_pct_manhwa, settings.manga_pct_manhua,
+            tuple(bool(kinds.get(k)) for k in SUPPORTED))
+
+
 def shares(settings) -> dict:
-    manhwa = max(0, min(100, int(settings.manga_pct_manhwa or 0)))
-    manhua = max(0, min(100, int(settings.manga_pct_manhua or 0)))
+    # Доли зависят только от настроек, а спрашиваются в отборе книг миллионами
+    # раз: CatalogPlan оценивает каждую группу каталога на каждую карточку.
+    # Без кэша 2400 карточек хвоста шли 7–16 минут чистого процессора
+    # (1,4 млн вызовов на 400 карточек). Копия — чтобы правка результата
+    # снаружи не испортила кэш.
+    return dict(_shares(*_shares_key(settings)))
+
+
+@lru_cache(maxsize=32)
+def _shares(pct_manhwa, pct_manhua, flags) -> dict:
+    manhwa = max(0, min(100, int(pct_manhwa or 0)))
+    manhua = max(0, min(100, int(pct_manhua or 0)))
     raw = {"manga": max(0, 100 - manhwa - manhua),
            "manhwa": manhwa, "manhua": manhua}
-    kinds = settings.manga_kinds
+    kinds = dict(zip(SUPPORTED, flags))
     enabled = [k for k in KEYS if kinds.get(k) or
                (k == "manga" and (kinds.get("one_shot") or kinds.get("doujin")))]
     if not enabled:
@@ -67,7 +86,7 @@ def level_avg(settings, key) -> int:
 
 def active(settings) -> list:
     """Издания с ненулевой долей в книжной части пака."""
-    values = shares(settings)
+    values = _shares(*_shares_key(settings))
     return [k for k in KEYS if values[k]] or ["manga"]
 
 
@@ -91,9 +110,16 @@ def average_target(settings) -> int:
     Издание с «любой» средней в счёт не идёт и тянется к общей книжной средней.
     Ни у одного издания средней нет — 0: книги считаются вместе с остальным
     паком, как и раньше."""
-    values = shares(settings)
-    weighted = [(level_avg(settings, k), values[k] or 1) for k in active(settings)
-                if level_avg(settings, k)]
+    avgs = tuple(level_avg(settings, k) for k in KEYS)
+    return _average_target(_shares_key(settings), avgs)
+
+
+@lru_cache(maxsize=32)
+def _average_target(key, avgs) -> int:
+    values = _shares(*key)
+    own = dict(zip(KEYS, avgs))
+    enabled = [k for k in KEYS if values[k]] or ["manga"]
+    weighted = [(own[k], values[k] or 1) for k in enabled if own[k]]
     if not weighted:
         return 0
     total = sum(w for _, w in weighted)

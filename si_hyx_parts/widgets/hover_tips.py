@@ -443,9 +443,34 @@ class HoverTipManager(_api.QObject):
                 popup.hide()
         self._queue_hover_tip()
 
+    # Фильтр стоит на ВСЁМ приложении и зовётся из C++ на каждое событие Qt
+    # (на постройке одной вкладки — десятки тысяч). Неинтересные типы —
+    # сразу назад, без цепочки сравнений ниже.
+    _HANDLED_EVENTS = None
+
+    @classmethod
+    def _handled_events(cls):
+        if cls._HANDLED_EVENTS is None:
+            T = _api.QEvent.Type
+            cls._HANDLED_EVENTS = frozenset((
+                T.Show, T.Enter, T.MouseMove, T.Polish, T.Resize, T.Paint,
+                T.Wheel, T.MouseButtonPress, T.ToolTip, T.Hide, T.Move,
+                T.ChildRemoved, T.Leave, T.KeyPress, T.WindowDeactivate))
+        return cls._HANDLED_EVENTS
+
+    # Колесо над полями (WheelBlocker главного окна) — тем же фильтром, а не
+    # третьим на приложении: каждый лишний фильтр — ещё один переход C++→Python
+    # на каждое событие. Зовётся первым, как раньше стоял (поставлен позже).
+    wheel_hook = None
+
     def eventFilter(self, obj, ev):
         try:
             et = ev.type()
+            if et not in self._handled_events():
+                return False
+            if (et == _api.QEvent.Type.Wheel and self.wheel_hook is not None
+                    and self.wheel_hook(obj, ev)):
+                return True
             if (et == _api.QEvent.Type.Show and isinstance(obj, _api.QWidget)
                     and obj.windowType() == _api.Qt.WindowType.Popup):
                 self._hover_version += 1

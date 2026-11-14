@@ -2,7 +2,19 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """Главное окно: вкладки — создание и отключение, порядок, полоса вкладок и перетаскивание файлов на неё."""
+import qtawesome as _qta
+
 import main as _api
+
+# Значок вкладки Qt ставит по центру высоты вкладки, а надпись — по метрикам
+# шрифта (подъём выше спуска), и её середина визуально ниже. Сдвиг глифа вниз
+# (доля размера значка: 2 px при 16 px) сажает значок на строку надписи.
+TAB_ICON_DY = 0.125
+
+
+def tab_icon(name):
+    """Значок вкладки: как config.get_icon, но глиф сдвинут на строку надписи."""
+    return _qta.icon(name, color='#cdd6f4', scale_factor=0.8, offset=(0.0, TAB_ICON_DY))
 
 
 class UnifiedWindowTabsMixin:
@@ -21,7 +33,7 @@ class UnifiedWindowTabsMixin:
         except Exception:
             pass
         if icon_name:
-            idx = self.tabs.addTab(widget, _api.get_icon(icon_name), title)
+            idx = self.tabs.addTab(widget, tab_icon(icon_name), title)
         else:
             idx = self.tabs.addTab(widget, title)
         # Значок ⓘ — отдельным виджетом на самой вкладке (как info_badge в формах),
@@ -31,16 +43,16 @@ class UnifiedWindowTabsMixin:
             # За подсказку значка вкладки отвечает фильтр QTabBar. Сам QLabel и
             # общий фильтр приложения не должны показывать её повторно.
             badge.setProperty("tabTipManaged", True)
-            # Бейдж ⓘ (16×16, значок 13px по центру) визуально садится на ~1px
-            # ниже центра текста вкладки. Нижний отступ сдвигает значок вверх,
-            # чтобы он встал на одну высоту с надписью (и с левым значком вкладки).
+            # Бейдж ⓘ (16×16, значок 13px по центру) по центру вкладки стоит
+            # на ~1,5 px выше середины надписи (замер по скриншоту). Верхний
+            # отступ опускает его на строку надписи (и левого значка вкладки).
             # Правый: QTabBar прижимает кнопку вкладки к самой рамке, не глядя
             # на padding, — отступ отодвигает ⓘ от края, и он встаёт посередине
             # между надписью и концом вкладки (padding-right у таббара снят,
             # см. unified_window). Отступ — margin стиля, а не ширина значка,
             # чтобы кружок подсветки при наведении остался 16×16.
             badge.setStyleSheet(
-                "#infoBadge{color:#89b4fa;margin:0px 8px 2px 0px;}")
+                "#infoBadge{color:#89b4fa;margin:1px 8px 0px 0px;}")
             badge.setFixedSize(24, 16)
             badge.setAlignment(_api.Qt.AlignmentFlag.AlignLeft
                                | _api.Qt.AlignmentFlag.AlignVCenter)
@@ -50,6 +62,96 @@ class UnifiedWindowTabsMixin:
         except Exception:
             self.tabs.setTabToolTip(idx, tip)
         return idx
+
+    # ------------------------------------------------------------------
+    # Вкладки по требованию: заглушка до первого открытия
+    # ------------------------------------------------------------------
+    def _add_lazy_tab(self, key, builder):
+        """Ставит в полосу вкладок лёгкую заглушку вкладки key: значок, надпись,
+        ⓘ и место в сохранённом порядке — сразу, а саму вкладку builder
+        (_add_*_tab) строит только при первом открытии (_build_lazy_tab)."""
+        lazy = getattr(self, "_lazy_tabs", None)
+        if lazy is None:
+            lazy = self._lazy_tabs = {}
+        if key in lazy:
+            return
+        ph = _api.QWidget()
+        lay = _api.QVBoxLayout(ph)
+        lbl = _api.QLabel("Загрузка вкладки…")
+        lbl.setAlignment(_api.Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet("color:#a6adc8; font-size:15px; background:transparent;")
+        lay.addWidget(lbl)
+        ph._lazy_key = key
+        ph._lazy_builder = builder
+        ph._lazy_label = lbl
+        ph._lazy_pending = False
+        lazy[key] = ph
+        self._add_tab(ph, key)
+        self._apply_tab_order(getattr(self, "_tab_order", []))
+
+    def _on_lazy_tab_current(self, *_):
+        """Открыли заглушку — строим вкладку, дав сперва нарисоваться надписи
+        «Загрузка вкладки…» (постройка держит GUI-поток секунду-другую)."""
+        ph = self.tabs.currentWidget()
+        if getattr(ph, "_lazy_builder", None) is None or ph._lazy_pending:
+            return
+        ph._lazy_pending = True
+        _api.QTimer.singleShot(40, lambda: self._build_lazy_tab(ph))
+
+    def _build_lazy_tab(self, ph):
+        key = getattr(ph, "_lazy_key", None)
+        builder = getattr(ph, "_lazy_builder", None)
+        lazy = getattr(self, "_lazy_tabs", None) or {}
+        if builder is None or lazy.get(key) is not ph:
+            return
+        if self.tabs.currentWidget() is not ph:
+            # Успели уйти на другую вкладку — строить незачем.
+            ph._lazy_pending = False
+            return
+        del lazy[key]
+        ph._lazy_builder = None
+        # Имя tab::key переходит к настоящей вкладке: _apply_tab_order внутри
+        # builder ставит её на место заглушки, а безымянная заглушка уезжает.
+        ph.setObjectName("")
+        _api.QApplication.setOverrideCursor(_api.Qt.CursorShape.WaitCursor)
+        try:
+            builder()
+        except Exception as e:
+            self.log(f"Не удалось открыть вкладку: {e}")
+        finally:
+            _api.QApplication.restoreOverrideCursor()
+        real = None
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if w is not ph and w is not None and w.objectName() == f"tab::{key}":
+                real = w
+                break
+        if real is None:
+            ph.setObjectName(f"tab::{key}")
+            ph._lazy_label.setText("Не удалось открыть вкладку — подробности в журнале.")
+            return
+        # Сначала переключаемся, потом убираем заглушку: удаление текущей
+        # вкладки само переключило бы на соседнюю (а та может оказаться
+        # заглушкой и тоже начать строиться).
+        self.tabs.setCurrentWidget(real)
+        idx = self.tabs.indexOf(ph)
+        if idx >= 0:
+            self.tabs.removeTab(idx)
+        ph.deleteLater()
+
+    def _drop_lazy_tab(self, key):
+        """Убирает заглушку вкладки key (вкладку выключили, не открыв)."""
+        ph = (getattr(self, "_lazy_tabs", None) or {}).pop(key, None)
+        if ph is None:
+            return
+        ph._lazy_builder = None
+        try:
+            idx = self.tabs.indexOf(ph)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            ph.deleteLater()
+        except Exception:
+            pass
 
     def _on_tab_moved(self, *args):
         # Пользователь перетащил вкладку — сохраняем порядок (но не во время
@@ -190,6 +292,7 @@ class UnifiedWindowTabsMixin:
             self.log(f"Не удалось добавить вкладку ShikimoriHYX: {e}")
 
     def _remove_shikimori_tab(self):
+        self._drop_lazy_tab("shikimori")
         t = getattr(self, "tab_shikimori", None)
         if t is None:
             return
@@ -226,6 +329,61 @@ class UnifiedWindowTabsMixin:
         return dict(getattr(self, "_shikimori_settings", {}) or {})
 
     # ------------------------------------------------------------------
+    # Экспериментальная вкладка «Поиск по сабам» (фраза в субтитрах аниме)
+    # ------------------------------------------------------------------
+    def _add_subsearch_tab(self):
+        """Создаёт и добавляет вкладку «Поиск по сабам» (если ещё не добавлена).
+        Импорт ленивый — модуль тянется только когда вкладка включена."""
+        if getattr(self, "tab_subsearch", None) is not None:
+            return
+        try:
+            from sub_search_tab import SubSearchTab
+            self.tab_subsearch = SubSearchTab(
+                self, dict(getattr(self, "_subsearch_settings", {}) or {}))
+            self._add_tab(self.tab_subsearch, 'subsearch')
+            self._apply_tab_order(getattr(self, "_tab_order", []))
+        except Exception as e:
+            self.tab_subsearch = None
+            self.log(f"Не удалось добавить вкладку «Поиск по сабам»: {e}")
+
+    def _remove_subsearch_tab(self):
+        self._drop_lazy_tab("subsearch")
+        t = getattr(self, "tab_subsearch", None)
+        if t is None:
+            return
+        try:
+            idx = self.tabs.indexOf(t)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+            try: t.cleanup()
+            except Exception: pass
+            t.deleteLater()
+        except Exception: pass
+        self.tab_subsearch = None
+
+    def _set_subsearch_tab_enabled(self, checked: bool):
+        self._subsearch_tab_enabled = bool(checked)
+        if checked:
+            self._add_subsearch_tab()
+        else:
+            # Перед закрытием запоминаем текущие настройки вкладки.
+            self._subsearch_settings = self._collect_subsearch_settings()
+            self._remove_subsearch_tab()
+        try: self._save_settings_now()
+        except Exception: pass
+
+    def _collect_subsearch_settings(self):
+        """Актуальные настройки «Поиска по сабам» (или последние сохранённые,
+        если вкладка сейчас не открыта)."""
+        t = getattr(self, "tab_subsearch", None)
+        if t is not None and hasattr(t, "get_settings"):
+            try:
+                return t.get_settings()
+            except Exception:
+                pass
+        return dict(getattr(self, "_subsearch_settings", {}) or {})
+
+    # ------------------------------------------------------------------
     # Экспериментальная вкладка ЛидербордHYX (просмотр выгрузки рекордов)
     # ------------------------------------------------------------------
     def _add_leaderboard_tab(self):
@@ -243,6 +401,7 @@ class UnifiedWindowTabsMixin:
             self.log(f"Не удалось добавить вкладку ЛидербордHYX: {e}")
 
     def _remove_leaderboard_tab(self):
+        self._drop_lazy_tab("leaderboard")
         t = getattr(self, "tab_leaderboard", None)
         if t is None:
             return
@@ -283,6 +442,7 @@ class UnifiedWindowTabsMixin:
             self.log(f"Не удалось добавить вкладку Collab: {e}")
 
     def _remove_coop_tab(self):
+        self._drop_lazy_tab("coop")
         t = getattr(self, "tab_coop", None)
         if t is None:
             return
@@ -337,6 +497,7 @@ class UnifiedWindowTabsMixin:
             self.log(f"Не удалось добавить вкладку Генерация аниме-пака: {e}")
 
     def _remove_animepack_tab(self):
+        self._drop_lazy_tab("animepack")
         t = getattr(self, "tab_animepack", None)
         if t is None:
             return
@@ -391,6 +552,7 @@ class UnifiedWindowTabsMixin:
             self.log(f"Не удалось добавить вкладку Апгрейд пака: {e}")
 
     def _remove_animepack_upgrade_tab(self):
+        self._drop_lazy_tab("animepack_upgrade")
         t = getattr(self, "tab_animepack_upgrade", None)
         if t is None:
             return

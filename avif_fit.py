@@ -39,8 +39,45 @@ def avif_pix_fmt(has_alpha: bool, chroma: str = "420") -> str:
     return {"444": "yuv444p10le", "422": "yuv422p10le"}.get(str(chroma), "yuv420p10le")
 
 
-def avif_encode_cmd(src, tmp_out, crf_val, scale_vf, has_alpha, pix_fmt, aspd):
+# Ограничения AV1 на тайл: ширина не больше 4096 px, площадь не больше
+# 4096×2304 (MAX_TILE_WIDTH / MAX_TILE_AREA). Тайлы режутся по суперблокам 64 px.
+_MAX_TILE_W = 4096
+_MAX_TILE_AREA = 4096 * 2304
+_SB = 64
+
+
+def aom_tile_log2(width: int, height: int) -> tuple[int, int]:
+    """log2 числа колонок и строк тайлов для картинки width×height.
+
+    По умолчанию 1/1 (2×2 тайла — libaom кодирует их параллельно). Но у широких
+    картинок (панорама 10212×3000) два тайла по 5106 px шире предела AV1, и
+    libaom не открывает кодер: «Invalid tile sizing: AV1 does not allow tiles
+    of width greater than 4096». Поэтому колонки и строки добавляются, пока
+    каждый тайл не уложится в ширину и площадь."""
+    w, h = int(width or 0), int(height or 0)
+    cols_log2, rows_log2 = 1, 1
+    if w <= 0 or h <= 0:
+        return cols_log2, rows_log2
+    sb_cols, sb_rows = -(-w // _SB), -(-h // _SB)
+
+    def _tile_px(sb_count, log2):
+        return -(-sb_count // (1 << log2)) * _SB
+
+    while cols_log2 < 6 and _tile_px(sb_cols, cols_log2) > _MAX_TILE_W:
+        cols_log2 += 1
+    while (rows_log2 < 6 and _tile_px(sb_cols, cols_log2)
+           * _tile_px(sb_rows, rows_log2) > _MAX_TILE_AREA):
+        rows_log2 += 1
+    return cols_log2, rows_log2
+
+
+def avif_encode_cmd(src, tmp_out, crf_val, scale_vf, has_alpha, pix_fmt, aspd,
+                    size=None):
     """Команда ffmpeg для одного кодирования картинки в AVIF (libaom-av1).
+
+    size — (ширина, высота) исходника; без него размер читается из src. По нему
+    выбирается число тайлов (aom_tile_log2): даунскейл только уменьшает кадр,
+    так что тайлов под исходный размер всегда достаточно.
 
     tune=iq («Image Quality») — режим тюнинга libaom именно под неподвижные
     изображения; передаётся через -aom-params, т.к. ffmpeg-обёртка -tune
@@ -70,10 +107,13 @@ def avif_encode_cmd(src, tmp_out, crf_val, scale_vf, has_alpha, pix_fmt, aspd):
     #
     # Старые сборки ffmpeg этого значения не знают — тогда _run повторит команду
     # без него (см. _ALLINTRA), а «Обработка» делает то же в ProcessWorker.
+    sw, sh = size if size else _dimensions(src)
+    tile_cols, tile_rows = aom_tile_log2(sw, sh)
     aom_common = ["-usage", "allintra",
                   "-cpu-used", str(max(0, min(8, aspd))),
                   "-aom-params", "tune=iq",
-                  "-tile-columns", "1", "-tile-rows", "1", "-row-mt", "1"]
+                  "-tile-columns", str(tile_cols), "-tile-rows", str(tile_rows),
+                  "-row-mt", "1"]
     if has_alpha:
         if scale_vf:
             fc = (f"[0:v]format=yuva420p10le,split[c][a];"
@@ -249,7 +289,8 @@ def fit_to_limit(src: str, out: str, limit_kb: int = 150, *, speed: int = 5,
     с Shikimori, а пак не должен зависеть от настроек вкладки «Обработка»."""
     tmp_files: list[str] = []
     best_tmp, best_size = None, -1
-    w0, h0 = _dimensions(src)
+    src_size = _dimensions(src)
+    w0, h0 = src_size
     # Предварительный даунскейл (max_side): гнать 1200×1700 постер целиком, чтобы
     # потом ужать его до полутора сотен килобайт, — это лишние пиксели, а время
     # кодирования почти прямо пропорционально их числу.
@@ -266,7 +307,8 @@ def fit_to_limit(src: str, out: str, limit_kb: int = 150, *, speed: int = 5,
         tmp = os.path.join(TEMP_DIR, f"avif_{uuid.uuid4().hex}_{cq}.avif")
         tmp_files.append(tmp)
         if not _run(avif_encode_cmd(src, tmp, cq, vf, False,
-                                    avif_pix_fmt(False, chroma), speed),
+                                    avif_pix_fmt(False, chroma), speed,
+                                    size=src_size if all(src_size) else None),
                     should_stop, runner):
             return None, 0
         if not os.path.exists(tmp):

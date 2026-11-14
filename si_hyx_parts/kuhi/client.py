@@ -28,9 +28,13 @@ def event_loop():
 class KuhiClient:
     def __init__(self, stopped=lambda: False, log=lambda message: None):
         from .provider_health import HEALTH
+        from ._race import RANKING
         self._health_start = HEALTH.snapshot()
         self.stopped = stopped
         self.log = log
+        # Источник, у которого видео не идёт, отключается до конца ЭТОГО
+        # прогона (ProviderHealth.start_run), а не ставится на паузу в 120 с.
+        HEALTH.start_run(RANKING, log)
         self._futures = set()
         self._lock = threading.Lock()
         self.closed = False
@@ -137,8 +141,9 @@ class KuhiClient:
         with self._lock:
             for future in self._futures:
                 future.cancel()
+        from .provider_health import HEALTH
+        HEALTH.end_run(self.log)
         if type(self) is KuhiClient:
-            from .provider_health import HEALTH
             for (name, kind), counts in sorted(HEALTH.snapshot().items()):
                 before = self._health_start.get((name, kind), {})
                 delta = {key: value - before.get(key, 0) for key, value in counts.items()}

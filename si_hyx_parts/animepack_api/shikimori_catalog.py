@@ -13,12 +13,17 @@ POPULATION_FIELDS = """
 
 
 def catalog_args(pattern, page, *, limit=PAGE_LIMIT, season="", kinds=(),
-                 score=0, genres=(), genres_exclude=(), studios=(), order="random"):
-    """The same filters for single-page sampling and ordered bulk refresh."""
+                 score=0, genres=(), genres_exclude=(), studios=(), order="random",
+                 censored=True):
+    """The same filters for single-page sampling and ordered bulk refresh.
+
+    censored=False — the whole catalog, including titles Shikimori hides by
+    default (Erotica/Hentai genres: e.g. "Nukitashi the Animation"). The full
+    database refresh uses it; generation filters such cards locally."""
     args = [f"page: {max(1, int(page))}",
             f"limit: {max(1, min(PAGE_LIMIT, int(limit)))}",
             f"order: {pattern.sub('', str(order or 'random')) or 'random'}",
-            "censored: true"]
+            f"censored: {'true' if censored else 'false'}"]
     if season:
         args.append(f'season: "{pattern.sub("", str(season))}"')
     kinds = [pattern.sub("", str(kind)) for kind in kinds]

@@ -277,13 +277,25 @@ def _append_answer(params, q, cand: _api.SongCandidate, s: _api.PackSettings) ->
     for text in cand.answer_variants():
         _api.ET.SubElement(right, "answer").text = text
 
-def _score_text(cand) -> str:
+def score_line(score) -> str:
     """«Рейтинг MAL — 『8.60⭐』». Оценка в карточке Shikimori — это оценка
     MyAnimeList (Shikimori её зеркалит), поэтому и называется она так
-    (просьба пользователя)."""
-    score = cand.score
+    (просьба пользователя). Та же строка у «Апгрейда пака»."""
+    try:
+        score = float(score or 0)
+    except (TypeError, ValueError):
+        score = 0.0
     return ("Рейтинг MAL — 『"
             + (f"{score:.2f}⭐" if score > 0 else "нет оценки") + "』")
+
+
+def author_line(name: str) -> str:
+    """«Автор — 『Имя』» — та же строка у генератора и «Апгрейда пака»."""
+    return f"Автор — 『{name}』"
+
+
+def _score_text(cand) -> str:
+    return score_line(cand.score)
 
 
 def _author_and_score(cand) -> list:
@@ -294,7 +306,7 @@ def _author_and_score(cand) -> list:
     честнее пустоты, по которой не понять, спрашивали ли вообще."""
     out = []
     if cand.author_name:
-        out.append(f"Автор — 『{cand.author_name}』")
+        out.append(author_line(cand.author_name))
     out.append(_score_text(cand))
     out.append(f"Индекс популярности — {int(round(cand.index))} "
                f"(Ур. {cand.level})")

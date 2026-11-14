@@ -22,6 +22,9 @@ async def catalogue(candidate, ctx):
     headers = dict(HEADERS)
     if ctx.get("animelib_token"):
         headers["Authorization"] = "Bearer " + ctx["animelib_token"]
+    # Сбой обоих адресов API — не то же самое, что «серий нет»: пустой ответ
+    # запомнился бы как «у тайтла нет дорожки с RU-субтитрами» (ru_missing).
+    failure, answered = None, False
     for base in BASES:
         try:
             found = {}
@@ -41,10 +44,14 @@ async def catalogue(candidate, ctx):
                             "animelib", "", base + "/episodes/" + str(ep["id"]), referer,
                             native_episode=True, episode_id=ep["id"], anime_id=ident, number=number,
                             api_headers=headers))
+            answered = True
             if catalog:
                 return catalog
-        except Exception:
+        except Exception as error:  # noqa: BLE001 — пробуем запасной адрес
+            failure = error
             continue
+    if failure is not None and not answered:
+        raise failure
     return {}
 
 

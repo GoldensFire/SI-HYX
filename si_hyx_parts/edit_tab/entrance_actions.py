@@ -132,3 +132,4 @@ class EditTabEntranceMixin:
         self._report_progress(0, "Ошибка")
         self.update_selection_label()
         _api.msgbox_critical(self, "Появление", f"Не удалось создать видео:\n{message}")
+        self._advance_export_queue()   # очередь экспорта («В очередь») — дальше

@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 from config import get_icon
 
 from .db_row_tip import RowTipWatcher, _InfoTipPopup
+from .db_snapshot import row_names
 from .db_title_delegate import TitleActionsDelegate, character_url
 from .db_title_tree import DbTitleTreeModel
 
@@ -55,15 +56,9 @@ def build_cells(rows, build) -> tuple[list, list, list]:
         line = tuple(str(text) for text, _value in cells)
         texts.append(line)
         sorts.append(tuple(value for _text, value in cells))
-        card = row.get("card") or getattr(row.get("candidate"), "anime", {})
-        names = []
-        if isinstance(card, dict):
-            names = [card.get(key) for key in
-                     ("russian", "name", "english", "japanese",
-                      "licenseNameRu")]
-            names.extend(card.get("synonyms") or [])
-        hay.append("\n".join((*line, *(str(name) for name in names if name)))
-                   .casefold())
+        # Названия — из карточки, а у строк из снимка панели — из `_names`.
+        names = row_names(row)
+        hay.append("\n".join((*line, *names)).casefold())
     return texts, sorts, hay
 
 

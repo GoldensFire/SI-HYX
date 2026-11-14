@@ -71,7 +71,13 @@ class UnifiedWindowConsoleMixin:
             tab = getattr(self, name, None)
             return tab is not None and cur is tab
         own_ui = any(is_tab(n) for n in ("tab_siquester", "tab_shikimori",
-                                         "tab_leaderboard", "tab_coop", "tab_photo"))
+                                         "tab_subsearch", "tab_leaderboard",
+                                         "tab_coop", "tab_photo"))
+        # Заглушка ещё не построенной вкладки (см. _add_lazy_tab) — как сама
+        # вкладка, иначе консоль мигала бы на время постройки.
+        if getattr(cur, "_lazy_key", None) in ("shikimori", "subsearch",
+                                               "leaderboard", "coop"):
+            own_ui = True
         return not (own_ui or is_tab("tab_edit")), not own_ui
 
     def _sync_console_visibility(self, index=None):

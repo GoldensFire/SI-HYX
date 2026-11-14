@@ -4,10 +4,11 @@
 """ShikimoriTab. Public namespace: shikimori_tab."""
 import shikimori_tab as _api
 from si_hyx_parts.shikimori_tab.search_results import ShikimoriSearchMixin
+from si_hyx_parts.shikimori_tab.pack_exclusion import PackExclusionMixin
 
 
 # ─── Вкладка ─────────────────────────────────────────────────────────────────
-class ShikimoriTab(ShikimoriSearchMixin, _api.QWidget):
+class ShikimoriTab(ShikimoriSearchMixin, PackExclusionMixin, _api.QWidget):
     """Экспериментальная вкладка поиска аниме/манги через Shikimori API.
 
     Включается/выключается в Настройках (по умолчанию выключена). Не зависит от
@@ -28,31 +29,16 @@ class ShikimoriTab(ShikimoriSearchMixin, _api.QWidget):
         self._thumb_cache: dict = {}   # anime_id -> QIcon
         self._thumb_pending: set = set()  # anime_id с уже запущенной загрузкой обложки
         self._placeholder = None       # серая заглушка-обложка
-        self._excluded: set = set()    # нормализованные названия из паков
-        self._excluded_bases: set = set()  # их «базовые» формы (без сезонов)
-        self._excluded_franchises: set = set()  # их «ключи франшиз» (без подзаголовков)
-        # Тексты вопросов из выбранных паков: название тайтла может не быть
-        # ответом, а просто упоминаться в вопросе («Как называется аниме про…»).
-        self._excluded_question_texts: set = set()
-        self._excluded_question_haystack: str = ""
-        self._question_term_cache: dict = {}
-        self._name_excluded_memo: dict = {}  # anime_id -> название совпало с паком
-        # Ключи франшиз самого Shikimori (manifest пака): по ним пак с «Атакой
-        # титанов» прячет и «Атаку! Титанов средней школы», хотя названия разные.
-        self._excluded_shiki_franchises: set = set()
-        self._excluded_prefixes: set = set()  # индекс _franchise_prefix_index по ним
+        # Паки для исключения и их термины (PackExclusionMixin).
+        self.init_pack_exclusion_state()
         self._quiet_failure = False    # авто-загрузка из кеша не показывает модальное окно
         self._cache_wait_genres = False  # авто-загрузка ждёт восстановления жанров
-        self._excluded_packs: list = []  # имена выбранных паков SiQuesterHYX
-        self._excluded_pack_files: list = []  # пути .siq, добавленных вручную
-        # Ручные .siq со снятой галочкой: остаются в списке окна, но не исключают.
-        self._disabled_pack_files: list = []
-        self._pack_file_errors: set = set()  # выбранные файлы, которые не прочитать
+        self._show_excluded = False    # показывать скрытые исключением паков (с пометкой)
+        self._pack_hidden_ids: set = set()  # id найденных, но скрытых паками
         self._collapse_franchise = True   # схлопывать сезоны/части одной франшизы
         self._seen_franchises: set = set()  # уже показанные франшизы (для схлопывания)
         self._franchise_of: dict = {}  # anime_id -> ключ франшизы Shikimori (из базы)
         self._franchise_peaks = None   # франшиза -> (просмотры, id) главной части
-        self._fkeys: dict = {}         # anime_id -> ключи франшизы по названиям
         self._page = 0                 # открытая страница списка (_PAGE_SIZE строк)
         # Просмотры и индекс берутся из базы генератора аниме-паков (pack_index):
         # здесь только то, что уже узнали в этом сеансе.
@@ -184,6 +170,18 @@ class ShikimoriTab(ShikimoriSearchMixin, _api.QWidget):
         self.lbl_status = _api.QLabel("Готово к поиску.")
         self.lbl_status.setStyleSheet(f"color:{_api.C['text2']}; font-size:12px;")
         bottom.addWidget(self.lbl_status, 1)
+        # Тайтл нашёлся, но спрятан исключением паков — эта кнопка возвращает
+        # такие тайтлы в список с пометкой «в исключениях паков».
+        self.btn_show_excluded = _api.QPushButton()
+        self.btn_show_excluded.setIcon(_api.get_icon('fa5s.eye'))
+        self.btn_show_excluded.setCheckable(True)
+        self.btn_show_excluded.setToolTip(
+            "Показать в списке тайтлы, скрытые исключением паков\n"
+            "(они помечены «в исключениях паков»).")
+        self.btn_show_excluded.setCursor(_api.Qt.CursorShape.PointingHandCursor)
+        self.btn_show_excluded.toggled.connect(self._on_show_excluded_toggled)
+        self.btn_show_excluded.setVisible(False)
+        bottom.addWidget(self.btn_show_excluded)
         # Страницы выдачи (по _PAGE_SIZE тайтлов) — видны, когда страниц больше одной.
         self.btn_page_prev = _api.QPushButton()
         self.btn_page_prev.setIcon(_api.get_icon('fa5s.chevron-left'))
@@ -579,314 +577,8 @@ class ShikimoriTab(ShikimoriSearchMixin, _api.QWidget):
             except Exception:
                 pass
 
-    # ── Исключение паков ───────────────────────────────────────────────────────
-    def _siq_datasets(self):
-        """Список загруженных в SiQuesterHYX датасетов или [] если вкладки нет."""
-        tsq = getattr(self.main, "tab_siquester", None) if self.main else None
-        inner = getattr(tsq, "inner", None) if tsq else None
-        return list(getattr(inner, "datasets", []) or []) if inner else []
-
-    @staticmethod
-    def _answer_variants(text: str) -> set:
-        """Нормализованные варианты одного ответа.
-
-        Один ответ нередко содержит несколько вариантов тайтла через « / » или
-        « | » («Охотник x Охотник / Hunter x Hunter (1999)») — разбиваем, чтобы
-        в исключения попал и русский, и ромадзи-вариант по отдельности. Делим
-        только по разделителю С ПРОБЕЛАМИ, чтобы не рвать «Fate/stay».
-
-        Ответ песенного вопроса генератора — «Мастера Меча Онлайн OP1 (2012) —
-        『crossing field』»: целиком он ни с одним тайтлом не совпадёт, поэтому
-        добавляем и голое название по правилу генератора (answer_title). Строки
-        реплик вроде «Исполнитель — 『LiSA』» названием тайтла не считаем.
-        """
-        from animepack import answer_title
-        out = set()
-        for line in (text or "", answer_title(text)):
-            for part in _api.re.split(r"\s+[/|]\s+", line):
-                n = _api._norm_title(part)
-                if n and n not in _api._ANSWER_LABELS:
-                    out.add(n)
-        return out
-
-    def _pack_answers(self, ds) -> set:
-        """Собирает нормализованные ответы из одного .siq-пака."""
-        out = set()
-        w = ds.get("widget")
-        siq = getattr(w, "_siq", None) if w else None
-        rounds = getattr(siq, "rounds", []) if siq else []
-        for rd in rounds:
-            for th in rd.get("themes", []):
-                for q in th.get("questions", []):
-                    answers = list(q.get("answers", []) or [])
-                    for it in q.get("items", []) or []:
-                        if (it.get("param") == "answer"
-                                and it.get("type") == "text"
-                                and not it.get("is_ref")):
-                            answers.append(it.get("text", ""))
-                    for ans in answers:
-                        out |= self._answer_variants(ans)
-        return out
-
-    def _pack_question_texts(self, ds) -> set:
-        """Тексты вопросов пака: название может быть только в вопросе, не в ответе.
-
-        Устный текст (placement="replic") берём тоже — генератор пишет туда
-        «Аниме: <название> (год)» рядом с видео вопроса."""
-        out = set()
-        w = ds.get("widget")
-        siq = getattr(w, "_siq", None) if w else None
-        rounds = getattr(siq, "rounds", []) if siq else []
-        for rd in rounds:
-            for th in rd.get("themes", []):
-                for q in th.get("questions", []):
-                    for it in q.get("items", []) or []:
-                        if (it.get("param") == "question"
-                                and it.get("type") == "text"
-                                and not it.get("is_ref")):
-                            n = _api._norm_title(it.get("text", ""))
-                            if n:
-                                out.add(n)
-        return out
-
-    @staticmethod
-    def _pack_franchises(ds) -> set:
-        """Ключи франшиз Shikimori из манифеста пака (у старых паков его нет).
-
-        Названия у частей франшизы разные: «Атака титанов» и «Атака! Титаны
-        средней школы», «Этот замечательный мир» и «Одаривая этот замечательный
-        мир взрывами!». У Shikimori у них один franchise — по нему пак и должен
-        прятать всю серию. Манифест пишется генератором рядом с content.xml.
-        """
-        path = str((ds or {}).get("siq_path") or "").strip()
-        if not path:
-            return set()
-        try:
-            from si_hyx_parts.animepack.pack_manifest import read as read_manifest
-            rows = read_manifest(path)
-        except Exception:  # noqa: BLE001 — чужой/битый пак просто без манифеста
-            return set()
-        return {str(key) for key in (rows.get("franchises") or ()) if key}
-
-    def _collect_pack_terms(self, names, files):
-        """(ответы, тексты вопросов, франшизы, нечитаемые файлы) из паков."""
-        answers = set()
-        questions = set()
-        franchises = set()
-        broken = []
-        wanted = set(names)
-        for idx, ds in enumerate(self._siq_datasets()):
-            name = ds.get("pkg_name") or f"Пак {idx + 1}"
-            if name not in wanted:
-                continue
-            answers |= self._pack_answers(ds)
-            questions |= self._pack_question_texts(ds)
-            franchises |= self._pack_franchises(ds)
-        for raw_path in files:
-            path = str(raw_path or "").strip()
-            if not path:
-                continue
-            try:
-                raw_answers, raw_questions = _api.read_pack_texts(path)
-            except Exception:  # noqa: BLE001 — чужой/битый .siq просто пропускаем
-                broken.append(path)
-                continue
-            for ans in raw_answers:
-                answers |= self._answer_variants(ans)
-            for text in raw_questions:
-                n = _api._norm_title(text)
-                if n:
-                    questions.add(n)
-            franchises |= self._pack_franchises({"siq_path": path})
-        return answers, questions, franchises, broken
-
-    def _refresh_packs_label(self):
-        """Подпись под кнопкой: сколько паков и что из них прочитано."""
-        names = list(self._excluded_packs)
-        files = list(self._excluded_pack_files)
-        if not names and not files:
-            off = len(self._disabled_pack_files)
-            self.lbl_packs.setText(
-                f"Паки не выбраны (отключено файлов: {off})." if off
-                else "Паки не выбраны.")
-            self.lbl_packs.setToolTip("")
-            return
-        shown = names + [_api.os.path.basename(path) or path for path in files]
-        text = (f"Выбрано паков: {len(names) + len(files)}. "
-                f"Названий: {len(self._excluded)}, текстов вопросов: "
-                f"{len(self._excluded_question_texts)}.\n" + ", ".join(shown))
-        available = {ds.get("pkg_name") or f"Пак {idx + 1}"
-                     for idx, ds in enumerate(self._siq_datasets())}
-        missing = [name for name in names if name not in available]
-        if missing:
-            text += "\nНе открыты в SiQuesterHYX: " + ", ".join(missing)
-        if self._disabled_pack_files:
-            text += f"\nОтключено файлов: {len(self._disabled_pack_files)}"
-        if self._pack_file_errors:
-            text += "\nНе удалось прочитать: " + ", ".join(
-                _api.os.path.basename(path) or path
-                for path in self._excluded_pack_files
-                if path in self._pack_file_errors)
-        self.lbl_packs.setText(text)
-        self.lbl_packs.setToolTip("\n".join(names + files))
-
-    def _pack_picker_start(self) -> str:
-        """Каталог для выбора .siq: прошлый выбор или папка загрузок."""
-        for path in reversed(self._excluded_pack_files
-                             + self._disabled_pack_files):
-            folder = _api.os.path.dirname(path)
-            if folder and _api.os.path.isdir(folder):
-                return folder
-        try:
-            from utils import default_download_dir
-            folder = default_download_dir()
-            if folder:
-                return folder
-        except Exception:
-            pass
-        return _api.os.path.expanduser("~")
-
-    @staticmethod
-    def _add_pack_file_item(view, path: str, checked: bool = True):
-        """Строка ручного .siq: галочка включает/выключает исключение без
-        удаления файла из списка (как у паков SiQuesterHYX)."""
-        item = _api.QListWidgetItem(_api.os.path.basename(path) or path)
-        item.setData(_api.Qt.ItemDataRole.UserRole, path)
-        item.setToolTip(path)
-        item.setFlags(item.flags() | _api.Qt.ItemFlag.ItemIsUserCheckable)
-        item.setCheckState(_api.Qt.CheckState.Checked if checked
-                           else _api.Qt.CheckState.Unchecked)
-        if not _api.os.path.isfile(path):
-            item.setText(item.text() + "  (файл не найден)")
-        view.addItem(item)
-
-    @staticmethod
-    def _pack_file_sort_key(path: str):
-        """Естественный порядок по имени: «пак № 2» раньше «пак № 10»."""
-        name = (_api.os.path.basename(path) or path).casefold()
-        return [(0, int(part), "") if part.isdigit() else (1, 0, part)
-                for part in _api.re.split(r"(\d+)", name)]
-
-    def _choose_packs(self):
-        datasets = self._siq_datasets()
-        dlg = _api.QDialog(self)
-        dlg.setWindowTitle("Паки для исключения")
-        dlg.setMinimumWidth(560)  # четыре кнопки в одной строке
-        lay = _api.QVBoxLayout(dlg)
-        intro = _api.QLabel(
-            "Тайтлы, которые встречаются в ответах или тексте вопросов "
-            "выбранных паков, будут скрыты из выдачи поиска:")
-        intro.setWordWrap(True)
-        lay.addWidget(intro)
-
-        checks = []
-        if datasets:
-            lay.addWidget(_api.QLabel("Открыты в SiQuesterHYX:"))
-            for idx, ds in enumerate(datasets):
-                name = ds.get("pkg_name") or f"Пак {idx + 1}"
-                cb = _api.QCheckBox(name)
-                cb.setChecked(name in self._excluded_packs)
-                lay.addWidget(cb)
-                checks.append((cb, name))
-        else:
-            hint = _api.QLabel("В SiQuesterHYX паки не открыты — это не мешает "
-                               "добавить файлы вручную.")
-            hint.setWordWrap(True)
-            hint.setStyleSheet(f"color:{_api.C['text3']}; font-size:11px;")
-            lay.addWidget(hint)
-
-        loaded = {name for _, name in checks}
-        missing = [name for name in self._excluded_packs if name not in loaded]
-        if missing:
-            lay.addWidget(_api.QLabel("Сохранены, но не открыты в SiQuesterHYX:"))
-            for name in missing:
-                cb = _api.QCheckBox(name)
-                cb.setChecked(True)
-                cb.setToolTip(
-                    "Пак сейчас не загружен, поэтому ничего не исключает. "
-                    "Откройте его в SiQuesterHYX — и исключение заработает.")
-                lay.addWidget(cb)
-                checks.append((cb, name))
-
-        line = _api.QFrame(); line.setFrameShape(_api.QFrame.Shape.HLine)
-        line.setStyleSheet(f"color:{_api.C['border']};")
-        lay.addWidget(line)
-        lay.addWidget(_api.QLabel(
-            "Добавленные вручную .siq-файлы (галочка — исключать):"))
-        file_list = _api.QListWidget()
-        file_list.setSelectionMode(
-            _api.QAbstractItemView.SelectionMode.ExtendedSelection)
-        file_list.setMaximumHeight(150)
-        off = set(self._disabled_pack_files)
-        for path in sorted(self._excluded_pack_files + self._disabled_pack_files,
-                           key=self._pack_file_sort_key):
-            self._add_pack_file_item(file_list, path, path not in off)
-        lay.addWidget(file_list)
-
-        # Все четыре кнопки одной строкой: файлы слева, OK/Отмена справа.
-        btn_row = _api.QHBoxLayout()
-        btn_add = _api.QPushButton("Добавить файлы…")
-        btn_add.setIcon(_api.get_icon('fa5s.folder-open'))
-        btn_remove = _api.QPushButton("Убрать выбранные")
-        btn_remove.setIcon(_api.get_icon('fa5s.trash'))
-        btn_remove.setToolTip("Удалить выделенные строки из списка. "
-                              "Чтобы временно не исключать пак, снимите галочку.")
-        btn_row.addWidget(btn_add)
-        btn_row.addWidget(btn_remove)
-        btn_row.addStretch(1)
-
-        def add_files():
-            paths, _ = _api.QFileDialog.getOpenFileNames(
-                dlg, "Добавить паки для исключения", self._pack_picker_start(),
-                "Пакеты SIGame (*.siq);;Все файлы (*)")
-            have = {_api.os.path.normcase(_api.os.path.abspath(
-                str(file_list.item(i).data(_api.Qt.ItemDataRole.UserRole) or "")))
-                for i in range(file_list.count())}
-            for path in paths:
-                key = _api.os.path.normcase(_api.os.path.abspath(path))
-                if key in have:
-                    continue
-                self._add_pack_file_item(file_list, path)
-                have.add(key)
-
-        def remove_files():
-            for item in file_list.selectedItems():
-                file_list.takeItem(file_list.row(item))
-
-        btn_add.clicked.connect(add_files)
-        btn_remove.clicked.connect(remove_files)
-
-        bb = _api.QDialogButtonBox(_api.QDialogButtonBox.StandardButton.Ok
-                              | _api.QDialogButtonBox.StandardButton.Cancel)
-        bb.accepted.connect(dlg.accept)
-        bb.rejected.connect(dlg.reject)
-        btn_row.addWidget(bb)
-        lay.addLayout(btn_row)
-        if dlg.exec() != _api.QDialog.DialogCode.Accepted:
-            return
-
-        chosen_names = [name for cb, name in checks if cb.isChecked()]
-        chosen_files, disabled_files = [], []
-        for i in range(file_list.count()):
-            item = file_list.item(i)
-            path = str(item.data(_api.Qt.ItemDataRole.UserRole) or "")
-            if not path:
-                continue
-            if item.checkState() == _api.Qt.CheckState.Checked:
-                chosen_files.append(path)
-            else:
-                disabled_files.append(path)
-        self._disabled_pack_files = disabled_files
-        answers, questions, franchises, broken = self._collect_pack_terms(
-            chosen_names, chosen_files)
-        self._excluded = answers
-        self._excluded_question_texts = questions
-        self._excluded_shiki_franchises = franchises
-        self._excluded_packs = chosen_names
-        self._excluded_pack_files = chosen_files
-        self._pack_file_errors = set(broken)
-        self._rebuild_excluded_bases()
-        self._refresh_packs_label()
+    # ── Исключение паков (PackExclusionMixin) ─────────────────────────────────
+    def _on_packs_changed(self):
         # Переприменяем к уже найденному (без нового запроса).
         if self._raw_results:
             self._apply_exclusions()
@@ -1075,26 +767,6 @@ class ShikimoriTab(ShikimoriSearchMixin, _api.QWidget):
             self._restore_packs(names, files)
         elif self._disabled_pack_files:
             self._refresh_packs_label()
-
-    def _restore_packs(self, names: list, files=None):
-        """Восстанавливает исключаемые паки по именам и путям .siq."""
-        wanted = set(names)
-        found = [ds.get("pkg_name") or f"Пак {idx + 1}"
-                 for idx, ds in enumerate(self._siq_datasets())
-                 if (ds.get("pkg_name") or f"Пак {idx + 1}") in wanted]
-        files = [str(path or "").strip() for path in (files or [])
-                 if str(path or "").strip()]
-        answers, questions, franchises, broken = self._collect_pack_terms(
-            found, files)
-        # Имена помним даже если паки ещё не открыты — попадут при следующем выборе.
-        self._excluded_packs = list(names) or found
-        self._excluded_pack_files = files
-        self._excluded = answers
-        self._excluded_question_texts = questions
-        self._excluded_shiki_franchises = franchises
-        self._pack_file_errors = set(broken)
-        self._rebuild_excluded_bases()
-        self._refresh_packs_label()
 
     def reset_settings(self):
         """Сбрасывает все фильтры и выбранные паки к значениям по умолчанию."""

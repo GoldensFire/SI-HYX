@@ -173,6 +173,9 @@ class EditTabExportMixin:
             self._refresh_export_btn()
             b.setEnabled(True)
             b.clicked.connect(self.start_cut)
+        sync = getattr(self, "_sync_export_queue_ui", None)
+        if sync is not None:
+            sync()
 
     def _cancel_cut(self):
         """Отменяет текущую обрезку/перекодировку/Smart Cut (self.ffmpeg_thread)."""
@@ -273,11 +276,202 @@ class EditTabExportMixin:
                 return True
         return False
 
+    # ── Очередь экспорта ──────────────────────────────────────────────────
+    # Пока идёт экспорт, рядом с «Отмена» стоит «В очередь»: следующий файл
+    # (или отрезок, или проект) готовится ЦЕЛИКОМ в момент нажатия — команда
+    # ffmpeg, эффекты, имя результата берутся из того, что видно сейчас, — но
+    # рабочий поток не запускается, а ждёт в _export_queue. Закончился текущий
+    # экспорт (on_ffmpeg_finished) — стартует следующий.
+    def _export_running(self):
+        th = getattr(self, "ffmpeg_thread", None)
+        return (bool(getattr(self, "_cut_btn_cancel", False))
+                or (th is not None and th.isRunning()))
+
+    def _launch_cut_worker(self, worker, *, status, phase, label, final="",
+                           log=None, cleanup=(), before_start=None):
+        """Запускает подготовленный экспорт (worker уже со всеми connect) —
+        или, если нажата «В очередь», ставит его в очередь.
+
+        status — подпись общей полосы, phase — фаза тикера, label — имя задачи
+        для журнала и меню очереди, final — путь результата (его занимает
+        задача: следующие в очереди его не возьмут), cleanup — временные файлы,
+        которые надо удалить, если задачу снимут с очереди, before_start —
+        что сделать прямо перед запуском (остановить просмотр проекта)."""
+        if getattr(self, "_export_enqueue", False):
+            self._export_queue.append({
+                "worker": worker, "status": status, "phase": phase,
+                "label": label, "final": str(final or ""), "log": log,
+                "cleanup": [p for p in cleanup if p], "before_start": before_start})
+            self._sync_export_queue_ui()
+            self._export_log(f"в очередь экспорта: {label} "
+                             f"(ждут: {len(self._export_queue)})")
+            return
+        if before_start is not None:
+            try:
+                before_start()
+            except Exception:
+                pass
+        self._report_progress(0, status)
+        self.log_label.setText(status if log is None else log)
+        self._set_cut_btn_cancel(True)
+        self._start_cut_phase(phase)
+        if getattr(self, "_cut_ticker", None) is None:
+            self._cut_ticker = _api.QTimer(self)
+            self._cut_ticker.setInterval(500)
+            self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
+        self._cut_ticker.start()
+        self._export_current_final = str(final or "")
+        self.ffmpeg_thread = worker
+        worker.start()
+
+    def _export_log(self, text):
+        if self.main is not None and hasattr(self.main, "log"):
+            try:
+                self.main.log(f"Монтаж: {text}")
+            except Exception:
+                pass
+
+    def _enqueue_export(self):
+        """«В очередь»: подготовить экспорт того, что открыто сейчас, и
+        поставить его за текущим. Ничего не идёт — обычный «Экспорт»."""
+        if not self._export_running() and not self._export_queue:
+            self.start_cut()
+            return
+        self._export_enqueue = True
+        try:
+            self.start_cut()
+        finally:
+            self._export_enqueue = False
+        if not self._export_running():
+            # Нажали в промежутке между задачами: новая встала В КОНЕЦ очереди,
+            # а не вперёд ждущих; очередь подталкиваем на случай, если её
+            # никто уже не продвинет.
+            _api.QTimer.singleShot(0, self._start_next_export)
+
+    def _refuse_enqueue(self, what):
+        """Путь экспорта, который не ставится в очередь Монтажа (у него свой
+        поток или своя очередь): говорим об этом, а не запускаем параллельно."""
+        if not getattr(self, "_export_enqueue", False):
+            return False
+        _api.msgbox_information(
+            self, "Очередь экспорта",
+            f"{what} в очередь не ставится. Дождитесь окончания текущего "
+            "экспорта или выберите другой режим.")
+        return True
+
+    def _start_next_export(self):
+        """Следующий экспорт из очереди — когда текущий полностью закончился."""
+        queue = getattr(self, "_export_queue", None)
+        if not queue or getattr(self, "_cut_btn_cancel", False):
+            # Пусто — или уже идёт другой экспорт: его конец снова позовёт нас.
+            self._sync_export_queue_ui()
+            return
+        th = getattr(self, "ffmpeg_thread", None)
+        if th is not None and th.isRunning():
+            # Сигнал «готово» приходит из run() чуть раньше выхода потока:
+            # ссылку на живой QThread терять нельзя — ждём, пока выйдет.
+            _api.QTimer.singleShot(100, self._start_next_export)
+            return
+        entry = queue.pop(0)
+        self._export_log(f"экспорт из очереди: {entry['label']}"
+                         + (f" (ещё ждут: {len(queue)})" if queue else ""))
+        self._launch_cut_worker(
+            entry["worker"], status=entry["status"], phase=entry["phase"],
+            label=entry["label"], final=entry["final"], log=entry["log"],
+            before_start=entry["before_start"])
+        self._sync_export_queue_ui()
+
+    def _advance_export_queue(self):
+        """Текущий экспорт закончен (успех, ошибка, отмена) — следующий."""
+        self._export_current_final = ""
+        if getattr(self, "_export_queue", None):
+            _api.QTimer.singleShot(0, self._start_next_export)
+        else:
+            self._sync_export_queue_ui()
+
+    def _drop_export_entry(self, entry):
+        for path in entry.get("cleanup") or ():
+            try:
+                if _api.os.path.exists(path):
+                    _api.os.remove(path)
+            except OSError:
+                pass
+        try:
+            entry["worker"].deleteLater()
+        except Exception:
+            pass
+
+    def _clear_export_queue(self):
+        queue = list(getattr(self, "_export_queue", None) or [])
+        self._export_queue = []
+        for entry in queue:
+            self._drop_export_entry(entry)
+        if queue:
+            self._export_log(f"очередь экспорта очищена ({len(queue)})")
+        self._sync_export_queue_ui()
+
+    def _remove_export_entry(self, index):
+        queue = getattr(self, "_export_queue", None) or []
+        if 0 <= index < len(queue):
+            entry = queue.pop(index)
+            self._drop_export_entry(entry)
+            self._export_log(f"снято с очереди экспорта: {entry['label']}")
+        self._sync_export_queue_ui()
+
+    def _sync_export_queue_ui(self):
+        """Кнопка «В очередь» видна, пока идёт экспорт или что-то ждёт; число
+        ждущих — в подписи, сами задачи — в меню стрелки."""
+        b = getattr(self, "btn_export_queue", None)
+        if b is None:
+            return
+        queue = getattr(self, "_export_queue", None) or []
+        b.setVisible(bool(queue) or bool(getattr(self, "_cut_btn_cancel", False)))
+        b.setText(f"В очередь ({len(queue)})" if queue else "В очередь")
+        menu = b.menu()
+        if menu is None:
+            return
+        menu.clear()
+        if not queue:
+            act = menu.addAction("Очередь пуста")
+            act.setEnabled(False)
+            return
+        for i, entry in enumerate(queue):
+            act = menu.addAction(_api.get_icon('fa5s.times'),
+                                 f"{i + 1}. {entry['label']} — снять")
+            act.triggered.connect(lambda _c=False, _i=i: self._remove_export_entry(_i))
+        menu.addSeparator()
+        act = menu.addAction(_api.get_icon('fa5s.trash'), "Очистить очередь")
+        act.triggered.connect(lambda _c=False: self._clear_export_queue())
+
+    def _export_taken(self, path):
+        """Имя занято экспортом в очереди или текущим (файла ещё нет на диске)."""
+        norm = _api.os.path.normcase(_api.os.path.abspath(str(path)))
+        taken = [e.get("final") for e in (getattr(self, "_export_queue", None) or [])]
+        taken.append(getattr(self, "_export_current_final", ""))
+        return any(t and _api.os.path.normcase(_api.os.path.abspath(t)) == norm
+                   for t in taken)
+
+    def _unique_export_output(self, path):
+        """_unique_output, но мимо имён, которые уже заняли экспорты очереди."""
+        cand = _api._unique_output(path)
+        if not self._export_taken(cand):
+            return cand
+        base, ext = _api.os.path.splitext(path)
+        i = 1
+        while True:
+            cand = f"{base}_{i}{ext}"
+            if not _api.os.path.exists(cand) and not self._export_taken(cand):
+                return cand
+            i += 1
+
     def start_cut(self):
         # Проект из нескольких кусков (или файл одиночного проекта не открыт)
         # собирается проектом; один кусок открытого файла режет «Обрезка» ниже.
+        # «В очередь» (_enqueue_export) готовит экспорт, пока идёт текущий:
+        # проверки «уже идёт» ниже его не касаются.
+        queueing = bool(getattr(self, "_export_enqueue", False))
         th = getattr(self, "ffmpeg_thread", None)
-        if not (th is not None and th.isRunning()) and self._project_export_route():
+        if (queueing or not (th is not None and th.isRunning())) and self._project_export_route():
             return
         if not self.actual_source_file or not self.actual_source_file.exists():
             _api.msgbox_warning(self, "Внимание", "Файл не загружен.")
@@ -289,7 +483,7 @@ class EditTabExportMixin:
         # И быстрая обрезка (FfmpegWorker), и Smart Cut (SmartCutWorker) кладутся
         # в self.ffmpeg_thread — одной проверки достаточно.
         th = getattr(self, "ffmpeg_thread", None)
-        if th is not None and th.isRunning():
+        if th is not None and th.isRunning() and not queueing:
             return
 
         # Режим картинки: «Экспорт» = собрать видео-проявление из картинки.
@@ -343,6 +537,8 @@ class EditTabExportMixin:
         # Висит предпросмотр привязки к объекту — «Экспорт» и есть его экспорт:
         # режем выбранный отрезок и вшиваем накладку по уже посчитанному пути.
         if self.has_track_preview():
+            if queueing and self._refuse_enqueue("Экспорт с привязкой к объекту"):
+                return
             self._render_track_overlay(in_s, out_s)
             return
 
@@ -377,6 +573,9 @@ class EditTabExportMixin:
         ovl_active = self.has_image_overlays()
         # Smart Cut несовместим с вшиванием субтитров (середина копируется): при
         # запросе hardsub откатываемся на полную перекодировку (mode 1).
+        if mode in (4, 5) and queueing and self._refuse_enqueue(
+                "Экспорт настройками «Обработки» (у него своя очередь — во вкладке «Обработка»)"):
+            return
         if mode in (4, 5):
             # 4 — «Перекодировать настройками «Обработки»», 5 — то же самое, но
             # ТОЛЬКО звук: точный рез + текущие настройки вкладки «Обработка»
@@ -523,8 +722,8 @@ class EditTabExportMixin:
         out_dir = (_api.Path(self.export_dir) if (self.export_dir and _api.os.path.isdir(self.export_dir))
                    else src.parent)
         final_out =str(out_dir / f"{src.stem}_{'проявление' if fx else 'пиксель'}.mp4")
-        if _api.os.path.exists(final_out):
-            final_out = _api._unique_output(final_out)
+        if _api.os.path.exists(final_out) or self._export_taken(final_out):
+            final_out = self._unique_export_output(final_out)
 
         venc = self._video_encoder_args(hardsub=False)
         cmd = [_api.FFMPEG, "-y", "-loop", "1", "-framerate", str(fps), "-i", str(src),
@@ -542,23 +741,14 @@ class EditTabExportMixin:
                        + venc + _api.reveal_pipe.COLOR_ARGS + ["-an", final_out])
 
         step = f" {batch_index}/{batch_total}" if batch_total > 1 else ""
-        self._report_progress(0, f"Создание видео{step}…")
-        self.log_label.setText(f"Создание видео из картинки{step}…")
-        self._set_cut_btn_cancel(True)
-        self._start_cut_phase(f"{self._reveal_effect_label()}…")
-        if getattr(self, "_cut_ticker", None) is None:
-            self._cut_ticker = _api.QTimer(self); self._cut_ticker.setInterval(500)
-            self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
-        self._cut_ticker.start()
-
         if fx:
-            self.ffmpeg_thread = _api.RevealVideoWorker(
+            worker = _api.RevealVideoWorker(
                 dec_cmd, enc_cmd, fx, self._pixelize_steps, fps,
                 duration=dur, still=True,
                 dvd_media=self._dvd_folder())
         else:
-            self.ffmpeg_thread = _api.FfmpegWorker(cmd, duration=dur)
-        self.ffmpeg_thread.progress.connect(self._on_cut_progress)
+            worker = _api.FfmpegWorker(cmd, duration=dur)
+        worker.progress.connect(self._on_cut_progress)
 
         def _on_finished(success, message, _final=final_out, _queue=queue,
                          _total=batch_total, _step=step):
@@ -593,8 +783,12 @@ class EditTabExportMixin:
                     except Exception: pass
                 self.on_ffmpeg_finished(success, message)
 
-        self.ffmpeg_thread.finished.connect(_on_finished)
-        self.ffmpeg_thread.start()
+        worker.finished.connect(_on_finished)
+        self._launch_cut_worker(
+            worker, status=f"Создание видео{step}…", phase=f"{self._reveal_effect_label()}…",
+            log=f"Создание видео из картинки{step}…", final=final_out,
+            label=_api.os.path.basename(final_out)
+            + (f" (пакет из {batch_total})" if batch_total > 1 else ""))
 
     def _execute_cut(self, in_s, out_s, mode, burn_subs,
                      src=None, force_overwrite=False, out_path=None):
@@ -629,11 +823,13 @@ class EditTabExportMixin:
         # файл сохраняется под именем с суффиксом (foo_обрез.mp4 → foo_обрез_1.mp4,
         # _2, …). Перезапись остаётся только для внутренней пере-обрезки
         # (force_overwrite / явный out_path) и правки «на месте» (цель == открытый файл).
-        if _api.os.path.exists(final_out) and not force_overwrite and not out_path:
+        # Имя, которое уже занял экспорт из очереди (файла ещё нет), тоже занято.
+        taken = self._export_taken(final_out)
+        if (_api.os.path.exists(final_out) or taken) and not force_overwrite and not out_path:
             loaded = str(self.actual_source_file) if self.actual_source_file else ""
             in_place = bool(loaded) and _api.os.path.normpath(loaded) == _api.os.path.normpath(final_out)
-            if not (self.chk_overwrite.isChecked() and in_place):
-                final_out = _api._unique_output(final_out)
+            if taken or not (self.chk_overwrite.isChecked() and in_place):
+                final_out = self._unique_export_output(final_out)
 
         temp_out = self._make_temp_out(final_out)
 
@@ -856,28 +1052,17 @@ class EditTabExportMixin:
                 src, in_s, dur_cut, burn_subs, ext_audio, audio_off,
                 sel_a if pick_audio else None, venc, temp_out)
 
-        self._report_progress(0, "Обрезка…")
-        self.log_label.setText("Обрезка...")
-        self._set_cut_btn_cancel(True)
-
         # Прогресс с ETA. Тикер раз в 0.5с обновляет «прошло/ETA», чтобы строка
         # не выглядела зависшей, даже если ffmpeg редко шлёт time= (короткие
-        # отрезки или фаза перемотки декодером до точки реза).
-        self._start_cut_phase(f"Обрезка и эффект «{self._reveal_effect_label()}»…"
-                              if reveal_cmds else "Обрезка…")
-        if getattr(self, "_cut_ticker", None) is None:
-            self._cut_ticker = _api.QTimer(self)
-            self._cut_ticker.setInterval(500)
-            self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
-        self._cut_ticker.start()
-
+        # отрезки или фаза перемотки декодером до точки реза) — его заводит
+        # _launch_cut_worker.
         if reveal_cmds:
-            self.ffmpeg_thread = _api.RevealVideoWorker(
+            worker = _api.RevealVideoWorker(
                 *reveal_cmds, fx, self._pixelize_steps, self.fps, duration=dur_cut,
                 dvd_media=self._dvd_folder())
         else:
-            self.ffmpeg_thread = _api.FfmpegWorker(cmd, duration=dur_cut)
-        self.ffmpeg_thread.progress.connect(self._on_cut_progress)
+            worker = _api.FfmpegWorker(cmd, duration=dur_cut)
+        worker.progress.connect(self._on_cut_progress)
 
         def _on_finished(success, message, _temp=temp_out, _final=final_out,
                          _exact=exact_copy, _reqdur=dur_cut, _burn=burn_subs,
@@ -964,6 +1149,8 @@ class EditTabExportMixin:
                         except Exception as e:
                             _api.msgbox_warning(self, "Не удалось удалить",
                                                 f"Не удалось удалить файл:\n{e}")
+                        # on_ffmpeg_finished здесь не зовётся — очередь двигаем сами.
+                        self._advance_export_queue()
                         return
                     if is_loaded:
                         self.load_file(_final)
@@ -984,8 +1171,14 @@ class EditTabExportMixin:
                         pass
                 self.on_ffmpeg_finished(success, message)
 
-        self.ffmpeg_thread.finished.connect(_on_finished)
-        self.ffmpeg_thread.start()
+        worker.finished.connect(_on_finished)
+        self._launch_cut_worker(
+            worker, status="Обрезка…", log="Обрезка...",
+            phase=(f"Обрезка и эффект «{self._reveal_effect_label()}»…"
+                   if reveal_cmds else "Обрезка…"),
+            final=final_out, cleanup=(temp_out,),
+            label=f"{_api.os.path.basename(final_out)} "
+                  f"({_api.s_to_time(in_s)}–{_api.s_to_time(out_s)})")
 
     def _reveal_cut_cmds(self, src, in_s, dur, burn_subs, ext_audio, audio_off,
                          audio_index, venc, out):
@@ -1073,32 +1266,24 @@ class EditTabExportMixin:
         # Как и в _execute_cut: повторная Smart Cut обрезка того же файла не
         # затирает прошлый клип, а уходит под именем с суффиксом. Явный out_path
         # (пере-рез) указывает на уже освобождённый файл — его не переименовываем.
-        if _api.os.path.exists(final_out) and not out_path:
+        taken = self._export_taken(final_out)
+        if (_api.os.path.exists(final_out) or taken) and not out_path:
             loaded = str(self.actual_source_file) if self.actual_source_file else ""
             in_place = bool(loaded) and _api.os.path.normpath(loaded) == _api.os.path.normpath(final_out)
-            if not (replace_original and in_place):
-                final_out = _api._unique_output(final_out)
+            if taken or not (replace_original and in_place):
+                final_out = self._unique_export_output(final_out)
         temp_out = self._make_temp_out(final_out, suffix)
-
-        self._report_progress(0, "Smart Cut…")
-        self.log_label.setText("Smart Cut…")
-        self._set_cut_btn_cancel(True)
-        self._start_cut_phase("Smart Cut…")
-        if getattr(self, "_cut_ticker", None) is None:
-            self._cut_ticker = _api.QTimer(self); self._cut_ticker.setInterval(500)
-            self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
-        self._cut_ticker.start()
 
         venc = self._video_encoder_args()
         # Выбранная аудиодорожка (если в контейнере их несколько). None → первая.
         sc_audio = (self.selected_audio_abs_index
                     if (self.selected_audio_abs_index is not None
                         and len(self._audio_streams) > 1) else None)
-        self.ffmpeg_thread = _api.SmartCutWorker(src, in_s, out_s, temp_out, venc,
-                                            audio_index=sc_audio,
-                                            no_audio=bool(getattr(self, "audio_disabled", False)))
-        self.ffmpeg_thread.progress.connect(self._on_cut_progress)
-        self.ffmpeg_thread.status.connect(self._smartcut_status)
+        worker = _api.SmartCutWorker(src, in_s, out_s, temp_out, venc,
+                                     audio_index=sc_audio,
+                                     no_audio=bool(getattr(self, "audio_disabled", False)))
+        worker.progress.connect(self._on_cut_progress)
+        worker.status.connect(self._smartcut_status)
 
         def _on_finished(success, message, _temp=temp_out, _final=final_out):
             try:
@@ -1146,8 +1331,12 @@ class EditTabExportMixin:
                         pass
                 self.on_ffmpeg_finished(success, message)
 
-        self.ffmpeg_thread.finished.connect(_on_finished)
-        self.ffmpeg_thread.start()
+        worker.finished.connect(_on_finished)
+        self._launch_cut_worker(
+            worker, status="Smart Cut…", phase="Smart Cut…", final=final_out,
+            cleanup=(temp_out,),
+            label=f"{_api.os.path.basename(final_out)} "
+                  f"({_api.s_to_time(in_s)}–{_api.s_to_time(out_s)}, Smart Cut)")
 
     def _open_export_settings(self):
         """Шестерёнка у «Экспорт»: окно настроек «Обработки» (звук, скорость,
@@ -1233,6 +1422,10 @@ class EditTabExportMixin:
         картинки после удачного сохранения этой (вместо итогового «Готово»),
         batch_step — (номер, всего) для подписи, with_overlays=False — не
         класть накладки, расставленные по открытой картинке."""
+        if getattr(self, "_export_enqueue", False) and self._refuse_enqueue(
+                "Экспорт настройками «Обработки» (у него своя очередь — во "
+                "вкладке «Обработка»)"):
+            return
         src = _api.Path(src) if src else self.actual_source_file
         if not src or not src.exists():
             _api.msgbox_warning(self, "Внимание", "Файл не загружен.")
@@ -1513,6 +1706,11 @@ class EditTabExportMixin:
                 _api.msgbox_critical(self, "Ошибка", f"Обрезка завершилась с ошибкой:\n{message}")
             self._report_progress(0, "Ошибка")
             self.update_selection_label()
+        # Экспорт закончен как угодно (успех, ошибка, отмена) — следующий из
+        # очереди Монтажа («В очередь»).
+        advance = getattr(self, "_advance_export_queue", None)
+        if advance is not None:
+            advance()
 
     @staticmethod
     def _escape_filter_path(p):

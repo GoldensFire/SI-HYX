@@ -155,12 +155,20 @@ class AnimePackTabOptionsMixin:
         # Во время сигнала toggled Qt ещё может держать старый sizeHint скрытой
         # песенной панели. Второй проход после обработки события не даёт следующим
         # галочкам («Кадры», «Персонажи») наехать на только что раскрытые поля.
-        _api.QTimer.singleShot(0, self._refresh_song_geometry)
+        # Один отложенный проход на пачку галочек (применение настроек ставит
+        # их десятками подряд), а не по проходу на каждую.
+        if not getattr(self, "_song_geometry_queued", False):
+            self._song_geometry_queued = True
+            _api.QTimer.singleShot(0, self._run_queued_song_geometry)
         self._recount()
+
+    def _run_queued_song_geometry(self):
+        self._song_geometry_queued = False
+        self._refresh_song_geometry()
 
     def _refresh_song_geometry(self):
         """Пересчитать высоту вложенной панели после включения/выключения песен."""
-        if getattr(self, "_closing", False):
+        if getattr(self, "_closing", False) or getattr(self, "_geometry_batch", False):
             return
         for name in ("box_audio_opts", "box_song_opts"):
             box = getattr(self, name, None)
@@ -213,11 +221,19 @@ class AnimePackTabOptionsMixin:
         if getattr(self, "btn_poster_clear", None) is not None:
             self.btn_poster_clear.setVisible(checked)
         if checked:
-            self._refresh_poster_cache()
+            self._refresh_poster_cache(force=False)
 
-    def _refresh_poster_cache(self):
-        """Подпись с общим размером двух кладовых переиспользуемых медиа."""
+    def _refresh_poster_cache(self, force: bool = True):
+        """Подпись с общим размером двух кладовых переиспользуемых медиа.
+
+        Подсчёт — обход десятков тысяч файлов (на открытии вкладки ~0,3–1 с в
+        GUI-потоке). force=False (галочка при применении настроек) не считает
+        заново, если подпись только что посчитана: на открытии вкладки иначе
+        обход шёл дважды подряд."""
         if getattr(self, "lbl_poster_cache", None) is None:
+            return
+        now = _api.time.monotonic()
+        if not force and now - getattr(self, "_poster_cache_at", -1e9) < 3.0:
             return
         try:
             posters, poster_size = _api.poster_cache.stats()
@@ -225,6 +241,7 @@ class AnimePackTabOptionsMixin:
             num, size = posters + media, poster_size + media_size
         except Exception:  # noqa: BLE001 — подпись не повод падать
             num, size = 0, 0
+        self._poster_cache_at = _api.time.monotonic()
         if not num:
             self.lbl_poster_cache.setText(
                 "Кладовая медиа пуста — файлы появятся после генерации.")

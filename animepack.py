@@ -109,7 +109,7 @@ SIQ_NS = "https://github.com/VladimirKhil/SI/blob/master/assets/siq_5.xsd"
 # семьи (картинка / ролик / текст) нужны и генератору, и вкладке, и тестам, а
 # менять их удобнее там, где они лежат все вместе.
 from si_hyx_parts.animepack.question_kinds import (
-    AI_ART_KIND, ANAGRAM_KIND, ANIME_KINDS, CATEGORY_LABELS, CHAR_KIND,
+    AI_ART_KIND, ANAGRAM_KIND, ANIME_DB_KINDS, ANIME_KINDS, CATEGORY_LABELS, CHAR_KIND,
     CHAR_ROLE_LABELS, CHAR_ROLES, CHAR_TASK_TEXT, CLIP_KINDS, FRAME_KIND,
     DESCRIPTION_AUDIO_KIND, DIALOGUE_KIND, FRAME_KINDS, GEMINI_TITLE_KINDS,
     HINT_LABELS, IMAGE_KINDS, KIND_LABELS,

@@ -3,42 +3,13 @@
 # See LICENSE and the public module for attribution and API.
 """_ExportSettingsDialog. Public namespace: edit_tab_dialogs."""
 import edit_tab_dialogs as _api
+from process_mirror import ProcessMirrorMixin
 
 # Режимы обрезки, которые кодируют настройками «Обработки» (см. cmb_mode).
 _PROCESS_MODES = (4, 5)
 
 
-def _value(w):
-    """Значение виджета-настройки в одном виде для обеих сторон зеркала."""
-    if isinstance(w, _api.QAbstractButton):
-        return w.isChecked()
-    if isinstance(w, _api.QComboBox):
-        return w.currentText() if w.isEditable() else w.currentIndex()
-    return w.value()
-
-
-def _set_value(w, v):
-    if isinstance(w, _api.QAbstractButton):
-        w.setChecked(bool(v))
-    elif isinstance(w, _api.QComboBox):
-        if w.isEditable():
-            w.setCurrentText(str(v))
-        else:
-            w.setCurrentIndex(int(v))
-    else:
-        w.setValue(v)
-
-
-def _changed_signal(w):
-    if isinstance(w, _api.QAbstractButton):
-        return w.toggled
-    if isinstance(w, _api.QComboBox):
-        # У редактируемого (FPS) значение — текст: ввод своего числа тоже правка.
-        return w.currentTextChanged if w.isEditable() else w.currentIndexChanged
-    return w.valueChanged
-
-
-class _ExportSettingsDialog(_api.QDialog):
+class _ExportSettingsDialog(ProcessMirrorMixin, _api.QDialog):
     """Настройки экспорта «Монтажа» для «Перекодировать настройками
     «Обработки»»: звук, скорость и видео вкладки «Обработка». Это не копия, а
     зеркало её виджетов: правка здесь ставит значение виджету «Обработки» (с
@@ -111,78 +82,10 @@ class _ExportSettingsDialog(_api.QDialog):
         self._syncing = False
         self.pull_all()
 
-    # ── Зеркало ──────────────────────────────────────────────────────────────
-    def _mirror(self, src, text=None):
-        """Виджет того же типа и с теми же пределами, что src, связанный с
-        ним в обе стороны."""
-        if isinstance(src, _api.QCheckBox):
-            dst = _api.QCheckBox(src.text() if text is None else text)
-        elif isinstance(src, _api.QComboBox):
-            dst = type(src)()
-            for i in range(src.count()):
-                dst.addItem(src.itemIcon(i), src.itemText(i), src.itemData(i))
-            if src.isEditable():
-                dst.setEditable(True)
-                dst.setInsertPolicy(_api.QComboBox.InsertPolicy.NoInsert)
-                if src.lineEdit() is not None:
-                    dst.lineEdit().setPlaceholderText(src.lineEdit().placeholderText())
-            # Пункты короткие (кроме режима обрезки — его ширину держит строка):
-            # видны целиком, без «по умо…».
-            dst.setSizeAdjustPolicy(_api.QComboBox.SizeAdjustPolicy.AdjustToContents)
-            if src.isEditable():
-                dst.setMinimumWidth(src.minimumWidth() + 20)
-        elif isinstance(src, _api.QSlider):
-            dst = _api.QSlider(src.orientation())
-            dst.setRange(src.minimum(), src.maximum())
-            dst.setSingleStep(src.singleStep()); dst.setPageStep(src.pageStep())
-        else:                                     # QSpinBox / QDoubleSpinBox
-            dst = type(src)()
-            if isinstance(src, _api.QDoubleSpinBox):
-                dst.setDecimals(src.decimals())
-            dst.setRange(src.minimum(), src.maximum())
-            dst.setSingleStep(src.singleStep())
-            dst.setPrefix(src.prefix()); dst.setSuffix(src.suffix())
-            dst.setMaximumWidth(max(80, src.maximumWidth() if src.maximumWidth() < 1000 else 110))
-        dst.setToolTip(src.toolTip())
-        self._pairs.append((src, dst))
-        _changed_signal(dst).connect(lambda *_a, s=src, d=dst: self._push(s, d))
-        _changed_signal(src).connect(lambda *_a, s=src, d=dst: self._pull(s, d))
-        return dst
-
-    def _push(self, src, dst):
-        """Правка здесь → виджет «Обработки» (без глушения сигналов: пусть
-        сработает всё, что там завязано на правку, — сохранение, видимость)."""
-        if self._syncing:
-            return
-        self._syncing = True
-        try:
-            if _value(src) != _value(dst):
-                _set_value(src, _value(dst))
-        finally:
-            self._syncing = False
-        self._refresh_states()
-
-    def _pull(self, src, dst):
-        """Правка в «Обработке» → здесь."""
-        if self._syncing:
-            return
-        try:
-            v = _value(src)
-            if _value(dst) != v:
-                dst.blockSignals(True)
-                try:
-                    _set_value(dst, v)
-                finally:
-                    dst.blockSignals(False)
-            self._refresh_states()
-        except RuntimeError:
-            pass                                  # окно или виджет уже удалены (выход)
-
     def pull_all(self):
         """Всё — заново из «Обработки». Нужен при показе окна: часть правок
         там идёт с заглушёнными сигналами (профиль, загрузка настроек)."""
-        for src, dst in self._pairs:
-            self._pull(src, dst)
+        self._pull_pairs()
         self._pull_profile()
         self._refresh_states()
 

@@ -16,6 +16,9 @@
 всеми, как раньше.
 """
 from __future__ import annotations
+from contextlib import contextmanager as _contextmanager
+import threading as _threading
+
 import animepack as _api
 
 # Ключи «корзин» средней сложности. None — общая средняя пака.
@@ -55,8 +58,36 @@ def level_bucket(kind) -> _api.Optional[str]:
     return None
 
 
+# Снимок «корзина и средняя» на время одной пачки отбора (frozen_targets):
+# настройки за пачку не меняются, а CatalogPlan спрашивает own_bucket
+# миллионами раз — по каждой группе каталога и каждому набранному вопросу.
+_frozen = _threading.local()
+
+
+@_contextmanager
+def frozen_targets(settings):
+    """В этом потоке own_bucket и level_avg_target по этим настройкам
+    считаются один раз на род/корзину, пока длится блок."""
+    previous = getattr(_frozen, "memo", None)
+    _frozen.memo = (settings, {}, {})
+    try:
+        yield
+    finally:
+        _frozen.memo = previous
+
+
 def level_avg_target(settings, bucket) -> int:
     """Просимая средняя для корзины (0 — не следить)."""
+    memo = getattr(_frozen, "memo", None)
+    if memo is not None and memo[0] is settings:
+        known = memo[1]
+        if bucket not in known:
+            known[bucket] = _level_avg_target(settings, bucket)
+        return known[bucket]
+    return _level_avg_target(settings, bucket)
+
+
+def _level_avg_target(settings, bucket) -> int:
     if bucket == MANGA_BUCKET:
         # У манги, манхвы и маньхуа средние свои; книжная — их смесь по долям.
         from .manga_editions import average_target
@@ -72,6 +103,16 @@ def own_bucket(settings, kind) -> _api.Optional[str]:
 
     Ноль в «своей» средней означает «следить как за всем остальным», поэтому
     такой вопрос возвращается в общую корзину (None)."""
+    memo = getattr(_frozen, "memo", None)
+    if memo is not None and memo[0] is settings:
+        known = memo[2]
+        if kind not in known:
+            known[kind] = _own_bucket(settings, kind)
+        return known[kind]
+    return _own_bucket(settings, kind)
+
+
+def _own_bucket(settings, kind) -> _api.Optional[str]:
     bucket = level_bucket(kind)
     if bucket and not level_avg_target(settings, bucket):
         return None

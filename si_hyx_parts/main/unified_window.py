@@ -75,7 +75,13 @@ class UnifiedWindow(
         # Колёсико мыши: меняет ли значения в полях (по умолчанию — нет, только прокрутка)
         self._wheel_changes_values = False
         self._wheel_filter = _api.WheelBlocker(self, lambda: self._wheel_changes_values)
-        _api.QApplication.instance().installEventFilter(self._wheel_filter)
+        _app = _api.QApplication.instance()
+        _tips = getattr(_app, "_hover_tip_mgr", None)
+        if _tips is not None:
+            # Тем же фильтром приложения, что и подсказки (см. wheel_hook).
+            _tips.wheel_hook = self._wheel_filter.eventFilter
+        else:
+            _app.installEventFilter(self._wheel_filter)
         # Проверка ffmpeg — В ФОНЕ, уже после показа окна. check_ffmpeg() запускает
         # bin\ffmpeg.exe (а это 215 МБ статической сборки) и ждёт его: на SSD это
         # ~350 мс до первого кадра, на жёстком диске — секунды, и всё это время
@@ -156,6 +162,10 @@ class UnifiedWindow(
                           "с .siq-вопросами."),
             'shikimori': ("fa5s.tv", "ShikimoriHYX",
                           "Экспериментальная вкладка: поиск аниме/манги через Shikimori"),
+            'subsearch': ("fa5s.closed-captioning", "Поиск по сабам",
+                          "Экспериментальная вкладка: аниме, в английских субтитрах "
+                          "которых звучит фраза (например, «six seven»). Порядок — "
+                          "по уровню из базы ShikimoriHYX, исключение паков — как там же."),
             'leaderboard': ("fa5s.trophy", "ЛидербордHYX",
                             "Просмотр выгрузки рекордов из Firebase: никнеймы и их "
                             "результаты, удаление ников из списка."),
@@ -342,6 +352,11 @@ class UnifiedWindow(
         self.tab_shikimori = None
         self._shikimori_settings = {}   # сохранённые фильтры вкладки ShikimoriHYX
 
+        # Экспериментальная вкладка «Поиск по сабам» (по умолчанию ВЫКЛ).
+        self._subsearch_tab_enabled = False
+        self.tab_subsearch = None
+        self._subsearch_settings = {}   # сохранённые настройки «Поиска по сабам»
+
         # Экспериментальная вкладка ЛидербордHYX (по умолчанию ВЫКЛ).
         self._leaderboard_tab_enabled = False
         self.tab_leaderboard = None
@@ -401,19 +416,31 @@ class UnifiedWindow(
         # появляется сразу, а вкладки досоздаются на глазах, не блокируя ввод
         # между собой. Порядок — как в сохранённом _tab_order (каждая
         # _add_*_tab в конце сама зовёт _apply_tab_order).
+        #
+        # 13.11.2026: и «по одной за такт» оказалось мало — вкладки строились
+        # подряд сразу после показа, а одна «Генерация пака» — это 2–3 с (на
+        # задушенном ноутбуке 8 с) одним куском; всего ~16 с окно не отвечало.
+        # Теперь в полосе вкладок сразу стоит лёгкая заглушка (значок, надпись,
+        # ⓘ, место в порядке), а сама вкладка строится при первом открытии
+        # (_add_lazy_tab / _build_lazy_tab). _deferred_tabs остаётся пустым:
+        # по нему ShikimoriHYX ждёт, пока главный поток не занят стройкой.
         self._deferred_tabs = []
-        if getattr(self, "_shikimori_tab_enabled", False):
-            self._deferred_tabs.append(self._add_shikimori_tab)
-        if getattr(self, "_leaderboard_tab_enabled", False):
-            self._deferred_tabs.append(self._add_leaderboard_tab)
-        if getattr(self, "_coop_tab_enabled", False):
-            self._deferred_tabs.append(self._add_coop_tab)
-        if getattr(self, "_animepack_tab_enabled", False):
-            self._deferred_tabs.append(self._add_animepack_tab)
-        if getattr(self, "_animepack_upgrade_tab_enabled", False):
-            self._deferred_tabs.append(self._add_animepack_upgrade_tab)
-        if self._deferred_tabs:
-            _api.QTimer.singleShot(0, self._build_deferred_tabs_step)
+        self._lazy_tabs = {}
+        for _flag, _key, _builder in (
+                ("_shikimori_tab_enabled", "shikimori", self._add_shikimori_tab),
+                ("_subsearch_tab_enabled", "subsearch", self._add_subsearch_tab),
+                ("_leaderboard_tab_enabled", "leaderboard", self._add_leaderboard_tab),
+                ("_coop_tab_enabled", "coop", self._add_coop_tab),
+                ("_animepack_tab_enabled", "animepack", self._add_animepack_tab),
+                ("_animepack_upgrade_tab_enabled", "animepack_upgrade",
+                 self._add_animepack_upgrade_tab)):
+            if getattr(self, _flag, False):
+                self._add_lazy_tab(_key, _builder)
+        self.tabs.currentChanged.connect(self._on_lazy_tab_current)
+        if self._lazy_tabs:
+            # Сохранённый порядок мог поставить заглушку первой — тогда она
+            # текущая с самого начала, и currentChanged уже не придёт.
+            _api.QTimer.singleShot(0, self._on_lazy_tab_current)
         if (getattr(self, "_animepack_tab_enabled", False)
                 or getattr(self, "_animepack_upgrade_tab_enabled", False)):
             # Отпечаток ключа Gemini (PBKDF2) — в фоне, пока строится окно.
@@ -529,6 +556,10 @@ class UnifiedWindow(
             self.tab_photo.inpaint.set_keep_models(self._keep_models_in_ram)
         except Exception:
             pass
+        try:
+            self.tab_photo.inpaint.set_export_mode(s.get("photo_export_mode", "lossless"), save=False)
+        except Exception:
+            pass
         self._show_advanced_encode = bool(s.get("advanced_encode_visible", False))
         try:
             tm.set_advanced_encode_visible(self._show_advanced_encode)
@@ -537,6 +568,8 @@ class UnifiedWindow(
         self._siquester_tab_enabled = bool(s.get("siquester_tab_enabled", False))
         self._shikimori_tab_enabled = bool(s.get("shikimori_tab_enabled", False))
         self._shikimori_settings = dict(s.get("shikimori", {}) or {})
+        self._subsearch_tab_enabled = bool(s.get("subsearch_tab_enabled", False))
+        self._subsearch_settings = dict(s.get("subsearch", {}) or {})
         self._leaderboard_tab_enabled = bool(s.get("leaderboard_tab_enabled", False))
         self._coop_tab_enabled = bool(s.get("coop_tab_enabled", False))
         self._coop_settings = dict(s.get("coop", {}) or {})
@@ -804,6 +837,12 @@ class UnifiedWindow(
                 tsh = getattr(self, "tab_shikimori", None)
                 if tsh is not None:
                     tsh.cleanup()
+            except Exception:
+                pass
+            try:
+                tss = getattr(self, "tab_subsearch", None)
+                if tss is not None:
+                    tss.cleanup()
             except Exception:
                 pass
             try:

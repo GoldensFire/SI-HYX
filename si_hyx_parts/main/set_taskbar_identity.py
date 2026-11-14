@@ -124,6 +124,13 @@ def main():
         except Exception: pass
         # Сервер не найден — запускаем нормально и загружаем файлы
 
+    # GIL отдаётся фоновым потоком раз в 1 мс, а не в 5 (по умолчанию). Пока
+    # фоном считает Python-поток (поиск ShikimoriHYX по базе, генерация пака),
+    # КАЖДЫЙ вызов Python из Qt в GUI-потоке — фильтр событий, слот — ждёт GIL
+    # до этого интервала; на постройке вкладки это десятки тысяч ожиданий
+    # (замер: «Поиск по сабам» строился 16,5 с вместо 2,7; с 1 мс — 10 с).
+    _api.sys.setswitchinterval(0.001)
+
     from diagnostic_logging import start_file
     start_file(_api.CONFIG_DIR)
     _api.qInstallMessageHandler(_api._qt_message_filter)

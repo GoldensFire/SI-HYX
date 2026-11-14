@@ -209,7 +209,7 @@ class EditTabSessionMixin:
             return
         view = self._session_view
         if view is not None:
-            tl.pps = max(tl.min_pps(), min(400.0, view[0]))
+            tl.pps = max(tl.min_pps(), min(tl.MAX_PPS, view[0]))
             tl.set_offset(view[1])
         if self.actual_source_file is not None:
             return      # файл уже открыли (бросок, лента) — плеер занят им

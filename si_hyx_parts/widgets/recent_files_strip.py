@@ -82,10 +82,10 @@ class RecentFilesStrip(_api.QWidget):
 
         self._update_folder_btn()
         # Клик ЛКМ в любом месте интерфейса ВНЕ ленты снимает выделение карточек.
-        try:
-            _api.QApplication.instance().installEventFilter(self)
-        except Exception:
-            pass
+        # Фильтр на всём приложении ставится только пока что-то выделено
+        # (_sync_click_filter): иначе Python-вызов шёл на КАЖДОЕ событие Qt
+        # всей программы — на постройке одной вкладки это ~60 тыс. вызовов.
+        self._click_filter_on = False
         if self._custom_folder:        # своя папка задана — показываем сразу, до refresh()
             self._folder = self._effective_folder()
             self._request_scan()
@@ -119,7 +119,25 @@ class RecentFilesStrip(_api.QWidget):
                 t.set_selected(False)
                 changed = True
         self._anchor_thumb = None
+        self._sync_click_filter()
         return changed
+
+    def _sync_click_filter(self):
+        """Фильтр кликов на приложении — ровно пока есть выделенные карточки."""
+        want = any(t._selected for t in self._ordered_thumbs())
+        if want == self._click_filter_on:
+            return
+        app = _api.QApplication.instance()
+        if app is None:
+            return
+        try:
+            if want:
+                app.installEventFilter(self)
+            else:
+                app.removeEventFilter(self)
+            self._click_filter_on = want
+        except Exception:
+            pass
 
     def eventFilter(self, obj, ev):
         # ЛКМ в любом месте интерфейса ВНЕ ленты снимает выделение карточек
@@ -133,8 +151,11 @@ class RecentFilesStrip(_api.QWidget):
         # ГЛОБАЛЬНУЮ позицию клика относительно экранного прямоугольника ленты.
         try:
             if (ev.type() == _api.QEvent.Type.MouseButtonPress
-                    and ev.button() == _api.Qt.MouseButton.LeftButton
-                    and any(t._selected for t in self._ordered_thumbs())):
+                    and ev.button() == _api.Qt.MouseButton.LeftButton):
+                if not any(t._selected for t in self._ordered_thumbs()):
+                    # Выделенные карточки ушли с ленты (обновление папки).
+                    self._sync_click_filter()
+                    return False
                 gp = ev.globalPosition().toPoint()
                 rect = _api.QRect(self.mapToGlobal(_api.QPoint(0, 0)), self.size())
                 if not rect.contains(gp):
@@ -172,6 +193,7 @@ class RecentFilesStrip(_api.QWidget):
             for t in thumbs:
                 t.set_selected(t is thumb)
             self._anchor_thumb = thumb
+        self._sync_click_filter()
 
     @classmethod
     def _get_all_ext(cls):

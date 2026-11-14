@@ -21,7 +21,8 @@ def iter_catalog_pages(client, max_pages, stopped, *, manga=False,
                 raise _api.AnimePackApiError("Shikimori: неполная пачка страниц каталога.")
         else:  # Public compatibility with older injected clients.
             fetch = client.random_mangas if manga else client.random_animes
-            groups = [fetch(page, **filters)]
+            groups = [fetch(page, **{k: v for k, v in filters.items()
+                                     if k != "censored"})]
         # Process every already received page; Stop prevents the next request.
         for rows in groups:
             if not isinstance(rows, list):

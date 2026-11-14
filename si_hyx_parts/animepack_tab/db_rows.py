@@ -38,7 +38,10 @@ def title_rows(cache, target: str = "anime", kinds=None, *, cards=None) -> list[
     # генератора, иначе панель показывала бы другие уровни (favorites_norm).
     ap.install_favorites_norms(cache)
     cards = filter_kinds(cache.all_cards(target) if cards is None else cards, kinds)
-    fr_index = _franchise_indexes(cache, cards)
+    # Ветку франшизы считаем один раз на карточку: она нужна и индексу серии,
+    # и самой строке, а на ~100 тысячах карточек это треть всего счёта.
+    branches: dict = {}
+    fr_index = _franchise_indexes(cache, cards, branches)
     screens = _adaptation_indexes(cache, cards) if manga else {}
     ru = None
     if manga:
@@ -56,8 +59,10 @@ def title_rows(cache, target: str = "anime", kinds=None, *, cards=None) -> list[
         # У книги «индекс франшизы» — это узнаваемость её АНИМЕ: либо прямой
         # экранизации, либо сериала той же серии. Без неё панель показывала бы
         # «Ван-Пис» неэкранизованной книгой, а генератор — уровнем сериала.
-        parts = cache.franchise(franchise) if franchise else []
-        branch = ap.franchise_branch_key(card, parts)
+        branch = branches.get(id(card))
+        if branch is None:
+            parts = cache.franchise(franchise) if franchise else []
+            branch = ap.franchise_branch_key(card, parts)
         screen = max(fr_index.get((franchise, branch), 0.0),
                      screens.get(shiki_id, 0.0))
         cand = ap.SongCandidate(
@@ -237,7 +242,7 @@ def _adaptation_indexes(cache, cards) -> dict:
     return out
 
 
-def _franchise_indexes(cache, cards) -> dict:
+def _franchise_indexes(cache, cards, branches=None) -> dict:
     """{(франшиза, ветка): индекс} по частям, какие лежат в кэше.
 
     Части франшиз общие для аниме и манги и спрашиваются один раз на все
@@ -250,6 +255,8 @@ def _franchise_indexes(cache, cards) -> dict:
             continue
         parts = cache.franchise(key)
         branch = ap.franchise_branch_key(card, parts)
+        if branches is not None:
+            branches[id(card)] = branch
         cache_key = (key, branch)
         if cache_key not in out:
             out[cache_key] = ap.branch_franchise_index(card, parts)

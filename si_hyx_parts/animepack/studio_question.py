@@ -165,9 +165,15 @@ def _catalog(generator) -> dict[str, list[dict]]:
     """{имя студии casefold: карточки}; собирается один раз."""
     with generator._studio_lock:
         if generator._studio_catalog is None:
+            from .catalog_superset import is_hentai
             out: dict[str, list[dict]] = {}
             for card in generator.db_cache.all_cards("anime"):
                 if not isinstance(card, dict):
+                    continue
+                # В полной базе есть и клипы/PV/реклама, и хентай — в пак
+                # идут только выбираемые виды и без хентая.
+                if (str(card.get("kind") or "") not in _api.ANIME_KINDS
+                        or is_hentai(card)):
                     continue
                 for name in _clean(card.get("studios")):
                     out.setdefault(name.casefold(), []).append(card)

@@ -393,6 +393,23 @@ class _UpgradePage(_api.QWidget):
         r += 1
         g.addWidget(self.chk_characters, r, 0, 1, 2)
         r += 1
+        self.chk_generator_answers = _api.QCheckBox("Ответ как в генераторе")
+        self.chk_generator_answers.setChecked(False)
+        self.chk_generator_answers.setToolTip(
+            "Трогать только те ответы, которые на 100 % совпали с названием "
+            f"тайтла на {self.source_name} (без опечаток), — в том числе "
+            "записанные как у генератора: «Название (год) OP1 — 『Песня』», "
+            "«Название (год) — 『Персонаж』» или два имени через «/».\n"
+            "Такому ответу, как в «Генерации аниме-пака», дописываются остальные "
+            "названия (последним — основное русское), в первый ответ — «(год)», "
+            "если года там нет, а ведущему устно — «Автор — 『…』 · Рейтинг "
+            "MAL — 『…』». Если в устном ответе уже есть «Исполнитель» или "
+            "«Исполнитель оригинала», автор не дублируется — в ту же реплику "
+            "дописывается только рейтинг MAL.\n"
+            "В вопросах с двумя и более ответами дописываются только автор и "
+            "рейтинг MAL; варианты названий и год не трогаются.")
+        g.addWidget(self.chk_generator_answers, r, 0, 1, 2)
+        r += 1
         g.addWidget(self._hint(
             "Дописываются все названия сразу: ромадзи, английское, "
             "лицензионное, синонимы и русское."),
@@ -968,6 +985,7 @@ class _UpgradePage(_api.QWidget):
         s.add_poster = self.chk_poster.isChecked()
         s.check_characters = self.chk_characters.isChecked()
         s.book_themes = self.chk_book_themes.isChecked()
+        s.generator_answers = self.chk_generator_answers.isChecked()
         s.max_variants = self.sp_max_variants.value()
         s.min_query_len = self.sp_min_len.value()
         s.strip_repeated_text = self.grp_repeats.isChecked()
@@ -1019,6 +1037,7 @@ class _UpgradePage(_api.QWidget):
         self.chk_poster.setChecked(s.add_poster)
         self.chk_characters.setChecked(s.check_characters)
         self.chk_book_themes.setChecked(s.book_themes)
+        self.chk_generator_answers.setChecked(s.generator_answers)
         self.sp_max_variants.setValue(max(1, min(50, int(s.max_variants))))
         self.sp_min_len.setValue(max(1, min(20, int(s.min_query_len))))
         self.grp_repeats.setChecked(s.strip_repeated_text)
@@ -1116,7 +1135,11 @@ class _UpgradePage(_api.QWidget):
             what.append("убираю спецвопросы")
         if settings.add_titles:
             what.append(f"дописываю варианты названий "
-                        f"({settings.source_name})")
+                        f"({settings.source_name})"
+                        + (" — как в генераторе: точный ответ (в том числе "
+                           "с годом, тегом и хвостом «— 『…』»), год, автор "
+                           "и оценка MAL"
+                           if settings.generator_answers else ""))
         if settings.strip_repeated_text:
             what.append("убираю повторяющийся текст тем")
         if settings.merge_text_audio:
@@ -1212,6 +1235,7 @@ class _UpgradePage(_api.QWidget):
         self.left_stack.setCurrentIndex(1)
         labels = {"special": "Спецвопрос", "title": "Названия",
                   "case": "Написание", "poster": "Постер",
+                  "year": "Год", "info": "Автор и MAL",
                   "image": "Картинка", "character": "Персонаж",
                   "repeat": "Повтор", "merge": "Вместе", "empty": "Пустой",
                   "audio": "Аудио", "video": "Видео", "unused": "Мусор"}

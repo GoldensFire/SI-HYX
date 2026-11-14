@@ -10,6 +10,16 @@ import animepack as ap
 SPREAD_WEIGHTS = {-2: 2, -1: 3, 0: 3, 1: 3, 2: 2}
 
 
+def live_quotas(generator):
+    """Квоты текущего отбора, а без него — из настроек.
+
+    Не через getattr с запасным значением: оно вычислялось бы на каждом
+    вызове, а question_quotas — пересчёт всех долей пака, и в оценке групп
+    каталога книг это шло десятки тысяч раз за пачку."""
+    quotas = getattr(generator, "_selection_quotas", None)
+    return generator.s.question_quotas if quotas is None else quotas
+
+
 def drift_limit(count) -> float:
     """Насколько текущая средняя может уйти от цели после count вопросов.
 
@@ -56,7 +66,7 @@ def fits(generator, candidate, levels, kind=None, flying=(), selected=None):
     queued = [c for c in flying if c is not candidate
               and ap.own_bucket(generator.s, c.kind) == bucket]
     seen.extend(int(c.level) for c in queued)
-    quotas = getattr(generator, "_selection_quotas", generator.s.question_quotas)
+    quotas = live_quotas(generator)
     relevant = {k: int(n) for k, n in quotas.items() if n and ap.own_bucket(generator.s, k) == bucket}
     slots = sum(relevant.values())
     if not slots:
@@ -152,12 +162,12 @@ def desired_level(generator, kind, questions=None):
     if kind == ap.CHAR_KIND and getattr(generator.s, 'char_level_avg', 0):
         seen = [c.char_level for c in questions if c.kind == ap.CHAR_KIND]
         target = generator.s.char_level_avg
-        quotas = getattr(generator, '_selection_quotas', generator.s.question_quotas)
+        quotas = live_quotas(generator)
         slots = quotas.get(kind, 0)
     elif target:
         seen = [question_level(c) for c in level_snapshot(generator, questions)
                 if ap.own_bucket(generator.s, c.kind) == bucket]
-        quotas = getattr(generator, '_selection_quotas', generator.s.question_quotas)
+        quotas = live_quotas(generator)
         slots = sum(n for k, n in quotas.items() if ap.own_bucket(generator.s, k) == bucket)
     else:
         return None
@@ -224,7 +234,7 @@ def character_fits(generator, candidate, kind=None, questions=None):
         values = ([c.char_level for c in questions if c.kind == ap.CHAR_KIND and c is not candidate]
                   if questions is not None else list(generator._char_levels))
         generator._char_target_eff = target
-        quotas = getattr(generator, '_selection_quotas', generator.s.question_quotas)
+        quotas = live_quotas(generator)
         slots = quotas.get(ap.CHAR_KIND, 0)
         remaining = slots - len(values) - 1
         if remaining < 0:

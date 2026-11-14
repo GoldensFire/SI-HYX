@@ -6,8 +6,9 @@ from types import SimpleNamespace
 import animepack as ap
 
 from .average_selection import (aim_level, desired_level, selection_questions, fits,
-                                level_snapshot)
+                                level_snapshot, live_quotas)
 from .catalog_profiles import profiles
+from .level_avg import frozen_targets
 from .level_inventory import attainable
 
 # Кандидат с заготовленным уровнем: профиль строится, когда он дошёл до
@@ -49,7 +50,7 @@ class CatalogPlan:
     def __init__(self, generator, pairs, manga=False):
         self.generator = generator
         self.manga = manga
-        quotas = getattr(generator, '_selection_quotas', generator.s.question_quotas)
+        quotas = live_quotas(generator)
         self.kinds = [k for k, n in quotas.items() if n and (k == ap.MANGA_KIND) == manga]
         self.active = any(ap.level_avg_target(generator.s, ap.own_bucket(generator.s, k))
                           or k == ap.CHAR_KIND and generator.s.char_level_avg for k in self.kinds)
@@ -58,6 +59,11 @@ class CatalogPlan:
         self.reachability = {}
         # Книжные доли (MangaMix) в текущей пачке: книги, ещё не дошедшие до отбора.
         self.taken = Counter()
+        # Сколько id план уже выдал и с какого счёта в нём кончилось издание
+        # книг (ключи MangaMix: "" — японская манга): по ним MangaMix.drop_dry
+        # отдаёт места пустого издания, а не перебирает каталог дальше.
+        self.served = 0
+        self.dry: dict[str, int] = {}
         self.original = deque(pairs)
         if not self.active:
             return
@@ -144,7 +150,7 @@ class CatalogPlan:
         вышел с той же средней 3,1, что даёт выбор ближайших к ней сразу."""
         from .average_selection import yields
         gen = self.generator
-        quotas = getattr(gen, '_selection_quotas', gen.s.question_quotas)
+        quotas = live_quotas(gen)
         buckets = {ap.own_bucket(gen.s, k) for k in self.kinds}
         unreachable = getattr(gen, '_unreachable_buckets', set())
         for bucket in buckets:
@@ -293,40 +299,74 @@ class CatalogPlan:
         gen = self.generator
         while self.groups and not gen.stopped():
             self._karaoke_first()
-            # Уровни набранных считаются один раз на пачку, а не в каждом
-            # _score: групп сотни, и иначе пачка из 20 книг шла минутами.
-            questions = list(level_snapshot(gen, selection_questions(gen)))
-            used = Counter(c.kind for c in questions)
-            quotas = getattr(gen, '_selection_quotas', gen.s.question_quotas)
-            spare = all(used[k] >= quotas.get(k, 0) for k in self.kinds)
-            self.reachability.clear()
-            self.taken.clear()
-            batch = []
-            for _ in range(size):
-                if not self.groups:
-                    break
-                if not spare and batch and all(used[k] >= quotas.get(k, 0) for k in self.kinds):
-                    break
-                aims = self._aims(questions, spare)
-                key = min(self.groups, key=lambda k: self._score(
-                    self.groups[k], questions, used, quotas, spare, aims))
-                group = self.groups[key]
-                kind = self._score(group, questions, used, quotas, spare, aims)[4]
-                _position, pair, candidate = group.popleft()
-                if not group:
-                    del self.groups[key]
-                batch.append(pair[0])
-                if candidate is None:
-                    continue
-                # Запас считается по уровню раскладки: у заготовки он может
-                # на шаг разойтись с живым уровнем кандидата.
-                self.stock[key[0]] -= 1
-                if kind is not None and used[kind] < quotas.get(kind, 0):
-                    questions.append(SimpleNamespace(kind=kind, level=candidate.level,
-                                                     char_level=candidate.level))
-                    used[kind] += 1
-                    mix = getattr(gen, '_manga_mix', None)
-                    if kind == ap.MANGA_KIND and mix is not None:
-                        mix.count(candidate, self.taken)
+            # Корзины и средние родов — один раз на пачку: _score спрашивает
+            # их по каждой группе и каждому набранному вопросу, и без снимка
+            # хвост в 2400 книг шёл 7–16 минут чистого процессора.
+            with frozen_targets(gen.s):
+                batch = self._next_batch(size)
             if batch:
                 yield batch
+
+    def _next_batch(self, size):
+        """Следующая пачка id по живому составу пака (см. batches)."""
+        gen = self.generator
+        # Уровни набранных считаются один раз на пачку, а не в каждом
+        # _score: групп сотни, и иначе пачка из 20 книг шла минутами.
+        questions = list(level_snapshot(gen, selection_questions(gen)))
+        used = Counter(c.kind for c in questions)
+        quotas = live_quotas(gen)
+        spare = all(used[k] >= quotas.get(k, 0) for k in self.kinds)
+        self.reachability.clear()
+        self.taken.clear()
+        batch = []
+        for _ in range(size):
+            if not self.groups:
+                break
+            if not spare and batch and all(used[k] >= quotas.get(k, 0) for k in self.kinds):
+                break
+            aims = self._aims(questions, spare)
+            key = min(self.groups, key=lambda k: self._score(
+                self.groups[k], questions, used, quotas, spare, aims))
+            group = self.groups[key]
+            kind = self._score(group, questions, used, quotas, spare, aims)[4]
+            _position, pair, candidate = group.popleft()
+            if not group:
+                del self.groups[key]
+            batch.append(pair[0])
+            if candidate is None:
+                continue
+            # Запас считается по уровню раскладки: у заготовки он может
+            # на шаг разойтись с живым уровнем кандидата.
+            self.stock[key[0]] -= 1
+            if kind is not None and used[kind] < quotas.get(kind, 0):
+                questions.append(SimpleNamespace(kind=kind, level=candidate.level,
+                                                 char_level=candidate.level))
+                used[kind] += 1
+                mix = getattr(gen, '_manga_mix', None)
+                if kind == ap.MANGA_KIND and mix is not None:
+                    mix.count(candidate, self.taken)
+        self.served += len(batch)
+        if self.manga:
+            self._mark_dry()
+        return batch
+
+    def _mark_dry(self):
+        """Отмечает издания книг, которых в плане под их рамку не осталось.
+
+        Группа с неполным профилем (уровень ещё не известен) считается
+        запасом: её книга вполне может попасть в рамку."""
+        from .manga_editions import active, card_range, edition
+        left = set()
+        for (level, kind, _adapted, incomplete), group in list(self.groups.items()):
+            if not group:
+                continue
+            card = {"kind": kind}
+            low, high = card_range(self.generator.s, card)
+            if level is None or incomplete or low <= level <= high:
+                left.add(edition(card))
+        for key in active(self.generator.s):
+            mark = "" if key == "manga" else key
+            if key in left:
+                self.dry.pop(mark, None)
+            else:
+                self.dry.setdefault(mark, self.served)

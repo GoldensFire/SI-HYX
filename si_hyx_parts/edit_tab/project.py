@@ -61,6 +61,7 @@ class EditTabProjectMixin:
         self._proj_transition = False  # пауза между кусками — не остановка просмотра
         self._proj_pending = None      # что сделать, когда догрузится другой файл
         self._proj_cur_id = ""         # клип, который сейчас показывает плеер
+        self._proj_end_shown = False   # просмотр доиграл: метка на конце проекта
         self._proj_internal_load = False   # файл открывает сам проект (кусок)
         self._proj_collapsed = False
         # Кадры полосы превью: ключ → QPixmap (None — заказан, False — не вышел)
@@ -1004,6 +1005,7 @@ class EditTabProjectMixin:
         """Клик или протяжка по таймлайну (и любой переход по проекту): плеер
         показывает кадр проекта в точке t."""
         t = max(0.0, float(t))
+        self._proj_end_shown = False
         self._proj_active = not self.project.is_empty()
         if self._fx_mode:
             self._fx_seek(t)
@@ -1090,6 +1092,13 @@ class EditTabProjectMixin:
             self._proj_cur_id = c.id
         t = c.start + (min(max(src_s, c.in_s), c.out_s) - c.in_s) / max(
             _mp.MIN_SPEED, c.speed)
+        if self._proj_end_shown:
+            # Доиграли до конца, и на экране всё ещё последний кадр (его точный
+            # кадр мог доехать из предекодера позже) — метка остаётся на конце.
+            if t >= self._proj_last_frame_t() - 1e-3:
+                t = self.project.duration()
+            else:
+                self._proj_end_shown = False
         tl.set_playhead(t)
         self._paint_project_time(t)
         return True
@@ -1140,6 +1149,16 @@ class EditTabProjectMixin:
             return False
         if self._fx_mode:
             self._fx_step(step)
+            return True
+        if self._proj_end_shown:
+            # Метка на конце проекта, на экране последний кадр: шаг влево —
+            # это сам последний кадр (метка встаёт на его начало), вправо —
+            # дальше конца некуда.
+            if step < 0:
+                self._proj_end_shown = False
+                t = self._proj_last_frame_t()
+                self.project_timeline.set_playhead(t)
+                self._paint_project_time(t)
             return True
         c = self.project.clip(self._proj_cur_id)
         if c is not None and abs(c.speed - 1.0) > 1e-6:
@@ -1234,6 +1253,20 @@ class EditTabProjectMixin:
         if self._proj_play is not None or self._fx_playing:
             self.project_stop()
         self._project_seek(self._proj_last_frame_t())
+
+    def _proj_show_end(self):
+        """Просмотр доиграл до конца: плейхед и время — на КОНЦЕ проекта (за
+        последним кадром), чтобы было видно, что проект доигран целиком.
+
+        Только показ: плеер и холст стоят на последнем кадре (_project_seek
+        выше), шаги считают от него. На самой длине проекта кадра нет — тот,
+        что начинается на out клипа, вырезан, — поэтому метка «конец» живёт
+        флагом _proj_end_shown, пока на экране последний кадр: его снимает
+        любая перемотка, шаг или новый просмотр."""
+        end = self.project.duration()
+        self._proj_end_shown = True
+        self.project_timeline.set_playhead(end)
+        self._paint_project_time(end)
 
     def _proj_last_frame_t(self):
         """Время последнего кадра проекта. Конец таймлайна для плейхеда —
@@ -1395,6 +1428,7 @@ class EditTabProjectMixin:
         t = self.project_timeline.playhead
         if t >= min(plan[-1]['t1'] - 0.05, self._proj_last_frame_t() - 1e-3):
             t = 0.0                     # с последнего кадра — заново с начала
+        self._proj_end_shown = False
         idx = next((i for i, s in enumerate(plan) if s['t0'] <= t < s['t1']), 0)
         self._proj_active = True
         self._proj_play = plan
@@ -1461,6 +1495,7 @@ class EditTabProjectMixin:
             # длине проекта плейхед стоял за последним кадром, а на экране был
             # кадр, начинающийся ровно на out клипа, то есть уже вырезанный.
             self._project_seek(self._proj_last_frame_t())
+            self._proj_show_end()
             return
         if self._deck_play_segment(idx, offset, cont):
             return                      # кусок играет дека (project_decks)
@@ -1652,7 +1687,9 @@ class EditTabProjectMixin:
         if p.is_empty():
             return
         th = getattr(self, "ffmpeg_thread", None)
-        if th is not None and th.isRunning():
+        # «В очередь» (_enqueue_export) собирает проект, пока идёт экспорт.
+        queueing = bool(getattr(self, "_export_enqueue", False))
+        if th is not None and th.isRunning() and not queueing:
             _api.msgbox_information(self, "Проект", "Дождитесь окончания текущей обрезки.")
             return
         srcs = {c.src for c in p.clips} | {c.audio_path for c in p.clips if c.audio_path}
@@ -1680,7 +1717,7 @@ class EditTabProjectMixin:
         ext = ".mp4" if video else ".m4a"
         folder = (self.export_dir if self.export_dir and _api.os.path.isdir(self.export_dir)
                   else _api.os.path.dirname(first.src))
-        default = _api._unique_output(_api.os.path.join(folder, f"{stem}_проект{ext}"))
+        default = self._unique_export_output(_api.os.path.join(folder, f"{stem}_проект{ext}"))
         flt = "Видео MP4 (*.mp4)" if video else "Звук M4A (*.m4a)"
         path, _f = _api.QFileDialog.getSaveFileName(self, "Сохранить видео проекта", default, flt)
         if not path:
@@ -1712,17 +1749,8 @@ class EditTabProjectMixin:
                 cmd[i:i + 2] = ["-/filter_complex", graph_file]
             except Exception:
                 graph_file = None
-        self.project_stop()
-        self._report_progress(0, "Сборка проекта…")
-        self._set_cut_btn_cancel(True)
-        self._start_cut_phase("Сборка проекта…")
-        if getattr(self, "_cut_ticker", None) is None:
-            self._cut_ticker = _api.QTimer(self)
-            self._cut_ticker.setInterval(500)
-            self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
-        self._cut_ticker.start()
-        self.ffmpeg_thread = _api.FfmpegWorker(cmd, duration=dur)
-        self.ffmpeg_thread.progress.connect(self._on_cut_progress)
+        worker = _api.FfmpegWorker(cmd, duration=dur)
+        worker.progress.connect(self._on_cut_progress)
 
         def _done(success, message, _temp=temp_out, _final=path, _graph=graph_file):
             try:
@@ -1754,5 +1782,11 @@ class EditTabProjectMixin:
             self._proj_status(f"видео проекта сохранено: {saved}")
             self.on_ffmpeg_finished(True, message)
 
-        self.ffmpeg_thread.finished.connect(_done)
-        self.ffmpeg_thread.start()
+        worker.finished.connect(_done)
+        # Просмотр проекта останавливается в момент запуска сборки: из очереди
+        # это может случиться намного позже нажатия.
+        self._launch_cut_worker(
+            worker, status="Сборка проекта…", phase="Сборка проекта…",
+            final=path, cleanup=(temp_out, graph_file),
+            label=f"проект → {_api.os.path.basename(path)}",
+            before_start=self.project_stop)

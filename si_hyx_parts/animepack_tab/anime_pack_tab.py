@@ -83,12 +83,23 @@ class AnimePackTab(
         if not _api._HAS_CORE:
             self._build_unavailable()
             return
-        self._build_ui()
-        if self._initial:
-            try:
-                self.apply_settings(self._initial)
-            except Exception:
-                pass
+        # Пока вкладка строится и применяет сохранённые настройки, каждая
+        # галочка звала пересчёт колонок настроек (_fit_settings_width,
+        # _refresh_song_geometry) — около сотни полных проходов по дереву
+        # виджетов, секунда-две на открытии вкладки. Раскладка до показа всё
+        # равно не окончательная: считаем один раз в конце (и снова в showEvent).
+        self._geometry_batch = True
+        try:
+            self._build_ui()
+            if self._initial:
+                try:
+                    self.apply_settings(self._initial)
+                except Exception:
+                    pass
+        finally:
+            self._geometry_batch = False
+        self._fit_settings_width()
+        self._refresh_song_geometry()
         self._recount()
         self._update_table_hint()
         # Жанры нужны только при открытии окна выбора — тянем их с задержкой,

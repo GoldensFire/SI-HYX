@@ -15,6 +15,8 @@ class UpgradeResult:
     titles: list = _api.field(default_factory=list)       # список Change (title)
     recased: list = _api.field(default_factory=list)      # список Change (case)
     posters: list = _api.field(default_factory=list)      # список Change (poster)
+    years: list = _api.field(default_factory=list)        # список Change (year)
+    infos: list = _api.field(default_factory=list)        # список Change (info)
     images: list = _api.field(default_factory=list)       # список Change (image)
     repeats: list = _api.field(default_factory=list)      # список Change (repeat)
     merged: list = _api.field(default_factory=list)       # список Change (merge)
@@ -44,7 +46,7 @@ class UpgradeResult:
     def parts(self) -> list:
         """Списки правок по функциям — в том порядке, в каком идут в отчёте."""
         return [self.specials, self.titles, self.recased, self.posters,
-                self.images, self.repeats, self.merged, self.empties,
+                self.years, self.infos, self.images, self.repeats, self.merged, self.empties,
                 self.audios, self.videos, self.unused]
 
     @property

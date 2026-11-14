@@ -8,6 +8,8 @@ import animepack_tab as _api
 
 # Расстояние между колонками вкладки — то же, что задано body в _build_ui.
 BODY_SPACING = 12
+# Зазор между колонкой «Пак» и её вертикальной полосой прокрутки.
+PACK_SCROLLBAR_GAP = 6
 
 def _fit_columns(self, scroll, outer: int):
     """Сколько колонок настроек помещается в отведённую панели ширину.
@@ -345,7 +347,10 @@ class AnimePackTabLayoutMixin:
         want = max(self.PACK_MIN_W,
                    min(self.PACK_MAX_W, int(pack.sizeHint().width())))
         scroll = getattr(self, "scroll_pack", None)
-        reserved = scroll.verticalScrollBar().sizeHint().width() if scroll else 0
+        # Полоса прокрутки плюс зазор: иначе она вплотную липнет к рамкам
+        # «Шаблона» и «Пака» (просьба пользователя).
+        reserved = (scroll.verticalScrollBar().sizeHint().width()
+                    + PACK_SCROLLBAR_GAP) if scroll else 0
         content_width = max(1, want - reserved)
         if pack.maximumWidth() != content_width:
             pack.setFixedWidth(content_width)
@@ -364,6 +369,8 @@ class AnimePackTabLayoutMixin:
 
     def _fit_settings_width(self):
         """Keep a stable settings column; only resizing the window can shrink it."""
+        if getattr(self, "_geometry_batch", False):
+            return   # вкладка ещё строится — посчитаем один раз в конце (__init__)
         scroll = getattr(self, "scroll_settings", None)
         panel = scroll.widget() if scroll is not None else None
         if panel is None:

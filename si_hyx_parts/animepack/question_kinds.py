@@ -121,5 +121,10 @@ SONG_CATEGORIES = ("standard", "instrumental", "chanting", "character")
 CATEGORY_LABELS = {"standard": "Обычные", "instrumental": "Инструментал",
                    "chanting": "Речитатив", "character": "От персонажа"}
 ANIME_KINDS = ("tv", "movie", "ova", "ona", "special")
+# База Shikimori хранит ВСЕ виды тайтлов, не только те, что можно выбрать для
+# пака: ShikimoriHYX, апгрейд и поиск по базе находят и ТВ-спешлы, клипы, PV и
+# рекламу. Генерация берёт из базы только отмеченные ANIME_KINDS
+# (catalog_superset.card_fits отсеивает остальные по полю kind).
+ANIME_DB_KINDS = ANIME_KINDS + ("tv_special", "music", "pv", "cm")
 KIND_LABELS = {"tv": "ТВ", "movie": "Фильм", "ova": "OVA", "ona": "ONA",
                "special": "Спешл"}

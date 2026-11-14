@@ -29,6 +29,26 @@ class RuEpisodeClient(KuhiClient):
         self.resources = {}
         self._pending = {}
         self._pending_lock = threading.Lock()
+        # Области запроса (тайтлы), где ответ RU-каталогов был неполным: сбой
+        # сети, таймаут, источник на паузе. Только без таких сбоев «дорожки
+        # с RU-субтитрами нет» можно запомнить (episode_suitability.ru_missing).
+        self._unsure: set[int] = set()
+
+    def _doubt(self, scope):
+        with self._pending_lock:
+            self._unsure.add(id(scope))
+
+    def scope_unsure(self, scope) -> bool:
+        """Был ли у этого тайтла неполный ответ каталогов или плееров."""
+        with self._pending_lock:
+            return id(scope) in self._unsure
+
+    def _sure_call(self, coro, scope, timeout):
+        """call(); пустой ответ по таймауту или «Стоп» помечает тайтл неполным."""
+        result = self.call(coro, scope, timeout)
+        if result is None:
+            self._doubt(scope)
+        return result
 
     def catalogue(self, candidate, ctx, scope):
         """Каталог серий; AnimeLIB отдаётся сразу, остальные дособираются в фоне.
@@ -53,7 +73,7 @@ class RuEpisodeClient(KuhiClient):
             if lead.done() and not lead.cancelled() and lead.exception() is None and lead.result():
                 return self._take(scope, [tasks[0][0]])
             return await self._rest(scope)
-        return self.call(collect(), scope, 70) or {}
+        return self._sure_call(collect(), scope, 70) or {}
 
     def more_catalogue(self, scope):
         """Каталоги, ещё не отданные catalogue(); {} — резерва нет."""
@@ -61,7 +81,7 @@ class RuEpisodeClient(KuhiClient):
             state = self._pending.get(id(scope))
             if not state or len(state[1]) == len(state[0]):
                 return {}
-        return self.call(self._rest(scope), scope, 70) or {}
+        return self._sure_call(self._rest(scope), scope, 70) or {}
 
     async def _rest(self, scope):
         with self._pending_lock:
@@ -81,11 +101,13 @@ class RuEpisodeClient(KuhiClient):
                 continue
             if not task.done():
                 task.cancel()
+                self._doubt(scope)
                 self.log(f"{name}: {identity}, каталог недоступен: источник превысил бюджет этапа (TimeoutError).")
                 continue
             error = None if task.cancelled() else task.exception()
             if task.cancelled() or error is not None:
                 error = error or asyncio.CancelledError()
+                self._doubt(scope)
                 self.log(f"{name}: {identity}, каталог недоступен: {error_detail(error)} ({type(error).__name__}).")
                 continue
             result = task.result()
@@ -109,6 +131,7 @@ class RuEpisodeClient(KuhiClient):
             releases, seen = [], set()
             for row, result in zip(rows, results):
                 if isinstance(result, BaseException):
+                    self._doubt(scope)
                     self.log(f"{row['source']}: список плееров недоступен: {error_detail(result)}.")
                     continue
                 for row in result:
@@ -117,16 +140,23 @@ class RuEpisodeClient(KuhiClient):
                         seen.add(key)
                         releases.append(row)
             return releases
-        return self.call(collect(), scope, 30) or []
+        return self._sure_call(collect(), scope, 30) or []
 
     def streams(self, rows, scope):
-        rows = [row for row in rows if not HEALTH.paused(f"{row['source']}/{row['player']}", "media")]
+        alive = [row for row in rows if not HEALTH.paused(f"{row['source']}/{row['player']}", "media")]
+        if len(alive) < len(rows):
+            self._doubt(scope)   # плеер на паузе — его ответ неизвестен
+        rows = alive
         resources = self.resources.setdefault(id(scope), [])
         async def collect():
             results = await collect_partial((resolve(row, scope, resources) for row in rows), scope, 55)
             streams = []
             for row, result in zip(rows, results):
                 if isinstance(result, BaseException):
+                    # Точный LookupError — ответ плеера «нужной дорожки нет»;
+                    # всё остальное — сбой, по которому судить нельзя.
+                    if type(result) is not LookupError:
+                        self._doubt(scope)
                     row["_resolve_error"] = result
                     HEALTH.result(f"{row['source']}/{row['player']}", "media", error=result)
                     self.log(f"{row['source']}/{row['player']}: поток недоступен: "
@@ -137,7 +167,7 @@ class RuEpisodeClient(KuhiClient):
                     stream.setdefault("outro", row.get("outro"))
                     streams.append(stream)
             return streams
-        return self.call(collect(), scope, 55) or []
+        return self._sure_call(collect(), scope, 55) or []
 
     def variants(self, streams, scope):
         async def collect():
@@ -166,6 +196,7 @@ class RuEpisodeClient(KuhiClient):
     def finish_scope(self, scope):
         with self._pending_lock:
             tasks = self._pending.pop(id(scope), ([], set(), ""))[0]
+            self._unsure.discard(id(scope))
         for _name, task in tasks:
             event_loop().call_soon_threadsafe(task.cancel)
         self.release_resources(scope)

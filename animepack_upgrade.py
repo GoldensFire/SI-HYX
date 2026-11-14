@@ -495,6 +495,14 @@ from si_hyx_parts.animepack_upgrade.media_jobs import (
     _PosterJob,
     _drop,
 )
+from si_hyx_parts.animepack_upgrade.generator_answer import (
+    whole_exact,
+    card_year,
+    add_year,
+    info_lines,
+    add_info_replic,
+    fetch_info,
+)
 from si_hyx_parts.animepack_upgrade.media_entries import (
     entry_basename,
     referenced_names,

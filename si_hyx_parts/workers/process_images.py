@@ -435,7 +435,8 @@ class ProcessImagesMixin:
             cmd = self._avif_encode_cmd(
                 path, tmp_out, crf_val,
                 vf_override if vf_override is not None else vf,
-                has_alpha, pix_fmt_avif, aspd)
+                has_alpha, pix_fmt_avif, aspd,
+                size=(orig_w, orig_h) if (orig_w and orig_h) else None)
             orig_size = _api.os.path.getsize(path) if _api.os.path.exists(path) else 1
             est_seconds = max(1, int(orig_size / 400_000))
 
