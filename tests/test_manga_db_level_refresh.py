@@ -38,7 +38,12 @@ def test_reread_discards_rows_published_by_an_obsolete_calculation(
             dialog._rows_for("manga", None)
         assert dialog._title_rows["manga"] is old_rows
         assert queued[0][0] == "counts"
-        dialog._work(dialog._age, queued[0])
+        # Снимок устарел: первый счёт покажет числа из снимка и поставит в
+        # очередь свежий пересчёт. Прогоняем всю цепочку, как рабочий поток.
+        while queued:
+            task = queued.pop(0)
+            result = dialog._work(dialog._age, task)
+            dialog._job_done(dialog._age, task, result)
         fresh = dialog._rows_for("manga", None)[0]
         assert fresh["level"] < old_level
         candidate = fresh["candidate"]

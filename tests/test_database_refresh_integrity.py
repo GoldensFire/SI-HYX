@@ -40,7 +40,9 @@ def test_refresh_is_unfiltered_and_resumes_a_saved_partial_catalog(tmp_path):
     generator.refresh_db(("anime",))
     assert calls[0][1]["season"] == ""
     assert calls[0][1]["score"] == 0 and calls[0][1]["genres_exclude"] == ()
-    assert set(calls[0][1]["kinds"]) == set(api.ANIME_KINDS)
+    # Полная база не перечисляет виды: пустой фильтр отдаёт и tv_special,
+    # music, pv, cm, которых нет среди выбираемых в паке ANIME_KINDS.
+    assert calls[0][1]["kinds"] == ()
     assert settings.year_from == 2025 and settings.genres_exclude == [12]
     halt[0] = False
     cache.reload()
