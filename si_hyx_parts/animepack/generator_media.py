@@ -182,6 +182,7 @@ class GeneratorMediaMixin:
             proc = _api.subprocess.Popen(cmd, stdout=_api.subprocess.PIPE,
                                     stderr=_api.subprocess.PIPE, **kw)
         except Exception as e:  # noqa: BLE001
+            self._note_unusable_tool(cmd, e)
             return 1, "", str(e)
         track_process(self, proc)
         deadline = _api.time.monotonic() + max(1.0, float(timeout))
@@ -207,6 +208,42 @@ class GeneratorMediaMixin:
                     return 1, "", f"не уложился в {float(timeout):.0f} с"
         finally:
             untrack_process(self, proc)
+
+    # Windows: «файл содержит вирус», «заблокировано политикой», «вредоносное ПО».
+    _BLOCKED_WINERRORS = (225, 1260, 4551)
+
+    def _note_unusable_tool(self, cmd, error) -> None:
+        """ffmpeg/ffprobe не запустился — останавливаем весь прогон сразу.
+
+        Без них не собирается ни один медиавопрос: песни, ролики, отрывки,
+        караоке и проявления падают каждый своим «[WinError 2]», а генерация
+        20 минут перебирала тайтлы и кончалась нулём вопросов. Так бывает,
+        когда распакован не весь архив (нет bin) или антивирус убрал файлы."""
+        try:
+            exe = str(cmd[0])
+        except (TypeError, IndexError):
+            return
+        tools = {str(_api.FFMPEG): "ffmpeg", str(_api.FFPROBE): "ffprobe"}
+        name = tools.get(exe)
+        if name is None or getattr(self, "_unusable_tool", ""):
+            return
+        if isinstance(error, FileNotFoundError):
+            where = (f"файла нет: {exe}" if _api.os.path.isabs(exe)
+                     else "его нет ни в папке bin рядом с программой, ни в PATH")
+        elif (isinstance(error, PermissionError)
+              or getattr(error, "winerror", None) in self._BLOCKED_WINERRORS):
+            where = f"Windows не даёт его запустить ({error}): {exe}"
+        else:
+            return
+        self._unusable_tool = (
+            f"Не запускается {name} — {where}. Без ffmpeg и ffprobe пак не "
+            "собрать (песни, ролики, отрывки серий, караоке), поэтому "
+            "генерация остановлена. Обычно распакован не весь архив "
+            "SI-HYX-v…-full.zip (рядом с SI-HYX.exe нужна папка bin) или "
+            "антивирус удалил либо заблокировал файлы в bin. Установите полную "
+            "версию заново и добавьте папку программы в исключения антивируса.")
+        self.log(self._unusable_tool)
+        self.stop_processes()
 
     @staticmethod
     def _kill(proc) -> None:

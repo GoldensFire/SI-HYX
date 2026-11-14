@@ -593,7 +593,8 @@ class AnimePackGenerator(
     def stopped(self) -> bool:
         runtime = getattr(self, "_runtime", None)
         event = getattr(runtime.local, "candidate_stop", None) if runtime else None
-        return (bool(self._should_stop()) or bool(event and event.is_set())
+        return (bool(self._should_stop()) or bool(getattr(self, "_unusable_tool", ""))
+                or bool(event and event.is_set())
                 or bool(runtime and runtime.current_task_cancelled()))
 
     # ── сколько времени ушло на что ───────────────────────────────────────
@@ -888,6 +889,10 @@ class AnimePackGenerator(
             result.songs = songs
             result.actual = dict(_api.Counter(c.kind for c in songs))
             result.failed_media = self._failed_media
+            if getattr(self, "_unusable_tool", ""):
+                # Не «Отменено»: пользователь ничего не нажимал, и ему нужна
+                # причина в окне ошибки. Готовые вопросы сохранит after_error.
+                raise _api.AnimePackError(self._unusable_tool)
             if self.stopped():
                 result.cancelled = True
                 if songs:

@@ -10,10 +10,10 @@ REM все "pause" — иначе сборка, запущенная не из �
 REM CI), зависнет в ожидании нажатия клавиши.
 if not defined NONINTERACTIVE set "NONINTERACTIVE=0"
 
-REM GUI/CI: переводим консоль в UTF-8. Python-вывод и так UTF-8
-REM (build_gui.py задаёт PYTHONUTF8), а cmd echo с кириллицей иначе приходит
-REM в лог кракозябрами. Для интерактивной консоли кодовую страницу не трогаем.
-if "%NONINTERACTIVE%"=="1" chcp 65001 >nul 2>&1
+REM ВНИМАНИЕ: не вызывать chcp 65001 внутри .bat-файла — смена кодовой страницы
+REM на лету в cmd.exe сбивает указатель чтения файла на многобайтовых символах UTF-8
+REM и приводит к синтаксическим ошибкам и аварийному завершению сборки.
+REM Python-вывод уже UTF-8 (PYTHONUTF8=1/PYTHONIOENCODING=utf-8), а echo выводятся в ASCII.
 
 REM Уровень deflate для архивов релиза (см. tools\make_release_zip.py):
 REM   4 — почти размер Compress-Archive Optimal, но заметно быстрее;
@@ -52,10 +52,10 @@ if /I "%UPDATE_PYINSTALLER%"=="1" (
 ) else (
     python -c "import PyInstaller" >nul 2>&1
     if errorlevel 1 (
-        echo [INFO] PyInstaller is not installed — installing...
+        echo [INFO] PyInstaller is not installed -- installing...
         python -m pip install --upgrade pyinstaller
     ) else (
-        echo [INFO] PyInstaller is already installed — update skipped.
+        echo [INFO] PyInstaller is already installed -- update skipped.
     )
 )
 if errorlevel 1 ( echo [ERROR] pip install pyinstaller failed. & if not "%NONINTERACTIVE%"=="1" pause & exit /b 1 )
@@ -117,10 +117,10 @@ REM    Код находит модели рядом с .exe (см. _resolve_mod
 echo [STEP 6/9] Copying bin/models assets...
 xcopy /E /I /Y bin "dist\%RELEASE_NAME%\bin" >nul
 if not exist "models\lama_fp32.onnx" (
-    echo [WARN] models\lama_fp32.onnx not found — «Удаление объектов» в сборке не заработает.
+    echo [WARN] models\lama_fp32.onnx not found -- object removal will not work in build.
 )
 if not exist "models\model_uint8.onnx" (
-    echo [WARN] models\model_uint8.onnx not found — «Удаление фона» в сборке не заработает.
+    echo [WARN] models\model_uint8.onnx not found -- background removal will not work in build.
 )
 if exist "models" xcopy /E /I /Y models "dist\%RELEASE_NAME%\models" >nul
 
