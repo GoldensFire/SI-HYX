@@ -22,6 +22,11 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
         # конкретного файла, а не только не начинать ещё не стартовавшие.
         self._removed_ids: set = set()
         self.pool = _api.QThreadPool()
+        # Отдельный ограниченный пул для фонового анализа добавленных файлов
+        # (ffprobe + loudnorm_stats): без лимита добавление сотни файлов
+        # плодило столько же одновременных процессов ffmpeg/ffprobe.
+        self._probe_pool = _api.QThreadPool()
+        self._probe_pool.setMaxThreadCount(min(4, max(2, _api.cpu_thread_count() // 2)))
         self.export_dir = ""  # пусто = экспортировать рядом с исходником
         self.setAcceptDrops(True)
         # Колонка «Время» (7): сколько длится перекодирование каждого файла.
@@ -193,9 +198,12 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
         """Группа «Аудио эффекты» (нормализация, фейды, деградация) + строка скорости."""
         ga = _api.QGroupBox("Аудио эффекты"); fa = _api.QFormLayout()
         self.ck_norm = _api.QCheckBox("Loudnorm"); self.ck_norm.setChecked(True)
-        self.s_tgt = _api.QDoubleSpinBox(); self.s_tgt.setValue(-20.0); self.s_tgt.setRange(-60.0, 20.0); self.s_tgt.setSingleStep(0.1)
-        self.s_lra = _api.QDoubleSpinBox(); self.s_lra.setValue(11.0); self.s_lra.setRange(0.0, 50.0); self.s_lra.setSingleStep(0.1)
-        self.s_tp = _api.QDoubleSpinBox(); self.s_tp.setValue(-1.5); self.s_tp.setRange(-60.0, 10.0); self.s_tp.setSingleStep(0.1)
+        # Диапазоны строго по ограничениям фильтра loudnorm в ffmpeg:
+        # I: [-70, -5], LRA: [1, 50], TP: [-9, 0]. setRange идёт ДО setValue,
+        # чтобы дефолтный диапазон QDoubleSpinBox (0..99.99) не обрезал минус.
+        self.s_tgt = _api.QDoubleSpinBox(); self.s_tgt.setRange(-70.0, -5.0); self.s_tgt.setValue(-20.0); self.s_tgt.setSingleStep(0.1)
+        self.s_lra = _api.QDoubleSpinBox(); self.s_lra.setRange(1.0, 50.0); self.s_lra.setValue(11.0); self.s_lra.setSingleStep(0.1)
+        self.s_tp = _api.QDoubleSpinBox(); self.s_tp.setRange(-9.0, 0.0); self.s_tp.setValue(-1.5); self.s_tp.setSingleStep(0.1)
         self.ck_fade = _api.QCheckBox("Затухание (Fade Out)"); self.ck_fade.setChecked(False)
         self.s_fade = _api.QDoubleSpinBox(); self.s_fade.setValue(1.0); self.s_fade.setRange(0.0, 60.0); self.s_fade.setSingleStep(0.1)
         self.s_fade.setMaximumWidth(110)
@@ -304,7 +312,7 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
         speed_h.setContentsMargins(8, 2, 8, 2); speed_h.setSpacing(6)
         speed_h.addWidget(_api.QLabel("Скорость:"))
         speed_h.addWidget(self.s_spd)
-        speed_h.addWidget(_api.info_badge("Изменение скорости видео и звука. 100% = без изменений"))
+        speed_h.addWidget(_api.info_badge("Изменение скорости видео и звука. 100% = без изменений. Для видео работает только при включённом перекодировании видео."))
         speed_h.addStretch()
         rv_inner.addWidget(speed_w)
 
@@ -367,9 +375,17 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
         if p: self.add_paths(p)
 
     def add_paths(self, paths):
+        existing = {
+            _api.os.path.normcase(_api.os.path.abspath(it['path']))
+            for it in self.items if it.get('path')
+        }
         for p in paths:
             try:
                 if not _api.os.path.exists(p): continue
+
+                norm_p = _api.os.path.normcase(_api.os.path.abspath(p))
+                if norm_p in existing:
+                    continue
 
                 # Не добавляем файлы, которые сами являются результатом обработки
                 stem = _api.Path(p).stem
@@ -380,6 +396,7 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
                 if ext in _api.ALLOWED_MEDIA: ft = "MEDIA"
                 elif ext in _api.ALLOWED_IMG: ft = "IMG"
                 else: continue
+                existing.add(norm_p)
 
                 iid = _api.uuid.uuid4().hex
                 # Только быстрый getsize — ffprobe уйдёт в фоновый поток
@@ -423,26 +440,38 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
                 self._join_running_queue(iid, it)
 
                 if ft == "MEDIA":
-                    def _bg(path_local, iid_local):
-                        # ffprobe + loudness — всё в фоне, UI не блокируем.
-                        # Результат отдаём в GUI-поток через сигналы: QTimer.singleShot
-                        # из обычного threading.Thread (без Qt event loop) НЕ
-                        # срабатывает — из-за этого битрейт и длительность не
-                        # появлялись при добавлении файла.
+                    def _bg(path_local=p, iid_local=iid, data_local=item_data):
+                        # ffprobe + loudnorm_stats в ограниченном пуле _probe_pool:
+                        # UI не блокируется, процессы не плодятся лавиной, а полный
+                        # замер кэшируется в data_local['loud_stats'], чтобы
+                        # process_media не прогонял громкость второй раз.
+                        if iid_local in self._removed_ids:
+                            return
                         try:
                             dur_r, br_r, size_r, a_br_r, a_codec_r = _api.get_media_info(path_local)
                             v_r = _api.get_video_codec_label(path_local)
                             size_label_r = f"{v_r} {_api.human_size(size_r)}" if v_r else _api.human_size(size_r)
-                            self.media_info_sig.emit(
-                                iid_local, size_label_r,
-                                _api.fmt_bitrate_with_codec(a_codec_r, a_br_r or br_r),
-                                float(dur_r or 0.0))
+                            if iid_local not in self._removed_ids:
+                                self.media_info_sig.emit(
+                                    iid_local, size_label_r,
+                                    _api.fmt_bitrate_with_codec(a_codec_r, a_br_r or br_r),
+                                    float(dur_r or 0.0))
                         except Exception: pass
+                        if iid_local in self._removed_ids:
+                            return
+                        val = None
                         try:
-                            val = _api.measure_loudness(path_local)
-                        except Exception: val = None
-                        self.media_lufs_sig.emit(iid_local, val)
-                    _api.threading.Thread(target=_bg, args=(p, iid), daemon=True).start()
+                            stats = _api.loudnorm_stats(
+                                path_local,
+                                should_stop=lambda: iid_local in self._removed_ids)
+                            if stats:
+                                data_local['loud_stats'] = stats
+                                val = float(stats['input_i'])
+                        except Exception:
+                            val = None
+                        if iid_local not in self._removed_ids:
+                            self.media_lufs_sig.emit(iid_local, val)
+                    self._probe_pool.start(_bg)
 
             except Exception as e:
                 self.main.log(f"add_paths error: {e}")
@@ -619,6 +648,8 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
 
     def clear(self):
         try:
+            self._removed_ids.update(self._item_data_map.keys())
+            self._probe_pool.clear()
             self.items.clear()
             self._item_map.clear()
             self._item_data_map.clear()

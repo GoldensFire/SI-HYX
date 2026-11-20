@@ -30,6 +30,87 @@ def _build_atempo_chain(speed_factor: float) -> list:
 _build_atempo_chain.__module__ = _api.__name__
 _api._build_atempo_chain = _build_atempo_chain
 
+
+def _norm_path(p: str) -> str:
+    return _api.os.path.normcase(_api.os.path.abspath(p))
+
+
+def _same_path(a: str, b: str) -> bool:
+    return bool(a and b) and _norm_path(a) == _norm_path(b)
+
+
+def _reserve_out_path(worker, out_dir, name, suffix, ext, src_path=None, *,
+                      allow_overwrite_src=False, fallback_tag=None):
+    """Выбирает и резервирует уникальный путь выхода под блокировкой воркера.
+
+    Защищает от совпадения выхода с исходником (при пустом суффиксе), коллизий
+    имён в одной очереди (clip.mp4 + clip.mkv, a.png + a.jpg, файлы с одним
+    именем из разных папок в общую папку экспорта) и гонки потоков QThreadPool.
+    """
+    src_norm = _norm_path(src_path) if src_path else ""
+    other_sources = set()
+    for it in list(getattr(worker, 'queue', None) or ()):
+        p = it.get('path') if isinstance(it, dict) else None
+        if p:
+            np = _norm_path(p)
+            if np != src_norm:
+                other_sources.add(np)
+
+    lock = getattr(worker, '_out_lock', None)
+    reserved = getattr(worker, '_reserved_outs', None)
+
+    def _pick():
+        def _taken(cand, check_disk=False):
+            cn = _norm_path(cand)
+            if reserved is not None and cn in reserved:
+                return True
+            if cn in other_sources:
+                return True
+            if not allow_overwrite_src and src_norm and cn == src_norm:
+                return True
+            if check_disk and _api.os.path.exists(cand):
+                return True
+            return False
+
+        cand = _api.os.path.join(out_dir, f"{name}{suffix}{ext}")
+        if not _taken(cand, check_disk=False):
+            if reserved is not None:
+                reserved.add(_norm_path(cand))
+            return cand
+
+        eff_suffix = suffix
+        if not eff_suffix and fallback_tag:
+            eff_suffix = fallback_tag
+            cand = _api.os.path.join(out_dir, f"{name}{eff_suffix}{ext}")
+            if not _taken(cand, check_disk=False):
+                if reserved is not None:
+                    reserved.add(_norm_path(cand))
+                return cand
+
+        for n in range(2, 10000):
+            cand = _api.os.path.join(out_dir, f"{name} ({n}){eff_suffix}{ext}")
+            if not _taken(cand, check_disk=True):
+                if reserved is not None:
+                    reserved.add(_norm_path(cand))
+                return cand
+
+        cand = _api.os.path.join(
+            out_dir, f"{name}_{_api.uuid.uuid4().hex[:6]}{eff_suffix}{ext}")
+        if reserved is not None:
+            reserved.add(_norm_path(cand))
+        return cand
+
+    if lock is not None:
+        with lock:
+            return _pick()
+    return _pick()
+
+
+_same_path.__module__ = _api.__name__
+_reserve_out_path.__module__ = _api.__name__
+_api._same_path = _same_path
+_api._reserve_out_path = _reserve_out_path
+
 class _ImgRunnable(_api.QRunnable):
     """Обёртка для параллельной обработки одного изображения в QThreadPool.
     Потоки QThreadPool — настоящие потоки Qt: эмит сигналов из них безопасен,
@@ -85,6 +166,8 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
         self._max_threads = 1
         self._meta_lama = None  # LaMa для знака Meta AI (_meta_inpainter)
         self._meta_lama_lock = _api.threading.Lock()
+        self._out_lock = _api.threading.Lock()
+        self._reserved_outs = set()
         self._priority_flag = self._priority_creationflag(settings.get('priority', 'normal'))
 
     _AI_BRANDS = ('gemini', 'chatgpt')
@@ -242,6 +325,27 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
         speed_factor = float(speed_percent) / 100.0
         video_enabled = sv.get('enabled', True)
 
+        vcodec = _api.get_video_codec(path)
+        # «(Аудио) Перекодировать настройками «Обработки»» из Монтажа: видеоряд
+        # источника игнорируем целиком и гоним ТОЛЬКО звук теми же настройками
+        # (битрейт/loudnorm/fade/скорость), что и обычная «Обработка» — итог
+        # .opus. Технически это ровно тот же путь, что и для файла БЕЗ видео,
+        # поэтому просто гасим is_video: ниже он уже разводит аудио-онли ветку
+        # (Pass-1 в opus + перенос) от видеокодирования.
+        audio_only = bool(item.get('audio_only'))
+        is_video = (vcodec is not None) and not audio_only
+
+        # Без перекодирования видео идёт копией (-c:v copy), поэтому ускорять
+        # или замедлять видеоряд невозможно — применение atempo к одному лишь
+        # звуку приводит к рассинхрону картинки и аудио. Для аудио-файлов
+        # (is_video=False) смена скорости продолжает работать.
+        if is_video and not video_enabled and abs(speed_factor - 1.0) > 0.01:
+            self.log.emit(
+                f"Скорость {speed_percent}% пропущена для видео без перекодирования "
+                "(иначе звук разойдётся с картинкой).")
+            speed_percent = 100
+            speed_factor = 1.0
+
         # Обрезка + «Обработка» одним проходом (кнопка «Обрезать и обработать» в
         # Монтаже после неточной copy-обрезки): item['trim'] = (in_s, out_s) —
         # режем диапазон исходника ПРЯМО в этом же кодировании, без отдельного
@@ -265,16 +369,6 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
         # БЕЗ деления (atempo в audio_filters добавляется В КОНЦЕ списка, после
         # fade-фильтров, так что на момент afade PTS ещё исходные).
         t0_video = (t0 / speed_factor) if speed_factor else t0
-
-        vcodec = _api.get_video_codec(path)
-        # «(Аудио) Перекодировать настройками «Обработки»» из Монтажа: видеоряд
-        # источника игнорируем целиком и гоним ТОЛЬКО звук теми же настройками
-        # (битрейт/loudnorm/fade/скорость), что и обычная «Обработка» — итог
-        # .opus. Технически это ровно тот же путь, что и для файла БЕЗ видео,
-        # поэтому просто гасим is_video: ниже он уже разводит аудио-онли ветку
-        # (Pass-1 в opus + перенос) от видеокодирования.
-        audio_only = bool(item.get('audio_only'))
-        is_video = (vcodec is not None) and not audio_only
 
         # Эффект проявления из Монтажа, который считается по кадрам: видео
         # приходит в кодировщик по трубе уже с ним (process_reveal), звук —
@@ -312,9 +406,10 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
 
         suffix = self._out_suffix(is_video, video_enabled, sv.get('metric'), crf,
                                   speed_percent, remove_audio,
-                                  sa.get('norm'), sa.get('fade'))
-        out_name = out_name + suffix + out_ext
-        out = _api.os.path.join(out_dir, out_name)
+                                  sa.get('norm'), sa.get('fade'),
+                                  fade_in=sa.get('fade_in'), deg=sa.get('deg'))
+        out = _reserve_out_path(self, out_dir, out_name, suffix, out_ext, path,
+                                fallback_tag="_out")
 
         sel_br = self.settings.get('audio', {}).get('bitrate', '128')
         audio_bitrate = self.get_target_bitrate_str(path, sel_br)
@@ -324,12 +419,19 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
         if not remove_audio:
             # Замер ровно того, что пойдёт в кодирование: выбранная в Монтаже
             # дорожка и сам вырезаемый отрезок. Он же — «Было LUFS» и основа
-            # второго прохода loudnorm (см. _build_audio_filters).
+            # второго прохода loudnorm (см. _build_audio_filters). Если файл уже
+            # замерен при добавлении в очередь целиком (без trim и смены
+            # дорожки) — переиспользуем кэш, не гоняя ffmpeg второй раз.
+            cached_stats = (item.get('loud_stats')
+                            if (not trim and audio_index is None) else None)
             try:
-                loud_stats = (self.loudnorm_stats(path, start=trim[0],
-                                                  dur=max(0.0, trim[1] - trim[0]),
-                                                  stream=audio_index)
-                              if trim else self.loudnorm_stats(path, stream=audio_index))
+                if isinstance(cached_stats, dict) and 'input_i' in cached_stats:
+                    loud_stats = cached_stats
+                else:
+                    loud_stats = (self.loudnorm_stats(path, start=trim[0],
+                                                      dur=max(0.0, trim[1] - trim[0]),
+                                                      stream=audio_index)
+                                  if trim else self.loudnorm_stats(path, stream=audio_index))
                 if loud_stats:
                     before_lufs = float(loud_stats['input_i'])
             except Exception: pass
@@ -469,7 +571,7 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                 cmd_step1 += [temp_intermediate]
 
                 orig_size = _api.os.path.getsize(path) if _api.os.path.exists(path) else 1
-                self.run_ffmpeg_capture(cmd_step1, max(1, int(orig_size/1000000)), cb, label="Pass 1 (Audio)", cancel_check=lambda: item["iid"] in self.removed_ids)
+                self.run_ffmpeg_capture(cmd_step1, max(1, int(orig_size/1000000)), cb, label="Кодирование аудио", cancel_check=lambda: item["iid"] in self.removed_ids)
                 current_input = temp_intermediate
 
                 if not remove_audio:
@@ -613,7 +715,9 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                         # 8-бит yuva420p — единственный надёжно совместимый вариант для
                         # прозрачного WebM.
                         self.log.emit("Альфа-канал → выход: VP9 WebM (SVT-AV1 alpha не поддерживает)")
-                        attempted_out = _api.os.path.splitext(attempted_out)[0] + ".webm"
+                        attempted_out = _reserve_out_path(
+                            self, out_dir, out_name, suffix, ".webm", path,
+                            fallback_tag="_out")
                         out = attempted_out
                         cmd_step2 += ["-c:v", "libvpx-vp9",
                                       "-crf", str(crf), "-b:v", "0",
@@ -638,7 +742,7 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                                                        dur_override=(item.get('dur') if (trim or feed) else None),
                                                        src_fps=src_fps)
                     _calc = _api.RealETACalculator(_tf, pass_num=1, has_second_pass=False) if _tf > 0 else None
-                    self.run_ffmpeg_capture(cmd_step2, est, cb, label="Pass 2 (Video)", eta_calc=_calc, cancel_check=lambda: item["iid"] in self.removed_ids,
+                    self.run_ffmpeg_capture(cmd_step2, est, cb, label="Кодирование видео", eta_calc=_calc, cancel_check=lambda: item["iid"] in self.removed_ids,
                                             **feed_kw)
 
             else:
@@ -706,11 +810,9 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
             else:
                 raise Exception("Output file не найден после ffmpeg (возможная ошибка записи).")
 
-        except Exception as e:
-            errstr = str(e)
-            self.log.emit(f"Ошибка при обработке {_api.os.path.basename(path)}: {errstr}")
+        except Exception:
             try:
-                if _api.os.path.exists(attempted_out) and _api.os.path.abspath(attempted_out) != _api.os.path.abspath(path):
+                if _api.os.path.exists(attempted_out) and not _same_path(attempted_out, path):
                     try:
                         _api.os.remove(attempted_out)
                         self.log.emit(f"Удалён повреждённый/недозаписанный выход: {attempted_out}")
@@ -784,13 +886,14 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
             # иначе угадка ждала бы .mp4 там, где на диске .opus.
             is_vid2 = (vcodec2 is not None) and not bool(item.get('audio_only'))
             out_ext2 = ".mp4" if is_vid2 else ".opus"
-            sfx2 = ""
-            if is_vid2 and ve2: sfx2 += f"_crf{crf2}_speed{spd2}"
-            if sa2.get('norm'): sfx2 += "_norm"
-            if sa2.get('fade'): sfx2 += "_fade"
+            rem_a2 = (bool(sa2.get('remove')) or bool(item.get('remove_audio'))) and is_vid2
+            sfx2 = ProcessWorker._out_suffix(is_vid2, ve2, sv2.get('metric'), crf2, spd2,
+                                             rem_a2, sa2.get('norm'), sa2.get('fade'),
+                                             fade_in=sa2.get('fade_in'), deg=sa2.get('deg'))
             out_name2 = self._sanitize_name(_api.os.path.basename(base2))
             guessed = _api.os.path.join(out_dir2, out_name2 + sfx2 + out_ext2)
-            if _api.os.path.exists(guessed): item['out_path'] = guessed
+            if _api.os.path.exists(guessed) and not _same_path(guessed, path):
+                item['out_path'] = guessed
         except Exception: pass
 
     def _overwrite_source_if_needed(self, item, out_path):
@@ -805,7 +908,7 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
             return
         try:
             if (_api.os.path.exists(out_path) and _api.os.path.exists(src)
-                    and _api.os.path.abspath(out_path) != _api.os.path.abspath(src)):
+                    and not _same_path(out_path, src)):
                 _api.os.remove(src)
                 self.log.emit(f"Исходник удалён (перезапись): {_api.os.path.basename(src)}")
         except Exception as e:
@@ -820,6 +923,24 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
             done = self._done_count
         pending = sum(1 for it in list(self.queue) if not it.get('is_done', False))
         return max(1, done + pending)
+
+    @staticmethod
+    def _format_error(exc: Exception) -> str:
+        """Человекочитаемое описание ошибки для лога.
+
+        Для CalledProcessError Python в str(e) печатает только командную строку
+        на сотни символов без stderr — вытаскиваем реальную причину из stderr."""
+        if isinstance(exc, _api.subprocess.CalledProcessError):
+            stderr = getattr(exc, 'stderr', None) or ""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode("utf-8", errors="replace")
+            lines = [ln.strip() for ln in stderr.splitlines() if ln.strip()]
+            meaningful = [ln for ln in lines if not ln.startswith(("frame=", "size="))]
+            tail = (meaningful or lines)[-8:]
+            if tail:
+                return f"ffmpeg (код {exc.returncode}): " + " | ".join(tail)
+            return f"ffmpeg завершился с кодом {exc.returncode}"
+        return str(exc)
 
     def _process_item(self, item, smooth, start, weight=1):
         """Обрабатывает один элемент очереди.
@@ -852,12 +973,7 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                         last_label[0] = pass_label
                         self.status.emit(iid, pass_label, "proc")
                     return
-                if pass_label and "Pass 1" in pass_label:
-                    display_pct = int(pct * 0.5)
-                elif pass_label and "Pass 2" in pass_label:
-                    display_pct = int(50 + pct * 0.5)
-                else:
-                    display_pct = pct
+                display_pct = pct
                 self.progress.emit(iid, display_pct)
                 label_changed = bool(pass_label) and pass_label != last_label[0]
                 if label_changed and pct < 100:
@@ -909,12 +1025,11 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
             self.status.emit(iid, "Готово", "done")
             self.progress.emit(iid, 100)
         except Exception as e:
-            tb = str(e)
-            if "StoppedByUser" in tb:
+            if "StoppedByUser" in str(e):
                 self.log.emit(f"Остановка {_api.os.path.basename(path)} выполнена.")
                 self.status.emit(iid, "Остановлено", "err")
             else:
-                self.log.emit(f"Ошибка {_api.os.path.basename(path)}: {tb}")
+                self.log.emit(f"Ошибка {_api.os.path.basename(path)}: {self._format_error(e)}")
                 self.status.emit(iid, "Ошибка", "err")
             item['is_done'] = True
         finally:
@@ -932,6 +1047,8 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
         self._done_count = 0
         self._prog_lock = _api.threading.Lock()
         self._processed_ids = set()   # iid'ы, уже отправленные в работу за этот запуск
+        with self._out_lock:
+            self._reserved_outs.clear()
         self._logged_cpu_msg = False
 
         cpu = max(1, _api.cpu_thread_count())

@@ -56,8 +56,11 @@ class ProcessProjectMixin:
         out_name = self._sanitize_name(item.get('name') or "проект")
         suffix = self._out_suffix(is_video, video_enabled, sv.get('metric'), crf,
                                   speed_percent, remove_audio,
-                                  sa.get('norm'), sa.get('fade'))
-        out = _api.os.path.join(self._out_dir_for(item['path']), out_name + suffix + out_ext)
+                                  sa.get('norm'), sa.get('fade'),
+                                  fade_in=sa.get('fade_in'), deg=sa.get('deg'))
+        out = _api._reserve_out_path(
+            self, self._out_dir_for(item['path']), out_name, suffix, out_ext,
+            item.get('path'), fallback_tag="_out")
         out_dur = src.duration / speed_factor if speed_factor else src.duration
 
         chains = [src.graph]
@@ -124,8 +127,7 @@ class ProcessProjectMixin:
                                       _api.fmt_bitrate_with_codec(a_codec, a_br or br_str))
             self.update_dur_sig.emit(item['iid'], str(dur_new or 0.0))
             return out
-        except Exception as e:
-            self.log.emit(f"Ошибка при обработке проекта: {e}")
+        except Exception:
             try:
                 if _api.os.path.exists(out):
                     _api.os.remove(out)

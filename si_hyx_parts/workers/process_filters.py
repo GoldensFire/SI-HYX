@@ -80,15 +80,38 @@ class ProcessFiltersMixin:
             import numpy as np
             pr = _api.subprocess.run(
                 [_api.FFPROBE, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=width,height",
-                 "-of", "csv=p=0:s=x", path],
+                 "-show_entries",
+                 "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
+                 "-of", "json", path],
                 stdout=_api.subprocess.PIPE, stderr=_api.subprocess.DEVNULL,
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=_api.CREATE_NO_WINDOW, timeout=30,
             )
-            iw, ih = (int(v) for v in _api.csv_fields(pr.stdout, "x")[:2])
+            streams = _api.json.loads(pr.stdout or "{}").get("streams") or []
+            if not streams:
+                return None
+            st = streams[0]
+            iw, ih = int(st.get("width") or 0), int(st.get("height") or 0)
             if iw <= 0 or ih <= 0:
                 return None
+            # ffmpeg декодирует с autorotate по умолчанию: при повороте на ±90°
+            # кадр на выходе повёрнут, ширина и высота меняются местами. Без
+            # учёта поворота reshape(n, ih, iw) ломает шаг строк и выдаёт рамку
+            # шире реального кадра (crop падает с кодом 234).
+            rot = 0
+            for sd in st.get("side_data_list") or []:
+                if "rotation" in sd:
+                    try:
+                        rot = int(round(float(sd["rotation"])))
+                    except (TypeError, ValueError):
+                        pass
+            if not rot:
+                try:
+                    rot = int(float((st.get("tags") or {}).get("rotate") or 0))
+                except (TypeError, ValueError):
+                    rot = 0
+            if abs(rot) % 180 == 90:
+                iw, ih = ih, iw
             # Чем крупнее кадр, тем меньше кадров берём — выборка целиком лежит
             # в памяти (серый кадр = w*h байт).
             frames = max(4, min(12, cls._CROP_SAMPLE_BYTES // max(1, iw * ih)))
@@ -649,7 +672,7 @@ class ProcessFiltersMixin:
 
     @staticmethod
     def _out_suffix(is_video, video_enabled, metric, crf, speed_percent,
-                    remove_audio, norm, fade):
+                    remove_audio, norm, fade, fade_in=False, deg=False):
         """Суффикс имени выходного файла (напр. «_crf45_speed100_norm_fade»).
 
         Чистая функция (вынесена из process_media для читаемости/тестируемости).
@@ -661,12 +684,16 @@ class ProcessFiltersMixin:
         if is_video and video_enabled:
             crf_tag = "autocrf" if metric == 'xpsnr' else f"crf{crf}"
             suffix += f"_{crf_tag}_speed{speed_percent}"
+        elif not is_video and speed_percent != 100:
+            suffix += f"_speed{speed_percent}"
         if remove_audio:
             suffix += "_noaudio"
         elif norm:
             suffix += "_norm"
-        if not remove_audio and fade:
+        if not remove_audio and (fade or fade_in):
             suffix += "_fade"
+        if not remove_audio and deg:
+            suffix += "_deg"
         return suffix
 
     @staticmethod
@@ -687,9 +714,9 @@ class ProcessFiltersMixin:
         (utils.loudnorm_linear_opts); иначе — прежний одиночный проход."""
         filters = []
         if sa.get('norm'):
-            tgt_i = float(sa.get('tgt', -20.0))
-            lra = float(sa.get('lra', 11.0))
-            tp = float(sa.get('tp', -1.5))
+            tgt_i = max(-70.0, min(-5.0, float(sa.get('tgt', -20.0))))
+            lra = max(1.0, min(50.0, float(sa.get('lra', 11.0))))
+            tp = max(-9.0, min(0.0, float(sa.get('tp', -1.5))))
             linear = _api.loudnorm_linear_opts(measured, tgt_i, lra, tp) if measured else ""
             filters.append(f"loudnorm=I={tgt_i}:LRA={lra}:TP={tp}{linear}")
         if sa.get('fade_in'):

@@ -61,7 +61,7 @@ class MediaTabSettingsMixin:
         try: self.c_fps.lineEdit().setPlaceholderText("напр. 48")
         except Exception: pass
         self.c_fps.setMinimumWidth(150); self.c_fps.setMaximumWidth(200)
-        fv.addRow(_api.row_with_info(self.chk_enable_video, "Если выключено — видео не трогается, меняется только звук. Включено — перекодирование в AV1 (SVT-AV1)."))
+        fv.addRow(_api.row_with_info(self.chk_enable_video, "Если выключено — видео не трогается, меняется только звук (скорость для видео не применяется). Включено — перекодирование в AV1 (SVT-AV1)."))
         fv.addRow(_api.label_with_info("Профиль:", "Стандарт: Использовать по умолчанию. Тёмные сцены: Только в темных сценах."), mode_h)
         henc = _api.QHBoxLayout(); henc.addWidget(self.s_crf); henc.addWidget(self.s_pre)
         self._badge_crf = _api.info_badge("Preset — скорость кодирования (0 медленно и качественно … 13 быстро, но страдает качество (Рекомендуется 1, если позволяет процессор)).")

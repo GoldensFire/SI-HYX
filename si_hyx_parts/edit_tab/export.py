@@ -11,8 +11,9 @@ from si_hyx_parts.edit_tab.tracks import drop_audio
 
 # Проходы ProcessWorker (label у run_ffmpeg_capture) → подпись этапа обрезки.
 _PROCESS_PHASES = {
-    "Pass 1 (Audio)": "Обработка: звук…",
-    "Pass 2 (Video)": "Обработка: видео…",
+    "Кодирование аудио": "Обработка: звук…",
+    "Кодирование видео": "Обработка: видео…",
+    "AV1 кодирование (тёмные сцены)": "Обработка: видео…",
 }
 
 

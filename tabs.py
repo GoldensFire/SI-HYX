@@ -38,8 +38,9 @@ from config import (
 from utils import (
     default_download_dir, fmt_bitrate_with_codec, get_media_info,
     get_video_codec_label, human_size, is_embed_candidate, kodik_get_info,
-    load_settings, mask_html_js, mask_html_js_lite, measure_loudness,
-    parse_youtube_start_seconds, play_done_sound, save_settings
+    load_settings, loudnorm_stats, mask_html_js, mask_html_js_lite,
+    measure_loudness, parse_youtube_start_seconds, play_done_sound,
+    save_settings
 )
 from widgets import (
     DraggableTreeWidget, ElidedLabel, InvertedWheelComboBox, LocalThumbnailRunnable,

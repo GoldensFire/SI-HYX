@@ -45,7 +45,10 @@ class ProcessImagesMixin:
         fmt = fmt.lower()
         ext = {'jpeg': 'jpg', 'jpg': 'jpg', 'png': 'png', 'ico': 'ico', 'webp': 'webp'}.get(fmt, fmt)
         suffix = "" if av.get('overwrite_src') else "_Сжатый"
-        out_path = _api.os.path.join(out_dir, f"{sanitized}{suffix}.{ext}")
+        orig_path = item.get('path') or src_path
+        out_path = _api._reserve_out_path(
+            self, out_dir, sanitized, suffix, f".{ext}", orig_path,
+            allow_overwrite_src=bool(av.get('overwrite_src')))
 
         # Прогресс подбора качества под лимит: во время прохода n из total процент
         # не превышает n/total*100 (реалистично отражает, что подбор ещё не закончен).
@@ -297,6 +300,7 @@ class ProcessImagesMixin:
             cb(100, "Пропущен")
             return path
         out_dir = self._out_dir_for(path)
+        orig_path = path
         av = self.settings.get('avif', {})
         adim = av.get('adim', 0) or 0
         aspd = av.get('aspd', 0)
@@ -305,8 +309,6 @@ class ProcessImagesMixin:
         if sanitized != raw_name:
             self.log.emit(f"Имя переименовано (AI-бренд): «{raw_name}» → «{sanitized}»")
         suffix = "" if av.get('overwrite_src') else "_Сжатый"
-        out_name = sanitized + suffix + ".avif"
-        out = _api.os.path.join(out_dir, out_name)
         path = self._strip_ai_watermarks(path, raw_name, av, tmp_files)
 
         # Выбранный пользователем формат: png/jpg/ico обрабатываем через Pillow
@@ -315,6 +317,10 @@ class ProcessImagesMixin:
         if img_fmt in ('png', 'jpg', 'jpeg', 'ico', 'webp'):
             self.log.emit(f"Формат изображения: {img_fmt.upper()}")
             return self._convert_simple_image(item, path, out_dir, sanitized, adim, av, img_fmt, cb)
+
+        out = _api._reserve_out_path(
+            self, out_dir, sanitized, suffix, ".avif", orig_path,
+            allow_overwrite_src=bool(av.get('overwrite_src')))
 
         tried_tmp_files = []
         # rot_tmp_file — входной файл после EXIF-поворота, не проба: чистится
@@ -339,7 +345,7 @@ class ProcessImagesMixin:
         pix_fmt_avif = self._avif_pix_fmt(has_alpha, av.get('chroma', '420'))
 
         # Если есть альфа — удаляем старый .avif чтобы не оставалось двух файлов
-        if has_alpha and _api.os.path.exists(out):
+        if has_alpha and _api.os.path.exists(out) and not _api._same_path(out, orig_path):
             try: _api.os.remove(out)
             except Exception: pass
 
@@ -379,7 +385,9 @@ class ProcessImagesMixin:
                 if _tgt_a:
                     im = im.resize(_tgt_a, _api.Image.LANCZOS)
 
-                out_webp = _api.os.path.splitext(out)[0] + ".webp"
+                out_webp = _api._reserve_out_path(
+                    self, out_dir, sanitized, suffix, ".webp", orig_path,
+                    allow_overwrite_src=bool(av.get('overwrite_src')))
                 limit_kb_l = int(av.get('limit', 0) or 0)
 
                 if limit_kb_l > 0:
@@ -399,7 +407,8 @@ class ProcessImagesMixin:
             size_new = _api.os.path.getsize(out_webp)
             self.update_item_sig.emit(item['iid'], _api.human_size(size_new), "-")
             _cleanup_final(tried_tmp_files)
-            if _api.os.path.exists(out) and out != out_webp:
+            if (_api.os.path.exists(out) and not _api._same_path(out, out_webp)
+                    and not _api._same_path(out, orig_path)):
                 try: _api.os.remove(out)
                 except Exception: pass
             return out_webp
@@ -660,7 +669,7 @@ class ProcessImagesMixin:
         except _api.subprocess.CalledProcessError as e:
             stderr_tail = e.stderr if hasattr(e, 'stderr') else ''
             _cleanup(tried_tmp_files)
-            if _api.os.path.exists(out):
+            if _api.os.path.exists(out) and not _api._same_path(out, orig_path):
                 try:
                     _api.os.remove(out)
                     self.log.emit(f"Удалён повреждённый AVIF: {out}")
@@ -674,7 +683,7 @@ class ProcessImagesMixin:
             raise Exception(f"AVIF conversion failed: {stderr_tail[:4000]}")
         except Exception:
             _cleanup(tried_tmp_files)
-            if _api.os.path.exists(out):
+            if _api.os.path.exists(out) and not _api._same_path(out, orig_path):
                 try:
                     _api.os.remove(out)
                     self.log.emit(f"Удалён повреждённый AVIF: {out}")
