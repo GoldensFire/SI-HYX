@@ -384,47 +384,6 @@ class UnifiedWindowTabsMixin:
         return dict(getattr(self, "_subsearch_settings", {}) or {})
 
     # ------------------------------------------------------------------
-    # Экспериментальная вкладка ЛидербордHYX (просмотр выгрузки рекордов)
-    # ------------------------------------------------------------------
-    def _add_leaderboard_tab(self):
-        """Создаёт и добавляет вкладку ЛидербордHYX (если ещё не добавлена).
-        Импорт ленивый — модуль тянется только когда вкладка включена."""
-        if getattr(self, "tab_leaderboard", None) is not None:
-            return
-        try:
-            from leaderboard_tab import LeaderboardTab
-            self.tab_leaderboard = LeaderboardTab(self)
-            self._add_tab(self.tab_leaderboard, 'leaderboard')
-            self._apply_tab_order(getattr(self, "_tab_order", []))
-        except Exception as e:
-            self.tab_leaderboard = None
-            self.log(f"Не удалось добавить вкладку ЛидербордHYX: {e}")
-
-    def _remove_leaderboard_tab(self):
-        self._drop_lazy_tab("leaderboard")
-        t = getattr(self, "tab_leaderboard", None)
-        if t is None:
-            return
-        try:
-            idx = self.tabs.indexOf(t)
-            if idx >= 0:
-                self.tabs.removeTab(idx)
-            try: t.cleanup()
-            except Exception: pass
-            t.deleteLater()
-        except Exception: pass
-        self.tab_leaderboard = None
-
-    def _set_leaderboard_tab_enabled(self, checked: bool):
-        self._leaderboard_tab_enabled = bool(checked)
-        if checked:
-            self._add_leaderboard_tab()
-        else:
-            self._remove_leaderboard_tab()
-        try: self._save_settings_now()
-        except Exception: pass
-
-    # ------------------------------------------------------------------
     # Экспериментальная вкладка Collab (совместная работа над .siq)
     # ------------------------------------------------------------------
     def _add_coop_tab(self):

@@ -775,9 +775,15 @@ class Project:
         main = self.main_track
         upper = [c for c in self.clips if c.track != main and c.has_video
                  and self.tracks[c.track].enabled]
+        # Картинка поверх — живой плеер показал бы её вместо кадра, без
+        # прозрачности и без видео под полями вписывания.
         if any(abs(c.scale - 1.0) > _EPS or abs(c.pos_x - 0.5) > _EPS
-               or abs(c.pos_y - 0.5) > _EPS or c.opacity < 1.0 for c in upper):
+               or abs(c.pos_y - 0.5) > _EPS or c.opacity < 1.0 or c.is_image
+               for c in upper):
             gaps.append("наложения (размер, место, прозрачность)")
+        if self.tracks[main].enabled and any(
+                c.has_video and is_placed(c) for c in self.clips_on(main)):
+            gaps.append("размер и место клипа в кадре")
         if any(c.transition and c.transition_s > 0 for c in self.clips_on(main)):
             gaps.append("переходы")
         if self.texts:
@@ -993,6 +999,43 @@ def fit_chain(mode, w, h, color="black"):
                 f"crop={w}:{h},")
     return (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
             f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color={color},")
+
+
+def _even(v):
+    return max(2, int(round(v / 2.0)) * 2)
+
+
+def is_placed(c):
+    """У клипа основной дорожки свой размер или место в кадре (place_chain)."""
+    if any(k in (c.keyframes or {}) for k in ("scale", "pos_x", "pos_y")):
+        return False
+    return (abs(float(c.scale) - 1.0) > _EPS or abs(float(c.pos_x) - 0.5) > _EPS
+            or abs(float(c.pos_y) - 0.5) > _EPS)
+
+
+def place_chain(c, w, h, color="black"):
+    """Размер и место клипа основной дорожки (scale — доля кадра, pos_x/pos_y
+    — центр) после fit_chain, с запятой в конце; '' — кадр как есть. Видимая
+    часть кадра клипа вырезается до масштаба (увеличение не раздувает кадр
+    в памяти), вокруг — цвет фона. Ключевые кадры размера и места (зум
+    effects) важнее: при них цепочки нет."""
+    if not is_placed(c):
+        return ""
+    s, px, py = float(c.scale), float(c.pos_x), float(c.pos_y)
+    bw, bh = w * s, h * s
+    ox, oy = w * px - bw / 2.0, h * py - bh / 2.0       # угол клипа в кадре
+    x0, y0 = max(0.0, ox), max(0.0, oy)
+    x1, y1 = min(float(w), ox + bw), min(float(h), oy + bh)
+    if x1 - x0 < 2 or y1 - y0 < 2:                      # клип целиком за краем
+        return f"drawbox=x=0:y=0:w={w}:h={h}:color={color}:t=fill,"
+    vw, vh = min(_even(x1 - x0), w), min(_even(y1 - y0), h)
+    dx = max(0, min(int(round(x0 / 2.0)) * 2, w - vw))
+    dy = max(0, min(int(round(y0 / 2.0)) * 2, h - vh))
+    cw, ch = min(w, _even((x1 - x0) / s)), min(h, _even((y1 - y0) / s))
+    cx = max(0, min(int(round((x0 - ox) / s)), w - cw))
+    cy = max(0, min(int(round((y0 - oy) / s)), h - ch))
+    return (f"crop={cw}:{ch}:{cx}:{cy},scale={vw}:{vh},"
+            f"pad={w}:{h}:{dx}:{dy}:color={color},")
 
 
 def _seek_s(c, s):

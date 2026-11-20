@@ -51,8 +51,10 @@ class EditTabProjectFxMixin:
     def _fx_wanted(self):
         if getattr(self, "project_timeline", None) is None:
             return False
-        if getattr(self, "_fs_window", None) is not None or getattr(self, "_audio_only_mode", False):
+        if getattr(self, "_audio_only_mode", False):
             return False
+        if getattr(self, "_fs_window", None) is not None and not getattr(self, "_fs_fx", False):
+            return False                # полный экран прежним плеером
         p = self.project
         return p.has_video() and bool(p.live_preview_gaps())
 
@@ -70,6 +72,7 @@ class EditTabProjectFxMixin:
             self._fx.stillReady.connect(self._fx_on_still)
             self._fx.cacheProgress.connect(self._fx_on_cache)
             self._fx.failed.connect(self._fx_on_failed)
+            self._fx.asideReady.connect(self._frame_ghost_on_ready)
         return self._fx
 
     def _fx_view_widget(self):
@@ -77,6 +80,7 @@ class EditTabProjectFxMixin:
             view = _api.FxPreviewView(self.video_container)
             view.setAcceptDrops(True)
             view.installEventFilter(self)
+            self._frame_connect(view)
             view.hide()
             self.video_container.layout().addWidget(view, 1)
             self._fx_view = view
@@ -94,10 +98,13 @@ class EditTabProjectFxMixin:
         view.set_note("Просмотр с эффектами · рендер кадра…")
         self._fx_show_still(self.project_timeline.playhead)
         self._fx_schedule_fill()
+        self._fs_btn_sync()
 
     def _fx_leave(self):
         if not self._fx_mode:
             return
+        if getattr(self, "_fs_fx", False):
+            self.exit_fullscreen()      # просмотр с эффектами из полного экрана — назад
         self._fx_stop()
         if self._fx is not None:
             self._fx.stop_fill()
@@ -106,11 +113,13 @@ class EditTabProjectFxMixin:
             self._fx_view.hide()
             self._fx_view.clear()
         self.video_widget.show()
+        self._fs_btn_sync()
         if not self.project.is_empty():
             self._project_seek(self.project_timeline.playhead)
 
     def _fx_project_changed(self):
         """Из _project_changed: план заново, кадр на плейхеде — заново."""
+        self._frame_ghost_invalidate()
         if not self._fx_mode:
             return
         if self._fx_playing:
@@ -143,6 +152,7 @@ class EditTabProjectFxMixin:
             return
         self._fx_view.set_image(img)
         self._fx_view.set_note(self._fx_cache_note)
+        self._frame_ghost_schedule(restart=False)
 
     def _fx_on_cache(self, done, total):
         self._fx_cache_note = ("" if done >= total else

@@ -242,6 +242,7 @@ class _UpgradePage(_api.QWidget):
         pv.addWidget(self._group_images())
         pv.addWidget(self._group_audio())
         pv.addWidget(self._group_video())
+        pv.addWidget(self._group_html())
         pv.addWidget(self._group_unused())
 
         self.btn_reset = _api.QPushButton("Сбросить настройки")
@@ -755,6 +756,26 @@ class _UpgradePage(_api.QWidget):
         g.setColumnStretch(1, 1)
         return grp
 
+    # ── группа «HTML → base64» ────────────────────────────────────────────
+    def _group_html(self) -> _api.QGroupBox:
+        grp = _api.QGroupBox("HTML → base64 (лёгкий режим)")
+        grp.setCheckable(True)
+        grp.setChecked(False)
+        grp.setToolTip(
+            "Каждый .html/.htm пака маскируется под VK точно так же, как во "
+            "вкладке Base64 с галочкой «Лёгкий режим (меньше размер)»: код "
+            "движка прячется одним base64-блобом, разметка, картинки и "
+            "скрипты-данные остаются как есть.\n"
+            "Имя файла не меняется, поэтому ссылки в content.xml остаются "
+            "верными. HTML без скриптов с кодом и не в UTF-8 не трогается.")
+        self.grp_html = grp
+        g = _api.QGridLayout(grp); g.setHorizontalSpacing(6); g.setVerticalSpacing(8)
+        g.addWidget(self._hint(
+            "Нужно, чтобы пак с HTML-играми проходил загрузку во ВКонтакте. "
+            "Каждый замаскированный файл попадает в таблицу правок."), 0, 0, 1, 2)
+        g.setColumnStretch(1, 1)
+        return grp
+
     # ── группа «Неиспользуемые файлы» ─────────────────────────────────────
     def _group_unused(self) -> _api.QGroupBox:
         grp = _api.QGroupBox("Удалить неиспользуемые файлы")
@@ -1011,6 +1032,7 @@ class _UpgradePage(_api.QWidget):
         s.video_preset = self.sp_vid_preset.value()
         s.video_height = _api.nearest_height(self.cb_vid_height.currentData())
         s.drop_unused = self.grp_unused.isChecked()
+        s.mask_html = self.grp_html.isChecked()
         s.out_dir = self._out_dir
         return s
 
@@ -1065,6 +1087,7 @@ class _UpgradePage(_api.QWidget):
         self.cb_vid_height.setCurrentIndex(
             max(0, self.cb_vid_height.findData(height)))
         self.grp_unused.setChecked(s.drop_unused)
+        self.grp_html.setChecked(s.mask_html)
         self._out_dir = s.out_dir or ""
         siq = str(data.get("siq") or "")
         # Пропавший файл не подставляем: подпись врала бы про выбранный пак.
@@ -1156,6 +1179,8 @@ class _UpgradePage(_api.QWidget):
             what.append(f"перекодирую видео тяжелее {settings.video_min_mb:g} МБ"
                         + (" (и всё не в AV1)" if settings.video_non_av1 else "")
                         + f" в av1 crf {settings.video_crf}")
+        if settings.mask_html:
+            what.append("маскирую HTML в base64 (лёгкий режим)")
         if settings.drop_unused:
             what.append("удаляю неиспользуемые файлы")
         return what or ["ничего не делаю"]
@@ -1221,7 +1246,7 @@ class _UpgradePage(_api.QWidget):
     # Правки, у которых места в раундах нет вовсе: это не вопрос, а файл в
     # архиве. Ни раунда, ни цены у них не бывает, и имя файла занимает все три
     # колонки разом — иначе оно жалось в «Тему» между двумя пустыми клетками.
-    FILE_KINDS = ("image", "audio", "video", "unused")
+    FILE_KINDS = ("image", "audio", "video", "html", "unused")
 
     def _fill_table(self, result):
         rows = (result.changes + list(result.skipped_specials)
@@ -1238,7 +1263,8 @@ class _UpgradePage(_api.QWidget):
                   "year": "Год", "info": "Автор и MAL",
                   "image": "Картинка", "character": "Персонаж",
                   "repeat": "Повтор", "merge": "Вместе", "empty": "Пустой",
-                  "audio": "Аудио", "video": "Видео", "unused": "Мусор"}
+                  "audio": "Аудио", "video": "Видео", "html": "HTML",
+                  "unused": "Мусор"}
         files: list[str] = []                 # имена файлов на три колонки
         rounds: list[str] = []                # раунды обычных правок
         for i, change in enumerate(sorted(rows, key=lambda c: c.order)):

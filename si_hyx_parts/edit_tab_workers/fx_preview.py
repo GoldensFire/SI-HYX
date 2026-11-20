@@ -16,7 +16,10 @@ Public namespace: edit_tab_workers.
   кусок кэша декодируется, неготовый рендерится на ходу и заодно пишется в
   кэш (split графа на второй выход) — второй просмотр того же места идёт из
   кэша;
-* на паузе кэш дорисовывается фоном от плейхеда (fill).
+* на паузе кэш дорисовывается фоном от плейхеда (fill);
+* кадры других проектов (aside) — фон без клипа, которого тянут рамкой в
+  окне просмотра: клип едет за курсором поверх этого фона, пока ffmpeg не
+  отрисует итог.
 
 Ключ куска — SHA-1 графа и входов окна (пути, время, фильтры, текст) и
 отметок файлов (время правки, размер): правка проекта сбрасывает ровно те
@@ -219,6 +222,7 @@ class FxPreview(_api.QObject):
 
     stillReady = _api.pyqtSignal(int, float, object)   # поколение, время, QImage
     cacheProgress = _api.pyqtSignal(int, int)          # готово кусков, всего
+    asideReady = _api.pyqtSignal(object, object)       # ключ, QImage (см. aside)
     failed = _api.pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -239,6 +243,9 @@ class FxPreview(_api.QObject):
         self._fill_proc = None
         self._fill_from = 0.0
         self._pruned = False
+        self._aside_lock = _api.threading.Lock()
+        self._aside_jobs = []
+        self._aside_thread = None
 
     # ── План ─────────────────────────────────────────────────────────────────
     def set_project(self, project):
@@ -280,27 +287,62 @@ class FxPreview(_api.QObject):
             plan = self.plan()
             if plan is None or plan.n_frames <= 0:
                 continue
-            f = max(0, min(plan.n_frames - 1, int(_api.math.floor(t * plan.fps + 1e-3))))
-            k = f // plan.chunk
-            img = None
-            try:
-                cmd, gfile = _frames_cmd(plan, k, f, limit=1)
-                if cmd is not None:
-                    r = _api.subprocess.run(cmd, stdin=_api.subprocess.DEVNULL,
-                                            capture_output=True, timeout=120,
-                                            creationflags=_api.CREATE_NO_WINDOW)
-                    if gfile:
-                        _remove(gfile)
-                    need = plan.w * plan.h * 3
-                    if r.returncode == 0 and len(r.stdout) >= need:
-                        img = _image(r.stdout[:need], plan.w, plan.h)
-                    elif r.returncode != 0:
-                        tail = (r.stderr or b"").decode("utf-8", "replace").strip()[-300:]
-                        self.failed.emit(tail or f"ffmpeg: код {r.returncode}")
-            except Exception as e:        # сбой ffmpeg или графа — не роняем поток
-                self.failed.emit(str(e))
+            img, f = self._render_frame(plan, t)
             if img is not None and self._still_req is None:
                 self.stillReady.emit(gen, f / plan.fps, img)
+
+    def _render_frame(self, plan, t):
+        """Кадр плана на t: (QImage или None, номер кадра). Из потоков."""
+        f = max(0, min(plan.n_frames - 1, int(_api.math.floor(t * plan.fps + 1e-3))))
+        k = f // plan.chunk
+        img = None
+        try:
+            cmd, gfile = _frames_cmd(plan, k, f, limit=1)
+            if cmd is not None:
+                r = _api.subprocess.run(cmd, stdin=_api.subprocess.DEVNULL,
+                                        capture_output=True, timeout=120,
+                                        creationflags=_api.CREATE_NO_WINDOW)
+                if gfile:
+                    _remove(gfile)
+                need = plan.w * plan.h * 3
+                if r.returncode == 0 and len(r.stdout) >= need:
+                    img = _image(r.stdout[:need], plan.w, plan.h)
+                elif r.returncode != 0:
+                    tail = (r.stderr or b"").decode("utf-8", "replace").strip()[-300:]
+                    self.failed.emit(tail or f"ffmpeg: код {r.returncode}")
+        except Exception as e:        # сбой ffmpeg или графа — не роняем поток
+            self.failed.emit(str(e))
+        return img, f
+
+    # ── Кадры других проектов ────────────────────────────────────────────────
+    def aside(self, jobs):
+        """Кадры других проектов — [(ключ, проект, время)], по одному, в своём
+        потоке; готовый — asideReady(ключ, QImage). Новый вызов заменяет
+        ожидающие задания (начатое дорисуется)."""
+        with self._aside_lock:
+            self._aside_jobs = list(jobs)
+            if self._aside_jobs and self._aside_thread is None:
+                self._aside_thread = _api.threading.Thread(target=self._aside_loop,
+                                                           daemon=True)
+                self._aside_thread.start()
+
+    def _aside_loop(self):
+        while True:
+            with self._aside_lock:
+                if not self._aside_jobs:
+                    self._aside_thread = None
+                    return
+                key, project, t = self._aside_jobs.pop(0)
+            try:
+                plan = _Plan(project) if project.has_video() else None
+            except Exception as e:        # битый граф проекта — не роняем поток
+                self.failed.emit(str(e))
+                plan = None
+            if plan is None or plan.n_frames <= 0:
+                continue
+            img, _f = self._render_frame(plan, t)
+            if img is not None:
+                self.asideReady.emit(key, img)
 
     # ── Игра ─────────────────────────────────────────────────────────────────
     def play(self, t):
@@ -483,5 +525,7 @@ class FxPreview(_api.QObject):
 
     def shutdown(self):
         self._still_req = None
+        with self._aside_lock:
+            self._aside_jobs = []
         self.stop()
         self.stop_fill()

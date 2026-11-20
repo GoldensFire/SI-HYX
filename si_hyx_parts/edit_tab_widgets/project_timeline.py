@@ -765,6 +765,9 @@ class ProjectTimeline(_api.QWidget):
             self._add_paste_action(menu)
             menu.addAction("Свойства клипа…",
                            lambda: self.actionRequested.emit('props', clip.id))
+            if clip.has_video and clip.track != self.project.main_track:
+                menu.addAction("Обводка…" + (" (есть)" if clip.stroke else ""),
+                               lambda: self.actionRequested.emit('stroke', clip.id))
             menu.addSeparator()
             if clip.audio_path:
                 act = menu.addAction("Без звука",

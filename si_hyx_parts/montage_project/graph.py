@@ -38,6 +38,7 @@ import os
 import threading
 
 import montage_project as _api
+from image_formats import ffmpeg_still
 from si_hyx_parts.montage_project import effects as _fx
 from si_hyx_parts.montage_project import layers as _ly
 from si_hyx_parts.montage_project import text_fx as _tfx
@@ -114,7 +115,7 @@ def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap, project=
         s = c.source_time(t_a)
         if c.is_image:
             g.inputs.append(["-loop", "1", "-framerate", rate, "-t", _api._num(span + 1.0),
-                             "-i", c.src])
+                             "-i", ffmpeg_still(c.src)])
         else:
             g.inputs.append(["-ss", _api._num(_api._seek_s(c, s)),
                              "-t", _api._num(span * speed + 0.5), "-i", c.src])
@@ -333,7 +334,7 @@ def _video(g, project, w, h, fps, rate, bg, r0, r1, subs, tonemap, items, texts=
                 continue
             if a > cursor:
                 filler(cursor, a)
-        fit = _api.fit_chain(c.fit or settings.fit, w, h, bg)
+        fit = _api.fit_chain(c.fit or settings.fit, w, h, bg) + _api.place_chain(c, w, h, bg)
         lab = g.label("v")
         if _api.has_fx(c):
             g.chains.append(_fx_main(g, project, c, f0, f1, a, b, rate, fit, fps, w, h,

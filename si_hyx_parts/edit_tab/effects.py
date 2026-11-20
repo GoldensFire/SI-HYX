@@ -243,8 +243,8 @@ class EditTabEffectsMixin:
         берём её собственный размер, для видео — ffprobe, а если не вышло —
         размер кадра на холсте."""
         if getattr(self, "is_still_image", False) and self.still_image_path:
-            img = _api.QImage(str(self.still_image_path))
-            if not img.isNull():
+            img = _api.read_qimage(self.still_image_path)
+            if img is not None:
                 return (img.width(), img.height())
         src = self.actual_source_file or self.filepath
         if src and _api.os.path.exists(str(src)):
@@ -284,8 +284,7 @@ class EditTabEffectsMixin:
             return
         path, _ = _api.QFileDialog.getOpenFileName(
             self, "Выберите картинку для наложения", "",
-            "Изображения (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.avif);;"
-            "Все файлы (*.*)")
+            "Изображения (" + _api.dialog_patterns() + ");;Все файлы (*.*)")
         if not path:
             return
         img = _api.load_overlay_image(path)

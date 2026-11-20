@@ -320,10 +320,13 @@ class EditTabTimelineMixin:
 
     def _refresh_export_btn(self):
         b = getattr(self, "btn_cut", None)
-        if b is None or getattr(self, "_cut_btn_cancel", False):
+        if b is None:
             return
-        label = getattr(self, "_export_btn_label", "Экспорт")
-        dur = getattr(self, "_export_dur", 0.0)
+        cancel = bool(getattr(self, "_cut_btn_cancel", False))
+        # Во время экспорта кнопка — «Отмена»: пределы ширины те же, а подпись
+        # без длительности; не влезает — остаётся один крестик.
+        label = "Отмена" if cancel else getattr(self, "_export_btn_label", "Экспорт")
+        dur = 0.0 if cancel else getattr(self, "_export_dur", 0.0)
         full = f"{label} · {self._fmt_export_dur(dur)}" if dur > 0 else label
         # Пределы ширины — от подписей, а не от текущего текста: иначе
         # укороченная подпись уменьшала бы sizeHint, и кнопка больше не
@@ -341,7 +344,9 @@ class EditTabTimelineMixin:
         need_full = need(full)
         b.setMinimumWidth(icon_w + pad)
         b.setMaximumWidth(max(232 - self._EXPORT_GEAR_W - 5, need_full))
-        if b.width() >= need_full:
+        if b.width() >= need_full or (cancel and not b.isVisible()):
+            # Кнопка ещё не разложена (вкладку не показывали) — ширина пока
+            # ничего не значит, подпись «Отмена» не срезаем.
             text = full
         elif b.width() >= need(label):
             text = label

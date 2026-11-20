@@ -168,9 +168,6 @@ class UnifiedWindow(
                           "Экспериментальная вкладка: аниме, в английских субтитрах "
                           "которых звучит фраза (например, «six seven»). Порядок — "
                           "по уровню из базы ShikimoriHYX, исключение паков — как там же."),
-            'leaderboard': ("fa5s.trophy", "ЛидербордHYX",
-                            "Просмотр выгрузки рекордов из Firebase: никнеймы и их "
-                            "результаты, удаление ников из списка."),
             'coop': ("fa5s.users", "Collab",
                      "Совместная работа над .siq: темы, вопросы и ответы напарника "
                      "в реальном времени — видно, кто что сделал, и где дубли."),
@@ -359,10 +356,6 @@ class UnifiedWindow(
         self.tab_subsearch = None
         self._subsearch_settings = {}   # сохранённые настройки «Поиска по сабам»
 
-        # Экспериментальная вкладка ЛидербордHYX (по умолчанию ВЫКЛ).
-        self._leaderboard_tab_enabled = False
-        self.tab_leaderboard = None
-
         # Экспериментальная вкладка Collab (по умолчанию ВЫКЛ).
         self._coop_tab_enabled = False
         self.tab_coop = None
@@ -431,7 +424,6 @@ class UnifiedWindow(
         for _flag, _key, _builder in (
                 ("_shikimori_tab_enabled", "shikimori", self._add_shikimori_tab),
                 ("_subsearch_tab_enabled", "subsearch", self._add_subsearch_tab),
-                ("_leaderboard_tab_enabled", "leaderboard", self._add_leaderboard_tab),
                 ("_coop_tab_enabled", "coop", self._add_coop_tab),
                 ("_animepack_tab_enabled", "animepack", self._add_animepack_tab),
                 ("_animepack_upgrade_tab_enabled", "animepack_upgrade",
@@ -614,7 +606,6 @@ class UnifiedWindow(
         self._shikimori_settings = dict(s.get("shikimori", {}) or {})
         self._subsearch_tab_enabled = bool(s.get("subsearch_tab_enabled", False))
         self._subsearch_settings = dict(s.get("subsearch", {}) or {})
-        self._leaderboard_tab_enabled = bool(s.get("leaderboard_tab_enabled", False))
         self._coop_tab_enabled = bool(s.get("coop_tab_enabled", False))
         self._coop_settings = dict(s.get("coop", {}) or {})
         self._animepack_tab_enabled = bool(s.get("animepack_tab_enabled", False))
@@ -887,12 +878,6 @@ class UnifiedWindow(
                 tss = getattr(self, "tab_subsearch", None)
                 if tss is not None:
                     tss.cleanup()
-            except Exception:
-                pass
-            try:
-                tlb = getattr(self, "tab_leaderboard", None)
-                if tlb is not None:
-                    tlb.cleanup()
             except Exception:
                 pass
             try:

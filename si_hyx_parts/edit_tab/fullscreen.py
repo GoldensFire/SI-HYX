@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
-"""Монтаж: полноэкранный режим видео."""
+"""Монтаж: полноэкранный режим видео.
+
+Проект с эффектами, текстом и наложениями (просмотр с эффектами, project_fx)
+идёт в полный экран тем же просмотром — FxPreviewView переезжает в окно
+полного экрана (_fs_fx). Без них — прежний холст плеера."""
 import edit_tab as _api
 
 
@@ -15,12 +19,39 @@ class EditTabFullscreenMixin:
         else:
             self.enter_fullscreen()
 
+    def _fs_available(self):
+        """Есть что показать в полный экран: видео в плеере или проект в
+        просмотре с эффектами (там в плеере может стоять картинка)."""
+        if getattr(self, "_audio_only_mode", False):
+            return False
+        if getattr(self, "_fx_mode", False) and getattr(self, "_fx_view", None) is not None:
+            return True
+        return (getattr(self, "video_stream_index", None) is not None
+                and getattr(self, "duration", 0) > 0.1)
+
+    def _fs_btn_sync(self):
+        """Кнопка полного экрана — по _fs_available (в полном экране не трогаем)."""
+        b = getattr(self, "btn_fullscreen", None)
+        if b is None or getattr(self, "_fs_window", None) is not None:
+            return
+        on = self._fs_available()
+        b.setEnabled(on)
+        try:
+            # Белый значок на сером выключенном фоне не выглядел выключенным.
+            b.setIcon(_api._fullscreen_icon(expand=True,
+                                            color="#ffffff" if on else _api.C['text3']))
+        except Exception:
+            pass
+
     def enter_fullscreen(self):
         if getattr(self, "_fs_window", None) is not None:
             return
-        if self.duration <= 0.1:   # нет загруженного видео
+        fx = bool(getattr(self, "_fx_mode", False)) and getattr(self, "_fx_view", None) is not None
+        if not fx and self.duration <= 0.1:   # нет загруженного видео
             return
-        self._fx_leave()           # полный экран играет прежний плеер
+        if not fx:
+            self._fx_leave()       # без эффектов полный экран играет прежний плеер
+        self._fs_fx = fx
         try:
             fs = _api.FullscreenVideo(self)
             # fs — самостоятельное окно без родителя (иначе showFullScreen на
@@ -39,11 +70,15 @@ class EditTabFullscreenMixin:
                 wh = fs.windowHandle()
                 if wh is not None:
                     wh.setScreen(src_screen)
-            # Снимаем фиксированные размеры с видео и переносим его в окно.
-            self.video_widget.setMinimumSize(0, 0)
-            self.video_widget.setMaximumSize(16777215, 16777215)
-            fs.attach_video(self.video_widget)
+            if fx:
+                fs.attach_video(self._fx_view)
+            else:
+                # Снимаем фиксированные размеры с видео и переносим его в окно.
+                self.video_widget.setMinimumSize(0, 0)
+                self.video_widget.setMaximumSize(16777215, 16777215)
+                fs.attach_video(self.video_widget)
             self._fs_window = fs
+            self._frame_refresh()      # рамки клипа в полном экране нет
             self.btn_fullscreen.setIcon(_api._fullscreen_icon(expand=False))
             self.btn_fullscreen.setToolTip("Свернуть (Esc / двойной клик по видео)")
             fs.showFullScreen()
@@ -70,16 +105,24 @@ class EditTabFullscreenMixin:
         except Exception as e:
             self.main.log(f"enter_fullscreen error: {e}")
             self._fs_window = None
+            self._fs_fx = False
 
     def exit_fullscreen(self):
         fs = getattr(self, "_fs_window", None)
         if fs is None:
             return
         self._fs_window = None
+        fs_fx, self._fs_fx = getattr(self, "_fs_fx", False), False
         try:
-            # Возвращаем видео обратно в контейнер вкладки.
-            self.vc_layout.insertWidget(0, self.video_widget, 0, _api.Qt.AlignmentFlag.AlignCenter)
-            self.video_widget.show()
+            if fs_fx and self._fx_view is not None:
+                # Просмотр с эффектами — на своё место (холст плеера там и стоял).
+                self.vc_layout.addWidget(self._fx_view, 1)
+                self._fx_view.show()
+            else:
+                # Возвращаем видео обратно в контейнер вкладки.
+                self.vc_layout.insertWidget(0, self.video_widget, 0,
+                                            _api.Qt.AlignmentFlag.AlignCenter)
+                self.video_widget.show()
         except Exception:
             pass
         # Оверлей субтитров мог стать дочерним к окну fs — вернём его главному
@@ -102,6 +145,8 @@ class EditTabFullscreenMixin:
             _api.QTimer.singleShot(0, self._restore_canvas_frame)
             # Проект с эффектами — снова просмотром с эффектами (project_fx).
             _api.QTimer.singleShot(0, self._fx_update_mode)
+            self._fs_btn_sync()
+            self._frame_refresh()
         except Exception:
             pass
 

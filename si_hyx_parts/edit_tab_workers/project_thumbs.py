@@ -165,6 +165,8 @@ class ProjectThumbWorker(_api.QThread):
         flags = _api.CREATE_NO_WINDOW
         if _api.os.name == 'nt':
             flags |= _BELOW_NORMAL_PRIORITY_CLASS
+        if _api.is_image_path(src):
+            src = _api.ffmpeg_still(src)       # GIF, AVIF, HEIC… — PNG-копией
         tail = ["-ss", f"{max(0.0, sec):.3f}", "-i", src, "-map", "0:v:0?",
                 "-frames:v", "1", "-vf", f"scale=-2:{max(8, height)}:flags=area",
                 "-f", "image2pipe", "-vcodec", "png", "-"]

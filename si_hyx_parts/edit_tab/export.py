@@ -146,15 +146,18 @@ class EditTabExportMixin:
             pass
         if cancel_mode:
             self._cut_btn_saved = (b.text(), b.icon(), b.styleSheet())
-            b.setText("Отмена")
             b.setIcon(_api.get_icon('fa5s.times', color='#1e1e2e'))
+            b.setToolTip("Отменить экспорт")
+            # Поля — как у «Экспорт»: ширина кнопки не меняется, а подпись
+            # «Отмена» остаётся, только если влезает (см. _refresh_export_btn) —
+            # рядом встаёт «В очередь», и в тесноте остаётся один крестик.
             b.setStyleSheet(f"""
                 QPushButton {{
                     background: {_api.C['red']};
                     color: #1e1e2e;
                     border: none;
                     border-radius: 6px;
-                    padding: 9px 24px;
+                    padding: 0 14px;
                     font-weight: 700;
                     font-size: 13px;
                     letter-spacing: 0.3px;
@@ -165,10 +168,12 @@ class EditTabExportMixin:
             """)
             b.setEnabled(True)
             b.clicked.connect(cancel_handler or self._cancel_cut)
+            self._refresh_export_btn()
         else:
             saved = getattr(self, '_cut_btn_saved', None)
             if saved:
                 b.setText(saved[0]); b.setIcon(saved[1]); b.setStyleSheet(saved[2])
+            b.setToolTip("")
             # Длительность могла смениться, пока шёл экспорт.
             self._refresh_export_btn()
             b.setEnabled(True)
@@ -375,6 +380,13 @@ class EditTabExportMixin:
         entry = queue.pop(0)
         self._export_log(f"экспорт из очереди: {entry['label']}"
                          + (f" (ещё ждут: {len(queue)})" if queue else ""))
+        launch = entry.get("launch")
+        if launch is not None:
+            # Экспорт настройками «Обработки»: элемент собран при постановке,
+            # запуск (и, если «Обработка» занята, её собственная очередь) — тут.
+            launch()
+            self._sync_export_queue_ui()
+            return
         self._launch_cut_worker(
             entry["worker"], status=entry["status"], phase=entry["phase"],
             label=entry["label"], final=entry["final"], log=entry["log"],
@@ -396,10 +408,12 @@ class EditTabExportMixin:
                     _api.os.remove(path)
             except OSError:
                 pass
-        try:
-            entry["worker"].deleteLater()
-        except Exception:
-            pass
+        worker = entry.get("worker")
+        if worker is not None:
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
 
     def _clear_export_queue(self):
         queue = list(getattr(self, "_export_queue", None) or [])
@@ -573,9 +587,6 @@ class EditTabExportMixin:
         ovl_active = self.has_image_overlays()
         # Smart Cut несовместим с вшиванием субтитров (середина копируется): при
         # запросе hardsub откатываемся на полную перекодировку (mode 1).
-        if mode in (4, 5) and queueing and self._refuse_enqueue(
-                "Экспорт настройками «Обработки» (у него своя очередь — во вкладке «Обработка»)"):
-            return
         if mode in (4, 5):
             # 4 — «Перекодировать настройками «Обработки»», 5 — то же самое, но
             # ТОЛЬКО звук: точный рез + текущие настройки вкладки «Обработка»
@@ -726,13 +737,13 @@ class EditTabExportMixin:
             final_out = self._unique_export_output(final_out)
 
         venc = self._video_encoder_args(hardsub=False)
-        cmd = [_api.FFMPEG, "-y", "-loop", "1", "-framerate", str(fps), "-i", str(src),
+        cmd = [_api.FFMPEG, "-y", "-loop", "1", "-framerate", str(fps), "-i", _api.ffmpeg_still(src),
                "-t", _api.s_to_time(dur), "-vf", vf] + venc \
               + ["-pix_fmt", "yuv420p", "-movflags", "+faststart", "-an", final_out]
         if fx:
             # Другой эффект — кадрами по трубе в тот же единственный кодировщик.
             dec_cmd = ([_api.FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error",
-                        "-loop", "1", "-framerate", str(fps), "-i", str(src),
+                        "-loop", "1", "-framerate", str(fps), "-i", _api.ffmpeg_still(src),
                         "-t", _api.s_to_time(dur), "-vf",
                         f"{vf},{_api.reveal_pipe.rgb_filter(str(src), self._escape_filter_path, True)}"]
                        + _api.reveal_pipe.PPM_ARGS + ["-"])
@@ -1375,7 +1386,7 @@ class EditTabExportMixin:
                                  project=None, name_stem=None,
                                  still_fps=None, cut_tag="_обрез",
                                  batch_next=None, with_overlays=True,
-                                 batch_step=None):
+                                 batch_step=None, before_start=None):
         """Кнопка «Обрезать и обработать»: режет диапазон [in_s,out_s) И сразу
         применяет вкладку «Обработка» ЕЁ ТЕКУЩИМИ настройками (CRF/preset/
         скорость/loudnorm/fps/…) — одним ffmpeg-проходом внутри
@@ -1421,11 +1432,14 @@ class EditTabExportMixin:
         Пакет картинок (_export_still_pixelize): batch_next — запуск следующей
         картинки после удачного сохранения этой (вместо итогового «Готово»),
         batch_step — (номер, всего) для подписи, with_overlays=False — не
-        класть накладки, расставленные по открытой картинке."""
-        if getattr(self, "_export_enqueue", False) and self._refuse_enqueue(
-                "Экспорт настройками «Обработки» (у него своя очередь — во "
-                "вкладке «Обработка»)"):
-            return
+        класть накладки, расставленные по открытой картинке.
+
+        «В очередь» (_export_enqueue): элемент «Обработки» (отрезок, дорожка,
+        накладки, субтитры, эффекты) собирается сейчас, из того, что открыто,
+        а запуск ждёт своей очереди Монтажа (_export_queue, ключ «launch»).
+        before_start — что сделать прямо перед запуском (остановить просмотр
+        проекта)."""
+        queueing = bool(getattr(self, "_export_enqueue", False))
         src = _api.Path(src) if src else self.actual_source_file
         if not src or not src.exists():
             _api.msgbox_warning(self, "Внимание", "Файл не загружен.")
@@ -1439,13 +1453,6 @@ class EditTabExportMixin:
         if tm is None:
             _api.msgbox_warning(self, "Внимание", "Вкладка «Обработка» недоступна.")
             return
-        # «Обработка» занята — обрезка встаёт в её очередь (enqueue_run) и
-        # стартует сама, как только текущий прогон закончится.
-        try:
-            busy = bool(getattr(tm, 'worker', None) is not None and tm.worker.isRunning())
-        except Exception:
-            busy = False
-
         stem = name_stem or src.stem
         out_dir = (_api.Path(self.export_dir)
                    if (self.export_dir and _api.os.path.isdir(self.export_dir)) else src.parent)
@@ -1463,16 +1470,6 @@ class EditTabExportMixin:
         # run['worker'] — воркер этой обрезки, пока она не дождалась очереди — None;
         # run['entry'] — её место в очереди «Обработки» (для отмены).
         run = {'worker': None, 'entry': None}
-        self._report_progress(0, "Обработка…")
-        self.log_label.setText(("В очереди «Обработки»…" if busy else "Отправлено в «Обработку»…")
-                               + (" (только звук)" if audio_only else ""))
-        self._set_cut_btn_cancel(True, cancel_handler=lambda: self._cancel_cut_and_process(tm, run))
-        self._start_cut_phase("В очереди «Обработки»" if busy else phase)
-        self._cut_queued = busy
-        if getattr(self, "_cut_ticker", None) is None:
-            self._cut_ticker = _api.QTimer(self); self._cut_ticker.setInterval(500)
-            self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
-        self._cut_ticker.start()
 
         iid = _api.uuid.uuid4().hex
         # Выбранная аудиодорожка (если в контейнере их несколько) — иначе
@@ -1651,19 +1648,61 @@ class EditTabExportMixin:
             proc_worker.status.connect(_on_status)
             proc_worker.finished_all.connect(_on_finished_all)
 
-        if busy:
-            run['entry'] = tm.enqueue_run([item], on_start=_attach)
+        def _launch():
+            if before_start is not None:
+                try:
+                    before_start()
+                except Exception:
+                    pass
+            # «Обработка» занята — обрезка встаёт в её очередь (enqueue_run) и
+            # стартует сама, как только текущий прогон закончится.
+            try:
+                busy = bool(getattr(tm, 'worker', None) is not None
+                            and tm.worker.isRunning())
+            except Exception:
+                busy = False
+            self._report_progress(0, "Обработка…")
+            self.log_label.setText(
+                ("В очереди «Обработки»…" if busy else "Отправлено в «Обработку»…")
+                + (" (только звук)" if audio_only else ""))
+            self._set_cut_btn_cancel(
+                True, cancel_handler=lambda: self._cancel_cut_and_process(tm, run))
+            self._start_cut_phase("В очереди «Обработки»" if busy else phase)
+            self._cut_queued = busy
+            if getattr(self, "_cut_ticker", None) is None:
+                self._cut_ticker = _api.QTimer(self); self._cut_ticker.setInterval(500)
+                self._cut_ticker.timeout.connect(lambda: self._report_cut(self._cut_lastp))
+            self._cut_ticker.start()
+            if busy:
+                run['entry'] = tm.enqueue_run([item], on_start=_attach)
+                return
+            # _run_items сама собирает настройки со всех виджетов «Обработки» и
+            # запускает ProcessWorker (тот же путь, что кнопка «НАЧАТЬ»); в
+            # очереди — только наш синтетический элемент, чужие файлы не
+            # затрагиваются.
+            tm._run_items([item])
+            proc_worker = getattr(tm, 'worker', None)
+            if proc_worker is None:
+                self._set_cut_btn_cancel(False)
+                self.on_ffmpeg_finished(False, "Не удалось запустить «Обработку»")
+                return
+            _attach(proc_worker)
+
+        if queueing:
+            if project is not None:
+                label = f"проект → {stem} («Обработка»)"
+            elif still_fps:
+                label = f"{src.name} → видео («Обработка»)"
+            else:
+                label = (f"{src.name} ({_api.s_to_time(in_s)}–{_api.s_to_time(out_s)}"
+                         f", «Обработка»{', звук' if audio_only else ''})")
+            self._export_queue.append({
+                "launch": _launch, "label": label, "final": "", "cleanup": []})
+            self._sync_export_queue_ui()
+            self._export_log(f"в очередь экспорта: {label} "
+                             f"(ждут: {len(self._export_queue)})")
             return
-        # _run_items сама собирает настройки со всех виджетов «Обработки» и
-        # запускает ProcessWorker (тот же путь, что кнопка «НАЧАТЬ»); в очереди —
-        # только наш синтетический элемент, чужие файлы не затрагиваются.
-        tm._run_items([item])
-        proc_worker = getattr(tm, 'worker', None)
-        if proc_worker is None:
-            self._set_cut_btn_cancel(False)
-            self.on_ffmpeg_finished(False, "Не удалось запустить «Обработку»")
-            return
-        _attach(proc_worker)
+        _launch()
 
     def on_ffmpeg_finished(self, success, message):
         if success:

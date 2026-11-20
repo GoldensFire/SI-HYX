@@ -37,6 +37,11 @@ class _PaintedVideoCanvas(_api.QWidget):
     # подвинули/растянули/повернули мышью — вкладка обновляет список слоёв.
     overlaysChanged = _api.pyqtSignal()
     overlaySelected = _api.pyqtSignal(int)
+    # Рамка клипа проекта (ClipFrameEditor): её потянули мышью — (рамка до,
+    # рамка после) в долях кадра; клик по кадру мимо рамки — точка в долях
+    # кадра (вкладка выбирает клип под ней).
+    clipFrameEdited = _api.pyqtSignal(_api.QRectF, _api.QRectF)
+    clipFramePicked = _api.pyqtSignal(_api.QPointF)
     # Первый кадр плеера после watch_player_format(): его QVideoFrameFormat.
     # По нему предекодер отдаёт точные HDR-кадры в том же формате — тогда
     # сцена рисует их тем же шейдером, что и воспроизведение.
@@ -129,6 +134,10 @@ class _PaintedVideoCanvas(_api.QWidget):
         self._ovl_sel = -1
         self._ovl_edit = False
         self._ovl_drag = None
+        # Рамка размера и места выбранного клипа проекта (задаёт вкладка).
+        self._clip_frame = _api.ClipFrameEditor()
+        # Кадр на начало переноса рамки: едет за курсором (_paint_clip_drag).
+        self._clip_drag_img = None
         for _b in (self._crop_apply_btn, self._crop_cancel_btn):
             _b.setVisible(False)
 
@@ -404,6 +413,55 @@ class _PaintedVideoCanvas(_api.QWidget):
 
     def selected_overlay_index(self):
         return self._ovl_sel
+
+    # ── Рамка клипа проекта ───────────────────────────────────────────────────
+    def set_clip_frame(self, rect):
+        """Рамка выбранного клипа в долях кадра (None — спрятать)."""
+        if self._clip_frame.set_rect(rect):
+            self.update()
+
+    def clip_frame_dragging(self):
+        return self._clip_frame.dragging()
+
+    def _clip_frame_press(self, ev):
+        """Нажатие для рамки клипа: захват ручки, иначе выбор клипа под
+        курсором (вкладка ставит его рамку сразу — её можно тут же тянуть)."""
+        if (ev.button() != _api.Qt.MouseButton.LeftButton or self._crop_mode
+                or self._trk is not None or not self._has_frame()):
+            return False
+        vr = _api.QRectF(self.video_rect())
+        if vr.width() <= 0 or vr.height() <= 0:
+            return False
+        pos = ev.position()
+        if not self._clip_frame.press(pos, vr):
+            self.clipFramePicked.emit(_api.QPointF((pos.x() - vr.left()) / vr.width(),
+                                                   (pos.y() - vr.top()) / vr.height()))
+            if not self._clip_frame.press(pos, vr):
+                return False
+        self._clip_drag_img = self.current_frame_image()
+        self.setCursor(self._clip_frame.cursor(self._clip_frame.hit(pos, vr)))
+        return True
+
+    def _paint_clip_drag(self, p, vr):
+        """Перенос рамки вживую: живой плеер показывает один клип, и если
+        тянут его самого — кадр едет и меняет размер вместе с рамкой (вокруг —
+        чёрное, как пустое место кадра проекта). Итог после отпускания рисует
+        просмотр с эффектами."""
+        img = self._clip_drag_img
+        r0, r1 = self._clip_frame.start_rect(), self._clip_frame.rect
+        if img is None or r0 is None or r1 is None or r0.width() <= 1e-9 or r0.height() <= 1e-9:
+            return
+        # Рамка не своего клипа (выбран нижний, показан верхний) — кадр не двигаем.
+        if (abs(r0.x()) > 1e-3 or abs(r0.y()) > 1e-3
+                or abs(r0.width() - 1.0) > 1e-3 or abs(r0.height() - 1.0) > 1e-3):
+            return
+        if r0 == r1:
+            return
+        tgt = _api.QRectF(r1.x() - r0.x() * r1.width() / r0.width(),
+                          r1.y() - r0.y() * r1.height() / r0.height(),
+                          r1.width() / r0.width(), r1.height() / r0.height())
+        p.fillRect(vr.intersected(_api.QRectF(self.rect())), _api.QColor(0, 0, 0))
+        p.drawImage(self._clip_frame.screen_rect(tgt, vr), img)
 
     def set_selected_overlay(self, idx):
         idx = int(idx)
@@ -854,6 +912,10 @@ class _PaintedVideoCanvas(_api.QWidget):
                 self.update()
                 ev.accept()
                 return
+        if self._clip_frame_press(ev):
+            self.update()
+            ev.accept()
+            return
         if self._zoom > 1.0 and ev.button() == _api.Qt.MouseButton.LeftButton:
             self._panning = True
             self._pan_last = ev.position()
@@ -884,6 +946,20 @@ class _PaintedVideoCanvas(_api.QWidget):
             if not (ev.buttons() & _api.Qt.MouseButton.LeftButton):
                 _i, _h = self._ovl_hit(ev.position(), _api.QRectF(self.video_rect()))
                 self.setCursor(self._ovl_cursor(_h))
+        if self._clip_frame.dragging():
+            if ev.buttons() & _api.Qt.MouseButton.LeftButton:
+                if self._clip_frame.move(ev.position(), _api.QRectF(self.video_rect()),
+                                         ev.modifiers()):
+                    self.update()
+            ev.accept()
+            return
+        if (self._clip_frame.rect is not None and not self._ovl_edit and not self._panning
+                and not (ev.buttons() & _api.Qt.MouseButton.LeftButton)):
+            _h = self._clip_frame.hit(ev.position(), _api.QRectF(self.video_rect()))
+            if _h is not None:
+                self.setCursor(self._clip_frame.cursor(_h))
+            else:
+                self.unsetCursor()
         if self._panning and self._pan_last is not None:
             d = ev.position() - self._pan_last
             self._pan_last = ev.position()
@@ -915,6 +991,14 @@ class _PaintedVideoCanvas(_api.QWidget):
             self.update()
             # Геометрия слоя поменялась — вкладке пора пересобрать список/подпись.
             self.overlaysChanged.emit()
+            ev.accept()
+            return
+        if self._clip_frame.dragging() and ev.button() == _api.Qt.MouseButton.LeftButton:
+            change = self._clip_frame.release()
+            self._clip_drag_img = None
+            self.update()
+            if change is not None:
+                self.clipFrameEdited.emit(*change)
             ev.accept()
             return
         if self._panning and ev.button() == _api.Qt.MouseButton.LeftButton:
@@ -1216,6 +1300,8 @@ class _PaintedVideoCanvas(_api.QWidget):
 
         Вынесено из paintEvent отдельным методом: GPU-холст (VideoCanvas) сам
         кадр не рисует, но эти же слои кладёт поверх него в QML-сцене."""
+        if self._clip_drag_img is not None and self._clip_frame.dragging():
+            self._paint_clip_drag(p, _api.QRectF(vr))
         # Наложенные картинки — сразу поверх кадра и ПОД субтитрами.
         if self._ovls:
             self._paint_image_overlays(p, _api.QRectF(vr))
@@ -1234,6 +1320,8 @@ class _PaintedVideoCanvas(_api.QWidget):
             self._paint_crop_overlay(p, vr)
         elif self._crop_norm is not None:
             self._paint_crop_indicator(p, vr)
+        if self._clip_frame.rect is not None and not self._crop_mode:
+            self._clip_frame.paint(p, _api.QRectF(vr))
         if self._trk is not None:
             self._paint_track_preview(p, vr)
 

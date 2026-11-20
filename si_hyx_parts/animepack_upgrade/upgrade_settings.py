@@ -191,6 +191,14 @@ class UpgradeSettings:
     # а старая осталась лежать в архиве и весить.
     drop_unused: bool = True
 
+    # ── Функция 9: HTML → base64 (лёгкий режим) ──────────────────────────
+    # Каждый .html/.htm пака маскируется под VK так же, как галочкой «Лёгкий
+    # режим» во вкладке Base64 (mask_html_js_lite): код движка прячется в
+    # base64, разметка и картинки остаются как есть. Имя файла не меняется,
+    # поэтому ссылки в content.xml трогать не нужно. Выключено по умолчанию:
+    # уже замаскированный или чужой HTML без нужды не переписываем.
+    mask_html: bool = False
+
     # ── Прочее ───────────────────────────────────────────────────────────
     out_dir: str = ""                    # пусто — рядом с исходным паком
 
@@ -237,14 +245,15 @@ class UpgradeSettings:
         if not (self.strip_specials or self.add_titles or self.compress_images
                 or self.strip_repeated_text or self.drop_empty_questions
                 or self.compress_audio or self.compress_video
-                or self.drop_unused or self.merge_text_audio):
+                or self.drop_unused or self.merge_text_audio
+                or self.mask_html):
             problems.append("Все функции выключены — паку нечего менять. "
                             "Включите «Убрать спецвопросы», «Дописать варианты "
                             "названий», «Сжать тяжёлые картинки», «Убрать "
                             "повторяющийся текст», «Текст под звук», «Удалить "
                             "пустые вопросы», «Сжать тяжёлое аудио», «Сжать "
                             "тяжёлое видео» или «Удалить неиспользуемые "
-                            "файлы».")
+                            "файлы» или «HTML → base64».")
         if self.compress_images and self.image_limit_kb >= self.image_min_mb * 1024:
             problems.append(
                 f"Сжимать не во что: картинки берутся от "
@@ -264,7 +273,7 @@ class Change:
     таблица на вкладке показывает их вперемешку, в порядке пака. У картинки
     места в раундах нет — вместо темы стоит имя файла, цены нет вовсе."""
     # special | title | case | poster | image | repeat | merge | empty |
-    # audio | video | unused | character | year | info
+    # audio | video | html | unused | character | year | info
     kind: str = "special"
     round_name: str = ""
     theme_name: str = ""

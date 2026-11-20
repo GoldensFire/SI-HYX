@@ -84,6 +84,8 @@ from edit_tab_dialogs import (
 )
 from edit_tab_frames import (AudioScrubber, FrameGrid, FramePrefetcher,
                              probe_frame_size)
+from image_formats import (IMAGE_EXTS, dialog_patterns, ffmpeg_still,
+                           is_image_path, read_qimage)
 from edit_tab_overlay import (
     ImageOverlay, OverlayCropDialog, OverlayLayersPanel, fit_rect_norm,
     load_overlay_image, overlay_chroma_format, overlay_filter_graph,

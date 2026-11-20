@@ -19,7 +19,8 @@ montage_project.
          в графе — альфа клипа × маска;
   stroke {width (доля высоты кадра), color, style: solid|torn, opacity} —
          обводка по альфе наложения (вырезанный персонаж, панель): альфа
-         размывается и режется порогом (расширение), torn — край «рваной
+         расширяется квадратом (boxblur и порог > 0 — углы прямоугольной
+         картинки остаются острыми; gblur их скруглял), torn — край «рваной
          бумаги» неподвижным geq-смещением; цвет — lut, сам клип — поверх;
   shadow {size — размытие, x, y — сдвиг (доли высоты кадра), opacity,
          color} — мягкая тень по альфе наложения (окна-вставки, колонки):
@@ -276,7 +277,6 @@ def stroke_chain(g, stroke, h, label):
     """Обводка по альфе (см. модуль): вход — [label], выход — без метки."""
     px = max(1, int(round(stroke["width"] * h)))
     pad = 2 * px + 2
-    sig = max(0.5, px / 2.0)
     y, u, v = _yuv(stroke["color"])
     s0, s1, sil = g.label("sa"), g.label("sb"), g.label("sc")
     tail = ""
@@ -299,8 +299,12 @@ def stroke_chain(g, stroke, h, label):
     fade = f",lut=a='val*{_api._num(op)}'" if op < 1.0 else ""
     return (f"[{label}]format=yuva420p,pad=iw+{2 * pad}:ih+{2 * pad}:{pad}:{pad}:color=black@0,"
             f"split[{s0}][{s1}];"
-            f"[{s1}]lut=y={y}:u={u}:v={v},gblur=sigma={_api._num(sig)}:planes=8,"
-            f"lut=a='if(gt(val,20),255,0)'{tail},gblur=sigma=0.6:planes=8{fade}[{sil}];"
+            # Квадратное расширение на px: среднее по окну (2px+1)² > 0, если
+            # в окне есть хоть один пиксель клипа (один столбец окна — это уже
+            # 255/(2px+1) ≥ 1), — угол прямоугольника остаётся углом.
+            f"[{s1}]lut=y={y}:u={u}:v={v},boxblur=luma_radius=0:luma_power=0:"
+            f"chroma_radius=0:chroma_power=0:alpha_radius={px}:alpha_power=1,"
+            f"lut=a='if(gt(val,0),255,0)'{tail},gblur=sigma=0.6:planes=8{fade}[{sil}];"
             # Один поток: overlay на кадр с альфой по срезам гоняется на их
             # стыке (цветность пары строк читала альфу соседнего среза) —
             # пиксели обводки плавали от сборки к сборке.

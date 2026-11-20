@@ -173,7 +173,8 @@ class VideoCanvas(_api._PaintedVideoCanvas):
         if not has_frame:
             return bool(self._audio_only_msg)
         return bool(self._ovls or self._text or self._image is not None
-                    or self._crop_norm is not None or self._trk is not None)
+                    or self._crop_norm is not None or self._trk is not None
+                    or self._clip_frame.rect is not None)
 
     def _refresh_overlay(self):
         """Рисует оверлеи в картинку ровно в размер холста (в пикселях

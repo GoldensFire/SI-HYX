@@ -23,6 +23,7 @@ class UpgradeResult:
     empties: list = _api.field(default_factory=list)      # список Change (empty)
     audios: list = _api.field(default_factory=list)       # список Change (audio)
     videos: list = _api.field(default_factory=list)       # список Change (video)
+    htmls: list = _api.field(default_factory=list)        # список Change (html)
     unused: list = _api.field(default_factory=list)       # список Change (unused)
     skipped_specials: list = _api.field(default_factory=list)  # без самого вопроса
     skipped_titles: list = _api.field(default_factory=list)    # ответ — имя персонажа
@@ -47,7 +48,7 @@ class UpgradeResult:
         """Списки правок по функциям — в том порядке, в каком идут в отчёте."""
         return [self.specials, self.titles, self.recased, self.posters,
                 self.years, self.infos, self.images, self.repeats, self.merged, self.empties,
-                self.audios, self.videos, self.unused]
+                self.audios, self.videos, self.htmls, self.unused]
 
     @property
     def changes(self) -> list:

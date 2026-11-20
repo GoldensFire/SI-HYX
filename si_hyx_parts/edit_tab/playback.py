@@ -14,8 +14,9 @@ class EditTabPlaybackMixin:
     def open_file(self):
         fname, _ = _api.QFileDialog.getOpenFileName(
             self, "Открыть медиа файл", "",
-            "Медиа файлы (*.mp4 *.mkv *.mov *.avi *.mp3 *.aac *.wav *.flac "
-            "*.png *.jpg *.jpeg *.bmp *.webp *.gif);;Все файлы (*)")
+            "Медиа файлы (*.mp4 *.mkv *.mov *.avi *.webm *.mp3 *.aac *.m4a *.wav *.flac "
+            + _api.dialog_patterns() + ");;Картинки (" + _api.dialog_patterns()
+            + ");;Все файлы (*)")
         if fname:
             self._project_leave()
             self.load_file(fname)
@@ -310,8 +311,7 @@ class EditTabPlaybackMixin:
         # ни плеер, ни прокси, ни обрезка не применимы. Показываем кадр статично и
         # включаем только пикселизацию/кадрирование. Экспорт собирает видео из
         # картинки (-loop 1) при «Экспорт».
-        _ext = _api.os.path.splitext(str(path))[1].lower()
-        if _ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff"):
+        if _api.is_image_path(path):
             self._load_still_image()
             return
 
@@ -376,8 +376,8 @@ class EditTabPlaybackMixin:
         try: self.player.setSource(_api.QUrl())
         except Exception: pass
 
-        img = _api.QImage(str(path))
-        if img.isNull():
+        img = _api.read_qimage(path)
+        if img is None:
             _api.msgbox_critical(self, "Ошибка", "Не удалось открыть картинку.")
             return
         self.is_still_image = True
@@ -1499,11 +1499,9 @@ class EditTabPlaybackMixin:
         # Для still-картинки доступны кадрирование/пикселизация/сохранение кадра
         # (полноэкранный режим — нет, он завязан на плеер).
         has_visual = has_video or is_image
-        audio_only_mode = bool(getattr(self, "_audio_only_mode", False))
-        _fsb = getattr(self, "btn_fullscreen", None)
-        if _fsb is not None:
-            # В режиме «только звук» смотреть в полный экран нечего.
-            _fsb.setEnabled(has_video and not audio_only_mode)
+        # Полный экран: видео в плеере или проект в просмотре с эффектами; в
+        # режиме «только звук» смотреть нечего (fullscreen._fs_btn_sync).
+        self._fs_btn_sync()
         _aob = getattr(self, "btn_audio_only", None)
         if _aob is not None:
             _aob.setEnabled(has_video)
@@ -1547,16 +1545,6 @@ class EditTabPlaybackMixin:
                 button.setEnabled(False)
         # Режимы обрезки, неприменимые к аудио, отключаем (см. ниже).
         self._update_mode_combo_for_media(has_video)
-        # Иконка полноэкранного режима белая поверх accent-заливки; на сером
-        # disabled-фоне белый значок «не выглядел» выключенным. Перекрашиваем его
-        # в приглушённый цвет, когда видео нет, и обратно в белый, когда есть.
-        try:
-            if getattr(self, "btn_fullscreen", None) is not None \
-                    and getattr(self, "_fs_window", None) is None:
-                self.btn_fullscreen.setIcon(_api._fullscreen_icon(
-                    expand=True, color="#ffffff" if has_video else _api.C['text3']))
-        except Exception:
-            pass
 
     def _toggle_audio_only(self, on):
         """Кнопка «Только звук»: снимает/возвращает видеодорожку у плеера.

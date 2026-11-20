@@ -146,6 +146,37 @@ class QuestionViewerItemsMixin:
                     prop_b.clicked.connect(_propagate_wrong)
                     rl.addWidget(prop_b)
 
+                    # Удалить этот же неправильный ответ из всех вопросов
+                    # выбранных раундов (повторяющаяся строка во всём паке).
+                    purge_b = _api.QPushButton("🗑"); purge_b.setFixedSize(22, 22)
+                    purge_b.setToolTip("Удалить этот неправильный ответ из всех вопросов "
+                                       "(выбор раундов)")
+                    purge_b.setStyleSheet("QPushButton{background:transparent;color:#585b70;border:none;"
+                                          "font-size:11px;border-radius:3px;padding:0;}"
+                                          "QPushButton:hover{color:#f38ba8;background:rgba(243,139,168,0.10);}")
+                    def _purge_wrong(_, le=le, i=_this_idx, qv=self):
+                        txt = le.text().strip()
+                        if not txt: return
+                        if i < len(ans_list_ref):
+                            ans_list_ref[i] = le.text()
+                        save_fn()
+                        mw = _api._find_mw(qv)
+                        datasets = getattr(mw, 'datasets', ())
+                        if qv._open_propagate_wrong_dialog(txt, datasets, remove=True) is None:
+                            return
+                        # Текущий вопрос: убрать строку и из открытого редактора,
+                        # если его раунд был среди выбранных (в данных её уже нет).
+                        try:
+                            qs = qv.siq.rounds[rnd]["themes"][th]["questions"]
+                            cur = qs[_api._q_idx(qs, price)].get("wrong_answers", [])
+                        except Exception:
+                            return
+                        if not any(a.strip() == txt for a in cur):
+                            ans_list_ref[:] = [a for a in ans_list_ref if a.strip() != txt]
+                            _refresh_rows()
+                    purge_b.clicked.connect(_purge_wrong)
+                    rl.addWidget(purge_b)
+
                 rl.addWidget(del_b)
 
                 def _row_enter(e, h=dh): h.setStyleSheet(_api._DH_SS_SHOWN)
@@ -954,11 +985,18 @@ class QuestionViewerItemsMixin:
                 wl.addWidget(warn, 0, _api._AlignVC)
             return w
 
-    def _open_propagate_wrong_dialog(self, wrong_text: str, datasets: list):
-        """Show round selector and copy wrong_text into wrong_answers of all questions in chosen rounds."""
+    def _open_propagate_wrong_dialog(self, wrong_text: str, datasets: list,
+                                     remove: bool = False):
+        """Show round selector and copy wrong_text into wrong_answers of all questions in chosen rounds.
+
+        remove=True — наоборот, удаляет wrong_text (сравнение без пробелов по
+        краям) из неправильных ответов всех вопросов выбранных раундов; раунды
+        текущего пакета отмечены заранее. Возвращает число затронутых вопросов
+        или None, если диалог отменён."""
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem
         dlg = QDialog(self)
-        dlg.setWindowTitle("Скопировать неправильный ответ в другие вопросы")
+        dlg.setWindowTitle("Удалить неправильный ответ из вопросов" if remove
+                           else "Скопировать неправильный ответ в другие вопросы")
         dlg.setMinimumWidth(460); dlg.setMinimumHeight(400)
         dlg.setStyleSheet("QDialog{background:#181825;color:#cdd6f4;}"
                           "QTreeWidget{background:#1e1e2e;border:1px solid #45475a;border-radius:4px;"
@@ -967,7 +1005,8 @@ class QuestionViewerItemsMixin:
                           "QTreeWidget::item:selected{background:#45475a;color:#b4befe;}"
                           "QTreeWidget::branch{background:#1e1e2e;}")
         vl = QVBoxLayout(dlg); vl.setContentsMargins(14,12,14,12); vl.setSpacing(8)
-        vl.addWidget(_api._lbl("Выберите раунды для добавления неправильного ответа:",
+        vl.addWidget(_api._lbl("Выберите раунды, из вопросов которых удалить неправильный ответ:"
+                          if remove else "Выберите раунды для добавления неправильного ответа:",
                           "color:#cdd6f4;font-size:12px;font-weight:700;"))
         _wrong_txt_lbl = _api._lbl(f"Текст: \u00ab{wrong_text}\u00bb", "color:#f9e2af;font-size:11px;")
         _wrong_txt_lbl.setWordWrap(True)
@@ -986,7 +1025,9 @@ class QuestionViewerItemsMixin:
             pkg_item.setExpanded(True)
             for ri, rd in enumerate(siq.rounds):
                 rd_item = QTreeWidgetItem(pkg_item, [rd["name"]])
-                rd_item.setCheckState(0, _api.Qt.CheckState.Unchecked)
+                rd_item.setCheckState(0, _api.Qt.CheckState.Checked
+                                      if remove and siq is self.siq
+                                      else _api.Qt.CheckState.Unchecked)
                 rd_item.setFlags(rd_item.flags() | _api.Qt.ItemFlag.ItemIsUserCheckable)
                 rd_item.setData(0, _api.Qt.ItemDataRole.UserRole, (siq, ri))
             _pkg_items.append(pkg_item)
@@ -1005,12 +1046,14 @@ class QuestionViewerItemsMixin:
         # runs up through it). Two live widgets sharing an objectName confuses
         # QStyleSheetStyle's rule cache and can leave one of them unpainted \u2014
         # that's what was making this button vanish. Style it inline instead.
-        ok_btn = _api.AnimatedButton("\u2192 \u0414\u043e\u0431\u0430\u0432\u0438\u0442\u044c")
+        ok_btn = _api.AnimatedButton("🗑 Удалить" if remove
+                                     else "\u2192 \u0414\u043e\u0431\u0430\u0432\u0438\u0442\u044c")
+        _ok_bg, _ok_hover = ("#f38ba8", "#eba0ac") if remove else ("#a6e3a1", "#94e2d5")
         ok_btn.setStyleSheet(
-            "QPushButton{background:#a6e3a1;color:#181825;border:none;font-weight:700;"
+            f"QPushButton{{background:{_ok_bg};color:#181825;border:none;font-weight:700;"
             "border-radius:4px;padding:4px 12px;}"
-            "QPushButton:hover{background:#94e2d5;}"
-            "QPushButton:pressed{background:#94e2d5;}")
+            f"QPushButton:hover{{background:{_ok_hover};}}"
+            f"QPushButton:pressed{{background:{_ok_hover};}}")
         ok_btn.setMinimumWidth(120); ok_btn.setFixedHeight(28)
         ok_btn.clicked.connect(dlg.accept)
         # Force each button to keep its full sizeHint width \u2014 a Preferred
@@ -1023,7 +1066,9 @@ class QuestionViewerItemsMixin:
         vl.addLayout(bot)
         dlg.adjustSize()   # recompute geometry from live font metrics, not the static minimum
         if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
+            return None
+        if remove:
+            return self._remove_wrong_from_rounds(wrong_text, _pkg_items)
         added_count = 0
         for pi in _pkg_items:
             for ci in range(pi.childCount()):
@@ -1059,3 +1104,48 @@ class QuestionViewerItemsMixin:
             mw._save_notif.setText(f"\u2192 \u0414\u043e\u0431\u0430\u0432\u043b\u0435\u043d\u043e \u0432 {added_count} \u0432\u043e\u043f\u0440\u043e\u0441\u043e\u0432")
             mw._show_save_notification()
             _api.QTimer.singleShot(3100, lambda: mw._save_notif.setText("\u2705  \u0424\u0430\u0439\u043b \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d"))
+        return added_count
+
+    def _remove_wrong_from_rounds(self, wrong_text: str, pkg_items: list) -> int:
+        """Удаляет wrong_text из неправильных ответов всех вопросов отмеченных
+        раундов (и в данных, и в content.xml). Пустой <wrong> убирается.
+        Возвращает число вопросов, где строка нашлась."""
+        target = wrong_text.strip()
+        removed = 0
+        for pi in pkg_items:
+            for ci in range(pi.childCount()):
+                child = pi.child(ci)
+                if child.checkState(0) != _api.Qt.CheckState.Checked: continue
+                data = child.data(0, _api.Qt.ItemDataRole.UserRole)
+                if not data: continue
+                siq_t, ri = data
+                try:
+                    for th_data in siq_t.rounds[ri]["themes"]:
+                        for q in th_data["questions"]:
+                            old = q.get("wrong_answers") or []
+                            new = [a for a in old if a.strip() != target]
+                            if len(new) != len(old):
+                                q["wrong_answers"] = new
+                                removed += 1
+                    root_xml, ns_url, tag = siq_t._load_xml_root()
+                    rnd_el, tag = siq_t._nav_to_round(root_xml, tag, ri)
+                    changed = False
+                    for th_el in rnd_el.findall(f'{tag("themes")}/{tag("theme")}'):
+                        for q_el in th_el.findall(f'{tag("questions")}/{tag("question")}'):
+                            wrong_el = q_el.find(tag("wrong"))
+                            if wrong_el is None: continue
+                            for a in wrong_el.findall(tag("answer")):
+                                if (a.text or "").strip() == target:
+                                    wrong_el.remove(a); changed = True
+                            if not wrong_el.findall(tag("answer")):
+                                q_el.remove(wrong_el); changed = True
+                    if changed:
+                        siq_t._save_xml(root_xml, ns_url)
+                except Exception as ex:
+                    _api._logger.warning(f"[remove_wrong] {ex}")
+        mw = _api._find_mw(self)
+        if hasattr(mw, "_show_save_notification"):
+            mw._save_notif.setText(f"🗑  Удалено из {removed} вопросов")
+            mw._show_save_notification()
+            _api.QTimer.singleShot(3100, lambda: mw._save_notif.setText("\u2705  \u0424\u0430\u0439\u043b \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d"))
+        return removed

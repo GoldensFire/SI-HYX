@@ -21,6 +21,7 @@ from config import (
     QVBoxLayout, QWidget, Qt, get_icon
 )
 from msgbox import (msgbox_information, msgbox_warning)
+from image_formats import dialog_patterns, png_copy
 from edit_tab_base import (
     C, DEFAULT_SUBTITLE_STYLE, _karaoke_font_family, _load_subtitle_presets,
     _pixelize_block_sequence, _save_subtitle_presets, make_divider,

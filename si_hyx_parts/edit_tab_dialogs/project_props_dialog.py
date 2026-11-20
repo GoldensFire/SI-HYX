@@ -304,7 +304,7 @@ class _PropsDialog(_api.QDialog):
 class ClipPropsDialog(_PropsDialog):
     """Свойства клипа: вид, переход, звук, эффекты."""
 
-    def __init__(self, clip, on_main, on_apply, parent=None):
+    def __init__(self, clip, on_main, on_apply, parent=None, page=None):
         super().__init__(f"Клип: {clip.name}", on_apply, parent)
         c = clip
         f = self._page("Картинка")
@@ -336,6 +336,33 @@ class ClipPropsDialog(_PropsDialog):
         if on_main:
             f.addRow("", _api.QLabel("Место, размер и наложение — у клипов верхних дорожек."))
 
+        f = self._page("Обводка")
+        st = c.stroke or {}
+        # Толщина — в % высоты кадра (в модели — доля); 0 — без обводки.
+        self.stroke_width = _spin(0.0, 8.0, float(st.get("width", 0.0)) * 100.0,
+                                  step=0.1, decimals=2)
+        self.stroke_width.setSpecialValueText("Нет")
+        self.stroke_color = _ColorButton(st.get("color", "#ffffff"))
+        self.stroke_style = _api.QComboBox()
+        for key, name in (("solid", "Ровная"), ("torn", "Рваная бумага")):
+            self.stroke_style.addItem(name, key)
+        self.stroke_style.setCurrentIndex(max(0, self.stroke_style.findData(
+            st.get("style", "solid"))))
+        self.stroke_opacity = _spin(0.0, 1.0, float(st.get("opacity", 1.0)))
+        f.addRow("Толщина (% высоты кадра)", self.stroke_width)
+        f.addRow("Цвет", self.stroke_color)
+        f.addRow("Вид", self.stroke_style)
+        f.addRow("Непрозрачность", self.stroke_opacity)
+        for w in (self.stroke_width, self.stroke_color, self.stroke_style, self.stroke_opacity):
+            w.setEnabled(not on_main and c.has_video)
+        note = _api.QLabel("Обводка — у клипов верхних дорожек (картинки и видео поверх "
+                           "кадра)." if on_main else
+                           "Обводка идёт по краю картинки, у PNG с прозрачностью — по "
+                           "контуру. 0 — без обводки.")
+        note.setWordWrap(True)
+        f.addRow("", note)
+        self._stroke_page = self.tabs.count() - 1
+
         f = self._page("Переход")
         self.transition = _api.QComboBox()
         self.transition.addItem("Нет", "")
@@ -366,11 +393,22 @@ class ClipPropsDialog(_PropsDialog):
         self.fx = EffectsEditor(c.effects, _mp.EFFECT_TYPES, markers=True)
         self.tabs.addTab(self.fx, "Эффекты")
         self.fx.setEnabled(c.has_video)
+        if page == "stroke":
+            self.tabs.setCurrentIndex(self._stroke_page)
+
+    def _stroke_value(self):
+        width = self.stroke_width.value()
+        if not self.stroke_width.isEnabled() or width <= 0:
+            return {}
+        return {"width": width / 100.0, "color": self.stroke_color.color(),
+                "style": self.stroke_style.currentData(),
+                "opacity": self.stroke_opacity.value()}
 
     def values(self):
         return {"fit": self.fit.currentData(), "pos_x": self.pos_x.value(),
                 "pos_y": self.pos_y.value(), "scale": self.scale.value(),
                 "opacity": self.opacity.value(), "blend": self.blend.currentData(),
+                "stroke": self._stroke_value(),
                 "reverse": self.reverse.isChecked(),
                 "transition": self.transition.currentData(),
                 "transition_s": self.transition_s.value(), "volume": self.volume.value(),

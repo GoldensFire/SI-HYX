@@ -34,6 +34,7 @@ try:
 except ImportError:                 # без QtMultimedia звук просмотра не поднимется
     QAudio = QVideoFrame = None
 from utils import csv_first
+from image_formats import ffmpeg_still, is_image_path
 from PyQt6.QtCore import (QFile, QFileDevice, QIODevice, QObject, QTimer, QUrl,
                           pyqtSlot)
 from PyQt6.QtGui import (QImage)

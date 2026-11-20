@@ -17,6 +17,7 @@ from si_hyx_parts.edit_tab.project_link import EditTabProjectLinkMixin
 from si_hyx_parts.edit_tab.project_texts import EditTabProjectTextsMixin
 from si_hyx_parts.edit_tab.project_fx import EditTabProjectFxMixin
 from si_hyx_parts.edit_tab.project_props import EditTabProjectPropsMixin
+from si_hyx_parts.edit_tab.project_frame import EditTabProjectFrameMixin
 from si_hyx_parts.edit_tab.timeline_seek import EditTabTimelineSeekMixin
 from si_hyx_parts.edit_tab.subtitle_sync import EditTabSubtitleSyncMixin
 from si_hyx_parts.edit_tab.project_audio import EditTabProjectAudioMixin
@@ -43,6 +44,7 @@ class EditTab(
     EditTabProjectTextsMixin,
     EditTabProjectFxMixin,
     EditTabProjectPropsMixin,
+    EditTabProjectFrameMixin,
     EditTabProjectAudioMixin,
     EditTabSpliceBridgeMixin,
     EditTabProjectSoundMixin,
@@ -383,7 +385,8 @@ class EditTab(
             return True
         # Двойной клик по видео → переключение полноэкранного режима.
         if (event.type() == _api.QEvent.Type.MouseButtonDblClick
-                and watched is self.video_widget):
+                and (watched is self.video_widget
+                     or watched is getattr(self, "_fx_view", None))):
             self.toggle_fullscreen()
             return True
         # Главное окно подвинули/изменили → ведём за ним оверлей субтитров.

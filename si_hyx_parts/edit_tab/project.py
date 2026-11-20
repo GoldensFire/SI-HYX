@@ -174,6 +174,7 @@ class EditTabProjectMixin:
                          else "Склеить клипы проекта в один файл (Ctrl+S)")
             if n > 0:
                 b.setEnabled(True)
+        self._frame_refresh()
 
     def _project_load_saved(self):
         """Проект из MONTAGE_PROJECT_PATH. Файл, который не загрузился (битый
@@ -749,7 +750,8 @@ class EditTabProjectMixin:
         fname, _ = _api.QFileDialog.getOpenFileName(
             self, "Добавить в проект", "",
             "Медиа файлы (*.mp4 *.mkv *.mov *.avi *.webm *.mp3 *.aac *.m4a *.wav *.flac "
-            "*.png *.jpg *.jpeg *.bmp *.webp *.gif);;Все файлы (*)")
+            + _api.dialog_patterns() + ");;Картинки (" + _api.dialog_patterns()
+            + ");;Все файлы (*)")
         if fname:
             self._project_drop([fname])
 
@@ -760,6 +762,8 @@ class EditTabProjectMixin:
             self._project_text_action(action, cid)
         elif action == 'props':
             self.project_clip_props(cid)
+        elif action == 'stroke':
+            self.project_clip_props(cid, page="stroke")
         elif action == 'project_settings':
             self.project_settings_dialog()
         elif action == 'split':
@@ -1069,6 +1073,7 @@ class EditTabProjectMixin:
         if lbl is not None:
             lbl.setText(_api.s_to_time(t))
         self._fs_sync_position()
+        self._frame_refresh()
 
     def _proj_follow_source(self, src_s):
         """Плеер показал кадр src_s файла (_paint_playhead) — плейхед проекта
@@ -1292,6 +1297,10 @@ class EditTabProjectMixin:
         проект из нескольких кусков — спросить: добавить в конец или начать
         заново. False — передумали, файл не открываем."""
         kind = 'fresh'
+        # Картинка при видео в проекте — поверх кадра у плейхеда (project_frame),
+        # видео не заменяется и из плеера не уходит.
+        if not self._frame_images_over_video([str(path)]):
+            return False
         # Связанный с файлом проект (нейросети, открытый) молча не заменяется.
         if len(self.project.clips) > 1 or (self._proj_link and self.project.clips):
             box = _api.QMessageBox(self)
@@ -1359,10 +1368,14 @@ class EditTabProjectMixin:
 
     def _project_drop(self, paths):
         """Файлы, брошенные на таймлайн (или «＋»), — в конец проекта целиком,
-        по очереди. Файл проекта (.json и его .bak) открывается проектом."""
+        по очереди. Файл проекта (.json и его .bak) открывается проектом;
+        картинки при видео в проекте — поверх кадра у плейхеда."""
         projects = [x for x in paths if _mp.is_project_file(x)]
         if projects:
             self.project_open_file(projects[0])
+            return
+        paths = self._frame_images_over_video(paths)
+        if not paths:
             return
         self._proj_drop_queue = list(paths)
         self._project_drop_next()
@@ -1708,10 +1721,12 @@ class EditTabProjectMixin:
             if mode == 5 and not p.audio_parts():
                 _api.msgbox_warning(self, "Проект", "В проекте нет звука — обрабатывать нечего.")
                 return
-            self.project_stop()
+            # Просмотр проекта останавливаем перед самим запуском: в очереди
+            # («В очередь») задача ждёт, и смотреть проект пока можно.
             self._execute_cut_and_process(
                 0.0, p.duration(), src=first.src, audio_only=(mode == 5),
-                burn_subs=(mode == 4), project=p.to_dict(), name_stem=f"{stem}_проект")
+                burn_subs=(mode == 4), project=p.to_dict(), name_stem=f"{stem}_проект",
+                before_start=self.project_stop)
             return
         video = p.has_video()
         ext = ".mp4" if video else ".m4a"

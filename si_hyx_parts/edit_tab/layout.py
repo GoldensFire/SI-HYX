@@ -1158,6 +1158,7 @@ class EditTabLayoutMixin:
             self.video_widget.cropCancelled.connect(self._on_crop_cancelled)
             self.video_widget.overlaysChanged.connect(self._on_overlays_changed)
             self.video_widget.overlaySelected.connect(self._on_overlay_picked)
+            self._frame_connect(self.video_widget)
             # Формат кадров плеера — точным кадрам предекодера (HDR).
             self.video_widget.playerFrameFormat.connect(self._on_player_frame_format)
         try:

@@ -49,6 +49,8 @@ from si_hyx_parts.edit_tab_widgets.player_widgets import (
     SubtitleOverlay,
 )
 
+from si_hyx_parts.edit_tab_widgets.clip_frame import ClipFrameEditor
+
 from si_hyx_parts.edit_tab_widgets.painted_video_canvas import _PaintedVideoCanvas
 
 from si_hyx_parts.edit_tab_widgets.project_timeline import ProjectTimeline

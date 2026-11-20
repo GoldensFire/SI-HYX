@@ -30,6 +30,7 @@ from config import (
     QWidget, Qt, get_icon, pyqtSignal
 )
 from edit_tab_base import C, make_icon_btn
+from image_formats import read_qimage
 from PyQt6.QtGui import QIcon, QImage, QPixmap, QTransform
 from PyQt6.QtWidgets import QDialogButtonBox, QPushButton, QSizePolicy
 # Сам ffmpeg-граф накладок живёт в utils: его собирает не только Монтаж, но и
@@ -48,8 +49,8 @@ HANDLE_PX = 8
 
 def load_overlay_image(path):
     """Читает картинку с диска в QImage (ARGB32, с альфой). None — не вышло."""
-    img = QImage(str(path))
-    if img.isNull():
+    img = read_qimage(path)
+    if img is None:
         return None
     if img.format() != QImage.Format.Format_ARGB32:
         img = img.convertToFormat(QImage.Format.Format_ARGB32)

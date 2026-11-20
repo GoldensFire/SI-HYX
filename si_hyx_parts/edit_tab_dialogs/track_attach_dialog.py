@@ -252,13 +252,17 @@ class _TrackAttachDialog(_api.QDialog):
     def _pick_image(self):
         path, _ = _api.QFileDialog.getOpenFileName(
             self, "Картинка для привязки", "",
-            "Изображения (*.png *.webp *.jpg *.jpeg *.bmp *.gif);;Все файлы (*.*)")
+            "Изображения (" + _api.dialog_patterns() + ");;Все файлы (*.*)")
         if not path:
             return
         try:
             from photo_tab import _load_image_alpha
             import numpy as np
             img = _load_image_alpha(path)
+            if img is None:
+                # Чего Pillow не читает (JPEG XL, EXR…) — через PNG-копию.
+                copy = _api.png_copy(path)
+                img = _load_image_alpha(copy) if copy else None
             if img is None:
                 raise ValueError("не удалось прочитать файл")
             if img.shape[2] == 3:      # без альфы — добиваем непрозрачным каналом

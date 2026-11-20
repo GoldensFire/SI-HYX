@@ -51,6 +51,9 @@ class PackUpgrader:
         # «Ответ как в генераторе»: (вопрос, id тайтла, книга?, место) — автор и
         # оценка спрашиваются пачками после обхода вопросов (fetch_info).
         self._info_jobs: list[tuple] = []
+        # HTML, замаскированный под VK: {имя записи: новые байты}. Имя то же,
+        # подменяется только содержимое (см. _do_html и _write).
+        self._masked_html: dict[str, bytes] = {}
 
     # ── мелочи ────────────────────────────────────────────────────────────
     def log(self, msg: str) -> None:
@@ -195,6 +198,8 @@ class PackUpgrader:
             images.update(self._do_video(
                 heavy_video, root, result,
                 len(questions) + len(heavy) + len(heavy_audio), steps))
+        if self.s.mask_html and not result.cancelled:
+            self._do_html(result)
 
         # Мусор ищем ПОСЛЕДНИМ: к этому моменту ссылки уже переписаны на
         # пережатые файлы, а постеры вписаны в ответы — иначе только что
@@ -1192,10 +1197,59 @@ class PackUpgrader:
                 before=_api.fmt_size(size), after="файл удалён (ссылок на него нет)",
                 title=name,
                 order=result.questions + result.heavy_images
-                + len(result.audios) + len(result.videos) + len(result.unused)))
+                + len(result.audios) + len(result.videos) + len(result.htmls)
+                + len(result.unused)))
         self.log(f"Неиспользуемых файлов удалено: {len(doomed)} "
                  f"({_api.fmt_size(result.saved_unused_bytes)}).")
         return set(doomed)
+
+    # ── HTML → base64 ─────────────────────────────────────────────────────
+    def _do_html(self, result) -> None:
+        """Маскирует каждый .html/.htm пака под VK лёгким режимом вкладки
+        Base64 (mask_html_js_lite). Имя записи не меняется — ссылки в
+        content.xml остаются верными; новые байты кладёт _write."""
+        try:
+            with _api.zipfile.ZipFile(self.path) as zf:
+                entries = [i for i in zf.infolist() if not i.is_dir()
+                           and _api.os.path.splitext(_api.unquote(
+                               i.filename.replace("\\", "/")))[1].lower()
+                           in (".html", ".htm")]
+                if not entries:
+                    self.log("HTML-файлов в паке нет.")
+                    return
+                for info in entries:
+                    if self.stopped():
+                        result.cancelled = True
+                        return
+                    name = _api.entry_basename(info.filename)
+                    try:
+                        html = zf.read(info.filename).decode("utf-8-sig")
+                    except UnicodeDecodeError:
+                        self.log(f"«{name}»: HTML не в UTF-8, оставляю как есть.")
+                        continue
+                    try:
+                        masked, n_in, _n_ext = _api.mask_html_js_lite(html)
+                    except Exception as e:  # чужой HTML бывает любым
+                        self.log(f"«{name}»: замаскировать не вышло ({e}), "
+                                 f"оставляю как есть.")
+                        continue
+                    if not n_in:
+                        self.log(f"«{name}»: скриптов с кодом нет, оставляю.")
+                        continue
+                    data = masked.encode("utf-8")
+                    self._masked_html[info.filename] = data
+                    result.htmls.append(_api.Change(
+                        kind="html", theme_name=name, price=0,
+                        before=f"html, {_api.fmt_size(info.file_size)}",
+                        after=f"base64 (лёгкий), {_api.fmt_size(len(data))}",
+                        title=info.filename,
+                        order=result.questions + result.heavy_images
+                        + len(result.audios) + len(result.videos)
+                        + len(result.htmls)))
+        except (OSError, _api.zipfile.BadZipFile) as e:
+            raise _api.UpgradeError(f"Файл не читается как .siq: {e}") from e
+        self.log(f"HTML замаскировано в base64 (лёгкий режим): "
+                 f"{len(result.htmls)} из {len(entries)}.")
 
     # ── запись ────────────────────────────────────────────────────────────
     def _out_path(self, out_path: _api.Optional[str]) -> str:
@@ -1233,6 +1287,12 @@ class PackUpgrader:
                 for info in src.infolist():
                     if (info.filename == cname or info.is_dir()
                             or info.filename in dropped):
+                        continue
+                    masked = self._masked_html.get(info.filename)
+                    if masked is not None:
+                        # HTML под VK: имя прежнее, содержимое новое.
+                        dst.writestr(info.filename, masked,
+                                     _api.zipfile.ZIP_DEFLATED)
                         continue
                     made = images.get(info.filename)
                     if made:
@@ -1398,6 +1458,13 @@ def example_lines(result: _api.UpgradeResult, limit: int = 3) -> list[str]:
                      if not getattr(result, "heavy_video", 0) else
                      f"  • примеров нет: ни один из {result.heavy_video} "
                      f"роликов перекодировать не пришлось.")
+
+    htmls = list(getattr(result, "htmls", []))
+    if htmls:
+        lines.append(f"HTML замаскировано в base64 (лёгкий режим): {len(htmls)}.")
+        for change in htmls[:limit]:
+            lines.append(f"  • {_api._shorten(change.theme_name)}: {change.before} → "
+                         f"{change.after}")
 
     unused = list(getattr(result, "unused", []))
     lines.append(f"Неиспользуемых файлов удалено: {len(unused)}"

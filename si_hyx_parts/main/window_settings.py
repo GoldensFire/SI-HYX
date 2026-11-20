@@ -703,12 +703,6 @@ class UnifiedWindowSettingsMixin:
         vexp.addWidget(hint(_api.icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
                             + " Аниме, в английских субтитрах которых звучит фраза "
                               "(например, «six seven»): от лёгкого к сложному, с исключением паков."))
-        chk_lb = _api.QCheckBox("Включить вкладку «ЛидербордHYX»")
-        chk_lb.setChecked(bool(getattr(self, "_leaderboard_tab_enabled", False)))
-        chk_lb.toggled.connect(self._set_leaderboard_tab_enabled)
-        vexp.addWidget(chk_lb)
-        vexp.addWidget(hint(_api.icon_html('fa5s.exclamation-triangle', 12, '#f9e2af')
-                            + " Просмотр рекордов из JSON-выгрузки Firebase."))
         chk_coop = _api.QCheckBox("Включить вкладку «Collab»")
         chk_coop.setChecked(bool(getattr(self, "_coop_tab_enabled", False)))
         chk_coop.toggled.connect(self._set_coop_tab_enabled)
@@ -735,7 +729,6 @@ class UnifiedWindowSettingsMixin:
                 "siquester сиквестер siq пакет вопросы статистика эксперимент вкладка просмотр sigame "
                 "shikimori шикимори аниме поиск оценка жанр год api "
                 "поиск по сабам субтитры фраза six seven английские "
-                "лидерборд leaderboard рекорды никнеймы firebase счёт ник "
                 "collab coop совместная работа пак напарник соавтор реалтайм темы вопросы ответы дубли синхронизация "
                 "генерация аниме пак опенинг эндинг песни amq anisongdb myanimelist shikimori aspg угадайка siq "
                 "манга кадры персонажи отрывки серии караоке сакуга арты pixiv "
@@ -917,7 +910,6 @@ class UnifiedWindowSettingsMixin:
                 'shikimori': self._collect_shikimori_settings(),
                 'subsearch_tab_enabled': bool(getattr(self, '_subsearch_tab_enabled', False)),
                 'subsearch': self._collect_subsearch_settings(),
-                'leaderboard_tab_enabled': bool(getattr(self, '_leaderboard_tab_enabled', False)),
                 'coop_tab_enabled': bool(getattr(self, '_coop_tab_enabled', False)),
                 'coop': self._collect_coop_settings(),
                 'animepack_tab_enabled': bool(getattr(self, '_animepack_tab_enabled', False)),

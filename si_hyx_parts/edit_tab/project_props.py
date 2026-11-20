@@ -16,7 +16,7 @@ import edit_tab as _api
 class EditTabProjectPropsMixin:
     """Монтаж: окна свойств проекта."""
 
-    def project_clip_props(self, cid=None):
+    def project_clip_props(self, cid=None, page=None):
         clip = self.project.clip(cid or self.project_timeline.selected)
         if clip is None:
             self._proj_status("выделите клип — свойства у выделенного клипа")
@@ -41,7 +41,7 @@ class EditTabProjectPropsMixin:
             self._project_changed()
 
         on_main = clip.track == self.project.main_track
-        _api.ClipPropsDialog(clip, on_main, apply, self).exec()
+        _api.ClipPropsDialog(clip, on_main, apply, self, page=page).exec()
 
     def project_text_props(self, tid):
         item = self._project_text(tid)
