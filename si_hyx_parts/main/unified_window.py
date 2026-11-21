@@ -461,9 +461,21 @@ class UnifiedWindow(
             pass
 
         # IPC-сервер: принимает файлы от нового запуска через ПКМ проводника
+        # и команды активации окна от второго экземпляра.
         self._ipc_server = _api.QLocalServer(self)
-        _api.QLocalServer.removeServer("YasperMoglotIPC")
-        self._ipc_server.listen("YasperMoglotIPC")
+        if not self._ipc_server.listen("YasperMoglotIPC"):
+            # Сокет мог остаться от аварийно завершившегося процесса.
+            # Удаляем его только если живой сервер на нём не отвечает.
+            probe = _api.QLocalSocket()
+            probe.connectToServer("YasperMoglotIPC")
+            alive = probe.waitForConnected(200)
+            if alive:
+                probe.disconnectFromServer()
+                self.log("IPC-сервер: другой экземпляр уже слушает YasperMoglotIPC.")
+            else:
+                _api.QLocalServer.removeServer("YasperMoglotIPC")
+                if not self._ipc_server.listen("YasperMoglotIPC"):
+                    self.log(f"IPC-сервер не удалось запустить: {self._ipc_server.errorString()}")
         self._ipc_server.newConnection.connect(self._on_ipc_connection)
 
         # HTTP-сервер: принимает URL от браузерного расширения (localhost:7432).
@@ -474,6 +486,7 @@ class UnifiedWindow(
 
         # Тихая проверка обновлений при запуске (молча, если версия актуальна)
         self._updating = False
+        _api.QTimer.singleShot(1500, self._check_previous_update_failure)
         _api.QTimer.singleShot(2500, lambda: self._check_updates(silent=True))
 
     def _build_deferred_tabs_step(self):
@@ -752,9 +765,21 @@ class UnifiedWindow(
     def _on_ipc_data(self, conn):
         try:
             data = bytes(conn.readAll()).decode('utf-8', errors='replace')
-            files = [f.strip() for f in data.splitlines() if f.strip() and _api.os.path.exists(f.strip())]
+            lines = [ln.strip() for ln in data.splitlines() if ln.strip()]
+            if not lines:
+                return
+            activate = "__ACTIVATE__" in lines
+            files = [f for f in lines if f != "__ACTIVATE__" and _api.os.path.exists(f)]
+            if activate or files:
+                if self.isMinimized():
+                    self.setWindowState(
+                        (self.windowState() & ~_api.Qt.WindowState.WindowMinimized)
+                        | _api.Qt.WindowState.WindowActive
+                    )
+                self.show()
+                self.raise_()
+                self.activateWindow()
             if files:
-                self.raise_(); self.activateWindow()
                 self.tabs.setCurrentWidget(self.tab_media)
                 added = self.tab_media.add_paths(files)
                 if added:
@@ -839,57 +864,144 @@ class UnifiedWindow(
     @staticmethod
     def _stop_worker(w, stop_ms=5000, kill_ms=2000):
         """Останавливает QThread-воркер: stop() → wait → terminate → wait."""
-        try:
-            if hasattr(w, "stop"):
-                w.stop()
-            w.wait(stop_ms)
-            if w.isRunning():
+        UnifiedWindow._stop_workers_parallel([w], stop_ms=stop_ms, kill_ms=kill_ms)
+
+    @staticmethod
+    def _stop_workers_parallel(workers, stop_ms=5000, kill_ms=2000):
+        """Останавливает все QThread-воркеры параллельно: сначала всем шлём
+        stop(), затем ждём с общим лимитом stop_ms; оставшихся снимаем через
+        terminate() с общим лимитом kill_ms."""
+        running = []
+        for w in workers or ():
+            if w is None:
+                continue
+            try:
+                if w.isRunning():
+                    running.append(w)
+            except Exception:
+                pass
+        if not running:
+            return
+        for w in running:
+            try:
+                if hasattr(w, "stop"):
+                    w.stop()
+            except Exception:
+                pass
+        deadline = _api.time.monotonic() + max(0.0, stop_ms / 1000.0)
+        still = []
+        for w in running:
+            rem_ms = max(1, int((deadline - _api.time.monotonic()) * 1000))
+            try:
+                w.wait(rem_ms)
+                if w.isRunning():
+                    still.append(w)
+            except Exception:
+                pass
+        if not still:
+            return
+        for w in still:
+            try:
                 w.terminate()
-                w.wait(kill_ms)
+            except Exception:
+                pass
+        kill_deadline = _api.time.monotonic() + max(0.0, kill_ms / 1000.0)
+        for w in still:
+            rem_ms = max(1, int((kill_deadline - _api.time.monotonic()) * 1000))
+            try:
+                if w.isRunning():
+                    w.wait(rem_ms)
+            except Exception:
+                pass
+
+    def _active_task_labels(self):
+        """Возвращает список человекочитаемых описаний активных фоновых задач."""
+        labels = []
+        try:
+            mr = getattr(self.tab_media, "worker", None)
+            if mr is not None and mr.isRunning():
+                labels.append("обработка медиа")
         except Exception:
             pass
+        try:
+            aw = getattr(self.tab_ytdlp, "active_workers", None)
+            dl = [w for w in (aw.values() if isinstance(aw, dict) else (aw or ()))
+                  if w is not None and w.isRunning()]
+            if dl:
+                labels.append(f"загрузка ({len(dl)})")
+        except Exception:
+            pass
+        try:
+            te = getattr(self, "tab_edit", None)
+            if te is not None:
+                for attr in ("cut_worker", "_reveal_worker", "_entrance_worker"):
+                    w = getattr(te, attr, None)
+                    if w is not None and w.isRunning():
+                        labels.append("экспорт в «Монтаже»")
+                        break
+        except Exception:
+            pass
+        try:
+            ap = getattr(self, "tab_animepack", None)
+            if ap is not None:
+                if getattr(ap, "_task", None) is not None:
+                    labels.append("генерация аниме-пака")
+                elif getattr(ap, "_db_task", None) is not None:
+                    labels.append("обновление базы аниме-пака")
+        except Exception:
+            pass
+        try:
+            apu = getattr(self, "tab_animepack_upgrade", None)
+            if apu is not None:
+                w = getattr(apu, "worker", None)
+                pages = getattr(apu, "_pages", None) or ()
+                if ((w is not None and w.isRunning())
+                        or any(getattr(p, "_task", None) is not None for p in pages)):
+                    labels.append("апгрейд пака")
+        except Exception:
+            pass
+        return labels
 
-    def closeEvent(self, ev):
+    def _shutdown_components(self):
+        """Останавливает все активные воркеры, вкладки, серверы и синхронно
+        сохраняет настройки. Вызывается и из closeEvent, и из _apply_update."""
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
         try:
             self.log("Завершение: останавливаем активные потоки...")
+            workers = []
             mr = getattr(self.tab_media, "worker", None)
-            if mr and mr.isRunning():
-                self._stop_worker(mr)
+            if mr is not None:
+                workers.append(mr)
             aw = getattr(self.tab_ytdlp, "active_workers", None)
-            for w in (list(aw.values()) if isinstance(aw, dict) else list(aw or [])):
-                self._stop_worker(w)
+            if isinstance(aw, dict):
+                workers.extend(aw.values())
+            elif aw:
+                workers.extend(aw)
+            self._stop_workers_parallel(workers, stop_ms=5000, kill_ms=2000)
             try:
                 te = getattr(self, "tab_edit", None)
                 if te is not None:
                     te.shutdown()
             except Exception:
                 pass
-            try:
-                tsq = getattr(self, "tab_siquester", None)
-                if tsq is not None:
-                    tsq.cleanup()
-            except Exception:
-                pass
-            try:
-                tsh = getattr(self, "tab_shikimori", None)
-                if tsh is not None:
-                    tsh.cleanup()
-            except Exception:
-                pass
-            try:
-                tss = getattr(self, "tab_subsearch", None)
-                if tss is not None:
-                    tss.cleanup()
-            except Exception:
-                pass
-            try:
-                tcp = getattr(self, "tab_coop", None)
-                if tcp is not None:
-                    tcp.cleanup()
-            except Exception:
-                pass
+            for _attr in ("tab_siquester", "tab_shikimori", "tab_subsearch",
+                          "tab_coop", "tab_animepack", "tab_animepack_upgrade"):
+                try:
+                    tab = getattr(self, _attr, None)
+                    if tab is not None:
+                        tab.cleanup()
+                except Exception:
+                    pass
             try:
                 self._stop_browser_http_server()
+            except Exception:
+                pass
+            try:
+                srv = getattr(self, "_ipc_server", None)
+                if srv is not None:
+                    srv.close()
             except Exception:
                 pass
             try:
@@ -897,12 +1009,28 @@ class UnifiedWindow(
             except Exception:
                 pass
             try:
-                self._save_settings_now()
+                self._save_settings_now(sync=True)
             except Exception:
                 pass
             self.log("Потоки остановлены, завершаем приложение.")
         except Exception:
             pass
+
+    def closeEvent(self, ev):
+        if not getattr(self, "_updating", False) and not getattr(self, "_force_close", False):
+            active = self._active_task_labels()
+            if active:
+                choice = _api.msgbox_actions(
+                    self,
+                    "Активные задачи",
+                    f"Сейчас выполняются задачи: {', '.join(active)}.\n\n"
+                    "Прервать их и закрыть программу?",
+                    ["Закрыть", "Отмена"],
+                )
+                if choice != "Закрыть":
+                    ev.ignore()
+                    return
+        self._shutdown_components()
         super().closeEvent(ev)
 
 
@@ -911,33 +1039,69 @@ _api.UnifiedWindow = UnifiedWindow
 
 def _install_crash_handler():
     """Глобальный обработчик необработанных исключений: пишет трейсбек в
-    crash.log, показывает пользователю диалог с ошибкой и аккуратно завершает
-    программу. Так падение не «исчезает в никуда», а видно пользователю."""
+    crash.log (с ротацией по размеру), перехватывает ошибки фоновых потоков
+    (threading.excepthook). Для нефатальных исключений в GUI-слотах показывает
+    диалог и позволяет продолжить работу; при фатальных ошибках пытается
+    сохранить настройки перед выходом."""
+    import logging as _logging
     import traceback as _tb
     import datetime as _dt
     crash_log = _api.os.path.join(_api.CONFIG_DIR, "crash.log")
-    _already = {"shown": False}
+    _max_log_bytes = 2 * 1024 * 1024
+    _log_lock = _api.threading.Lock()
+    _state = {"in_dialog": False, "last_dialog_ts": 0.0}
 
-    def _handle(exc_type, exc_value, exc_tb):
-        # Ctrl+C — стандартное поведение, не показываем диалог
-        if issubclass(exc_type, KeyboardInterrupt):
-            _api.sys.__excepthook__(exc_type, exc_value, exc_tb)
-            return
-        tb_text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
-        # Защита от рекурсии: если падение случилось при показе диалога
-        if _already["shown"]:
+    def _write_crash_log(header: str, tb_text: str):
+        with _log_lock:
             try:
-                _api.sys.stderr.write(tb_text)
+                if _api.os.path.exists(crash_log) and _api.os.path.getsize(crash_log) >= _max_log_bytes:
+                    bak = crash_log + ".1"
+                    try:
+                        _api.os.replace(crash_log, bak)
+                    except OSError:
+                        pass
+                with open(crash_log, "a", encoding="utf-8") as f:
+                    f.write(f"\n===== {_dt.datetime.now():%Y-%m-%d %H:%M:%S} {header} =====\n")
+                    f.write(tb_text)
             except Exception:
                 pass
-            _api.os._exit(1)
-        _already["shown"] = True
+
+    def _save_active_window_settings():
         try:
-            with open(crash_log, "a", encoding="utf-8") as f:
-                f.write(f"\n===== {_dt.datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
-                f.write(tb_text)
+            app = _api.QApplication.instance()
+            if app is None:
+                return
+            for w in app.topLevelWidgets():
+                if hasattr(w, "_save_settings_now"):
+                    try:
+                        w._save_settings_now(sync=True)
+                    except Exception:
+                        pass
         except Exception:
             pass
+
+    def _log_to_active_window(msg: str):
+        try:
+            app = _api.QApplication.instance()
+            if app is None:
+                return
+            for w in app.topLevelWidgets():
+                if hasattr(w, "log_signal"):
+                    try:
+                        w.log_signal.emit(msg)
+                        return
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _handle_thread_exc(args):
+        exc_type = args.exc_type
+        if issubclass(exc_type, SystemExit):
+            return
+        th_name = getattr(args.thread, "name", "Thread") if args.thread else "Thread"
+        tb_text = "".join(_tb.format_exception(exc_type, args.exc_value, args.exc_traceback))
+        _write_crash_log(f"[thread: {th_name}]", tb_text)
         try:
             if _api.sys.stderr is not None:
                 _api.sys.stderr.write(tb_text)
@@ -945,12 +1109,89 @@ def _install_crash_handler():
         except Exception:
             pass
         try:
+            _logging.getLogger("si_hyx.crash").error(
+                "Unhandled exception in thread %s:\n%s", th_name, tb_text
+            )
+        except Exception:
+            pass
+        _log_to_active_window(
+            f"Ошибка в фоновом потоке ({th_name}): {exc_type.__name__}: {args.exc_value}"
+        )
+
+    def _handle(exc_type, exc_value, exc_tb):
+        # Ctrl+C — стандартное поведение, не показываем диалог
+        if issubclass(exc_type, KeyboardInterrupt):
+            _api.sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        tb_text = "".join(_tb.format_exception(exc_type, exc_value, exc_tb))
+        _write_crash_log("[main]", tb_text)
+        try:
+            if _api.sys.stderr is not None:
+                _api.sys.stderr.write(tb_text)
+                _api.sys.stderr.flush()
+        except Exception:
+            pass
+
+        app = None
+        try:
+            app = _api.QApplication.instance()
+        except Exception:
+            app = None
+
+        fatal = (
+            issubclass(exc_type, (SystemExit, MemoryError))
+            or app is None
+            or _state["in_dialog"]
+        )
+        if fatal:
+            _save_active_window_settings()
+            if _state["in_dialog"]:
+                _api.os._exit(1)
+            _state["in_dialog"] = True
+            try:
+                from error_report import ErrorReportDialog
+                dlg = ErrorReportDialog(
+                    "SI-HYX — критическая ошибка",
+                    "Произошла критическая ошибка, программа будет закрыта.",
+                    detail=f"{exc_type.__name__}: {exc_value}",
+                    where="Критическая ошибка (краш)",
+                    report_detail=tb_text)
+                try:
+                    if _api.APP_ICON:
+                        dlg.setWindowIcon(_api.QIcon(_api.APP_ICON))
+                except Exception:
+                    pass
+                dlg.exec()
+            except Exception:
+                try:
+                    from PyQt6.QtWidgets import QMessageBox
+                    box = QMessageBox()
+                    box.setIcon(QMessageBox.Icon.Critical)
+                    box.setWindowTitle("SI-HYX — критическая ошибка")
+                    box.setText("Произошла критическая ошибка, программа будет закрыта.")
+                    box.setInformativeText(f"{exc_type.__name__}: {exc_value}")
+                    box.setDetailedText(tb_text)
+                    box.exec()
+                except Exception:
+                    pass
+            _api.os._exit(1)
+
+        # Нефатальное исключение в GUI-слоте: логируем и продолжаем работу,
+        # не убивая процесс и не теряя настройки/проект.
+        _log_to_active_window(f"Необработанная ошибка: {exc_type.__name__}: {exc_value}")
+        now = _api.time.monotonic()
+        if now - _state["last_dialog_ts"] < 3.0:
+            return
+        _state["last_dialog_ts"] = now
+        _state["in_dialog"] = True
+        try:
             from error_report import ErrorReportDialog
             dlg = ErrorReportDialog(
-                "SI-HYX — критическая ошибка",
-                "Произошла непредвиденная ошибка, программа будет закрыта.",
+                "SI-HYX — непредвиденная ошибка",
+                "Произошла непредвиденная ошибка. Подробности записаны в crash.log; "
+                "вы можете продолжить работу или сохранить проект.",
                 detail=f"{exc_type.__name__}: {exc_value}",
-                where="Критическая ошибка (краш)",
+                where="Необработанное исключение в интерфейсе",
                 report_detail=tb_text)
             try:
                 if _api.APP_ICON:
@@ -959,20 +1200,12 @@ def _install_crash_handler():
                 pass
             dlg.exec()
         except Exception:
-            try:
-                from PyQt6.QtWidgets import QMessageBox
-                box = QMessageBox()
-                box.setIcon(QMessageBox.Icon.Critical)
-                box.setWindowTitle("SI-HYX — критическая ошибка")
-                box.setText("Произошла непредвиденная ошибка, программа будет закрыта.")
-                box.setInformativeText(f"{exc_type.__name__}: {exc_value}")
-                box.setDetailedText(tb_text)
-                box.exec()
-            except Exception:
-                pass
-        _api.os._exit(1)
+            pass
+        finally:
+            _state["in_dialog"] = False
 
     _api.sys.excepthook = _handle
+    _api.threading.excepthook = _handle_thread_exc
 
 _install_crash_handler.__module__ = _api.__name__
 _api._install_crash_handler = _install_crash_handler

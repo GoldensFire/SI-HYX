@@ -254,6 +254,9 @@ class GeneratorMediaMixin:
 
     def stop_processes(self) -> None:
         """Убивает все запущенные ffmpeg (зовётся по «Стоп» и при уборке)."""
+        runtime = getattr(self, "_runtime", None)
+        if runtime is not None:
+            runtime.wake()
         with self._procs_lock:
             procs = list(self._procs)
         for proc in procs:

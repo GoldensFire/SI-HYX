@@ -956,13 +956,19 @@ class UnifiedWindowSettingsMixin:
         except Exception:
             pass
 
-    def _save_settings_now(self):
+    def _save_settings_now(self, sync: bool = False):
         if getattr(self, "_settings_readonly", False):
             # Настройки не прочитались при старте — см. _load_settings.
             self.log("save settings: настройки не прочитались при запуске — "
                      "сохранение отключено до перезапуска (файл не затёрт)")
             return False
         try:
+            timer = getattr(self, "_save_timer", None)
+            if sync and timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
             data = self._collect_settings()
             # _collect_settings возвращает {} при любой ошибке (напр. после
             # изменения кода обращение к ещё не созданному виджету). НЕ пишем
@@ -971,10 +977,21 @@ class UnifiedWindowSettingsMixin:
             if not data:
                 self.log("save settings: пустой результат сборки — пропуск (файл не затёрт)")
                 return False
-            if _api.save_settings(data):
-                return True
-            self.log("save settings: файл не был обновлён")
-            return False
+            if sync:
+                _api.flush_settings_saves(timeout=3.0)
+                if _api.save_settings(data):
+                    return True
+                self.log("save settings: файл не был обновлён")
+                return False
+            def _on_done(ok):
+                if not ok:
+                    try:
+                        self.log_signal.emit("save settings: файл не был обновлён")
+                    except Exception:
+                        pass
+            return bool(_api.save_settings_async(
+                data, on_done=_on_done, save_fn=_api.save_settings
+            ))
         except Exception as e:
             self.log(f"save settings error: {e}")
             return False

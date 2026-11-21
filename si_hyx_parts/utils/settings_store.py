@@ -2,7 +2,17 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """settings.json: чтение, атомарная запись и снимки истории. Public namespace: utils."""
+import copy
+import threading
+
 import utils as _api
+
+_SAVE_LOCK = threading.Lock()
+_ASYNC_LOCK = threading.Lock()
+_ASYNC_PENDING = None
+_ASYNC_THREAD = None
+_ASYNC_IDLE = threading.Event()
+_ASYNC_IDLE.set()
 
 
 def _settings_history_paths() -> list:
@@ -153,60 +163,114 @@ def save_settings(settings: dict) -> bool:
     # бы папки и прочее к значениям по умолчанию).
     if not isinstance(settings, dict):
         return False
-    if not settings and _api.settings_files_exist():
-        return False
+    with _SAVE_LOCK:
+        if not settings and _api.settings_files_exist():
+            return False
 
-    # Что лежит на диске сейчас. Читаем ДО записи: если ничего не изменилось,
-    # диск вообще не трогаем (сохранение висит на каждом поле — при протяжке
-    # ползунка это были десятки лишних перезаписей подряд).
-    current, current_status = _api._read_settings_file(_api.SETTINGS_FILE, retries=2)
-    if current_status == "ok" and current == settings:
-        return True
+        # Что лежит на диске сейчас. Читаем ДО записи: если ничего не изменилось,
+        # диск вообще не трогаем (сохранение висит на каждом поле — при протяжке
+        # ползунка это были десятки лишних перезаписей подряд).
+        current, current_status = _api._read_settings_file(_api.SETTINGS_FILE, retries=2)
+        if current_status == "ok" and current == settings:
+            return True
 
-    # Временный файл — СВОЙ у каждого процесса. Общее имя settings.json.tmp
-    # означало, что два одновременно запущенных экземпляра программы пишут в
-    # один и тот же файл и один может опубликовать обрывок другого.
-    tmp = f"{_api.SETTINGS_FILE}.{_api.os.getpid()}.tmp"
-    try:
-        _api.os.makedirs(_api.os.path.dirname(_api.SETTINGS_FILE), exist_ok=True)
-        text = _api.json.dumps(settings, ensure_ascii=False, indent=2)
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
+        # Временный файл — СВОЙ у каждого процесса. Общее имя settings.json.tmp
+        # означало, что два одновременно запущенных экземпляра программы пишут в
+        # один и тот же файл и один может опубликовать обрывок другого.
+        tmp = f"{_api.SETTINGS_FILE}.{_api.os.getpid()}.tmp"
+        try:
+            _api.os.makedirs(_api.os.path.dirname(_api.SETTINGS_FILE), exist_ok=True)
+            text = _api.json.dumps(settings, ensure_ascii=False, indent=2)
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                try:
+                    _api.os.fsync(f.fileno())
+                except Exception:
+                    pass
+            # Перечитываем то, что РЕАЛЬНО легло на диск: обрезанный/битый файл не
+            # должен попасть на место рабочих настроек.
+            with open(tmp, "r", encoding="utf-8") as f:
+                written = _api.json.load(f)
+            if not isinstance(written, dict) or written != settings:
+                raise ValueError("проверка записанных настроек не прошла")
+        except Exception:
             try:
-                _api.os.fsync(f.fileno())
+                _api.os.remove(tmp)
             except Exception:
                 pass
-        # Перечитываем то, что РЕАЛЬНО легло на диск: обрезанный/битый файл не
-        # должен попасть на место рабочих настроек.
-        with open(tmp, "r", encoding="utf-8") as f:
-            written = _api.json.load(f)
-        if not isinstance(written, dict) or written != settings:
-            raise ValueError("проверка записанных настроек не прошла")
-    except Exception:
-        try:
-            _api.os.remove(tmp)
-        except Exception:
-            pass
-        return False
+            return False
 
-    if current_status == "ok":
-        # В .bak (и в историю) уходит только валидный прежний файл.
-        _api._snapshot_settings_history(_api.json.dumps(current, ensure_ascii=False, indent=2))
-        _api._replace_with_retry(_api.SETTINGS_FILE, _api.SETTINGS_FILE + ".bak")
-    # current_status == 'corrupt'/'locked' → .bak НЕ трогаем: там лежит
-    # последняя заведомо рабочая версия, и затирать её мусором нельзя.
+        if current_status == "ok":
+            # В .bak (и в историю) уходит только валидный прежний файл.
+            _api._snapshot_settings_history(_api.json.dumps(current, ensure_ascii=False, indent=2))
+            _api._replace_with_retry(_api.SETTINGS_FILE, _api.SETTINGS_FILE + ".bak")
+        # current_status == 'corrupt'/'locked' → .bak НЕ трогаем: там лежит
+        # последняя заведомо рабочая версия, и затирать её мусором нельзя.
 
-    if not _api._replace_with_retry(tmp, _api.SETTINGS_FILE):
-        try:
-            _api.os.remove(tmp)          # не оставляем мусор рядом с настройками
-        except Exception:
-            pass
-        return False
-    return True
+        if not _api._replace_with_retry(tmp, _api.SETTINGS_FILE):
+            try:
+                _api.os.remove(tmp)          # не оставляем мусор рядом с настройками
+            except Exception:
+                pass
+            return False
+        return True
 
 save_settings.__module__ = _api.__name__
 _api.save_settings = save_settings
+
+
+def _async_save_worker():
+    global _ASYNC_PENDING, _ASYNC_THREAD
+    while True:
+        with _ASYNC_LOCK:
+            item = _ASYNC_PENDING
+            _ASYNC_PENDING = None
+            if item is None:
+                _ASYNC_THREAD = None
+                _ASYNC_IDLE.set()
+                return
+        data, on_done, save_fn = item
+        try:
+            ok = (save_fn or _api.save_settings)(data)
+        except Exception:
+            ok = False
+        if on_done is not None:
+            try:
+                on_done(ok)
+            except Exception:
+                pass
+
+
+def save_settings_async(settings: dict, on_done=None, save_fn=None) -> bool:
+    """Ставит запись settings.json в фоновый поток с объединением повторных
+    вызовов: GUI не блокируется на time.sleep/fsync, если файл занят
+    антивирусом. Для гарантированной записи при выходе зовите
+    flush_settings_saves() + save_settings()."""
+    global _ASYNC_PENDING, _ASYNC_THREAD
+    if not isinstance(settings, dict):
+        return False
+    snapshot = copy.deepcopy(settings)
+    with _ASYNC_LOCK:
+        _ASYNC_PENDING = (snapshot, on_done, save_fn)
+        _ASYNC_IDLE.clear()
+        if _ASYNC_THREAD is None or not _ASYNC_THREAD.is_alive():
+            _ASYNC_THREAD = threading.Thread(
+                target=_async_save_worker, name="sihyx-settings-save", daemon=True
+            )
+            _ASYNC_THREAD.start()
+    return True
+
+save_settings_async.__module__ = _api.__name__
+_api.save_settings_async = save_settings_async
+
+
+def flush_settings_saves(timeout: float = 5.0) -> bool:
+    """Дожидается завершения фоновой записи настроек (перед выходом)."""
+    return _ASYNC_IDLE.wait(timeout=max(0.0, float(timeout)))
+
+flush_settings_saves.__module__ = _api.__name__
+_api.flush_settings_saves = flush_settings_saves
 
 def save_json_atomic(path: str, data) -> bool:
     """Атомарная запись небольшого JSON-файла (настройки отдельных вкладок).

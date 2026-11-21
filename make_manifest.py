@@ -109,6 +109,67 @@ def _reused_binver(app_dir: str):
     return value if len(value) == 64 and all(c in "0123456789abcdef" for c in value) else ""
 
 
+def manifest_signing_payload(manifest: dict) -> bytes:
+    """Канонический JSON манифеста без поля signature — то, что подписывается Ed25519."""
+    payload = {k: v for k, v in manifest.items() if k != "signature"}
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False).encode("utf-8")
+
+
+def _load_ed25519_private_key(key_source: str):
+    """Загружает приватный ключ Ed25519 из файла PEM или 64-hex строки."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    src = (key_source or "").strip()
+    if os.path.isfile(src):
+        with open(src, "rb") as f:
+            raw = f.read()
+        if b"-----BEGIN" in raw:
+            return serialization.load_pem_private_key(raw, password=None)
+        src = raw.decode("ascii").strip()
+    return Ed25519PrivateKey.from_private_bytes(bytes.fromhex(src))
+
+
+def sign_manifest(manifest: dict, key_source: str) -> str:
+    """Подписывает manifest (без поля signature) ключом Ed25519; возвращает hex-подпись."""
+    priv = _load_ed25519_private_key(key_source)
+    return priv.sign(manifest_signing_payload(manifest)).hex()
+
+
+def verify_manifest_signature(manifest: dict, public_key_hex: str) -> bool:
+    """Проверяет Ed25519-подпись manifest['signature'] по публичному ключу (64 hex)."""
+    sig_hex = str(manifest.get("signature", "") or "").strip()
+    if not sig_hex or not public_key_hex:
+        return False
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex.strip()))
+        pub.verify(bytes.fromhex(sig_hex), manifest_signing_payload(manifest))
+        return True
+    except Exception:
+        return False
+
+
+def cmd_keygen(out_path: str):
+    """Генерирует пару ключей Ed25519: приватный PEM в out_path, публичный hex в stdout."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    priv = Ed25519PrivateKey.generate()
+    pem = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    with open(out_path, "wb") as f:
+        f.write(pem)
+    pub_hex = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    ).hex()
+    print(f"wrote private key: {out_path}")
+    print(f"UPDATE_MANIFEST_PUBLIC_KEY = \"{pub_hex}\"")
+
+
 def cmd_manifest(app_dir: str, dist_dir: str, update_zip: str, full_zip: str,
                  reuse_binver: bool = False):
     # APP_VERSION берём из config.py (скрипт лежит рядом с ним)
@@ -137,6 +198,9 @@ def cmd_manifest(app_dir: str, dist_dir: str, update_zip: str, full_zip: str,
         "full_sha": _sha256_file(full_zip),
         "silent": bool(getattr(config, "SILENT_UPDATE", False)),
     }
+    signing_key = os.environ.get("SIHYX_MANIFEST_SIGNING_KEY", "").strip()
+    if signing_key:
+        manifest["signature"] = sign_manifest(manifest, signing_key)
     out = os.path.join(dist_dir, "manifest.json")
     with open(out, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
@@ -151,12 +215,16 @@ def main():
     if len(args) >= 2 and args[0] == "binver":
         cmd_binver(args[1])
         return
+    if len(args) >= 2 and args[0] == "keygen":
+        cmd_keygen(args[1])
+        return
     if len(args) >= 5 and args[0] == "manifest":
         cmd_manifest(args[1], args[2], args[3], args[4],
                      reuse_binver=len(args) >= 6 and args[5] == "reuse-binver")
         return
     print("usage:")
     print("  make_manifest.py binver   <app_dir>")
+    print("  make_manifest.py keygen   <private_key.pem>")
     print("  make_manifest.py manifest <app_dir> <dist_dir> <update_zip> <full_zip> [reuse-binver]")
     sys.exit(2)
 

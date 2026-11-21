@@ -33,7 +33,8 @@ class RunLog:
         self.callback('Генерация началась. Подробности записываются в отдельный журнал.')
 
     def emit(self, message):
-        message = str(message)
+        from animepack_api import redact_secrets
+        message = redact_secrets(str(message))
         with self.lock:
             if self.stream.closed:
                 self.callback(message)

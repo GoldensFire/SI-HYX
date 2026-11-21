@@ -1325,6 +1325,31 @@ class GeneratorSelectionMixin:
             franchise = str(cand.anime.get("franchise") or "").strip()
             cand.popular_franchise_title = popular_franchise_title(
                 cand.anime, known_parts.get(franchise, ()))
+        media_folders = {"image": "Images", "audio": "Audio", "video": "Video"}
+        log_fn = getattr(self, "log", None) or getattr(self, "_log", None)
+        ready_songs = []
+        for cand in songs:
+            probe = _api.ET.Element("questions")
+            _api._append_question(probe, cand, self.s)
+            missing = None
+            for item in probe.iter("item"):
+                folder = media_folders.get(item.get("type"))
+                if folder and item.get("isRef") == "True":
+                    ref_name = (item.text or "").strip()
+                    if not ref_name or not (Path(self.folder) / folder / ref_name).is_file():
+                        missing = f"{folder}/{ref_name}"
+                        break
+            if missing is not None:
+                title = (cand.anime.get("russian") or cand.anime.get("name")
+                         or getattr(cand, "song_name", "") or "?")
+                if callable(log_fn):
+                    log_fn(f"Внимание: вопрос «{title}» пропущен при сборке пака — "
+                           f"нет медиафайла {missing}.")
+                continue
+            ready_songs.append(cand)
+        if not ready_songs:
+            raise _api.AnimePackError("Готовых вопросов с файлами медиа нет — сохранять нечего.")
+        songs = ready_songs
         xml = _api.build_content_xml(songs, self.s)
         with open(_api.os.path.join(self.folder, "content.xml"), "wb") as f:
             f.write(xml)
@@ -1408,8 +1433,10 @@ class GeneratorSelectionMixin:
                                   ("Video", used_video)):
                 for name in sorted(names):
                     src = _api.os.path.join(self.folder, folder, name)
-                    if _api.os.path.exists(src):
-                        zf.write(src, f"{folder}/{name}", _api.zipfile.ZIP_STORED)
+                    if not _api.os.path.isfile(src):
+                        raise FileNotFoundError(
+                            f"Пропал медиафайл при упаковке: {folder}/{name}")
+                    zf.write(src, f"{folder}/{name}", _api.zipfile.ZIP_STORED)
         return str(target)
 
     def cleanup(self) -> None:

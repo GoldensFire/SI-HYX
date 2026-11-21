@@ -85,6 +85,7 @@ YouTubecookies.txt
 .mcp.json
 .cursorrules
 .windsurfrules
+repomix-*.xml
 # Инструкции и памятки для ИИ-агентов — только на машине разработчика.
 /AGENTS.md
 /CLAUDE.md

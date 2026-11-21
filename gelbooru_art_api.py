@@ -202,7 +202,11 @@ class GelbooruArtClient(PixivArtClient):
                     answer = self.session.get(API_URL, params=query,
                                               timeout=TIMEOUT)
             except Exception as error:  # noqa: BLE001 — сеть, а не ключ
-                text = " ".join(str(error).split())[:160].replace(key, "…")
+                from animepack_api import redact_secrets
+                text = " ".join(str(error).split())
+                if key:
+                    text = text.replace(key, "…")
+                text = redact_secrets(text)[:160]
                 self._network_failure(f"Gelbooru не ответил: {text}")
             status = int(getattr(answer, "status_code", 0) or 0)
             if status != 429:

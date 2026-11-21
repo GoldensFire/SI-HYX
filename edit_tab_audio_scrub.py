@@ -63,7 +63,10 @@ class AudioScrubber(QThread):
         self._want = None            # заказанное начало окна (с)
         self._busy = None            # окно, которое декодируется прямо сейчас
         self._win = None             # (начало_с, PCM-байты)
-        self._fails = 0              # подряд неудачных декодов (нет дорожки?)
+        self._fails = 0              # подряд неудачных декодов у начала файла (нет дорожки?)
+        self._has_audio = False      # у текущего источника уже был успешный декод
+        self._eof_from = None        # позиция want > 0, за которой аудиодорожка кончилась
+        self._gen = 0                # поколение источника/формата (отсекает запоздалый декод)
         self._stop = False
         self._proc = None
 
@@ -76,6 +79,7 @@ class AudioScrubber(QThread):
             self._channels = max(1, int(channels or 2))
             self._sample_bytes = 4 if int(sample_bytes or 2) == 4 else 2
             self._fmt = "f32le" if self._sample_bytes == 4 else "s16le"
+            self._gen += 1
         with self._lock:
             self._win = None
 
@@ -88,29 +92,41 @@ class AudioScrubber(QThread):
             self._want = None
             self._busy = None
             self._fails = 0
+            self._has_audio = False
+            self._eof_from = None
+            self._gen += 1
         self._kill_proc()
 
     def source(self):
         with self._cond:
             return (self._src, self._stream)
 
+    def _format_snapshot(self):
+        with self._cond:
+            return self._rate, self._channels, self._sample_bytes
+
     def frame_bytes(self):
-        return self._sample_bytes * self._channels
+        _rate, ch, sb = self._format_snapshot()
+        return sb * ch
 
     def request(self, t_s):
         """Заказать окно PCM вокруг t_s, если текущего не хватает."""
         t_s = max(0.0, float(t_s or 0.0))
+        rate, ch, sb = self._format_snapshot()
         with self._lock:
             win = self._win
         if win is not None:
             start, buf = win
-            end = start + len(buf) / float(self.frame_bytes() * self._rate)
+            fb = sb * ch
+            end = start + len(buf) / float(fb * rate)
             if (t_s >= start or start <= 0.0) and t_s <= end - self.MARGIN_S:
                 return
         want = max(0.0, t_s - self.LEAD_S)
         with self._cond:
             if self._src is None or self._fails >= self.MAX_FAILS:
                 return           # у файла просто нет звука — не гоняем ffmpeg
+            if self._eof_from is not None and want >= self._eof_from - 0.05:
+                return           # хвост файла за концом аудиодорожки
             if self._busy is not None and abs(self._busy - want) < 0.05:
                 return           # ровно это окно уже декодируется
             self._want = want
@@ -119,31 +135,35 @@ class AudioScrubber(QThread):
     def slice_at(self, t_s, dur_s, fade_s=0.003):
         """PCM-срез [t_s, t_s+dur_s) из готового окна (None — окна ещё нет).
         Края приглушены: без этого на стыке срезов слышен щелчок."""
+        rate, ch, sb = self._format_snapshot()
         with self._lock:
             win = self._win
         if win is None:
             return None
         start, buf = win
-        fb = self.frame_bytes()
-        off = int(round((float(t_s) - start) * self._rate)) * fb
+        fb = sb * ch
+        off = int(round((float(t_s) - start) * rate)) * fb
         if off < 0 or off >= len(buf):
             return None
-        n = max(fb, int(round(max(0.0, float(dur_s)) * self._rate)) * fb)
+        n = max(fb, int(round(max(0.0, float(dur_s)) * rate)) * fb)
         chunk = buf[off:off + n]
         if len(chunk) < fb * 8:
             return None
-        return self._faded(chunk, fade_s)
+        return self._faded(chunk, fade_s, rate=rate, ch=ch, sb=sb)
 
     def stop(self):
         with self._cond:
             self._stop = True
             self._want = None
+            self._gen += 1
             self._cond.notify()
         self._kill_proc()
 
     # ── внутреннее ───────────────────────────────────────────────────────────
-    def _faded(self, data, fade_s):
-        code = "f" if self._sample_bytes == 4 else "h"
+    def _faded(self, data, fade_s, rate=None, ch=None, sb=None):
+        if rate is None or ch is None or sb is None:
+            rate, ch, sb = self._format_snapshot()
+        code = "f" if sb == 4 else "h"
         try:
             a = array.array(code)
             a.frombytes(data)
@@ -151,9 +171,9 @@ class AudioScrubber(QThread):
             return data
         if sys.byteorder == "big":
             a.byteswap()             # ffmpeg отдаёт little-endian
-        ch = max(1, self._channels)
+        ch = max(1, ch)
         total = len(a) // ch
-        n = min(int(max(0.0, fade_s) * self._rate), total // 2)
+        n = min(int(max(0.0, fade_s) * rate), total // 2)
         if n <= 0:
             return data
         is_int = (code == "h")
@@ -189,19 +209,34 @@ class AudioScrubber(QThread):
                     return
                 want = self._want
                 self._want = None
+                gen = self._gen
                 src, stream = self._src, self._stream
-                rate, ch, fmt = self._rate, self._channels, self._fmt
+                rate, ch, sb, fmt = self._rate, self._channels, self._sample_bytes, self._fmt
                 self._busy = want
             data = self._decode(src, stream, want, rate, ch, fmt) if src else None
+            emit = False
             with self._cond:
+                if self._gen != gen or self._stop:
+                    continue
                 self._busy = None
-                # Пусто — скорее всего у файла нет звуковой дорожки (картинка,
-                # немое видео). Пара попыток, и перестаём звать ffmpeg на каждый
-                # шаг: иначе удержание клавиши запускало бы его без конца.
-                self._fails = 0 if data else (self._fails + 1)
-            if data:
-                with self._lock:
-                    self._win = (want, data)
+                if data:
+                    self._has_audio = True
+                    self._fails = 0
+                    if self._eof_from is not None and want >= self._eof_from:
+                        self._eof_from = None
+                    with self._lock:
+                        self._win = (want, data)
+                    emit = True
+                elif self._has_audio or want > 0.05:
+                    # Попали за конец аудиодорожки: запоминаем границу хвоста,
+                    # но не отключаем звук для всего файла.
+                    if want > 0.05:
+                        self._eof_from = (want if self._eof_from is None
+                                          else min(self._eof_from, want))
+                else:
+                    # Пусто у начала файла — скорее всего нет звуковой дорожки.
+                    self._fails += 1
+            if emit:
                 self.ready.emit()
 
     def _decode(self, src, stream, start, rate, ch, fmt):

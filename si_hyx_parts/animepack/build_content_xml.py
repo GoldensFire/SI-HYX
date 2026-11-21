@@ -3,7 +3,31 @@
 # See LICENSE and the public module for attribution and API.
 """build_content_xml. Public namespace: animepack."""
 from __future__ import annotations
+import re
 import animepack as _api
+
+# Символы, запрещённые в XML 1.0 (управляющие, кроме \t, \n, \r, суррогаты и non-characters).
+_XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+
+
+def sanitize_xml_text(value: str) -> str:
+    """Удаляет символы, запрещённые в XML 1.0."""
+    return _XML_ILLEGAL_RE.sub("", value) if value else ""
+
+
+def sanitize_xml_tree(root) -> None:
+    """Очищает тексты, хвосты и атрибуты всех узлов XML-дерева перед сериализацией."""
+    for elem in root.iter():
+        if elem.text:
+            elem.text = sanitize_xml_text(elem.text)
+        if elem.tail:
+            elem.tail = sanitize_xml_text(elem.tail)
+        if elem.attrib:
+            for key, val in list(elem.attrib.items()):
+                if isinstance(val, str):
+                    clean = sanitize_xml_text(val)
+                    if clean != val:
+                        elem.attrib[key] = clean
 
 
 def build_content_xml(songs: list, s: _api.PackSettings,
@@ -51,7 +75,10 @@ def build_content_xml(songs: list, s: _api.PackSettings,
             questions_el = _api.ET.SubElement(theme_el, "questions")
             for cand in theme:
                 _api._append_question(questions_el, cand, s)
-    return _api.ET.tostring(pkg, encoding="utf-8", xml_declaration=True)
+    sanitize_xml_tree(pkg)
+    xml = _api.ET.tostring(pkg, encoding="utf-8", xml_declaration=True)
+    _api.ET.fromstring(xml)
+    return xml
 
 build_content_xml.__module__ = _api.__name__
 _api.build_content_xml = build_content_xml

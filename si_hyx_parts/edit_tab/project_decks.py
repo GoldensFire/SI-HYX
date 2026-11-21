@@ -124,9 +124,9 @@ class EditTabProjectDecksMixin:
             # плеер на соседний (см. FrameGrid.center_of).
             'pos_ms': int(round(center * 1000.0)),
             # Плеер на паузе показывает кадр, накрывающий позицию, — он и есть
-            # заказанный. Окно с запасом назад: у файла с плавающей частотой
-            # (vfr) кадр начинается не на сетке среднего fps.
-            'window': (int((center - 0.25) * 1_000_000), int(center * 1_000_000) + 1),
+            # заказанный. Окно с запасом в обе стороны: на VFR и при ненулевом
+            # start_time контейнера ближайший кадр может иметь pts чуть выше center.
+            'window': (int((center - 0.25) * 1_000_000), int((center + 0.25) * 1_000_000) + 1),
             'floor_us': int((first - 0.5) / fps * 1_000_000),
             # Кадр, начинающийся на s1, уже вырезан (_proj_seg_frames).
             'bound_us': int((last + 0.5) / fps * 1_000_000),
@@ -144,16 +144,35 @@ class EditTabProjectDecksMixin:
         self._deck_probing.add(norm)
 
         def probe(p=path, n=norm, codecs=self._deck_codecs, infos=self._deck_tinfo):
-            meta = _api.run_ffprobe(p) or {}
-            v = next((s for s in meta.get('streams', []) if s.get('codec_type') == 'video'), {})
-            codecs[n] = str(v.get('codec_name') or '').lower()
-            # Дорожки и файлы рядом — для панели, когда кусок заиграет дека.
             try:
-                infos[n] = self._deck_tracks_scan(p, meta)
-            except Exception:
-                pass
+                meta = _api.run_ffprobe(p) or {}
+                v = next((s for s in meta.get('streams', []) if s.get('codec_type') == 'video'), {})
+                codecs[n] = str(v.get('codec_name') or '').lower()
+                # Дорожки и файлы рядом — для панели, когда кусок заиграет дека.
+                try:
+                    infos[n] = self._deck_tracks_scan(p, meta)
+                except Exception:
+                    pass
+            finally:
+                if not self._deck_closed:
+                    try:
+                        _api.QTimer.singleShot(0, self, self._deck_on_probed)
+                    except RuntimeError:
+                        pass
         threading.Thread(target=probe, daemon=True, name="deck-probe").start()
         return None
+
+    def _deck_on_probed(self):
+        """Фоновый ffprobe завершён — повторно раздаём заказы декам (и на паузе,
+        и на ходу)."""
+        if self._deck_closed:
+            return
+        if self._proj_play is not None:
+            self._deck_lookahead()
+        else:
+            tl = getattr(self, "project_timeline", None)
+            if tl is not None:
+                self._deck_prepare(tl.playhead)
 
     def _deck_wanted(self, plan, idx, n):
         """Видеокуски после idx, которым нужны деки: не больше n и не дальше
@@ -444,7 +463,8 @@ class EditTabProjectDecksMixin:
         self._deck_look_later(_FREE_DELAY_S)
         self._deck_lookahead()
         self._deck_arm()
-        self._deck_tracks_follow(seg['clip'].src)
+        orig = self.project.clip(seg['clip'].id)
+        self._deck_tracks_follow(orig.src if orig is not None else seg['clip'].src)
         self._deck_subtitle(force=True)
 
     def _deck_start_later(self, deck, delay_s):
@@ -487,7 +507,7 @@ class EditTabProjectDecksMixin:
         if pts < tgt['floor_us'] or pts == self._deck_shown:
             return
         sent = self._deck_sent
-        if sent is not None and sent[0] is deck and pts >= tgt['window'][1]:
+        if sent is not None and sent[0] is deck and pts > max(self._deck_shown, tgt['pos_ms'] * 1000):
             # Разгон: кадр пришёл позже, чем шли бы часы деки с момента play().
             due = sent[1] + (pts / 1_000_000.0 - sent[2]) / sent[3]
             lat = _api.time.monotonic() - due

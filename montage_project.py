@@ -69,8 +69,6 @@ TRANSITIONS = (
 # Роль дорожки: голос приглушает музыку (ProjectSettings.duck).
 TRACK_ROLES = ('', 'voice', 'music')
 MIN_SCALE, MAX_SCALE = 0.02, 4.0
-# Реверс держит все кадры куска в памяти (фильтр reverse) — длиннее не берём.
-MAX_REVERSE_S = 10.0
 
 
 class ProjectError(ValueError):
@@ -167,7 +165,7 @@ class Clip:
     transition_s: float = 0.0     # его длина: клип встаёт внахлёст на предыдущий
     fade_in: float = 0.0          # нарастание и затухание звука клипа, с
     fade_out: float = 0.0
-    reverse: bool = False         # кусок исходника идёт задом наперёд (до MAX_REVERSE_S)
+    reverse: bool = False         # кусок исходника идёт задом наперёд
     freeze_at: float = -1.0       # стоп-кадр: кадр исходника на этом времени всю длину
                                   # клипа (in_s/out_s задают только длину, как у картинки)
     # v3 — эффекты (si_hyx_parts/montage_project/effects.py); пустые — как v2.
@@ -851,8 +849,11 @@ class Project:
             gaps.append("приглушение музыки под голос")
         if self.settings.loudness is not None:
             gaps.append("выравнивание громкости")
-        if any(c.reverse or c.frozen for c in self.clips):
-            gaps.append("реверс и стоп-кадр")
+        if any(c.frozen for c in self.clips):
+            gaps.append("стоп-кадр")
+        if any(c.reverse and c.has_video and reverse_preview_lookup(c) is None
+               for c in self.clips):
+            gaps.append("реверс")
         if any(c.keyframes for c in self.clips):
             gaps.append("ключевые кадры (зум, панорама, поворот, прозрачность)")
         if any(c.effects for c in self.clips):
@@ -1127,6 +1128,7 @@ class SourceGraph:
     width: int
     height: int
     fps: float
+    feeds: list = field(default_factory=list)   # ReverseVideoFeedSpec / ReverseAudioFeedSpec
 
     def input_args(self):
         # libplacebo в графе (Anime4K без кэша) — все на одном устройстве
@@ -1216,5 +1218,9 @@ from si_hyx_parts.montage_project.vulkan_fx import (  # noqa: E402,F401
     RIFE_MODELS, UPSCALE_PRESETS, VULKAN_DEVICE_ARGS, interp_path, interp_rate, interp_wanted,
     interp_source, shader_path, to_compute, upscale_of, upscale_path, upscale_vf, upscale_wanted,
     vulkan_ok)
+from si_hyx_parts.montage_project.reverse_fx import (  # noqa: E402,F401
+    REVERSE_CHUNK_S, ReverseAudioFeedSpec, ReverseFeedGroup, ReverseVideoFeedSpec,
+    build_reverse_preview, reverse_audio_chunks, reverse_chunks, reverse_preview_dir,
+    reverse_preview_lookup, reverse_preview_path, reverse_preview_source, reverse_preview_span)
 from si_hyx_parts.montage_project.graph import (  # noqa: E402,F401
     build_export, build_source, loudnorm_filter, text_cues)

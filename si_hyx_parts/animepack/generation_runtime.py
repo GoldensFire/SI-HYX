@@ -14,6 +14,8 @@ from .generation_priority import (
 
 
 YIELD_THREADS = 6
+# Максимальное ожидание свободного слота кодировщика (отдельно от таймаута самого ffmpeg).
+ENCODER_QUEUE_TIMEOUT = 1800.0
 # Кодировщики, которые держат слот: AVIF, SVT-AV1 и кодировщики видеокарты.
 HEAVY_ENCODERS = frozenset({"libaom-av1", "libsvtav1"}) | ENCODER_NAMES
 
@@ -109,6 +111,11 @@ class GenerationRuntime:
     def end_selection(self):
         with self.condition:
             self._draining = True
+            self.condition.notify_all()
+
+    def wake(self):
+        """Немедленно будит потоки, ждущие слот в _acquire (например, по «Стоп»)."""
+        with self.condition:
             self.condition.notify_all()
 
     def current_task_cancelled(self):
@@ -237,11 +244,12 @@ def encoding_operation(function):
         # ffprobe, скачивание и Opus не должны занимать слот кодировщика.
         heavy = (function.__name__ != "_run_capture" or
                  any(value in HEAVY_ENCODERS for value in (command or [])))
-        deadline = None
-        if function.__name__ == "_run_capture":
-            seconds = args[1] if len(args) > 1 else kwargs.get("timeout", 180)
-            deadline = time.monotonic() + float(seconds)
-        slot = (runtime.encoding(getattr(generator, "_diagnostics", None), deadline=deadline,
+        queue_deadline = None
+        if runtime is not None and heavy:
+            queue_timeout = getattr(runtime, "queue_timeout", ENCODER_QUEUE_TIMEOUT)
+            if queue_timeout is not None:
+                queue_deadline = time.monotonic() + float(queue_timeout)
+        slot = (runtime.encoding(getattr(generator, "_diagnostics", None), deadline=queue_deadline,
                                  image=function.__name__ == '_to_avif')
                 if runtime is not None and heavy else nullcontext())
         # Вложенные рабочие потоки (например, поиск каверов) тоже получают
@@ -252,14 +260,6 @@ def encoding_operation(function):
         with worker:
             try:
                 with slot:
-                    if deadline is not None:
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            return 1, "", "не дождался свободного кодировщика"
-                        if len(args) > 1:
-                            args = (args[0], remaining, *args[2:])
-                        else:
-                            kwargs["timeout"] = remaining
                     result = function(generator, *args, **kwargs)
                     if (function.__name__ in {"_run_capture", "_run_killable"}
                             and isinstance(result, tuple) and len(result) >= 2 and result[0]):
@@ -271,7 +271,7 @@ def encoding_operation(function):
                             raise
                     return result
             except TimeoutError:
-                if deadline is None:
+                if function.__name__ != "_run_capture":
                     raise
                 return 1, "", "не дождался свободного кодировщика"
     return run

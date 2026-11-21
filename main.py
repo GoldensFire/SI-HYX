@@ -31,12 +31,14 @@ from config import (
     QKeySequence, QLabel, QLineEdit, QListWidget, QLocalServer,
     QLocalSocket, QMainWindow, QMenu, QProgressBar, QPushButton,
     QScrollArea, QSlider, QTabWidget, QTextCursor, QTextEdit, QThreadPool,
-    QTimer, QToolButton, QVBoxLayout, QWidget, Qt, STYLESHEET, USER_AGENT,
+    QTimer, QToolButton, QVBoxLayout, QWidget, Qt, STYLESHEET,
+    UPDATE_MANIFEST_PUBLIC_KEY, USER_AGENT,
     get_icon, http_get, icon_html, pyqtSignal, strip_default_tag,
     ytdlp_base_cmd
 )
-from utils import (check_ffmpeg, ffmpeg_problem, load_settings_ex, parse_version,
-                   save_settings, settings_files_exist)
+from utils import (check_ffmpeg, ffmpeg_problem, flush_settings_saves,
+                   load_settings_ex, parse_version, save_settings,
+                   save_settings_async, settings_files_exist)
 from widgets import (
     LatinKeySequenceEdit, RecentFilesStrip, WheelBlocker, combo_set_value,
     info_badge, install_hover_tips

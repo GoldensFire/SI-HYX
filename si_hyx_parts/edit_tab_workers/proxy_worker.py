@@ -125,9 +125,8 @@ class ProxyWorker(_api.QThread):
         cmds = []
         if feed:
             pbase = _base("pipe:0")
-            cmds += [(pbase + ["-map", "0:v:0", "-map", "0:a?", "-c:a", "aac",
-                               self.output_path], feed),
-                     (pbase + ["-map", "0:v:0", "-an", self.output_path], feed)]
+            cmds.append((pbase + ["-map", "0:v:0", "-map", "0:a?", "-c:a", "aac",
+                                  self.output_path], feed))
         fbase = _base(str(self.input_path))
         cmds += [(fbase + ["-map", "0:v:0", "-map", "0:a?", "-c:a", "aac",
                            self.output_path], None),
@@ -135,12 +134,14 @@ class ProxyWorker(_api.QThread):
         last_error = "неизвестная ошибка"
         for cmd, feed_path in cmds:
             if self._stopped:
+                self._remove_output()
                 self.finished.emit(False, "Отменено", "")
                 return
             try:
                 self.progress.emit("Создание превью…")
                 rc, err = self._run_with_progress(cmd, feed_path=feed_path)
                 if self._stopped:
+                    self._remove_output()
                     self.finished.emit(False, "Отменено", "")
                     return
                 # rc==0 не гарантия успеха: mov/mp4 с moov в конце файла (не
@@ -155,10 +156,20 @@ class ProxyWorker(_api.QThread):
                 if rc == 0 and self._looks_like_real_output(err):
                     self.finished.emit(True, "OK", self.output_path)
                     return
+                self._remove_output()
                 last_error = (err or "")[-600:] or f"код {rc}"
             except Exception as e:
+                self._remove_output()
                 last_error = str(e)
+        self._remove_output()
         self.finished.emit(False, last_error, "")
+
+    def _remove_output(self):
+        try:
+            if self.output_path and _api.os.path.exists(self.output_path):
+                _api.os.remove(self.output_path)
+        except OSError:
+            pass
 
     def _looks_like_real_output(self, err_text=""):
         if "Output file is empty" in (err_text or ""):

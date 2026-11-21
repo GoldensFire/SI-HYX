@@ -81,6 +81,7 @@ class EditTabProjectMixin:
         self._proj_save_pending = False
         self._proj_save_thread = None
         self._proj_prep_worker = None     # фоновая подготовка сборки проекта
+        self._rev_prev_worker = None      # фоновая сборка кэша reverse_preview
         self.project = self._project_load_saved()
         self._proj_undo = _api.deque(maxlen=100)
         self._proj_redo = _api.deque(maxlen=100)
@@ -357,6 +358,7 @@ class EditTabProjectMixin:
         self.project_timeline.refresh()
         self._project_sync_source()
         self._project_update_ui()
+        self._rev_preview_ensure()
         self._snd_schedule_prepare()
 
     def _project_edited(self):
@@ -454,7 +456,7 @@ class EditTabProjectMixin:
                     or abs(b.in_s - a.out_s) > 1e-3 or abs(b.start - a.end) > 1e-3):
                 return None
         if any(c.muted or abs(c.volume - 1.0) > 1e-6
-               or abs(c.speed - 1.0) > 1e-6 or c.audio_detached for c in run):
+               or abs(c.speed - 1.0) > 1e-6 or c.audio_detached or c.reverse for c in run):
             return None
         if len(run) == 1:
             return run[0]
@@ -981,18 +983,60 @@ class EditTabProjectMixin:
         if clip is None or clip.is_image or clip.frozen:
             return
         new_val = not clip.reverse
-        if new_val and clip.has_video and (clip.out_s - clip.in_s) > _mp.MAX_REVERSE_S + 1e-6:
-            _api.msgbox_warning(
-                self, "Реверс",
-                f"Реверс видео поддерживается для клипов не длиннее {_mp.MAX_REVERSE_S:g} с исходника.\n"
-                "Разрежьте клип (Ctrl+B) на более короткие куски.")
-            return
         self._project_snapshot()
         clip.reverse = new_val
         if new_val and clip.speed_curve:
             clip.speed_curve = []
         self._project_changed()
         self._proj_status("реверс включён" if new_val else "реверс выключен")
+
+    def _rev_preview_ensure(self):
+        """Запускает фоновую сборку кэша reverse_preview для реверс-клипов,
+        у которых кэш ещё не готов."""
+        if getattr(self, "_rev_prev_worker", None) is not None:
+            return
+        missing = [
+            _mp.Clip(**{f: getattr(c, f) for f in c.__dataclass_fields__})
+            for c in self.project.clips
+            if (c.reverse and c.has_video and not c.is_image
+                and _api.os.path.isfile(c.src)
+                and _mp.reverse_preview_lookup(c) is None)
+        ]
+        if not missing:
+            return
+        w = _api.ReversePreviewWorker(missing, self)
+        self._rev_prev_worker = w
+        w.progress.connect(self._proj_status)
+        w.clipReady.connect(self._rev_preview_on_ready)
+        w.failed.connect(lambda msg: self._proj_status(f"реверс-превью: {msg}"))
+        w.done.connect(self._rev_preview_on_done)
+        w.start()
+
+    def _rev_preview_on_ready(self, _path):
+        """Кэш реверс-превью готов: обновляем режим (выход из 540p FxPreview,
+        если реверс был единственной причиной) и подставляем кадр в плеер."""
+        was_fx = getattr(self, "_fx_mode", False)
+        self._project_update_ui()
+        if not getattr(self, "_fx_mode", False) and self._proj_play is None:
+            if not was_fx:
+                self._project_seek(self.project_timeline.playhead)
+            self._snd_schedule_prepare()
+        self._proj_status("реверс-превью готово")
+
+    def _rev_preview_on_done(self):
+        self._rev_prev_worker = None
+        self._rev_preview_ensure()
+
+    def _rev_preview_shutdown(self):
+        w = getattr(self, "_rev_prev_worker", None)
+        if w is not None:
+            try:
+                w.stop()
+                if w.isRunning():
+                    w.wait(3000)
+            except Exception:
+                pass
+            self._rev_prev_worker = None
 
     # ── Кадры и волна на клипах ──────────────────────────────────────────────
     def _project_thumb(self, clip, t, height):
@@ -1127,6 +1171,7 @@ class EditTabProjectMixin:
                 pass
             self._proj_prep_worker = None
         self._link_stop()
+        self._rev_preview_shutdown()
         self._fx_shutdown()
         self._pmix_stop()
         self._deck_shutdown()
@@ -1163,6 +1208,15 @@ class EditTabProjectMixin:
         except Exception:
             return False
 
+    def _proj_live_clip(self, c):
+        """Для живого плеера и дек: если у реверс-клипа готов кэш
+        reverse_preview, подставляет его как обычный прямой клип."""
+        if c is not None and c.reverse and c.has_video:
+            sub = _mp.reverse_preview_source(c)
+            if sub is not None:
+                return sub
+        return c
+
     def _project_plan(self):
         """Цепочка для просмотра: куски подряд, соседние куски одного файла,
         идущие в нём встык (например, после разрезания), склеены в один —
@@ -1179,16 +1233,17 @@ class EditTabProjectMixin:
             if c is None:
                 plan.append({'t0': t0, 't1': t1, 'clip': None})
                 continue
-            s0, s1 = c.source_time(t0), c.source_time(t1)
+            lc = self._proj_live_clip(c)
+            s0, s1 = lc.source_time(t0), lc.source_time(t1)
             last = plan[-1] if plan else None
             if (last is not None and last['clip'] is not None
-                    and last['clip'].src == c.src
-                    and abs(last['clip'].speed - c.speed) < 1e-6
+                    and last['clip'].src == lc.src
+                    and abs(last['clip'].speed - lc.speed) < 1e-6
                     and abs(last['t1'] - t0) < 1e-6
                     and abs(last['s1'] - s0) < 0.002):
                 last['t1'], last['s1'] = t1, s1
                 continue
-            plan.append({'t0': t0, 't1': t1, 'clip': c, 's0': s0, 's1': s1})
+            plan.append({'t0': t0, 't1': t1, 'clip': lc, 's0': s0, 's1': s1})
         dur = self.project.duration()
         if plan and dur > plan[-1]['t1'] + 1e-6:
             # Звук длиннее картинки: в файле хвост — чёрный кадр со звуком.
@@ -1275,7 +1330,7 @@ class EditTabProjectMixin:
             self._proj_tick(src_s)
             self._paint_project_time(tl.playhead)
             return True
-        c = self.project.clip(self._proj_cur_id)
+        c = self._proj_live_clip(self.project.clip(self._proj_cur_id))
         # Первый кадр клипа, разрезанного не по сетке кадров, начинается чуть
         # раньше его in — допуск в полкадра, иначе плейхед на нём не двигался.
         lead = (0.5 / c.fps) if c is not None and c.fps else 1e-4
@@ -1303,7 +1358,8 @@ class EditTabProjectMixin:
         к плейхеду, если файл в проекте несколько раз)."""
         t = self.project_timeline.playhead
         best, dist = None, None
-        for c in self.project.clips:
+        for orig in self.project.clips:
+            c = self._proj_live_clip(orig)
             lead = (0.5 / c.fps) if c.fps else 1e-4
             if not self._proj_is_loaded(c.src) or not (c.in_s - lead <= src_s < c.out_s):
                 continue
@@ -1315,7 +1371,7 @@ class EditTabProjectMixin:
     def _proj_time_of_source(self, src_s):
         """Время проекта для кадра src_s открытого файла в текущем клипе или
         None (кадр не из него)."""
-        c = self.project.clip(getattr(self, "_proj_cur_id", ""))
+        c = self._proj_live_clip(self.project.clip(getattr(self, "_proj_cur_id", "")))
         if c is None or c.is_image or not self._proj_is_loaded(c.src):
             return None
         lead = (0.5 / c.fps) if c.fps else 1e-4
@@ -1945,8 +2001,12 @@ class EditTabProjectMixin:
             subs = self._project_burn_subs(project=p_copy, snap=burn_snap) if burn_snap else None
             if is_cancelled():
                 return None
-            return _mp.build_export(p_copy, temp_out, _api.FFMPEG, enc_args,
-                                    subs=subs, tonemap=tonemap)
+            feeds = []
+            built = _mp.build_export(p_copy, temp_out, _api.FFMPEG, enc_args,
+                                     subs=subs, tonemap=tonemap, feeds_out=feeds)
+            if built is None:
+                return None
+            return (built, feeds)
 
         def _cleanup_temp():
             try:
@@ -1965,13 +2025,13 @@ class EditTabProjectMixin:
                     self._project_update_ui()
                 self.on_ffmpeg_finished(False, f"Ошибка подготовки сборки: {payload}")
                 return
-            built = payload
-            if built is None:
+            if payload is None:
                 _cleanup_temp()
                 if not queueing:
                     self._set_cut_btn_cancel(False)
                     self._project_update_ui()
                 return
+            built, feeds = payload
             cmd, graph, dur = built
             graph_file = None
             if len(" ".join(cmd)) > _INLINE_GRAPH_MAX:
@@ -1992,7 +2052,7 @@ class EditTabProjectMixin:
                         False,
                         f"Не удалось записать временный файл графа фильтров (TEMP недоступен или полон): {e}")
                     return
-            worker = _api.FfmpegWorker(cmd, duration=dur)
+            worker = _api.FfmpegWorker(cmd, duration=dur, feeds=feeds)
             worker.progress.connect(self._on_cut_progress)
 
             def _done(success, message, _temp=temp_out, _final=path, _graph=graph_file):

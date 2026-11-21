@@ -136,6 +136,56 @@ class UnifiedWindowUpdatesMixin:
         except Exception:
             return ""
 
+    @staticmethod
+    def _is_valid_sha256(value: str) -> bool:
+        s = (value or "").strip().lower()
+        return len(s) == 64 and all(c in "0123456789abcdef" for c in s)
+
+    @staticmethod
+    def _verify_manifest_signature(manifest: dict, public_key_hex: str) -> bool:
+        sig_hex = str(manifest.get("signature", "") or "").strip()
+        if not sig_hex or not public_key_hex:
+            return False
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            payload = {k: v for k, v in manifest.items() if k != "signature"}
+            raw = _api.json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+            pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex.strip()))
+            pub.verify(bytes.fromhex(sig_hex), raw)
+            return True
+        except Exception:
+            return False
+
+    @classmethod
+    def _fetch_verified_manifest(cls, assets):
+        """Скачивает и проверяет manifest.json из релиза (allow_insecure=False).
+        Если задан UPDATE_MANIFEST_PUBLIC_KEY — требует валидную подпись Ed25519.
+        Возвращает (dict, "") или (None, текст_ошибки)."""
+        man = next(
+            (a for a in (assets or [])
+             if str(a.get("name", "")).lower() == "manifest.json"),
+            None,
+        )
+        if man is None:
+            return None, "В релизе отсутствует manifest.json."
+        url = man.get("browser_download_url", "")
+        if not url:
+            return None, "В manifest.json отсутствует ссылка для загрузки."
+        try:
+            with _api.http_get(url, headers={"User-Agent": _api.APP_NAME},
+                               timeout=15, allow_insecure=False) as r:
+                data = _api.json.loads(r.read().decode("utf-8", "replace"))
+        except Exception as e:
+            return None, f"Не удалось скачать manifest.json: {e}"
+        if not isinstance(data, dict):
+            return None, "Некорректный формат manifest.json."
+        pub_key = (getattr(_api, "UPDATE_MANIFEST_PUBLIC_KEY", "") or "").strip()
+        if pub_key and not cls._verify_manifest_signature(data, pub_key):
+            return None, "Подпись manifest.json не прошла проверку (Ed25519)."
+        return data, ""
+
     def _repair_bundled_tools(self):
         """Ставит full-архив последнего релиза поверх программы: так
         возвращаются bin (ffmpeg, ffprobe, yt-dlp) и models. Путь тот же, что
@@ -161,18 +211,16 @@ class UnifiedWindowUpdatesMixin:
                 if full is None:
                     self.log_signal.emit(f"В релизе {tag} нет полного архива (…-full.zip).")
                     return
-                sha = ""
-                man = next((a for a in assets
-                            if str(a.get("name", "")).lower() == "manifest.json"), None)
-                if man is not None:
-                    try:
-                        with _api.http_get(man.get("browser_download_url", ""),
-                                           headers={"User-Agent": _api.APP_NAME},
-                                           timeout=15, allow_insecure=False) as r:
-                            data = _api.json.loads(r.read().decode("utf-8", "replace")) or {}
-                        sha = str(data.get("full_sha", "") or "")
-                    except Exception:
-                        sha = ""
+                data, err = self._fetch_verified_manifest(assets)
+                if data is None:
+                    self.log_signal.emit(
+                        f"Починка отменена: {err} Установка без проверки контрольной суммы запрещена.")
+                    return
+                sha = str(data.get("full_sha", "") or "").strip().lower()
+                if not self._is_valid_sha256(sha):
+                    self.log_signal.emit(
+                        "Починка отменена: в manifest.json отсутствует корректный full_sha.")
+                    return
                 size = int(full.get("size", 0) or 0)
                 if size:
                     self.log_signal.emit(f"Полная версия {tag}: ~{size / 1024 / 1024:.0f} МБ.")
@@ -195,14 +243,11 @@ class UnifiedWindowUpdatesMixin:
         """Решает, что качать из релиза, экономя трафик:
         • update-архив (только код, ~десятки МБ) — если bin не изменился
           (manifest.bin_sha == локальный bin/.binver);
-        • full-архив (код + bin, ~сотни МБ) — если bin изменился, либо релиз
-          старого формата (нет manifest.json / update-архива).
-        Возвращает (url, size_bytes, sha256, silent). sha256 — ожидаемый хеш
-        выбранного архива из manifest (для проверки после загрузки); "" если
-        проверить нечем (старый формат / нет хеша в manifest). silent — флаг
-        manifest["silent"]: True у релиза, помеченного «необязательным» (см.
-        _check_updates) — старый формат релиза (без manifest) всегда даёт
-        False, т.е. ведёт себя как обычное обязательное обновление."""
+        • full-архив (код + bin, ~сотни МБ) — если bin изменился.
+        Требует валидный manifest.json (и Ed25519-подпись, если задан
+        UPDATE_MANIFEST_PUBLIC_KEY) и непустой SHA256 выбранного архива;
+        без них обновление отменяется.
+        Возвращает (url, size_bytes, sha256, silent)."""
         assets = rel.get("assets", [])
 
         def by(pred):
@@ -217,25 +262,13 @@ class UnifiedWindowUpdatesMixin:
                     or n.endswith("-app.zip") or n == "app.zip")
         update_asset = by(is_update)
         full_asset   = by(lambda n: n.endswith(".zip") and not is_update(n))
-        manifest     = by(lambda n: n == "manifest.json")
 
-        # Старый формат релиза (нет update-архива/manifest) → поведение как раньше:
-        # берём полный (первый не-update) zip, а если такого нет — любой .zip.
-        # Проверить целостность нечем → sha = "".
-        if not update_asset or not manifest:
-            z = full_asset or by(lambda n: n.endswith(".zip"))
-            return (z.get("browser_download_url", ""), int(z.get("size", 0) or 0), "", False) if z else ("", 0, "", False)
+        man, err = self._fetch_verified_manifest(assets)
+        if man is None:
+            self.log_signal.emit(
+                f"Обновление отменено: {err} Установка без проверки контрольной суммы запрещена.")
+            return ("", 0, "", False)
 
-        # Читаем manifest: bin_sha (что качать) + update_sha/full_sha (что проверять)
-        # + silent (необязательное обновление — см. _check_updates).
-        man = {}
-        try:
-            with _api.http_get(manifest.get("browser_download_url", ""),
-                          headers={"User-Agent": _api.APP_NAME}, timeout=15,
-                          allow_insecure=False) as r:
-                man = _api.json.loads(r.read().decode("utf-8", "replace")) or {}
-        except Exception:
-            man = {}
         remote_bin_sha = man.get("bin_sha", "") or ""
         is_silent = bool(man.get("silent", False))
 
@@ -246,7 +279,13 @@ class UnifiedWindowUpdatesMixin:
         else:
             chosen = full_asset or update_asset
             sha = (man.get("full_sha", "") or "") if chosen is full_asset else (man.get("update_sha", "") or "")
-        return (chosen.get("browser_download_url", ""), int(chosen.get("size", 0) or 0), sha, is_silent) if chosen else ("", 0, "", False)
+
+        sha = str(sha).strip().lower()
+        if not chosen or not self._is_valid_sha256(sha):
+            self.log_signal.emit(
+                "Обновление отменено: в manifest.json отсутствует корректная контрольная сумма архива.")
+            return ("", 0, "", False)
+        return (chosen.get("browser_download_url", ""), int(chosen.get("size", 0) or 0), sha, is_silent)
 
     def _skip_file(self):
         return _api.os.path.join(_api.CONFIG_DIR, "skipped_update.txt")
@@ -337,6 +376,12 @@ class UnifiedWindowUpdatesMixin:
     def _start_update_download(self, url: str):
         if getattr(self, "_updating", False):
             return
+        expected_sha = (getattr(self, "_pending_update_sha", "") or "").strip().lower()
+        if not self._is_valid_sha256(expected_sha):
+            self.log(
+                "Ошибка обновления: отсутствует корректная контрольная сумма архива "
+                "(manifest.json). Установка отменена.")
+            return
         self._updating = True
         self.log("Скачивание обновления…")
 
@@ -365,27 +410,37 @@ class UnifiedWindowUpdatesMixin:
                                     last_pct = pct
                                     self.log_signal.emit(f"Загрузка обновления: {pct}%")
 
-                # Проверка целостности: сверяем sha256 загруженного архива с
-                # ожидаемым из manifest. Битый/подменённый zip не распаковываем.
-                expected_sha = (getattr(self, "_pending_update_sha", "") or "").lower()
-                if expected_sha:
-                    h = _api.hashlib.sha256()
-                    with open(zip_path, "rb") as f:
-                        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                            h.update(chunk)
-                    actual_sha = h.hexdigest()
-                    if actual_sha != expected_sha:
-                        self.log_signal.emit(
-                            "Ошибка обновления: контрольная сумма архива не совпала "
-                            "(файл повреждён или подменён). Установка отменена.")
-                        self._updating = False
-                        return
-                    self.log_signal.emit("Контрольная сумма архива подтверждена.")
+                # Обязательная проверка целостности: сверяем sha256 загруженного
+                # архива с ожидаемым из manifest. Битый/подменённый zip не распаковываем.
+                h = _api.hashlib.sha256()
+                with open(zip_path, "rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        h.update(chunk)
+                actual_sha = h.hexdigest()
+                if actual_sha != expected_sha:
+                    self.log_signal.emit(
+                        "Ошибка обновления: контрольная сумма архива не совпала "
+                        "(файл повреждён или подменён). Установка отменена.")
+                    self._updating = False
+                    return
+                self.log_signal.emit("Контрольная сумма архива подтверждена.")
 
                 self.log_signal.emit("Распаковка обновления…")
                 extract_dir = _api.os.path.join(tmp, "extracted")
+                _api.os.makedirs(extract_dir, exist_ok=True)
+                extract_real = _api.os.path.realpath(extract_dir)
                 import zipfile
                 with zipfile.ZipFile(zip_path) as z:
+                    for member in z.infolist():
+                        target = _api.os.path.realpath(
+                            _api.os.path.join(extract_real, member.filename)
+                        )
+                        if target != extract_real and not target.startswith(
+                            extract_real + _api.os.sep
+                        ):
+                            raise ValueError(
+                                f"Недопустимый путь в архиве обновления: {member.filename}"
+                            )
                     z.extractall(extract_dir)
 
                 src_root = self._find_exe_root(extract_dir)
@@ -410,6 +465,49 @@ class UnifiedWindowUpdatesMixin:
                 return dirpath
         return None
 
+    def _check_previous_update_failure(self):
+        """Проверяет маркер провала прошлого обновления и чистит старую
+        задачу SIHYX_SelfUpdate_Launch, если она осталась от прошлых версий."""
+        upd_dir = _api.os.path.join(_api.tempfile.gettempdir(), "sihyx_update")
+        fail_marker = _api.os.path.join(upd_dir, "update_failed.txt")
+        if _api.os.path.isfile(fail_marker):
+            try:
+                with open(fail_marker, "r", encoding="utf-8", errors="replace") as f:
+                    msg = f.read().strip()
+            except Exception:
+                msg = ""
+            try:
+                _api.os.remove(fail_marker)
+            except Exception:
+                pass
+            if msg:
+                self.log(f"Предыдущее обновление не удалось: {msg}")
+                try:
+                    from msgbox import msgbox_warning
+                    msgbox_warning(
+                        self,
+                        "Ошибка обновления",
+                        "Не удалось установить обновление — файлы программы "
+                        "были заняты, выполнен откат к предыдущей версии.\n\n"
+                        + msg,
+                    )
+                except Exception:
+                    pass
+        if _api.IS_WIN:
+            def _cleanup_stale_launch_task():
+                try:
+                    flags = getattr(_api.subprocess, "CREATE_NO_WINDOW", 0)
+                    _api.subprocess.run(
+                        ["schtasks", "/Delete", "/TN", "SIHYX_SelfUpdate_Launch", "/F"],
+                        creationflags=flags,
+                        stdout=_api.subprocess.DEVNULL,
+                        stderr=_api.subprocess.DEVNULL,
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
+            _api.threading.Thread(target=_cleanup_stale_launch_task, daemon=True).start()
+
     def _apply_update(self, src_root: str):
         """Готовит апдейтер и запускает его ВНЕ job-объекта программы через
         Планировщик задач, затем закрывает программу. В Win Sandbox/жёстких
@@ -427,7 +525,10 @@ class UnifiedWindowUpdatesMixin:
             js_path = _api.os.path.join(upd_dir, "run_updater.js")
             log_path = _api.os.path.join(upd_dir, "update_log.txt")
             lock_path = _api.os.path.join(upd_dir, "updater.lock")
-            for _p in (log_path, lock_path):
+            fail_marker = _api.os.path.join(upd_dir, "update_failed.txt")
+            launch_xml = _api.os.path.join(upd_dir, "relaunch.xml")
+            backup_dir = _api.os.path.join(app_dir, ".sihyx_update_backup")
+            for _p in (log_path, lock_path, fail_marker, launch_xml):
                 try:
                     if _api.os.path.exists(_p): _api.os.remove(_p)
                 except Exception: pass
@@ -437,27 +538,28 @@ class UnifiedWindowUpdatesMixin:
 
             task_name = "SIHYX_SelfUpdate"
             launch_task = task_name + "_Launch"
-            relaunch_path = _api.os.path.join(upd_dir, "relaunch.cmd")
             register_path = _api.os.path.join(upd_dir, "register.cmd")
             register_console_path = _api.os.path.join(upd_dir, "register_console.cmd")
             leaf = _api.os.path.basename(exe_path)
             src_exe = _api.os.path.join(src_root, leaf)
-            # Время триггера задач (в будущем). Реально задачи запускаются через
-            # schtasks /Run; авто-срабатывание по /ST безвредно — у программы
-            # single-instance (повторный старт просто закроется).
             st = _api.time.strftime("%H:%M", _api.time.localtime(_api.time.time() + 120))
 
             # Параметры «зашиты» в скрипт (а не через -args) — запускается и
-            # Планировщиком, и напрямую, без возни с кавычками в путях.
+            # Планировщиком, и напрямую, в полном Юникоде (utf-8-sig).
             hdr = (
                 "$AppPid=" + str(int(_api.os.getpid())) + "\n"
                 "$Src=" + q(src_root) + "\n"
                 "$Dst=" + q(app_dir) + "\n"
                 "$Exe=" + q(exe_path) + "\n"
+                "$SrcExe=" + q(src_exe) + "\n"
+                "$Leaf=" + q(leaf) + "\n"
+                "$Backup=" + q(backup_dir) + "\n"
                 "$Log=" + q(log_path) + "\n"
                 "$Lock=" + q(lock_path) + "\n"
+                "$FailMarker=" + q(fail_marker) + "\n"
                 "$TaskName=" + q(task_name) + "\n"
-                "$RelaunchCmd=" + q(relaunch_path) + "\n"
+                "$LaunchTask=" + q(launch_task) + "\n"
+                "$LaunchXml=" + q(launch_xml) + "\n"
             )
             body = (
                 "$ErrorActionPreference='SilentlyContinue'\n"
@@ -476,19 +578,81 @@ class UnifiedWindowUpdatesMixin:
                 "for($i=0; ($i -lt 60) -and (-not $free); $i++){ try { $fs=[System.IO.File]::Open($Exe,'Open','ReadWrite','None'); $fs.Close(); $free=$true; break } catch { Start-Sleep -Milliseconds 500 } }\n"
                 "W \"Exe free=$free\"\n"
                 "Start-Sleep -Milliseconds 500\n"
-                "# 3) Копируем новую версию поверх старой (с ретраями)\n"
+                "# 3) Резервная копия текущей версии (exe + _internal) на случай отката\n"
+                "$hasBackup=$false\n"
+                "try {\n"
+                "  if(Test-Path $Backup){ Remove-Item $Backup -Recurse -Force -ErrorAction SilentlyContinue }\n"
+                "  New-Item -ItemType Directory -Path $Backup -Force | Out-Null\n"
+                "  if(Test-Path $Exe){ Copy-Item $Exe (Join-Path $Backup $Leaf) -Force }\n"
+                "  $dstInt = Join-Path $Dst '_internal'\n"
+                "  if(Test-Path $dstInt){ robocopy $dstInt (Join-Path $Backup '_internal') /MIR /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null; if($LASTEXITCODE -lt 8){ $hasBackup=$true } } else { $hasBackup=$true }\n"
+                "  W \"Backup ready=$hasBackup\"\n"
+                "} catch { W \"Backup error: $_\" }\n"
+                "# 4) Копируем новую версию: корень (/E, не трогаем bin/models/польз. файлы)\n"
+                "#    и _internal (/MIR — удаляем устаревшие файлы прошлой сборки).\n"
                 "$ok=$false\n"
-                "for($try=1; $try -le 12; $try++){ robocopy $Src $Dst /E /IS /IT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null; $rc=$LASTEXITCODE; W \"robocopy try $try rc=$rc\"; if($rc -lt 8){ $ok=$true; break }; Start-Sleep -Seconds 2 }\n"
-                "if($ok){ W 'Copy OK.' } else { W 'Copy FAILED (robocopy rc>=8).' }\n"
-                "# 4) Перезапуск новой версии ОТДЕЛЬНОЙ задачей (relaunch.cmd).\n"
-                "#    Планировщик убивает ВСЁ дерево процессов завершившейся задачи —\n"
-                "#    поэтому запускать приложение из самой задачи-апдейтера нельзя\n"
-                "#    (новая версия тут же умрёт). Отдельная задача делает приложение\n"
-                "#    своим ГЛАВНЫМ процессом → оно живёт и стартует в интерактивной\n"
-                "#    сессии (видимое окно).\n"
-                "try { Start-Process -FilePath $RelaunchCmd -Wait -WindowStyle Hidden; W 'Relaunch task triggered.' } catch { W \"Relaunch failed: $_\" }\n"
+                "$srcInt = Join-Path $Src '_internal'\n"
+                "$dstInt = Join-Path $Dst '_internal'\n"
+                "for($try=1; $try -le 12; $try++){\n"
+                "  robocopy $Src $Dst /E /IS /IT /XD _internal .sihyx_update_backup /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null\n"
+                "  $rc1=$LASTEXITCODE\n"
+                "  $rc2=0\n"
+                "  if(Test-Path $srcInt){\n"
+                "    robocopy $srcInt $dstInt /MIR /IS /IT /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null\n"
+                "    $rc2=$LASTEXITCODE\n"
+                "  }\n"
+                "  W \"robocopy try $try rc_root=$rc1 rc_internal=$rc2\"\n"
+                "  if(($rc1 -lt 8) -and ($rc2 -lt 8)){ $ok=$true; break }\n"
+                "  Start-Sleep -Seconds 2\n"
+                "}\n"
+                "if($ok){\n"
+                "  W 'Copy OK.'\n"
+                "  if(Test-Path $Backup){ Remove-Item $Backup -Recurse -Force -ErrorAction SilentlyContinue }\n"
+                "  if(Test-Path $FailMarker){ Remove-Item $FailMarker -Force -ErrorAction SilentlyContinue }\n"
+                "} else {\n"
+                "  W 'Copy FAILED (robocopy rc>=8). Rolling back...'\n"
+                "  if($hasBackup){\n"
+                "    try {\n"
+                "      $bakExe = Join-Path $Backup $Leaf\n"
+                "      if(Test-Path $bakExe){ Copy-Item $bakExe $Exe -Force }\n"
+                "      $bakInt = Join-Path $Backup '_internal'\n"
+                "      if(Test-Path $bakInt){ robocopy $bakInt $dstInt /MIR /IS /IT /R:2 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null }\n"
+                "      W 'Rollback finished.'\n"
+                "    } catch { W \"Rollback error: $_\" }\n"
+                "    Remove-Item $Backup -Recurse -Force -ErrorAction SilentlyContinue\n"
+                "  }\n"
+                "  \"Не удалось скопировать файлы обновления (robocopy rc>=8). Лог: $Log\" | Out-File -FilePath $FailMarker -Encoding utf8\n"
+                "}\n"
+                "# 5) Перезапуск ОТДЕЛЬНОЙ задачей через UTF-16 XML (работает на любых\n"
+                "#    кириллических путях и пробелах, без триггера по времени, задача\n"
+                "#    сразу удаляется после запуска).\n"
+                "$TargetExe = if(Test-Path $Exe){ $Exe } else { $SrcExe }\n"
+                "try {\n"
+                "  $EscExe = [System.Security.SecurityElement]::Escape($TargetExe)\n"
+                "  $EscDir = [System.Security.SecurityElement]::Escape($Dst)\n"
+                "  $Xml = \"<?xml version=`\"1.0`\" encoding=`\"UTF-16`\"?>`r`n\" +\n"
+                "    \"<Task version=`\"1.2`\" xmlns=`\"http://schemas.microsoft.com/windows/2004/02/mit/task`\">`r`n\" +\n"
+                "    \"  <Triggers />`r`n\" +\n"
+                "    \"  <Principals><Principal id=`\"Author`\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>`r`n\" +\n"
+                "    \"  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Enabled>true</Enabled></Settings>`r`n\" +\n"
+                "    \"  <Actions Context=`\"Author`\"><Exec><Command>$EscExe</Command><WorkingDirectory>$EscDir</WorkingDirectory></Exec></Actions>`r`n\" +\n"
+                "    \"</Task>\"\n"
+                "  [System.IO.File]::WriteAllText($LaunchXml, $Xml, [System.Text.Encoding]::Unicode)\n"
+                "  schtasks /Create /F /TN $LaunchTask /XML $LaunchXml | Out-Null\n"
+                "  if($LASTEXITCODE -eq 0){\n"
+                "    schtasks /Run /TN $LaunchTask | Out-Null\n"
+                "    W 'Relaunch task triggered.'\n"
+                "    Start-Sleep -Seconds 2\n"
+                "    schtasks /Delete /TN $LaunchTask /F | Out-Null\n"
+                "  } else {\n"
+                "    W 'Relaunch XML task create failed; fallback Start-Process.'\n"
+                "    Start-Process -FilePath $TargetExe -WorkingDirectory $Dst\n"
+                "  }\n"
+                "} catch { W \"Relaunch failed: $_\"; try { Start-Process -FilePath $TargetExe -WorkingDirectory $Dst } catch {} }\n"
                 "W 'Done.'\n"
                 "Remove-Item $Lock -Force -ErrorAction SilentlyContinue\n"
+                "Remove-Item $LaunchXml -Force -ErrorAction SilentlyContinue\n"
+                "schtasks /Delete /TN $LaunchTask /F | Out-Null\n"
                 "schtasks /Delete /TN $TaskName /F | Out-Null\n"
             )
             with open(ps_path, "w", encoding="utf-8-sig") as f:
@@ -512,17 +676,6 @@ class UnifiedWindowUpdatesMixin:
                 f.write("@echo off\r\n"
                         "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden "
                         "-File \"%~dp0apply_update.ps1\"\r\n")
-            # relaunch.cmd — регистрирует и запускает ОТДЕЛЬНУЮ задачу-лаунчер,
-            # действие которой = сам .exe (он становится главным процессом задачи
-            # → переживает завершение задачи-апдейтера). Кавычки form2: /TR "\"path\""
-            # — единственная форма, что работает для путей с пробелами (проверено).
-            with open(relaunch_path, "w", encoding="ascii", errors="replace") as f:
-                f.write("@echo off\r\n"
-                        'set "EXE=' + exe_path + '"\r\n'
-                        'if not exist "%EXE%" set "EXE=' + src_exe + '"\r\n'
-                        'schtasks /Create /F /TN "' + launch_task + '" /TR "\\"%EXE%\\"" '
-                        '/SC ONCE /ST ' + st + ' /RL LIMITED >nul 2>&1\r\n'
-                        'schtasks /Run /TN "' + launch_task + '" >nul 2>&1\r\n')
             # register.cmd — регистрирует и запускает задачу-апдейтер (form2-кавычки).
             # Пути — через %~dp0 (папка самого .cmd): cmd подставляет их в
             # Юникоде, а записанные в ascii-файл пути с кириллицей портились.
@@ -546,13 +699,14 @@ class UnifiedWindowUpdatesMixin:
                 return
 
             self.log(f"Обновление готово. Перезапуск… (лог: {log_path})")
-            # ЖЁСТКО завершаем процесс: QApplication.quit() не всегда освобождает
-            # файлы (живут Qt-потоки/серверы) → robocopy не перезапишет залоченный exe.
-            try: self._save_settings_now()
-            except Exception: pass
-            try: self._stop_browser_http_server()
-            except Exception: pass
-            _api.QTimer.singleShot(700, lambda: _api.os._exit(0))
+            # Корректно останавливаем все вкладки/воркеры/серверы и синхронно
+            # сбрасываем настройки, затем гарантированно завершаем процесс,
+            # чтобы robocopy не упёрся в залоченные файлы.
+            try:
+                self._shutdown_components()
+            except Exception:
+                pass
+            _api.QTimer.singleShot(500, lambda: _api.os._exit(0))
         except Exception as e:
             self._updating = False
             self.log(f"Ошибка применения обновления: {e}")

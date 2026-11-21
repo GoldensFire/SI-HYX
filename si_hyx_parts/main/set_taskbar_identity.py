@@ -91,6 +91,50 @@ def _set_taskbar_identity(hwnd):
 _set_taskbar_identity.__module__ = _api.__name__
 _api._set_taskbar_identity = _set_taskbar_identity
 
+def _send_to_running_instance(cli_files, attempts=1, delay=0.15) -> bool:
+    """Пробует подключиться к уже запущенному экземпляру по IPC и передать ему
+    файлы (или команду __ACTIVATE__ для поднятия окна)."""
+    payload = (('\n'.join(cli_files) if cli_files else '__ACTIVATE__') + '\n').encode('utf-8')
+    for i in range(max(1, attempts)):
+        try:
+            sock = _api.QLocalSocket()
+            sock.connectToServer("YasperMoglotIPC")
+            if sock.waitForConnected(800):
+                sock.write(payload)
+                sock.flush()
+                sock.waitForBytesWritten(1000)
+                sock.disconnectFromServer()
+                return True
+        except Exception:
+            pass
+        if i + 1 < attempts:
+            _api.time.sleep(delay)
+    return False
+
+
+def _acquire_single_instance_mutex():
+    """На Windows создаёт именованный мьютекс для атомарной защиты от
+    одновременного запуска двух экземпляров. Возвращает (handle, already_exists)."""
+    if not _api.IS_WIN:
+        return None, False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        handle = k32.CreateMutexW(None, False, "Local\\SIHYX_SingleInstance_Mutex")
+        err = ctypes.get_last_error()
+        if handle and err == 183:  # ERROR_ALREADY_EXISTS
+            k32.CloseHandle(handle)
+            return None, True
+        return handle, False
+    except Exception:
+        return None, False
+
+
 def main():
     # AppUserModelID задаём до QApplication и первого окна. Проверено запуском:
     # БЕЗ него панель задач группирует окно под python.exe и рисует иконку
@@ -110,19 +154,15 @@ def main():
     # Парсим аргументы один раз
     cli_files = [f for f in _api.sys.argv[1:] if _api.os.path.exists(f)]
 
-    # Если запущен с аргументами (через ПКМ) — пробуем передать файлы уже открытому окну
-    if cli_files:
-        try:
-            sock = _api.QLocalSocket()
-            sock.connectToServer("YasperMoglotIPC")
-            if sock.waitForConnected(800):
-                sock.write(('\n'.join(cli_files) + '\n').encode('utf-8'))
-                sock.flush()
-                sock.waitForBytesWritten(1000)
-                sock.disconnectFromServer()
-                return  # Файл передан — новое окно не открываем
-        except Exception: pass
-        # Сервер не найден — запускаем нормально и загружаем файлы
+    # Single-instance: всегда проверяем уже открытое окно — с файлами или без.
+    if _send_to_running_instance(cli_files, attempts=1):
+        return
+    mutex_handle, already_exists = _acquire_single_instance_mutex()
+    if already_exists:
+        # Первый экземпляр уже стартует, но мог ещё не открыть IPC-сокет.
+        _send_to_running_instance(cli_files, attempts=10, delay=0.15)
+        return
+    _api._instance_mutex_handle = mutex_handle
 
     # GIL отдаётся фоновым потоком раз в 1 мс, а не в 5 (по умолчанию). Пока
     # фоном считает Python-поток (поиск ShikimoriHYX по базе, генерация пака),

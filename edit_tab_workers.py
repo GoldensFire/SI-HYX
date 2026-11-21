@@ -80,3 +80,5 @@ from si_hyx_parts.edit_tab_workers.project_sound import ProjectSoundEngine
 from si_hyx_parts.edit_tab_workers.video_deck import VideoDeck
 
 from si_hyx_parts.edit_tab_workers.fx_preview import FxPreview
+
+from si_hyx_parts.edit_tab_workers.reverse_preview import ReversePreviewWorker

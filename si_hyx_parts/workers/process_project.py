@@ -46,7 +46,7 @@ class ProcessProjectMixin:
             _api.escape_filter_path) if is_video and item.get('sdr_tonemap') else {})
         src = _mp.build_source(proj, video=is_video, audio=has_audio and not remove_audio,
                                subs=item.get('project_subs') if is_video else None,
-                               tonemap=tonemap)
+                               tonemap=tonemap, reverse_pipes=True)
         if src is None:
             raise Exception("Проект пуст — собирать нечего.")
         if is_video and video_enabled and not self.svt_available:
@@ -111,8 +111,24 @@ class ProcessProjectMixin:
                 calc = _api.RealETACalculator(frames, pass_num=1, has_second_pass=False) if frames > 0 else None
             self.log.emit(f"Монтаж: проект «{out_name}» — {len(src.inputs)} входов, "
                           f"{out_dur:.1f} с, одно кодирование.")
-            self.run_ffmpeg_capture(cmd, max(1, int(out_dur)), cb, label=None, eta_calc=calc,
-                                    cancel_check=lambda: item["iid"] in self.removed_ids)
+            fg = _mp.ReverseFeedGroup(src.feeds, ffmpeg=_api.FFMPEG) if src.feeds else None
+            if fg is not None:
+                fg.start()
+            try:
+                def _cancel():
+                    cancelled = item["iid"] in self.removed_ids
+                    if cancelled and fg is not None:
+                        fg.stop()
+                    return cancelled
+                self.run_ffmpeg_capture(cmd, max(1, int(out_dur)), cb, label=None, eta_calc=calc,
+                                        cancel_check=_cancel)
+            except Exception:
+                if fg is not None:
+                    fg.stop()
+                raise
+            finally:
+                if fg is not None:
+                    fg.join()
             if not _api.os.path.exists(out):
                 raise Exception("Output file не найден после ffmpeg (возможная ошибка записи).")
             if src.audio and sa.get('norm'):
@@ -202,7 +218,8 @@ class ProcessProjectMixin:
         dur = proj.duration()
         take = min(_SAMPLE_MAX_S, dur)
         t0 = max(0.0, (dur - take) / 2.0)
-        part = _mp.build_source(proj, audio=False, tonemap=tonemap, window=(t0, t0 + take))
+        part = _mp.build_source(proj, audio=False, tonemap=tonemap, window=(t0, t0 + take),
+                                reverse_pipes=True)
         if part is None or not part.video:
             return None
         tmp = _api.os.path.join(_api.TEMP_DIR, f"projsample_{_api.uuid.uuid4().hex}.mkv")
@@ -211,7 +228,16 @@ class ProcessProjectMixin:
                + ["-filter_complex", part.graph, "-map", "[vout]",
                   "-c:v", "libx264", "-preset", "ultrafast", "-crf", "4",
                   "-an", "-t", f"{part.duration:.6f}", tmp])
-        if not self._run_killable(cmd) or not _api.os.path.exists(tmp):
+        fg = _mp.ReverseFeedGroup(part.feeds, ffmpeg=_api.FFMPEG) if part.feeds else None
+        if fg is not None:
+            fg.start()
+        try:
+            ok = self._run_killable(cmd)
+        finally:
+            if fg is not None:
+                fg.stop()
+                fg.join()
+        if not ok or not _api.os.path.exists(tmp):
             self.log.emit("⚠ Не удалось собрать сэмпл проекта — обрезка полос и "
                           "подбор CRF пропущены.")
             return None

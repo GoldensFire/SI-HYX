@@ -49,6 +49,8 @@ class RevealVideoWorker(_api.QThread):
         if _api.os.name == 'nt':
             kw['creationflags'] = _api.CREATE_NO_WINDOW
         p = _api.subprocess.Popen(cmd, **kw)
+        import process_guard
+        process_guard.assign_to_job(p)
         self._procs.append(p)
         return p
 

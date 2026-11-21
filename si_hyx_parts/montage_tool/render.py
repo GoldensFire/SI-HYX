@@ -126,7 +126,8 @@ def _encoder_args(encoder, encoders=None):
     return _api.ffmpeg_env.h264_encoder_args(encoders, _api.ENCODERS[encoder])
 
 
-def export_command(p, out_path, encoder="auto", encoders=None, subs=None, loudnorm=None):
+def export_command(p, out_path, encoder="auto", encoders=None, subs=None, loudnorm=None,
+                   feeds_out=None):
     """(cmd, graph, duration) — та же сборка, что у «Экспорт» вкладки
     (EditTab.project_export): HDR-куски сводятся в SDR так, как их видно в
     просмотре, граф — montage_project.build_export. ToolError, если
@@ -136,7 +137,8 @@ def export_command(p, out_path, encoder="auto", encoders=None, subs=None, loudno
         (c.src for c in p.clips if c.has_video and not c.is_image), _api.escape_filter_path)
     built = _api.montage_project.build_export(
         p, str(out_path), _api.FFMPEG, _encoder_args(encoder, encoders),
-        audio_args=_audio_args(out_path), subs=subs, tonemap=tonemap, loudnorm=loudnorm)
+        audio_args=_audio_args(out_path), subs=subs, tonemap=tonemap, loudnorm=loudnorm,
+        feeds_out=feeds_out)
     if built is None:
         raise _api.ToolError("nothing_to_render", "в проекте нечего собирать")
     return built
@@ -265,19 +267,27 @@ def render(p, out_path, encoder="auto", overwrite=False, on_progress=None,
     stem, ext = _api.os.path.splitext(out)
     tmp = f"{stem}.sihyx_part{ext}"
     measured = measure_loudness(p) if p.settings.loudness is not None else None
-    cmd, graph, dur = export_command(p, tmp, encoder, encoders, subs, loudnorm=measured)
+    feeds = []
+    cmd, graph, dur = export_command(p, tmp, encoder, encoders, subs, loudnorm=measured,
+                                     feeds_out=feeds)
     cmd = with_faststart(cmd)
     # -progress — ключ=значение в stdout раз в полсекунды; stdin закрыт.
     cmd[1:1] = ["-nostdin", "-nostats", "-progress", "pipe:1"]
     graph_file = _graph_to_file(cmd, graph)
     t_start = time.monotonic()
     tail = collections.deque(maxlen=20)
+    fg = _api.montage_project.ReverseFeedGroup(feeds, ffmpeg=_api.FFMPEG) if feeds else None
+    if fg is not None:
+        fg.start()
     try:
         proc = _api.subprocess.Popen(
             cmd, stdin=_api.subprocess.DEVNULL, stdout=_api.subprocess.PIPE,
             stderr=_api.subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
             creationflags=_api.CREATE_NO_WINDOW)
     except OSError as e:
+        if fg is not None:
+            fg.stop()
+            fg.join()
         _remove(graph_file)
         raise _api.ToolError("ffmpeg_not_started", f"не удалось запустить ffmpeg: {e}") from e
 
@@ -305,9 +315,16 @@ def render(p, out_path, encoder="auto", overwrite=False, on_progress=None,
     except KeyboardInterrupt:
         cancelled = True
     finally:
-        if cancelled and proc.poll() is None:
-            proc.kill()
+        if cancelled:
+            if fg is not None:
+                fg.stop()
+            if proc.poll() is None:
+                proc.kill()
         rc = proc.wait()
+        if fg is not None:
+            if rc != 0:
+                fg.stop()
+            fg.join()
         reader.join(timeout=5)
         _remove(graph_file)
     if cancelled:

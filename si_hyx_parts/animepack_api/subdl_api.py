@@ -96,11 +96,13 @@ class SubdlApi:
         if code == 429:
             error = str(_payload(response).get("error") or "").casefold()
             if error == "rate_limit":
+                self.limiter.penalize(RATE_LIMIT_WAIT)
                 if retry:
                     self._sleep(RATE_LIMIT_WAIT)
                     return None
                 raise _api.AnimePackApiError("SubDL просит сбавить темп")
             if error == "service_busy":
+                self.limiter.penalize(5.0)
                 raise _api.AnimePackApiError("SubDL занят, попробуйте позже")
             # daily_limit, api_download_limit_exceeded и 429 без пояснения —
             # на сегодня ключ своё отработал.
@@ -113,8 +115,15 @@ class SubdlApi:
     def _get(self, url: str, params=None):
         for retry in (True, False):
             self.limiter.acquire()
-            response = self.session.get(url, params=params, timeout=(10, 45))
-            checked = self._check(response, retry)
+            try:
+                response = self.session.get(url, params=params, timeout=(10, 45))
+                checked = self._check(response, retry)
+            except _api.AnimePackApiError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                if isinstance(e, _api.requests.exceptions.RetryError) and "429" in str(e):
+                    self.limiter.penalize(RATE_LIMIT_WAIT)
+                raise _api._friendly(e, "SubDL") from e
             if checked is not None:
                 return checked
         raise _api.AnimePackApiError("SubDL просит сбавить темп")

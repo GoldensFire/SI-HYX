@@ -67,7 +67,7 @@ from edit_tab_base import (
 from edit_tab_workers import (
     AssExtractor, AudioSegmentWaveformLoader, AudioWaveformLoader,
     FfmpegWorker, FxPreview, PgsExtractor, ProjectSoundEngine, ProjectThumbWorker,
-    ProxyWorker, RevealVideoWorker, ShareDeleteIODevice, VideoDeck,
+    ProxyWorker, RevealVideoWorker, ReversePreviewWorker, ShareDeleteIODevice, VideoDeck,
     SmartCutWorker, SubtitleExtractor, TrackOverlayWorker, TrackPathWorker,
     VideoInpaintWorker, open_share_delete_file
 )

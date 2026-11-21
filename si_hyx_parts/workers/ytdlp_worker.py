@@ -6,6 +6,7 @@ import codecs
 from urllib.parse import urlsplit
 
 import workers as _api
+import process_guard
 from .download_network import is_network_error, is_ssl_error, network_hint
 from .download_process import (
     copy_cookies_for_job, remove_temp_cookie, stop_process, stop_process_async,
@@ -176,6 +177,7 @@ class YtdlpWorker(_api.QThread):
             cmd, stdout=_api.subprocess.PIPE, stderr=_api.subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             creationflags=_api.CREATE_NO_WINDOW, bufsize=1, env=_api.subprocess_env())
+        process_guard.assign_to_job(self._proc)
         if not self.is_running:
             stop_process(self._proc)
         _api.threading.Thread(target=self._watchdog, args=(self._proc,), daemon=True).start()
@@ -340,6 +342,7 @@ class YtdlpWorker(_api.QThread):
             cmd, stdout=_api.subprocess.PIPE, stderr=_api.subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             creationflags=_api.CREATE_NO_WINDOW, bufsize=1, env=_api.subprocess_env())
+        process_guard.assign_to_job(self._proc)
         if not self.is_running:
             stop_process(self._proc)
         _api.threading.Thread(target=self._watchdog, args=(self._proc,), daemon=True).start()

@@ -41,6 +41,7 @@ import montage_project as _api
 from image_formats import ffmpeg_still
 from si_hyx_parts.montage_project import effects as _fx
 from si_hyx_parts.montage_project import layers as _ly
+from si_hyx_parts.montage_project import reverse_fx as _rfx
 from si_hyx_parts.montage_project import text_fx as _tfx
 from si_hyx_parts.montage_project import vulkan_fx as _vfx
 
@@ -59,9 +60,11 @@ def _fr(t, fps):
 class _Graph:
     """Входы и цепочки фильтров одного графа."""
 
-    def __init__(self):
+    def __init__(self, reverse_pipes=False):
         self.inputs = []
         self.chains = []
+        self.feeds = []
+        self.reverse_pipes = bool(reverse_pipes)
         self._n = {}
 
     def label(self, prefix):
@@ -76,9 +79,10 @@ def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap, project=
     n кадров в размере вписывания fit, метки с нуля (без метки выхода).
 
     Стоп-кадр — один кадр исходника на freeze_at, продлённый tpad на всю
-    длину. Реверс — кусок исходника [время на t_b, время на t_a) читается
-    ровно (-t без запаса: лишние кадры после reverse оказались бы первыми)
-    и разворачивается уже в размере проекта: reverse держит все кадры."""
+    длину. Короткий реверс (≤ REVERSE_CHUNK_S) — прямо в графе с fps и format
+    до reverse (экономит RAM на 10-битном источнике) и запасом _seek_s в -t;
+    длинный реверс при экспорте (g.reverse_pipes) — чанковый пайп-генератор
+    без временных файлов на диске."""
     up = ""
     if project is not None:
         # Персонаж без фона (layers.matte_source) или замедление RIFE
@@ -98,9 +102,48 @@ def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap, project=
             tonemap = subs = None        # кэш уже в SDR и без субтитров
     speed = c.play_speed
     span = t_b - t_a
+    # Для превью без пайпов (FxPreview и др.) длинный реверс берёт готовый кэш,
+    # если нет вшиваемых субтитров и HDR-тонемаппинга.
+    if (c.reverse and not g.reverse_pipes and span * speed > _rfx.REVERSE_CHUNK_S + 1e-6
+            and not (subs or {}).get(_api.source_key(c.src))
+            and not (tonemap or {}).get(_api.source_key(c.src))):
+        rev_sub = _rfx.reverse_preview_source(c)
+        if rev_sub is not None:
+            c = rev_sub
     idx = len(g.inputs)
     hold = "1"
-    pick = reverse = ""
+    pick = ""
+    sub_vf = (subs or {}).get(_api.source_key(c.src)) if not c.is_image else None
+    tone_vf = (tonemap or {}).get(_api.source_key(c.src)) if not c.is_image else None
+    tone = f"{tone_vf}," if tone_vf else ""
+    speed_vf = "" if abs(speed - 1.0) <= 1e-6 else f"setpts=(PTS-STARTPTS)/{_api._num(speed)},"
+    if c.speed_curve and not (c.frozen or c.reverse or c.is_image):
+        speed_vf = _fx.curve_setpts(c) + ","
+
+    # Длинный реверс при экспорте: чанковый пайп-генератор (0 байт на диске, O(1) RAM).
+    if c.reverse and g.reverse_pipes and span * speed > _rfx.REVERSE_CHUNK_S + 1e-6:
+        s = c.source_time(t_b)
+        t_end = s + span * speed
+        has_alpha = (pix_fmt == "yuva420p" and bool(c.matte))
+        pipe_name = _rfx.make_pipe_name("v")
+        vf_pre = (f"{up}setpts=PTS-STARTPTS,{speed_vf}"
+                  f"scale=iw*sar:ih,setsar=1,{_ly.crop_filter(c)}{fit}setsar=1")
+        if has_alpha:
+            g.inputs.append(["-f", "image2pipe", "-c:v", "pam", "-framerate", rate,
+                             "-i", pipe_name])
+            spec_pix, spec_fmt = "rgba", "pam"
+        else:
+            g.inputs.append(["-f", "yuv4mpegpipe", "-i", pipe_name])
+            spec_pix, spec_fmt = "yuv420p", "yuv4mpegpipe"
+        g.feeds.append(_rfx.ReverseVideoFeedSpec(
+            pipe_name=pipe_name, src=c.src, t_start=s, t_end=t_end,
+            n_frames=n, fps=fps or 25.0, rate=rate, src_fps=float(c.fps or 0.0),
+            speed=speed, vf_pre=vf_pre, pix_fmt=spec_pix, fmt=spec_fmt,
+            tone_vf=tone_vf or "", sub_vf=sub_vf or ""))
+        return (f"[{idx}:v:0]setpts=PTS-STARTPTS,"
+                f"tpad=stop_mode=clone:stop_duration={hold},"
+                f"trim=end_frame={n},setpts=PTS-STARTPTS,format={pix_fmt}")
+
     if c.frozen:
         s = c.freeze_at
         g.inputs.append(["-ss", _api._num(_api._seek_s(c, s)), "-t", "1", "-i", c.src])
@@ -108,9 +151,10 @@ def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap, project=
         hold = _api._num(span + 1.0)
     elif c.reverse:
         s = c.source_time(t_b)
-        g.inputs.append(["-ss", _api._num(_api._seek_s(c, s)),
-                         "-t", _api._num(span * speed), "-i", c.src])
-        reverse = "reverse,"
+        seek = _api._seek_s(c, s)
+        lead = max(0.0, s - seek)
+        g.inputs.append(["-ss", _api._num(seek),
+                         "-t", _api._num(span * speed + lead), "-i", c.src])
     else:
         s = c.source_time(t_a)
         if c.is_image:
@@ -119,22 +163,22 @@ def _source_chain(g, c, t_a, t_b, n, rate, fit, pix_fmt, subs, tonemap, project=
         else:
             g.inputs.append(["-ss", _api._num(_api._seek_s(c, s)),
                              "-t", _api._num(span * speed + 0.5), "-i", c.src])
-    sub_vf = (subs or {}).get(_api.source_key(c.src)) if not c.is_image else None
-    tone_vf = (tonemap or {}).get(_api.source_key(c.src)) if not c.is_image else None
-    tone = f"{tone_vf}," if tone_vf else ""
     burn = ""
     if sub_vf:
         # Первый кадр после входного seek — кадр, на котором стоит s.
         first = _api.snap_to_frame(s, c.fps)
         burn = f"setpts=PTS-STARTPTS+{_api._num(first)}/TB,{sub_vf},"
-    speed_vf = "" if abs(speed - 1.0) <= 1e-6 else f"setpts=(PTS-STARTPTS)/{_api._num(speed)},"
-    if c.speed_curve and not (c.frozen or c.reverse or c.is_image):
-        speed_vf = _fx.curve_setpts(c) + ","
     # scale=iw*sar:ih — неквадратный пиксель (анаморфный DVD) в квадратный до
     # вписывания: вписывание шло по размеру в пикселях, а setsar=1 потом
     # показывал кадр 16:9 как 3:2. У квадратного пикселя фильтр кадр не трогает.
+    if c.reverse:
+        return (f"[{idx}:v:0]{tone}{burn}{pick}{up}setpts=PTS-STARTPTS,{speed_vf}"
+                f"scale=iw*sar:ih,setsar=1,{_ly.crop_filter(c)}{fit}setsar=1,"
+                f"fps={rate},format={pix_fmt},reverse,"
+                f"tpad=stop_mode=clone:stop_duration={hold},"
+                f"trim=end_frame={n},setpts=PTS-STARTPTS")
     return (f"[{idx}:v:0]{tone}{burn}{pick}{up}setpts=PTS-STARTPTS,{speed_vf}"
-            f"scale=iw*sar:ih,setsar=1,{_ly.crop_filter(c)}{fit}setsar=1,{reverse}"
+            f"scale=iw*sar:ih,setsar=1,{_ly.crop_filter(c)}{fit}setsar=1,"
             f"fps={rate},tpad=stop_mode=clone:stop_duration={hold},"
             f"trim=end_frame={n},setpts=PTS-STARTPTS,format={pix_fmt}")
 
@@ -616,9 +660,20 @@ def _audio(g, project, parts, w0, w1, total_s, pre=0.0):
             # Кривая скорости: rubberband помнит прошлое — звук клипа
             # считается с его начала, кусок окна вырезается сэмплами.
             seek, src_span = c.in_s, c.out_s - c.in_s
-        g.inputs.append(["-ss", _api._num(seek),
-                         "-t", _api._num(src_span + 0.25), "-i", c.audio_path])
-        spec = f"{idx}:{c.audio_stream}" if c.audio_stream >= 0 else f"{idx}:a:0"
+        use_areverse = bool(c.reverse)
+        if c.reverse and g.reverse_pipes and src_span > _rfx.REVERSE_CHUNK_S + 1e-6:
+            pipe_name = _rfx.make_pipe_name("a")
+            g.inputs.append(["-f", "f32le", "-ar", str(rate), "-ac", "2", "-i", pipe_name])
+            g.feeds.append(_rfx.ReverseAudioFeedSpec(
+                pipe_name=pipe_name, audio_path=c.audio_path,
+                audio_stream=c.audio_stream, t_start=seek,
+                t_end=seek + src_span, rate=rate))
+            spec = f"{idx}:a:0"
+            use_areverse = False
+        else:
+            g.inputs.append(["-ss", _api._num(seek),
+                             "-t", _api._num(src_span + 0.25), "-i", c.audio_path])
+            spec = f"{idx}:{c.audio_stream}" if c.audio_stream >= 0 else f"{idx}:a:0"
         lab = g.label("a")
         tempo = _api.atempo_chain(speed)
         tempo_vf = (",".join(tempo) + ",") if tempo else ""
@@ -649,7 +704,7 @@ def _audio(g, project, parts, w0, w1, total_s, pre=0.0):
             fade_vf += "asetpts=PTS-STARTPTS,"
         g.chains.append(
             f"[{spec}]aresample={rate},aformat=sample_fmts=fltp:channel_layouts=stereo,"
-            f"{tempo_vf}{skip}atrim=end_sample={n},{'areverse,' if c.reverse else ''}"
+            f"{tempo_vf}{skip}atrim=end_sample={n},{'areverse,' if use_areverse else ''}"
             f"asetpts=PTS-STARTPTS,{fade_vf}"
             f"volume={_api._num(c.volume)},adelay={a0}S:all=1[{lab}]")
         role = project.tracks[c.track].role
@@ -672,7 +727,8 @@ def _audio(g, project, parts, w0, w1, total_s, pre=0.0):
     g.chains.append(f"[amix]alimiter=limit={_LIMIT}:level=0:latency=1{trim}[aout]")
 
 
-def build_source(project, video=True, audio=True, subs=None, tonemap=None, window=None):
+def build_source(project, video=True, audio=True, subs=None, tonemap=None, window=None,
+                 reverse_pipes=False):
     """Граф проекта без кодирования: SourceGraph или None, если собирать
     нечего. video/audio=False выбрасывают соответствующую часть.
 
@@ -697,7 +753,7 @@ def build_source(project, video=True, audio=True, subs=None, tonemap=None, windo
     w, h, fps = project.output_format()
     rate = _api.fps_expr(fps)
     bg = _api.ff_color(project.settings.background)
-    g = _Graph()
+    g = _Graph(reverse_pipes=reverse_pipes)
     vout = None
     total_s = w1 - w0
     if video and project.has_video():
@@ -740,7 +796,7 @@ def build_source(project, video=True, audio=True, subs=None, tonemap=None, windo
     if parts:
         _audio(g, project, parts, w0, w1, total_s, pre)
     return _api.SourceGraph(g.inputs, ";".join(g.chains), vout is not None, bool(parts),
-                            total_s, w, h, fps)
+                            total_s, w, h, fps, feeds=g.feeds)
 
 
 def _name_vout(g, label):
@@ -776,7 +832,7 @@ def loudnorm_filter(target, measured=None):
 
 
 def build_export(project, out_path, ffmpeg, video_args, audio_args=None, subs=None,
-                 tonemap=None, loudnorm=None):
+                 tonemap=None, loudnorm=None, feeds_out=None):
     """Команда ffmpeg для сборки проекта.
 
     Возвращает (cmd, graph, duration): graph — граф фильтров (его кладут в
@@ -784,11 +840,15 @@ def build_export(project, out_path, ffmpeg, video_args, audio_args=None, subs=No
     длина итога для прогресса. None, если собирать нечего. subs и tonemap —
     как у build_source. Целевая громкость проекта (settings.loudness) —
     loudnorm на выходе звука; loudnorm — замер первого прохода (см.
-    loudnorm_filter), без него нормализация однопроходная."""
+    loudnorm_filter), без него нормализация однопроходная. feeds_out —
+    необязательный список, куда добавляются пайп-генераторы длинного реверса."""
     audio_args = audio_args or ["-c:a", "aac", "-b:a", "192k"]
-    src = build_source(project, subs=subs, tonemap=tonemap)
+    src = build_source(project, subs=subs, tonemap=tonemap,
+                       reverse_pipes=(feeds_out is not None))
     if src is None:
         return None
+    if feeds_out is not None and src.feeds:
+        feeds_out.extend(src.feeds)
     graph, amap = src.graph, "[aout]"
     if src.audio and project.settings.loudness is not None:
         graph += (f";[aout]{loudnorm_filter(project.settings.loudness, loudnorm)},"

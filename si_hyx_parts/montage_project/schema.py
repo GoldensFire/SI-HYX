@@ -135,7 +135,7 @@ def describe_schema():
                    "scale": [_api.MIN_SCALE, _api.MAX_SCALE], "opacity": [0.0, 1.0],
                    "duck": [0.0, 1.0], "loudness": list(_LOUDNESS_RANGE),
                    "frame_side": [16, _MAX_SIDE], "fps": [1.0, _MAX_FPS],
-                   "reverse_max_s": _api.MAX_REVERSE_S, "text_max_chars": _TEXT_MAX,
+                   "text_max_chars": _TEXT_MAX,
                    "shadow": {k: [lo, hi, d] for k, lo, hi, d in _api.SHADOW_FIELDS}},
         "notes": [
             "Время — секунды. start — место клипа на шкале проекта, in_s/out_s — кусок исходника.",
@@ -538,9 +538,6 @@ def _check_clip(raw, i, kinds, main, strict, check_files, problems):
             problems.append({"path": f"{path}.freeze_at", "message": "стоп-кадр — только у видео"})
         elif src_dur > 0 and freeze >= src_dur:
             problems.append({"path": f"{path}.freeze_at", "message": "за концом исходника"})
-    if raw.get("reverse") and (out_s - in_s) > _api.MAX_REVERSE_S + 1e-6:
-        problems.append({"path": f"{path}.reverse",
-                         "message": f"реверс — не длиннее {_api.MAX_REVERSE_S:g} с исходника"})
     for name in ("transition_s", "fade_in", "fade_out"):
         if _num_or(raw.get(name, 0.0), 0.0) < 0:
             problems.append({"path": f"{path}.{name}", "message": "отрицательная длина"})

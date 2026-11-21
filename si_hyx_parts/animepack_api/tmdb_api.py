@@ -51,6 +51,8 @@ class TmdbApi:
         except _api.AnimePackApiError:
             raise
         except Exception as e:  # noqa: BLE001
+            from .music_clients import _penalize_on_rate_limit
+            _penalize_on_rate_limit(self.limiter, e)
             raise _api._friendly(e, "TMDB") from e
         return data if isinstance(data, dict) else {}
 
@@ -160,6 +162,8 @@ class AnimeThemesApi:
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
+            from .music_clients import _penalize_on_rate_limit
+            _penalize_on_rate_limit(self.limiter, e)
             raise _api._friendly(e, "AnimeThemes") from e
         out: dict[int, dict] = {}
         for anime in (data.get("anime") or []):

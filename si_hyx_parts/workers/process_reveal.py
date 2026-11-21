@@ -150,6 +150,8 @@ class RevealFeed:
         self._dec = _api.subprocess.Popen(self.decode_cmd, stdout=_api.subprocess.PIPE,
                                           stderr=_api.subprocess.PIPE,
                                           stdin=_api.subprocess.DEVNULL, **kw)
+        import process_guard
+        process_guard.assign_to_job(self._dec)
         self._err_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._err_thread.start()
         self._thread = threading.Thread(target=self._pump, args=(stdin,), daemon=True)
@@ -167,11 +169,12 @@ class RevealFeed:
     def _pump(self, stdin):
         from frame_reveal_video import VideoReveal
         total = max(1, round(self.dur * self.fps))
-        reveal = (VideoReveal(self.effect, self.steps, total, self.fps, still=self.still,
-                              dvd_media=self.dvd_media,
-                              ffmpeg=_api.FFMPEG, ffprobe=_api.FFPROBE)
-                  if self.effect else None)
+        reveal = None
         try:
+            reveal = (VideoReveal(self.effect, self.steps, total, self.fps, still=self.still,
+                                  dvd_media=self.dvd_media,
+                                  ffmpeg=_api.FFMPEG, ffprobe=_api.FFPROBE)
+                      if self.effect else None)
             frames = reveal_pipe.pump(self._dec.stdout, stdin, reveal, lambda: self._stopped)
             if frames == 0 and not self._stopped:
                 self.error = "декодер не отдал ни одного кадра"
@@ -179,7 +182,17 @@ class RevealFeed:
             pass                       # кодировщик закрылся — причину скажет он
         except Exception as e:  # noqa: BLE001 — ошибка эффекта уходит в лог
             self.error = str(e)
+            p = self._dec
+            if p is not None and p.poll() is None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
         finally:
+            try:
+                stdin.close()
+            except Exception:
+                pass
             if reveal is not None:
                 reveal.close()
 

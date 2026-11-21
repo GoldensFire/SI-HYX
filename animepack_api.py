@@ -149,6 +149,7 @@ from si_hyx_parts.animepack_api.music_clients import (
     AnimePackApiError,
     RateLimiter,
     make_session,
+    redact_secrets,
     _friendly,
     AmqApi,
     AnisongApi,

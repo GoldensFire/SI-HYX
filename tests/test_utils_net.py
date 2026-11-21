@@ -339,7 +339,7 @@ class TestHttpGet:
                 raise req.exceptions.SSLError("bad cert")
             return FakeResponse(content=b"ok")
         monkeypatch.setattr(config.requests, "get", fake_get)
-        resp = config.http_get("https://x.example/")
+        resp = config.http_get("https://x.example/", allow_insecure=True)
         assert resp.read() == b"ok"
         assert calls[1].get("verify") is False
 
@@ -351,7 +351,7 @@ class TestHttpGet:
             raise req.exceptions.SSLError("bad cert")
         monkeypatch.setattr(config.requests, "get", fake_get)
         with pytest.raises(req.exceptions.SSLError):
-            config.http_get("https://upd.example/app.exe", allow_insecure=False)
+            config.http_get("https://upd.example/app.exe")
 
     def test_http_error_raises(self, monkeypatch):
         import config

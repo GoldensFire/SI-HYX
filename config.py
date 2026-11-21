@@ -49,9 +49,28 @@ from pathlib import Path
 
 # PyQt6 imports
 def fail_and_exit(msg, exc=None):
-    print(msg)
+    detail = str(msg)
     if exc is not None:
-        traceback.print_exception(type(exc), exc, exc.__traceback__)
+        detail += "\n\n" + "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+    stream = sys.stderr or sys.stdout
+    if stream is not None:
+        try:
+            stream.write(detail + "\n")
+            stream.flush()
+        except Exception:
+            pass
+    # В оконной сборке (console=False) stdout/stderr == None, поэтому
+    # показываем системное окно MessageBoxW, чтобы ошибка не пропала бесследно.
+    if sys.platform.startswith("win") and (stream is None or getattr(sys, "frozen", False)):
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                None, detail[:2000], "SI-HYX — ошибка запуска", 0x10
+            )
+        except Exception:
+            pass
     sys.exit(1)
 
 
@@ -188,11 +207,6 @@ def _requests():
     global _requests_mod
     if _requests_mod is None:
         import requests as _r
-        try:
-            import urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        except Exception:
-            pass
         _requests_mod = _r
     return _requests_mod
 
@@ -234,14 +248,13 @@ class _Resp:
         try: self._r.close()
         except Exception: pass
 
-def http_get(url, headers=None, timeout=30, stream=True, allow_insecure=True, log_fn=None):
-    """GET через requests с проверкой сертификата.
+def http_get(url, headers=None, timeout=30, stream=True, allow_insecure=False, log_fn=None):
+    """GET через requests с проверкой TLS-сертификата.
+    allow_insecure=False (по умолчанию): повтора без проверки НЕТ, нужен
+    валидный сертификат.
     allow_insecure=True: при SSL-ошибке повторяет без проверки (verify=False)
-    с записью предупреждения в лог — нужно для превью/картинок на машинах без
-    системных CA.
-    allow_insecure=False: повтора НЕТ, нужен валидный сертификат. Критично для
-    автообновления: иначе MITM мог бы подсунуть вредоносный .exe (повтор без
-    проверки = установка непроверенного кода = RCE).
+    с записью предупреждения в лог (использовать только явно там, где это
+    осознанно допустимо).
     Возвращает _Resp (совместим со старым urllib-кодом)."""
     requests = _requests()
     h = headers or {}
@@ -259,7 +272,14 @@ def http_get(url, headers=None, timeout=30, stream=True, allow_insecure=True, lo
                 log_fn(msg)
             except Exception:
                 pass
-        r = requests.get(url, headers=h, timeout=timeout, stream=stream, verify=False)
+        import warnings
+        with warnings.catch_warnings():
+            try:
+                import urllib3
+                warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+            except Exception:
+                pass
+            r = requests.get(url, headers=h, timeout=timeout, stream=stream, verify=False)
         r.raise_for_status()
         return _Resp(r)
 
@@ -274,7 +294,14 @@ else:
     CONFIG_DIR = os.path.join(str(Path.home()), ".unified_media_tool")
 
 
-os.makedirs(CONFIG_DIR, exist_ok=True)
+try:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+except OSError:
+    CONFIG_DIR = os.path.join(tempfile.gettempdir(), "unified_media_tool")
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+    except OSError:
+        pass
 
 
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
@@ -292,16 +319,40 @@ SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 # Qt читает переменную один раз на процесс при первом декодировании, поэтому
 # ставим её здесь — config.py импортируется раньше любого QtMultimedia-плеера
 # (и вкладки «Монтаж», и вкладки SiQuesterHYX).
+def _read_settings_early():
+    """Читает settings.json с повторами и фолбэком на .bak и снимки истории
+    (.1..5) до инициализации Qt — чтобы занятость или порча основного файла
+    не сбрасывали ранние настройки (например, выключенное HW-ускорение)."""
+    import time as _time
+    candidates = [SETTINGS_FILE, SETTINGS_FILE + ".bak"] + [
+        f"{SETTINGS_FILE}.{i}" for i in range(1, 6)
+    ]
+    for idx, path in enumerate(candidates):
+        retries = 3 if idx < 2 else 1
+        for attempt in range(retries):
+            if not os.path.exists(path):
+                break
+            try:
+                with open(path, "r", encoding="utf-8") as _f:
+                    data = json.load(_f)
+                if isinstance(data, dict) and data:
+                    return data
+                break
+            except OSError:
+                if attempt + 1 < retries:
+                    _time.sleep(0.1 * (attempt + 1))
+            except Exception:
+                break
+    return None
+
+
 def _hw_decode_device_types():
-    try:
-        with open(SETTINGS_FILE, encoding="utf-8") as _f:
-            _s = json.load(_f)
+    _s = _read_settings_early()
+    if isinstance(_s, dict):
         if _s.get("video_software_render", False):
             return ""                       # программный рендер → только ЦП
         if not _s.get("video_hw_decode", True):
             return ""                       # пользователь выключил ускорение
-    except Exception:
-        pass
     return "d3d11va,dxva2"
 
 # Выключено — значение "none" (такого устройства нет, список пуст): пустую
@@ -561,6 +612,11 @@ SILENT_UPDATE = False
 # Репозиторий для автообновления (GitHub Releases)
 GITHUB_OWNER = "GoldensFire"
 GITHUB_REPO = "SI-HYX"
+# Публичный ключ Ed25519 (64 hex-символа) для проверки подписи manifest.json.
+# Генерация пары ключей: `python make_manifest.py keygen <priv.pem>`.
+# При сборке задать переменную окружения SIHYX_MANIFEST_SIGNING_KEY=<priv.pem>.
+# Если строка непустая — автообновление принимает ТОЛЬКО подписанные манифесты.
+UPDATE_MANIFEST_PUBLIC_KEY = ""
 DISCORD_URL = "https://discord.gg/EPCE3rMfFa"
 GITHUB_URL = "https://github.com/GoldensFire/SI-HYX"
 GUIDE_URL = "https://steamcommunity.com/sharedfiles/filedetails/?id=3744506167"

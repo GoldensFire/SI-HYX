@@ -213,5 +213,6 @@ class EditTabSessionMixin:
             tl.set_offset(view[1])
         if self.actual_source_file is not None:
             return      # файл уже открыли (бросок, лента) — плеер занят им
+        self._rev_preview_ensure()
         t = self._session_playhead if self._session_playhead is not None else 0.0
         self._project_seek(min(t, self._proj_last_frame_t()))

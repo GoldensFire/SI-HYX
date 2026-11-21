@@ -252,6 +252,8 @@ from si_hyx_parts.utils.settings_store import (
     _replace_with_retry,
     _snapshot_settings_history,
     save_settings,
+    save_settings_async,
+    flush_settings_saves,
     save_json_atomic,
 )
 from si_hyx_parts.utils.media_info import human_size

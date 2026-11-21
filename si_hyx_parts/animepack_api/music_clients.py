@@ -3,7 +3,35 @@
 # See LICENSE and the public module for attribution and API.
 """Ошибки и ограничитель запросов; клиенты AMQ, AnisongDB и MyAnimeList. Public namespace: animepack_api."""
 from __future__ import annotations
+import re
 import animepack_api as _api
+
+_SECRET_QUERY_RE = re.compile(
+    r"(?i)(\b(?:api_key|apikey|token|access_token)=)([^&\s'\"()<>]+)"
+)
+_SECRET_BEARER_RE = re.compile(r"(?i)\b(Bearer\s+)([A-Za-z0-9._\-]+)")
+
+
+def redact_secrets(text: str) -> str:
+    """Скрывает ключи API и токены в URL и сообщениях об ошибках перед записью в журнал."""
+    s = str(text or "")
+    s = _SECRET_QUERY_RE.sub(r"\1…", s)
+    s = _SECRET_BEARER_RE.sub(r"\1…", s)
+    return s
+
+redact_secrets.__module__ = _api.__name__
+_api.redact_secrets = redact_secrets
+
+
+def _penalize_on_rate_limit(limiter, error: Exception, seconds: float = 5.0) -> None:
+    """При 429 или исчерпанных ретраях 429 притормаживает соседние потоки."""
+    if limiter is None:
+        return
+    resp = getattr(error, "response", None)
+    status = int(getattr(resp, "status_code", 0) or 0) if resp is not None else 0
+    if status == 429 or (isinstance(error, _api.requests.exceptions.RetryError)
+                         and "429" in str(error)):
+        limiter.penalize(seconds)
 
 
 class AnimePackApiError(Exception):
@@ -76,6 +104,7 @@ def make_session(user_agent: str = _api.USER_AGENT) -> _api.requests.Session:
         total=4, connect=4, read=4, backoff_factor=1.5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST"],
+        respect_retry_after_header=False,
     )
     adapter = _api.HTTPAdapter(max_retries=retry, pool_maxsize=16)
     s.mount("https://", adapter)
@@ -90,7 +119,7 @@ def _friendly(e: Exception, what: str) -> _api.AnimePackApiError:
         return _api.AnimePackApiError(f"{what}: сервер не ответил вовремя.")
     if isinstance(e, _api.requests.ConnectionError):
         return _api.AnimePackApiError(f"{what}: нет связи с сервером.")
-    return _api.AnimePackApiError(f"{what}: {e}")
+    return _api.AnimePackApiError(f"{what}: {redact_secrets(str(e))}")
 
 _friendly.__module__ = _api.__name__
 _api._friendly = _friendly
@@ -164,6 +193,7 @@ class AmqApi:
         except _api.AnimePackApiError:
             raise
         except Exception as e:
+            _penalize_on_rate_limit(self.limiter, e)
             raise _api._friendly(e, "AMQ") from e
         amap = (data or {}).get("animeMap")
         if not isinstance(amap, dict):
@@ -198,6 +228,7 @@ class AnisongApi:
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
+            _penalize_on_rate_limit(self.limiter, e)
             raise _api._friendly(e, "AnisongDB") from e
         if not isinstance(data, list):
             raise _api.AnimePackApiError("AnisongDB вернул неожиданный ответ.")
@@ -277,6 +308,7 @@ class MalApi:
             except _api.AnimePackApiError:
                 raise
             except Exception as e:
+                _penalize_on_rate_limit(self.limiter, e)
                 raise _api._friendly(e, "MyAnimeList") from e
             if not isinstance(chunk, list) or not chunk:
                 break

@@ -6,6 +6,7 @@ import logging
 from urllib.parse import urlsplit
 
 import workers as _api
+import process_guard
 from . import doh_proxy
 from .download_network import is_network_error, is_ssl_error, network_hint
 from .download_process import (
@@ -142,6 +143,7 @@ class InfoWorker(_api.QThread):
                     cmd, stdout=_api.subprocess.PIPE, stderr=_api.subprocess.PIPE,
                     text=True, encoding="utf-8", errors="replace",
                     creationflags=_api.CREATE_NO_WINDOW, env=_api.subprocess_env())
+                process_guard.assign_to_job(self._proc)
                 if self.cancelled:
                     stop_process(self._proc)
                     self._proc.communicate(timeout=5)

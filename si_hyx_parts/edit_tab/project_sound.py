@@ -92,7 +92,7 @@ class EditTabProjectSoundMixin:
         звук, начатый с плейхеда, отставал от картинки на ~60 мс."""
         tl = self.project_timeline
         t = tl.playhead
-        c = self.project.clip(getattr(self, "_proj_cur_id", ""))
+        c = self._proj_live_clip(self.project.clip(getattr(self, "_proj_cur_id", "")))
         if c is not None and not c.is_image and self._proj_ready_for(c.src):
             try:
                 tp = c.start + (self.player.position() / 1000.0 - c.in_s) / max(

@@ -52,6 +52,7 @@ class _GenTask(_api.QRunnable):
 
     def stop(self):
         self._stop = True
+        self._runtime.wake()
         # Флага мало: самые долгие шаги — это запущенные ffmpeg (обрезка песни и
         # кодирование картинок). Пока их не убить, «Стоп» выглядит залипшим.
         gen = self._gen

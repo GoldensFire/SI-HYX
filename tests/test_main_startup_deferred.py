@@ -69,10 +69,11 @@ class TestReadonlySettings:
 
     def test_normal_run_writes(self, monkeypatch):
         written = []
-        monkeypatch.setattr(main, "save_settings", lambda data: written.append(data))
+        monkeypatch.setattr(main, "save_settings", lambda data: written.append(data) or True)
         w = _FakeWindow(_settings_readonly=False)
         w._collect_settings = lambda: {"a": 1}
         main.UnifiedWindow._save_settings_now(w)
+        main.flush_settings_saves(timeout=3.0)
         assert written == [{"a": 1}]
 
     def test_debounced_save_uses_timer(self, qapp):

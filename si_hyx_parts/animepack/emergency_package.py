@@ -64,7 +64,11 @@ def _fallback_xml(settings, elements):
         theme = ET.SubElement(themes, 'theme', {'name': settings.theme_title or 'Аниме'})
         questions = ET.SubElement(theme, 'questions')
         questions.extend(elements[index:index + per_theme])
-    return ET.tostring(package, encoding='utf-8', xml_declaration=True)
+    from .build_content_xml import sanitize_xml_tree
+    sanitize_xml_tree(package)
+    xml = ET.tostring(package, encoding='utf-8', xml_declaration=True)
+    ET.fromstring(xml)
+    return xml
 
 
 def _xml(generator, ready, elements, result):

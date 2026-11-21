@@ -248,15 +248,26 @@ class FfmpegWorker(_api.QThread):
     progress = _api.pyqtSignal(float)
     finished = _api.pyqtSignal(bool, str)
 
-    def __init__(self, cmd, duration=None, parent=None):
+    def __init__(self, cmd, duration=None, parent=None, feeds=None):
         super().__init__(parent)
         from ffmpeg_faststart import with_faststart
         self.cmd = with_faststart(cmd)
         self.duration = duration
+        self.feeds = list(feeds or [])
+        self._feed_group = None
         self.proc = None
         self._stopped = False
 
     def run(self):
+        fg = None
+        if self.feeds:
+            try:
+                fg = _api.montage_project.ReverseFeedGroup(self.feeds, ffmpeg=_api.FFMPEG)
+                fg.start()
+                self._feed_group = fg
+            except Exception as e:
+                self.finished.emit(False, f"Не удалось запустить пайп реверса: {e}")
+                return
         try:
             self.proc = _api.subprocess.Popen(
                 self.cmd, stderr=_api.subprocess.PIPE, text=True,
@@ -265,14 +276,23 @@ class FfmpegWorker(_api.QThread):
             import process_guard
             process_guard.assign_to_job(self.proc)
         except Exception as e:
+            if fg is not None:
+                fg.stop()
+                fg.join()
             self.finished.emit(False, f"Не удалось запустить ffmpeg: {e}")
             return
 
         proc = self.proc
         if self.duration is None:
             rc = proc.wait()
+            if fg is not None:
+                if self._stopped or rc != 0:
+                    fg.stop()
+                fg.join()
             if self._stopped:
                 self.finished.emit(False, "Отменено")
+            elif fg is not None and fg.error and rc != 0:
+                self.finished.emit(False, f"Код: {rc}\n{fg.error}")
             else:
                 self.finished.emit(rc == 0, f"Код: {rc}")
             return
@@ -299,13 +319,21 @@ class FfmpegWorker(_api.QThread):
                 except Exception:
                     pass
             rc = proc.wait()
+            if fg is not None:
+                if self._stopped or rc != 0:
+                    fg.stop()
+                fg.join()
             if self._stopped:
                 self.finished.emit(False, "Отменено")
-            elif rc != 0 and tail:
-                self.finished.emit(False, f"Код: {rc}\n" + "\n".join(tail))
+            elif rc != 0 and (tail or (fg is not None and fg.error)):
+                extra = ([fg.error] if fg is not None and fg.error else []) + tail
+                self.finished.emit(False, f"Код: {rc}\n" + "\n".join(extra))
             else:
                 self.finished.emit(rc == 0, f"Код: {rc}")
         except Exception as e:
+            if fg is not None:
+                fg.stop()
+                fg.join()
             try:
                 proc.kill()
             except Exception:
@@ -315,6 +343,9 @@ class FfmpegWorker(_api.QThread):
     def stop(self):
         """Помечает воркер отменённым и убивает ffmpeg-процесс (без зомби)."""
         self._stopped = True
+        fg = self._feed_group
+        if fg is not None:
+            fg.stop()
         p = self.proc
         if p and p.poll() is None:
             try:

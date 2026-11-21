@@ -30,6 +30,7 @@ class _DeckHome(_api.QObject):
     """Создаёт плеер деки в её потоке: объект Qt живёт там, где создан."""
 
     born = _api.pyqtSignal(object, object)       # QMediaPlayer, QVideoSink
+    synced = _api.pyqtSignal(int)                # барьер очереди при перемотке в том же файле
 
     @_api.pyqtSlot()
     def create(self):
@@ -37,6 +38,10 @@ class _DeckHome(_api.QObject):
         sink = prime_disconnect_notify(_api.QVideoSink(self))
         player.setVideoSink(sink)
         self.born.emit(player, sink)
+
+    @_api.pyqtSlot(int)
+    def sync(self, gen):
+        self.synced.emit(gen)
 
     @_api.pyqtSlot()
     def shutdown(self):
@@ -56,6 +61,7 @@ class VideoDeck(_api.QObject):
 
     _c_create = _api.pyqtSignal()
     _c_shutdown = _api.pyqtSignal()
+    _c_sync = _api.pyqtSignal(int)
     _c_url = _api.pyqtSignal(_api.QUrl)
     _c_device = _api.pyqtSignal(_api.QIODevice, _api.QUrl)
     _c_position = _api.pyqtSignal('qint64')
@@ -80,6 +86,7 @@ class VideoDeck(_api.QObject):
         self._seen_loading = False
         self._accept = False         # кадры уже от заказанного файла
         self._opened = False         # path открыт: новый заказ — только перемотка
+        self._seek_gen = 0           # поколение перемотки в том же файле
         self._dev = None
         self._old_devs = []
         self._pending = None         # заказ до рождения плеера
@@ -89,9 +96,17 @@ class VideoDeck(_api.QObject):
         self._home.moveToThread(self._thread)
         self._c_create.connect(self._home.create)
         self._c_shutdown.connect(self._home.shutdown)
+        self._c_sync.connect(self._home.sync)
         self._home.born.connect(self._on_born)
+        self._home.synced.connect(self._on_synced)
         self._thread.start()
         self._c_create.emit()
+
+    @staticmethod
+    def _norm_path(path):
+        if not path:
+            return None
+        return _api.os.path.normcase(_api.os.path.abspath(str(path)))
 
     def _on_born(self, player, sink):
         self.player, self.sink = player, sink
@@ -122,9 +137,13 @@ class VideoDeck(_api.QObject):
         if self.player is None:
             self._pending = (key, path, pos_ms, window, rate)
             return
-        if self._opened and path == self.path:
+        if self._opened and self._norm_path(path) == self._norm_path(self.path):
             # Файл уже открыт — только перемотка: декодер не разбирается.
-            self._accept = True
+            # Барьер _c_sync отсекает старые кадры, уже стоявшие в очереди до setPosition.
+            self._seek_gen += 1
+            self._accept = False
+            self._c_pause.emit()
+            self._c_sync.emit(self._seek_gen)
             self._c_rate.emit(float(rate))
             self._c_position.emit(int(pos_ms))
             self._c_pause.emit()
@@ -188,11 +207,17 @@ class VideoDeck(_api.QObject):
     def shutdown(self):
         self.unload()
         self._c_shutdown.emit()
-        self._thread.quit()
-        self._thread.wait(3000)
+        # _DeckHome.shutdown() сам вызывает currentThread().quit() после
+        # обработки queued-сигналов unload (stop/setSource) и deleteLater().
+        if not self._thread.wait(3000):
+            self._thread.quit()
+            self._thread.wait(1000)
         self._close_old_devices()
 
     # ── Из потока деки ───────────────────────────────────────────────────────
+    def _on_synced(self, gen):
+        if gen == self._seek_gen and self._opened and self.key is not None:
+            self._accept = True
     def _on_status(self, status):
         S = _api.QMediaPlayer.MediaStatus
         if status == S.LoadingMedia:
