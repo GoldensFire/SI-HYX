@@ -13,6 +13,7 @@ _api = _sys.modules[__name__]
 
 import base64
 import functools
+import html as _html
 import io
 import json
 import os
@@ -62,6 +63,33 @@ def __getattr__(name):
 # часть скриптов осталась бы незакодированной (CodeQL py/bad-tag-filter).
 _B64_SCRIPT_RX = re.compile(r'(?is)<script\b([^>]*)>(.*?)</script\b[^>]*>')
 _B64_SRC_RX    = re.compile(r'(?i)src\s*=\s*[\'"]([^\'"]+)[\'"]')
+# Атрибуты тега <script>: имя и опциональное значение в "..." / '...' / без кавычек.
+# Ветки не пересекаются — без риска ReDoS.
+_B64_ATTR_RX = re.compile(
+    r'([A-Za-z_:][\w:.-]*)(?:\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+)))?'
+)
+# Значения type=, которые браузер исполняет как JavaScript (WHATWG HTML).
+# Любой иной type (text/plain, application/json, x-shader/… и т. п.) — блок данных.
+_B64_JS_TYPES = frozenset({
+    "",
+    "module",
+    "text/javascript",
+    "application/javascript",
+    "text/ecmascript",
+    "application/ecmascript",
+    "text/javascript1.0",
+    "text/javascript1.1",
+    "text/javascript1.2",
+    "text/javascript1.3",
+    "text/javascript1.4",
+    "text/javascript1.5",
+    "text/jscript",
+    "text/livescript",
+    "text/x-ecmascript",
+    "text/x-javascript",
+    "application/x-ecmascript",
+    "application/x-javascript",
+})
 # 1×1 прозрачный gif — носитель onload-триггера
 _B64_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
 # Максимум символов в одном непрерывном куске base64. VK режет файл, если
@@ -69,48 +97,88 @@ _B64_GIF = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAA
 # 120 — с запасом ниже 184. Дробится и payload (data-si), и сам загрузчик (onload).
 _B64_CHUNK = 120
 
-from si_hyx_parts.utils.html_mask import mask_html_js
+# Загрузчик полного режима:
+#   m:<b64>             — document.body.innerHTML (DOM/svg/canvas/onclick)
+#   s:<url>             — внешний <script src> без доп. атрибутов
+#   e:<attrs_b64>:<url> — внешний <script src> с атрибутами (type="module", crossorigin…)
+#   a:<attrs_b64>:<b64> — инлайн <script> или блок данных с атрибутами (id, type, data-*)
+#   b:<b64>             — инлайн <script> без атрибутов
+_FULL_LOADER = (
+    r"var im=document.querySelector('img[data-si]');"
+    r"var q=im.getAttribute('data-si').split('|');"
+    r"var td=new TextDecoder();"
+    r"function D(v){return td.decode(Uint8Array.from("
+    r"atob(v.replace(/[^A-Za-z0-9+\/=]/g,'')),"
+    r"function(c){return c.charCodeAt(0);}));}"
+    r"function A(s,u){var a=JSON.parse(D(u));"
+    r"for(var j=0;j<a.length;j++)s.setAttribute(a[j][0],a[j][1]);}"
+    r"var i=0;function n(){if(i>=q.length)return;"
+    r"var it=q[i++],k=it.charAt(0),v=it.slice(2);"
+    r"if(k=='m'){document.body.innerHTML=D(v);n();}"
+    r"else if(k=='s'){var s=document.createElement('script');"
+    r"s.onload=s.onerror=n;s.src=v;document.body.appendChild(s);}"
+    r"else if(k=='e'){var p=v.indexOf(':'),s=document.createElement('script');"
+    r"A(s,v.slice(0,p));s.onload=s.onerror=n;s.src=v.slice(p+1);document.body.appendChild(s);}"
+    r"else if(k=='a'){var p=v.indexOf(':'),s=document.createElement('script');"
+    r"A(s,v.slice(0,p));s.textContent=D(v.slice(p+1));document.body.appendChild(s);n();}"
+    r"else{var s=document.createElement('script');"
+    r"s.textContent=D(v);document.body.appendChild(s);n();}}n();"
+)
+
+from si_hyx_parts.utils.html_mask import (
+    _parse_script_attrs,
+    _is_js_script_type,
+    mask_html_js,
+)
 
 
 # ── Лёгкая маскировка (доп-режим) ────────────────────────────────────────────
 # ЧТО РЕЖЕТ VK (установлено эмпирически): фильтр «исполняемый файл» ловит
-# ЛИТЕРАЛЬНЫЕ <script>, eval, function/Function в открытой части документа. Не
-# длину base64, не MIME, не canvas/svg. Заведомо проходящий вывод = старый метод
-# (mask_html_js): в открытом HTML НЕТ ни одного <script>/eval/function — всё тело
-# и скрипты лежат в data-si одним base64, а запуск идёт через
-# `window['Fun'+'ction'](atob(<loader>))()` в onload скрытой картинки (в onload
-# нет слова Function — оно склеено 'Fun'+'ction'; loader/движок VK не видит,
-# они в base64). Ранние lite-версии оставляли `<script>…(0,eval)…</script>`
-# в открытую и потому отклонялись — этот подход в корне непригоден.
+# ЛИТЕРАЛЬНЫЕ <script>, eval, function/Function в открытой части документа.
+# Заведомо проходящий вывод = оболочка mask_html_js: в открытом HTML НЕТ ни
+# одного <script>/eval/function — всё тело и скрипты лежат в data-si, а запуск
+# идёт через `window['Fun'+'ction'](atob(<loader>))()` в onload скрытой картинки.
 #
-# Поэтому lite = ТОЧНО envelope старого метода (та же скрытность), но с одной
-# оптимизацией размера: крупные ассеты (аудио/картинки как длинные base64/data:
-# литералы в скриптах) НЕ попадают в base64 повторно. Старый метод кодирует их
-# внутри скрипта → они шифруются вторым слоем (+33% на мегабайтах). Здесь такой
-# ассет-литерал ВЫНОСИТСЯ из скрипта, кладётся в data-si ОДИН раз как отдельный
-# элемент `r:<idx>:<сам base64>` (без повторного кодирования), а на его месте в
-# коде — ссылка `__SI_Ak`. Loader объявляет `window.__SI_Ak` (реассемблирует,
-# НЕ декодируя) ДО запуска скриптов, движок читает их из глобальной области.
-# Всё остальное (разметка тела, обычные скрипты) прячется как в старом методе.
-_LITE_STRIP_RX = re.compile(
-    r'(?s)/\*.*?\*/'                       # блочные комментарии
-    r'|//[^\n]*'                           # строчные комментарии
-    r'|"(?:[^"\\]|\\.)*"'                  # "строки"
-    r"|'(?:[^'\\]|\\.)*'"                  # 'строки'
-    r'|`(?:[^`\\]|\\.)*`')                 # `шаблоны`
+# Оптимизация размера в лёгком режиме:
+#   1) крупные base64/data:-литералы внутри инлайн-JS выносятся в элементы
+#      `r:<idx>:<сырой base64>` (без повторного base64) → window.__SI_Ak;
+#   2) скрипты-данные (например <script id="data" type="text/plain">), чьё
+#      содержимое само является чистым base64, кладутся сырыми в
+#      `d:<attrs_b64>:<сырой base64>` (без двойного base64) и восстанавливаются
+#      в DOM с исходными атрибутами до запуска JS.
+#
+# Сканер JS для выноса ассетов: различает комментарии, строки, шаблонные строки
+# и regexp-литералы `/…/`, чтобы кавычка внутри регулярки вроде `/"/g` не
+# сбивала парсинг. Все ветки под `*`/`+` строго непересекающиеся (без ReDoS).
+_LITE_SCAN_RX = re.compile(
+    r'//[^\n]*'                           # строчный комментарий
+    r'|/\*[\s\S]*?\*/'                    # блочный комментарий
+    r'|"(?:[^"\\]|\\[\s\S])*"'            # "строка"
+    r"|'(?:[^'\\]|\\[\s\S])*'"            # 'строка'
+    r'|`|/'                               # шаблон или слэш (деление / regexp)
+)
+_LITE_REGEX_RX = re.compile(
+    r'/(?:\\[^\n]|\[(?:\\[^\n]|[^\]\\\n])*\]|[^/\\\n\[])+/[A-Za-z]*'
+)
+_LITE_TPL_CHUNK_RX = re.compile(r'(?:[^`\\$]|\\[\s\S]|\$(?!\{))*')
+_LITE_REGEX_PREV_KW = frozenset({
+    "return", "case", "throw", "in", "of", "typeof", "void",
+    "delete", "new", "yield", "await", "else", "do", "instanceof",
+})
 # Крупный ассет: строковый литерал из ЧИСТОГО base64 (опц. с data:-префиксом)
 # длиной ≥ порога. Внутри такого литерала нет кавычек/скобок — выносится как есть.
 _LITE_HOIST_MIN = 512
 _LITE_ASSET_INNER_RX = re.compile(
     r'(?:data:[\w.+/;=-]*?base64,)?[A-Za-z0-9+/=]+')
+_LITE_PURE_B64_RX = re.compile(r'[A-Za-z0-9+/=\s]+')
+_LITE_WS_RX = re.compile(r'\s+')
 
 from si_hyx_parts.utils.html_mask import _lite_hoist_assets
 
 
-# Loader lite: как в mask_html_js плюс тип элемента 'r' — сырой ассет, который
-# объявляется глобальной переменной window.__SI_Ak БЕЗ base64-декодирования
-# (только снимаем переносы строк через R). Порядок в data-si гарантирует, что
-# все 'r' идут до 'b'-скриптов, поэтому ссылки __SI_Ak уже определены.
+# Loader lite: всё то же, что _FULL_LOADER, плюс:
+#   r:<idx>:<raw>        — сырой ассет → window.__SI_A<idx> (без декодирования)
+#   d:<attrs_b64>:<raw>  — сырой base64 data-скрипт с исходными атрибутами
 _LITE_LOADER = (
     r"var im=document.querySelector('img[data-si]');"
     r"var q=im.getAttribute('data-si').split('|');"
@@ -119,15 +187,24 @@ _LITE_LOADER = (
     r"atob(v.replace(/[^A-Za-z0-9+\/=]/g,'')),"
     r"function(c){return c.charCodeAt(0);}));}"
     r"function R(v){return v.replace(/\s/g,'');}"
+    r"function A(s,u){var a=JSON.parse(D(u));"
+    r"for(var j=0;j<a.length;j++)s.setAttribute(a[j][0],a[j][1]);}"
     r"var i=0;function n(){if(i>=q.length)return;"
     r"var it=q[i++],k=it.charAt(0),v=it.slice(2);"
     r"if(k=='m'){document.body.innerHTML=D(v);n();}"
     r"else if(k=='r'){var p=v.indexOf(':');"
     r"window['__SI_A'+v.slice(0,p)]=R(v.slice(p+1));n();}"
+    r"else if(k=='d'){var p=v.indexOf(':'),s=document.createElement('script');"
+    r"A(s,v.slice(0,p));s.textContent=R(v.slice(p+1));document.body.appendChild(s);n();}"
     r"else if(k=='s'){var s=document.createElement('script');"
-    r"s.src=v;s.onload=n;document.body.appendChild(s);}"
+    r"s.onload=s.onerror=n;s.src=v;document.body.appendChild(s);}"
+    r"else if(k=='e'){var p=v.indexOf(':'),s=document.createElement('script');"
+    r"A(s,v.slice(0,p));s.onload=s.onerror=n;s.src=v.slice(p+1);document.body.appendChild(s);}"
+    r"else if(k=='a'){var p=v.indexOf(':'),s=document.createElement('script');"
+    r"A(s,v.slice(0,p));s.textContent=D(v.slice(p+1));document.body.appendChild(s);n();}"
     r"else{var s=document.createElement('script');"
-    r"s.textContent=D(v);document.body.appendChild(s);n();}}n();")
+    r"s.textContent=D(v);document.body.appendChild(s);n();}}n();"
+)
 
 from si_hyx_parts.utils.html_mask import mask_html_js_lite, ensure_deno_on_path
 
@@ -236,6 +313,7 @@ from si_hyx_parts.utils.web import default_download_dir, clean_url
 from si_hyx_parts.utils.media_info import pretty_audio_codec, fmt_bitrate_with_codec
 
 from si_hyx_parts.utils.media_info import (
+    probe_media,
     get_media_info,
     audio_stream_count,
     csv_fields,

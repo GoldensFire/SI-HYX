@@ -797,6 +797,9 @@ class EditTab(
                 save=False)
             self.export_dir = settings.get('export_dir', "") or ""
             self._update_export_dir_label()
+            if self.export_dir:
+                import process_guard
+                process_guard.start_stale_temp_cleanup([self.export_dir])
             # Покадровый скраб-звук теперь всегда включён (настройка убрана из UI).
             self._scrub_audio_enabled = True
             # Последние настройки стиля «Создать субтитры» (шрифт/размер/цвет/…) —
@@ -865,8 +868,8 @@ class EditTab(
             pass
         # Убиваем все фоновые ffmpeg-процессы, чтобы не остались зомби (баг #3).
         for attr in ('ffmpeg_thread', 'proxy_thread', 'audio_worker',
-                     '_vinp_worker', '_trk_worker', '_entrance_worker',
-                     '_sub_sync_worker'):
+                     '_audio_partial_worker', '_vinp_worker', '_trk_worker',
+                     '_entrance_worker', '_sub_sync_worker', '_proj_prep_worker'):
             w = getattr(self, attr, None)
             if w is None:
                 continue
@@ -874,16 +877,17 @@ class EditTab(
                 if hasattr(w, 'stop'):
                     w.stop()
                 if w.isRunning():
-                    if not w.wait(2000):
-                        w.terminate(); w.wait()
+                    if not w.wait(3000):
+                        w.terminate(); w.wait(1000)
             except Exception:
                 pass
-        try:
-            if getattr(self, 'audio_worker', None) and self.audio_worker.tmp_wav \
-                    and _api.os.path.exists(self.audio_worker.tmp_wav):
-                _api.os.remove(self.audio_worker.tmp_wav)
-        except Exception:
-            pass
+        for attr in ('audio_worker', '_audio_partial_worker'):
+            try:
+                w = getattr(self, attr, None)
+                if w and w.tmp_wav and _api.os.path.exists(w.tmp_wav):
+                    _api.os.remove(w.tmp_wav)
+            except Exception:
+                pass
         try:
             if self.tmp_proxy_file and _api.os.path.exists(self.tmp_proxy_file):
                 _api.os.remove(self.tmp_proxy_file)

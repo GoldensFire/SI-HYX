@@ -85,9 +85,10 @@ class EditTabExportMixin:
     @staticmethod
     def _move_tolerant(temp, final):
         """os.replace, но с откатом на копирование, если temp и final лежат на
-        РАЗНЫХ дисках: os.replace тогда падает с WinError 17 / EXDEV. shutil.move
-        в этом случае копирует и удаляет источник. Все прочие ошибки (в т.ч.
-        WinError 32 «занят») пробрасываются наверх — их разбирает
+        РАЗНЫХ дисках: os.replace тогда падает с WinError 17 / EXDEV. Сначала
+        копируем во временный файл рядом с целью и меняем атомарным os.replace,
+        чтобы при сбое копирования старый final остался цел. Все прочие ошибки
+        (в т.ч. WinError 32 «занят») пробрасываются наверх — их разбирает
         _replace_tolerant."""
         try:
             _api.os.replace(temp, final)
@@ -96,11 +97,38 @@ class EditTabExportMixin:
                      or e.errno == getattr(_api.errno, "EXDEV", 18))
             if not cross:
                 raise
-            # Цель может уже существовать — shutil.move на непустой файл ругается,
-            # поэтому убираем её сами (занятую цель отловит WinError 32 выше).
-            if _api.os.path.exists(final):
-                _api.os.remove(final)
-            _api.shutil.move(temp, final)
+            out_dir = _api.os.path.dirname(_api.os.path.abspath(final))
+            suffix = _api.Path(final).suffix
+            tf = _api.tempfile.NamedTemporaryFile(
+                delete=False, suffix=suffix, prefix=".sihyx_tmp_", dir=out_dir)
+            staged = tf.name
+            tf.close()
+            try:
+                _api.shutil.copy2(temp, staged)
+                try:
+                    _api.os.replace(staged, final)
+                except OSError as e2:
+                    cross2 = (getattr(e2, "winerror", None) == 17
+                              or e2.errno == getattr(_api.errno, "EXDEV", 18))
+                    if not cross2:
+                        raise
+                    # Фолбэк для подменённого os.replace: staged уже полностью
+                    # скопирован рядом с целью, перенос внутри того же диска.
+                    if _api.os.path.exists(final):
+                        _api.os.remove(final)
+                    _api.shutil.move(staged, final)
+            except BaseException:
+                try:
+                    if _api.os.path.exists(staged):
+                        _api.os.remove(staged)
+                except OSError:
+                    pass
+                raise
+            try:
+                if _api.os.path.exists(temp):
+                    _api.os.remove(temp)
+            except OSError:
+                pass
         return final
 
     @staticmethod
@@ -1773,13 +1801,16 @@ class EditTabExportMixin:
             cached = self._subtitle_fonts_cache.get(cache_key)
             if cached is not None and _api.os.path.isdir(cached):
                 return cached
+        d = None
         try:
             d = _api.tempfile.mkdtemp(prefix="sihyx_fonts_")
             # -dump_attachment:t "" выгружает все attachments в текущую папку.
             # ffmpeg при этом завершается с ненулевым кодом (нет выходного файла) —
             # это ожидаемо, нас интересуют только извлечённые файлы.
-            _api.subprocess.run([_api.FFMPEG, "-y", "-dump_attachment:t", "", "-i", str(src)],
-                           cwd=d, capture_output=True, creationflags=_api.CREATE_NO_WINDOW)
+            _api.subprocess.run(
+                [_api.FFMPEG, "-y", "-dump_attachment:t", "", "-i", str(src)],
+                cwd=d, capture_output=True, creationflags=_api.CREATE_NO_WINDOW,
+                timeout=30)
             if _api.os.listdir(d):
                 if cache_key is not None:
                     self._subtitle_fonts_cache[cache_key] = d
@@ -1794,7 +1825,12 @@ class EditTabExportMixin:
                 return d
             _api.os.rmdir(d)
         except Exception:
-            pass
+            if d:
+                try:
+                    import shutil
+                    shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
         return None
 
     def _discard_temp_cut(self, path, is_loaded):

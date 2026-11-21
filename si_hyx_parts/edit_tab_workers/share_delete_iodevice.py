@@ -262,6 +262,8 @@ class FfmpegWorker(_api.QThread):
                 self.cmd, stderr=_api.subprocess.PIPE, text=True,
                 encoding="utf-8", errors="replace",
                 creationflags=_api.CREATE_NO_WINDOW)
+            import process_guard
+            process_guard.assign_to_job(self.proc)
         except Exception as e:
             self.finished.emit(False, f"Не удалось запустить ffmpeg: {e}")
             return

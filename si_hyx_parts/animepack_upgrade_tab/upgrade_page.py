@@ -758,21 +758,35 @@ class _UpgradePage(_api.QWidget):
 
     # ── группа «HTML → base64» ────────────────────────────────────────────
     def _group_html(self) -> _api.QGroupBox:
-        grp = _api.QGroupBox("HTML → base64 (лёгкий режим)")
+        grp = _api.QGroupBox("HTML → base64")
         grp.setCheckable(True)
         grp.setChecked(False)
         grp.setToolTip(
             "Каждый .html/.htm пака маскируется под VK точно так же, как во "
-            "вкладке Base64 с галочкой «Лёгкий режим (меньше размер)»: код "
-            "движка прячется одним base64-блобом, разметка, картинки и "
-            "скрипты-данные остаются как есть.\n"
+            "вкладке Base64: теги <script> и тело <body> прячутся в data-si "
+            "с запуском через onload скрытой картинки (атрибуты id, type, "
+            "data-* и скрипты-данные сохраняются).\n"
             "Имя файла не меняется, поэтому ссылки в content.xml остаются "
-            "верными. HTML без скриптов с кодом и не в UTF-8 не трогается.")
+            "верными. HTML без <script> и не в UTF-8 не трогается.")
         self.grp_html = grp
         g = _api.QGridLayout(grp); g.setHorizontalSpacing(6); g.setVerticalSpacing(8)
+        r = 0
+        self.chk_html_lite = _api.QCheckBox("Лёгкий режим (меньше размер)")
+        self.chk_html_lite.setChecked(False)
+        self.chk_html_lite.setToolTip(
+            "Включено (лёгкий режим): та же маскировка под VK (всё в data-si, "
+            "запуск через onload скрытой картинки), но крупные base64-ассеты "
+            "в скриптах и <script type=\"text/plain\"> не кодируются в base64 "
+            "повторно — файл с встроенными картинками, звуками или базами "
+            "заметно меньше.\n"
+            "Выключено (обычный режим): весь <body> и скрипты кодируются "
+            "целиком без разбора JS-литералов (+33–35% веса) — максимально "
+            "простой и надёжный вариант.")
+        g.addWidget(self.chk_html_lite, r, 0, 1, 2)
+        r += 1
         g.addWidget(self._hint(
             "Нужно, чтобы пак с HTML-играми проходил загрузку во ВКонтакте. "
-            "Каждый замаскированный файл попадает в таблицу правок."), 0, 0, 1, 2)
+            "Каждый замаскированный файл попадает в таблицу правок."), r, 0, 1, 2)
         g.setColumnStretch(1, 1)
         return grp
 
@@ -1033,6 +1047,7 @@ class _UpgradePage(_api.QWidget):
         s.video_height = _api.nearest_height(self.cb_vid_height.currentData())
         s.drop_unused = self.grp_unused.isChecked()
         s.mask_html = self.grp_html.isChecked()
+        s.mask_html_lite = self.chk_html_lite.isChecked()
         s.out_dir = self._out_dir
         return s
 
@@ -1088,6 +1103,7 @@ class _UpgradePage(_api.QWidget):
             max(0, self.cb_vid_height.findData(height)))
         self.grp_unused.setChecked(s.drop_unused)
         self.grp_html.setChecked(s.mask_html)
+        self.chk_html_lite.setChecked(s.mask_html_lite)
         self._out_dir = s.out_dir or ""
         siq = str(data.get("siq") or "")
         # Пропавший файл не подставляем: подпись врала бы про выбранный пак.
@@ -1180,7 +1196,8 @@ class _UpgradePage(_api.QWidget):
                         + (" (и всё не в AV1)" if settings.video_non_av1 else "")
                         + f" в av1 crf {settings.video_crf}")
         if settings.mask_html:
-            what.append("маскирую HTML в base64 (лёгкий режим)")
+            mode = "лёгкий режим" if settings.mask_html_lite else "обычный режим"
+            what.append(f"маскирую HTML в base64 ({mode})")
         if settings.drop_unused:
             what.append("удаляю неиспользуемые файлы")
         return what or ["ничего не делаю"]

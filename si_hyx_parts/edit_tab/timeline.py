@@ -54,12 +54,16 @@ class EditTabTimelineMixin:
         # чтобы устаревшая волна старой дорожки не прилетела последней.
         if self.audio_worker and self.audio_worker.isRunning():
             try:
-                self.audio_worker.stop(); self.audio_worker.wait()
+                self.audio_worker.stop()
+                if not self.audio_worker.wait(3000):
+                    self.audio_worker.terminate(); self.audio_worker.wait(1000)
             except Exception:
                 pass
         if self._audio_partial_worker and self._audio_partial_worker.isRunning():
             try:
-                self._audio_partial_worker.stop(); self._audio_partial_worker.wait()
+                self._audio_partial_worker.stop()
+                if not self._audio_partial_worker.wait(3000):
+                    self._audio_partial_worker.terminate(); self._audio_partial_worker.wait(1000)
             except Exception:
                 pass
         if cached is not None:

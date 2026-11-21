@@ -20,8 +20,8 @@ import uuid
 from pathlib import Path
 from config import (
     ALLOWED_AUDIO, ALLOWED_IMG, ALLOWED_MEDIA, COLOR_DONE, COLOR_ERR,
-    COLOR_PROC, CONFIG_DIR, CREATE_NO_WINDOW, DEFAULT_TAG, FFMPEG, FFPROBE,
-    ITEM_AUDIO_ROLE, ITEM_COMPARE_ROLE, ITEM_STATUS_ROLE, Image, ImageOps,
+    COLOR_PROC, COLOR_STOP, CONFIG_DIR, CREATE_NO_WINDOW, DEFAULT_TAG, FFMPEG, FFPROBE,
+    ITEM_AUDIO_ROLE, ITEM_COMPARE_ROLE, ITEM_PATH_ROLE, ITEM_STATUS_ROLE, Image, ImageOps,
     QAbstractItemView, QAbstractSpinBox, QApplication, QBrush, QByteArray,
     QColor, QComboBox, QDialog, QEvent, QFileDialog, QFont, QFrame,
     QHBoxLayout, QHeaderView, QIcon, QInputDialog, QKeySequence,

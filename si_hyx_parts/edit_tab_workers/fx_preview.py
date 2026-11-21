@@ -170,10 +170,13 @@ def _image(buf, w, h):
 
 
 def _popen(cmd):
-    return _api.subprocess.Popen(cmd, stdin=_api.subprocess.DEVNULL,
-                                 stdout=_api.subprocess.PIPE,
-                                 stderr=_api.subprocess.DEVNULL,
-                                 creationflags=_api.CREATE_NO_WINDOW)
+    p = _api.subprocess.Popen(cmd, stdin=_api.subprocess.DEVNULL,
+                              stdout=_api.subprocess.PIPE,
+                              stderr=_api.subprocess.DEVNULL,
+                              creationflags=_api.CREATE_NO_WINDOW)
+    import process_guard
+    process_guard.assign_to_job(p)
+    return p
 
 
 def _kill(proc):

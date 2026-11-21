@@ -32,6 +32,8 @@ from collections import OrderedDict
 import hdr_tonemap
 import montage_project as _mp
 
+from PyQt6.QtCore import QThread as _QThread, pyqtSignal as _pyqtSignal
+
 import edit_tab as _api
 
 # Длинная команда ffmpeg: граф фильтров уходит в файл (-/filter_complex) —
@@ -42,6 +44,29 @@ _INLINE_GRAPH_MAX = 6000
 _THUMB_CACHE_MAX = 900
 # За сколько до конца куска разбирать ffprobe файл следующего куска (в фоне).
 _PROBE_LEAD_S = 3.0
+# Задержка автосохранения проекта (мс): серия правок уходит одной фоновой записью.
+_AUTOSAVE_DEBOUNCE_MS = 700
+
+
+class _ProjectPrepWorker(_QThread):
+    """Фоновая подготовка сборки проекта (tonemap ffprobe, вшивание субтитров,
+    извлечение шрифтов и build_export), чтобы не блокировать GUI-поток."""
+    done = _pyqtSignal(object)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+        self._cancelled = False
+
+    def stop(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            res = self._fn(lambda: self._cancelled)
+            self.done.emit((True, res))
+        except Exception as e:
+            self.done.emit((False, e))
 
 
 class EditTabProjectMixin:
@@ -51,6 +76,11 @@ class EditTabProjectMixin:
     def _project_init(self):
         """Вызывается из __init__ до сборки интерфейса."""
         self._proj_save_blocked = False   # файл проекта не загрузился и не отложен
+        self._proj_save_timer = None      # debounce-таймер автосохранения
+        self._proj_save_lock = threading.Lock()
+        self._proj_save_pending = False
+        self._proj_save_thread = None
+        self._proj_prep_worker = None     # фоновая подготовка сборки проекта
         self.project = self._project_load_saved()
         self._proj_undo = _api.deque(maxlen=100)
         self._proj_redo = _api.deque(maxlen=100)
@@ -184,7 +214,25 @@ class EditTabProjectMixin:
         path = _api.MONTAGE_PROJECT_PATH
         for _attempt in range(2):        # сам файл, затем его .bak
             try:
-                return _mp.load_project(path)
+                p = _mp.load_project(path)
+                dropped = list(getattr(p, "dropped_clips", []) or [])
+                if dropped:
+                    src = (path if _api.os.path.isfile(path) else next(
+                        (b for b in (_mp.backup_path(path), path + ".bak")
+                         if _api.os.path.isfile(b)), ""))
+                    aside = ""
+                    if src:
+                        cand = f"{src}.dropped-{_api.time.strftime('%Y%m%d-%H%M%S')}"
+                        try:
+                            _api.shutil.copy2(src, cand)
+                            aside = cand
+                        except OSError:
+                            aside = ""
+                    self._proj_load_note = (
+                        f"пропущено {len(dropped)} клипов"
+                        + (f", копия исходника: {aside}" if aside else "")
+                    )
+                return p
             except _mp.ProjectError as e:
                 bad = e.path or path
                 aside = f"{bad}.unreadable-{_api.time.strftime('%Y%m%d-%H%M%S')}"
@@ -201,17 +249,88 @@ class EditTabProjectMixin:
                 return _mp.Project()
         return _mp.Project()
 
-    def _project_save(self):
-        """Сохраняет проект в MONTAGE_PROJECT_PATH (не затирая файл, который
-        не загрузился, — см. _project_load_saved)."""
+    def _project_write_files(self, payload, link_req, *, fsync=False):
+        """Пишет снимок проекта на диск (основной файл и при необходимости
+        связанный). Возвращает строку ошибки или '' при успехе."""
+        errs = []
+        with self._proj_save_lock:
+            try:
+                _api.os.makedirs(_api.os.path.dirname(_api.MONTAGE_PROJECT_PATH), exist_ok=True)
+                _mp.save_project(payload, _api.MONTAGE_PROJECT_PATH, fsync=fsync)
+            except Exception as e:
+                errs.append(f"проект не сохранён: {e}")
+            if link_req is not None:
+                lpath, ldata = link_req
+                try:
+                    _mp.save_project(payload, lpath, fsync=fsync)
+                    try:
+                        st = _api.os.stat(lpath)
+                        stamp = (st.st_mtime_ns, st.st_size)
+                    except OSError:
+                        stamp = None
+                    self._link_finish_write_back(lpath, ldata, stamp)
+                except Exception as e:
+                    errs.append(f"проект не сохранён в {lpath}: {e}")
+        return "; ".join(errs)
+
+    def _project_save_dispatch(self):
+        """Отправка отложенного автосохранения в фоновый поток (без fsync)."""
         if getattr(self, "_proj_save_blocked", False):
             return
+        self._proj_save_pending = False
         try:
-            _api.os.makedirs(_api.os.path.dirname(_api.MONTAGE_PROJECT_PATH), exist_ok=True)
-            _mp.save_project(self.project, _api.MONTAGE_PROJECT_PATH)
-        except Exception:
-            pass
-        self._link_write_back()
+            payload = self.project.to_dict()
+            link_req = self._link_prepare_write_back(payload)
+        except Exception as e:
+            self._proj_status(f"проект не сохранён: {e}")
+            return
+
+        def _bg():
+            err = self._project_write_files(payload, link_req, fsync=False)
+            if err:
+                try:
+                    _api.QTimer.singleShot(0, lambda msg=err: self._proj_status(msg))
+                except Exception:
+                    pass
+
+        th = threading.Thread(target=_bg, name="sihyx-project-autosave", daemon=True)
+        self._proj_save_thread = th
+        th.start()
+
+    def _project_save(self, *, immediate=False, fsync=False):
+        """Сохраняет проект в MONTAGE_PROJECT_PATH (не затирая файл, который
+        не загрузился, — см. _project_load_saved). По умолчанию — с debounce
+        в фоновом потоке без fsync; при закрытии (immediate=True, fsync=True) —
+        синхронно с fsync."""
+        if getattr(self, "_proj_save_blocked", False):
+            return
+        if immediate:
+            timer = getattr(self, "_proj_save_timer", None)
+            if timer is not None:
+                timer.stop()
+            self._proj_save_pending = False
+            th = getattr(self, "_proj_save_thread", None)
+            if th is not None and th.is_alive():
+                th.join(timeout=2.0)
+            try:
+                payload = self.project.to_dict()
+                link_req = self._link_prepare_write_back(payload)
+            except Exception as e:
+                self._proj_status(f"проект не сохранён: {e}")
+                return
+            err = self._project_write_files(payload, link_req, fsync=fsync)
+            if err:
+                self._proj_status(err)
+            return
+        self._proj_save_pending = True
+        timer = getattr(self, "_proj_save_timer", None)
+        if timer is None:
+            timer = _api.QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(_AUTOSAVE_DEBOUNCE_MS)
+            timer.timeout.connect(self._project_save_dispatch)
+            self._proj_save_timer = timer
+        timer.start()
 
     def _proj_status(self, text):
         try:
@@ -373,52 +492,82 @@ class EditTabProjectMixin:
             idx = self.audio_stream_index
         return str(self.actual_source_file), (int(idx) if idx is not None else -1)
 
-    def _project_burn_subs(self):
-        """Вшивание субтитров в проект: {ключ файла: фильтр subtitles=…} для
-        каждого видеофайла проекта, если стоит «Вшить субтитры»; иначе None.
-        Файл, о котором панель, — с дорожкой из списка; остальные — с той, что
-        выбирали для них (session_state; ею же они идут в просмотре). Раньше
-        субтитры получали только куски открытого файла, и в проекте из
-        нескольких файлов остальные куски выходили без субтитров."""
+    def _capture_burn_subs_state(self):
+        """Снимает состояние UI для _project_burn_subs на GUI-потоке, чтобы
+        дальше ffprobe и извлечение шрифтов шли в фоновом потоке."""
         if not self.chk_burn_subs.isChecked():
             return None
         shown = self._tracks_file()
         if getattr(self, "_deck_tv", None) is None and getattr(self, "is_still_image", False):
             shown = None
         shown_key = _mp.source_key(shown) if shown else None
+        try:
+            sub_style = int(self.cmb_sub_style.currentIndex())
+        except Exception:
+            sub_style = 0
+        return {
+            'shown_key': shown_key,
+            'shown_idx': int(self.cmb_subs.currentIndex()),
+            'shown_ext': self.selected_sub_ext_path,
+            'shown_streams': list(getattr(self, '_sub_streams', []) or []),
+            'session_files': {k: dict(v) for k, v in (self._session_files or {}).items()
+                              if isinstance(v, dict)},
+            'sub_style': sub_style,
+        }
+
+    def _project_burn_subs(self, project=None, snap=None):
+        """Вшивание субтитров в проект: {ключ файла: фильтр subtitles=…} для
+        каждого видеофайла проекта, если стоит «Вшить субтитры»; иначе None.
+        Файл, о котором панель, — с дорожкой из списка; остальные — с той, что
+        выбирали для них (session_state; ею же они идут в просмотре). Раньше
+        субтитры получали только куски открытого файла, и в проекте из
+        нескольких файлов остальные куски выходили без субтитров."""
+        if snap is None:
+            snap = self._capture_burn_subs_state()
+        if not snap:
+            return None
+        proj = self.project if project is None else project
+        shown_key = snap['shown_key']
+        sub_style = snap['sub_style']
         subs = {}
-        for c in self.project.clips:
+        for c in proj.clips:
             if not c.has_video or c.is_image:
                 continue
             key = _mp.source_key(c.src)
             if key in subs:
                 continue
             if key == shown_key:
-                idx = self.cmb_subs.currentIndex()
-                vf = (self._subtitles_vf(c.src, self.selected_sub_ext_path, idx - 1)
+                idx = snap['shown_idx']
+                vf = (self._subtitles_vf(c.src, snap['shown_ext'], idx - 1,
+                                         streams=snap['shown_streams'],
+                                         sub_style_choice=sub_style)
                       if idx > 0 else None)
             else:
-                vf = self._project_remembered_subs_vf(c.src)
+                vf = self._project_remembered_subs_vf(
+                    c.src, session_files=snap['session_files'], sub_style_choice=sub_style)
             subs[key] = vf
         subs = {k: v for k, v in subs.items() if v}
         return subs or None
 
-    def _project_remembered_subs_vf(self, src):
+    def _project_remembered_subs_vf(self, src, session_files=None, sub_style_choice=None):
         """Фильтр субтитров файла по его запомненному выбору дорожки или None
         («Выкл», дорожки или файла больше нет)."""
-        rec = self._session_files.get(_mp.source_key(src)) or {}
+        store = self._session_files if session_files is None else session_files
+        rec = store.get(_mp.source_key(src)) or {}
         spec = rec.get('subs')
         if not isinstance(spec, list) or len(spec) < 2:
             return None
         if spec[0] == 'ext':
             ext = str(spec[1])
-            return self._subtitles_vf(src, ext) if _api.os.path.exists(ext) else None
+            return (self._subtitles_vf(src, ext, sub_style_choice=sub_style_choice)
+                    if _api.os.path.exists(ext) else None)
         if spec[0] != 'emb':
             return None
         meta = _api.run_ffprobe(src) or {}
         streams = [s for s in meta.get('streams', []) if s.get('codec_type') == 'subtitle']
         i = next((i for i, s in enumerate(streams) if s.get('index') == spec[1]), None)
-        return self._subtitles_vf(src, None, i, streams) if i is not None else None
+        return (self._subtitles_vf(src, None, i, streams, sub_style_choice=sub_style_choice)
+                if i is not None else None)
 
     def _project_restore_audio(self):
         """Открыли файл, куски которого лежат в проекте, → в списке дорожек
@@ -791,6 +940,8 @@ class EditTabProjectMixin:
                 self._project_changed()
         elif action == 'detach_audio' and clip is not None:
             self.project_detach_audio(clip.id)
+        elif action == 'reverse' and clip is not None:
+            self.project_toggle_reverse(clip.id)
         elif action.startswith('speed:') and clip is not None:
             value = action.split(':', 1)[1]
             if value == 'custom':
@@ -823,6 +974,25 @@ class EditTabProjectMixin:
             self._project_snapshot()
             p.add_track(action.split(':', 1)[1])
             self._project_changed()
+
+    def project_toggle_reverse(self, cid=None):
+        """Включает или выключает реверс для видео- или аудиоклипа на таймлайне."""
+        clip = self.project.clip(cid or self.project_timeline.selected)
+        if clip is None or clip.is_image or clip.frozen:
+            return
+        new_val = not clip.reverse
+        if new_val and clip.has_video and (clip.out_s - clip.in_s) > _mp.MAX_REVERSE_S + 1e-6:
+            _api.msgbox_warning(
+                self, "Реверс",
+                f"Реверс видео поддерживается для клипов не длиннее {_mp.MAX_REVERSE_S:g} с исходника.\n"
+                "Разрежьте клип (Ctrl+B) на более короткие куски.")
+            return
+        self._project_snapshot()
+        clip.reverse = new_val
+        if new_val and clip.speed_curve:
+            clip.speed_curve = []
+        self._project_changed()
+        self._proj_status("реверс включён" if new_val else "реверс выключен")
 
     # ── Кадры и волна на клипах ──────────────────────────────────────────────
     def _project_thumb(self, clip, t, height):
@@ -936,6 +1106,26 @@ class EditTabProjectMixin:
         return self._proj_waves.get(self._proj_norm(clip.src))
 
     def _project_shutdown(self):
+        timer = getattr(self, "_proj_save_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        try:
+            self._project_save(immediate=True, fsync=True)
+        except Exception:
+            pass
+        prep = getattr(self, "_proj_prep_worker", None)
+        if prep is not None:
+            try:
+                prep.stop()
+                if prep.isRunning():
+                    if not prep.wait(3000):
+                        prep.terminate(); prep.wait(1000)
+            except Exception:
+                pass
+            self._proj_prep_worker = None
         self._link_stop()
         self._fx_shutdown()
         self._pmix_stop()
@@ -1700,9 +1890,10 @@ class EditTabProjectMixin:
         if p.is_empty():
             return
         th = getattr(self, "ffmpeg_thread", None)
+        prep_th = getattr(self, "_proj_prep_worker", None)
         # «В очередь» (_enqueue_export) собирает проект, пока идёт экспорт.
         queueing = bool(getattr(self, "_export_enqueue", False))
-        if th is not None and th.isRunning() and not queueing:
+        if ((th is not None and th.isRunning()) or (prep_th is not None and prep_th.isRunning())) and not queueing:
             _api.msgbox_information(self, "Проект", "Дождитесь окончания текущей обрезки.")
             return
         srcs = {c.src for c in p.clips} | {c.audio_path for c in p.clips if c.audio_path}
@@ -1740,68 +1931,122 @@ class EditTabProjectMixin:
         if not path.lower().endswith(ext):
             path += ext
         temp_out = self._make_temp_out(path)
-        # HDR10-куски сводятся в SDR так, как их видно в просмотре.
-        tonemap = hdr_tonemap.tonemap_filters(
-            (c.src for c in p.clips if c.has_video and not c.is_image), self._escape_filter_path)
-        built = _mp.build_export(p, temp_out, _api.FFMPEG, self._video_encoder_args(),
-                                 subs=self._project_burn_subs(), tonemap=tonemap)
-        if built is None:
+        p_copy = p.copy()
+        enc_args = self._video_encoder_args()
+        burn_snap = self._capture_burn_subs_state()
+
+        def _prep(is_cancelled):
+            # HDR10-куски сводятся в SDR так, как их видно в просмотре.
+            tonemap = hdr_tonemap.tonemap_filters(
+                (c.src for c in p_copy.clips if c.has_video and not c.is_image),
+                self._escape_filter_path)
+            if is_cancelled():
+                return None
+            subs = self._project_burn_subs(project=p_copy, snap=burn_snap) if burn_snap else None
+            if is_cancelled():
+                return None
+            return _mp.build_export(p_copy, temp_out, _api.FFMPEG, enc_args,
+                                    subs=subs, tonemap=tonemap)
+
+        def _cleanup_temp():
             try:
-                _api.os.remove(temp_out)
+                if _api.os.path.exists(temp_out):
+                    _api.os.remove(temp_out)
             except OSError:
                 pass
-            return
-        cmd, graph, dur = built
-        graph_file = None
-        if len(" ".join(cmd)) > _INLINE_GRAPH_MAX:
-            try:
-                tf = _api.tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False,
-                                                      suffix=".txt", prefix="sihyx_graph_")
-                tf.write(graph)
-                tf.close()
-                graph_file = tf.name
-                i = cmd.index("-filter_complex")
-                cmd[i:i + 2] = ["-/filter_complex", graph_file]
-            except Exception:
-                graph_file = None
-        worker = _api.FfmpegWorker(cmd, duration=dur)
-        worker.progress.connect(self._on_cut_progress)
 
-        def _done(success, message, _temp=temp_out, _final=path, _graph=graph_file):
-            try:
-                if getattr(self, "_cut_ticker", None) is not None:
-                    self._cut_ticker.stop()
-            except Exception:
-                pass
-            self._set_cut_btn_cancel(False)
-            self._project_update_ui()
-            if _graph:
-                try:
-                    _api.os.remove(_graph)
-                except OSError:
-                    pass
-            if not success:
-                try:
-                    if _api.os.path.exists(_temp):
-                        _api.os.remove(_temp)
-                except OSError:
-                    pass
-                self.on_ffmpeg_finished(False, message)
+        def _on_prep_done(outcome):
+            self._proj_prep_worker = None
+            ok, payload = outcome
+            if not ok:
+                _cleanup_temp()
+                if not queueing:
+                    self._set_cut_btn_cancel(False)
+                    self._project_update_ui()
+                self.on_ffmpeg_finished(False, f"Ошибка подготовки сборки: {payload}")
                 return
-            try:
-                saved = self._replace_tolerant(_temp, _final)
-            except Exception as e:
-                self.on_ffmpeg_finished(False, f"Ошибка при сохранении: {e}")
+            built = payload
+            if built is None:
+                _cleanup_temp()
+                if not queueing:
+                    self._set_cut_btn_cancel(False)
+                    self._project_update_ui()
                 return
-            self._progress_result_path = saved
-            self._proj_status(f"видео проекта сохранено: {saved}")
-            self.on_ffmpeg_finished(True, message)
+            cmd, graph, dur = built
+            graph_file = None
+            if len(" ".join(cmd)) > _INLINE_GRAPH_MAX:
+                try:
+                    tf = _api.tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False,
+                                                          suffix=".txt", prefix="sihyx_graph_")
+                    tf.write(graph)
+                    tf.close()
+                    graph_file = tf.name
+                    i = cmd.index("-filter_complex")
+                    cmd[i:i + 2] = ["-/filter_complex", graph_file]
+                except Exception as e:
+                    _cleanup_temp()
+                    if not queueing:
+                        self._set_cut_btn_cancel(False)
+                        self._project_update_ui()
+                    self.on_ffmpeg_finished(
+                        False,
+                        f"Не удалось записать временный файл графа фильтров (TEMP недоступен или полон): {e}")
+                    return
+            worker = _api.FfmpegWorker(cmd, duration=dur)
+            worker.progress.connect(self._on_cut_progress)
 
-        worker.finished.connect(_done)
-        # Просмотр проекта останавливается в момент запуска сборки: из очереди
-        # это может случиться намного позже нажатия.
-        self._launch_cut_worker(
-            worker, status="Сборка проекта…", phase="Сборка проекта…",
-            final=path, cleanup=(temp_out, graph_file),
-            label=f"проект → {_api.os.path.basename(path)}",
-            before_start=self.project_stop)
+            def _done(success, message, _temp=temp_out, _final=path, _graph=graph_file):
+                try:
+                    if getattr(self, "_cut_ticker", None) is not None:
+                        self._cut_ticker.stop()
+                except Exception:
+                    pass
+                self._set_cut_btn_cancel(False)
+                self._project_update_ui()
+                if _graph:
+                    try:
+                        _api.os.remove(_graph)
+                    except OSError:
+                        pass
+                if not success:
+                    try:
+                        if _api.os.path.exists(_temp):
+                            _api.os.remove(_temp)
+                    except OSError:
+                        pass
+                    self.on_ffmpeg_finished(False, message)
+                    return
+                try:
+                    saved = self._replace_tolerant(_temp, _final)
+                except Exception as e:
+                    extra = (f"\nГотовый файл остался во временном файле:\n{_temp}"
+                             if _api.os.path.exists(_temp) else "")
+                    self.on_ffmpeg_finished(False, f"Ошибка при сохранении: {e}{extra}")
+                    return
+                self._progress_result_path = saved
+                self._proj_status(f"видео проекта сохранено: {saved}")
+                self.on_ffmpeg_finished(True, message)
+
+            worker.finished.connect(_done)
+            # Просмотр проекта останавливается в момент запуска сборки: из очереди
+            # это может случиться намного позже нажатия.
+            prev_enq = getattr(self, "_export_enqueue", False)
+            if queueing:
+                self._export_enqueue = True
+            try:
+                self._launch_cut_worker(
+                    worker, status="Сборка проекта…", phase="Сборка проекта…",
+                    final=path, cleanup=(temp_out, graph_file),
+                    label=f"проект → {_api.os.path.basename(path)}",
+                    before_start=self.project_stop)
+            finally:
+                if queueing:
+                    self._export_enqueue = prev_enq
+
+        prep_worker = _ProjectPrepWorker(_prep, self)
+        self._proj_prep_worker = prep_worker
+        prep_worker.done.connect(_on_prep_done)
+        if not queueing:
+            self._proj_status("подготовка сборки проекта…")
+            self._set_cut_btn_cancel(True, prep_worker.stop)
+        prep_worker.start()

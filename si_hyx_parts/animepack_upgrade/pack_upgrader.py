@@ -1205,9 +1205,12 @@ class PackUpgrader:
 
     # ── HTML → base64 ─────────────────────────────────────────────────────
     def _do_html(self, result) -> None:
-        """Маскирует каждый .html/.htm пака под VK лёгким режимом вкладки
-        Base64 (mask_html_js_lite). Имя записи не меняется — ссылки в
-        content.xml остаются верными; новые байты кладёт _write."""
+        """Маскирует каждый .html/.htm пака под VK выбранным режимом вкладки
+        Base64 (mask_html_js или mask_html_js_lite). Имя записи не меняется —
+        ссылки в content.xml остаются верными; новые байты кладёт _write."""
+        lite = bool(getattr(self.s, "mask_html_lite", False))
+        mask_fn = _api.mask_html_js_lite if lite else _api.mask_html_js
+        mode_label = "лёгкий" if lite else "обычный"
         try:
             with _api.zipfile.ZipFile(self.path) as zf:
                 entries = [i for i in zf.infolist() if not i.is_dir()
@@ -1228,27 +1231,27 @@ class PackUpgrader:
                         self.log(f"«{name}»: HTML не в UTF-8, оставляю как есть.")
                         continue
                     try:
-                        masked, n_in, _n_ext = _api.mask_html_js_lite(html)
+                        masked, n_in, n_ext = mask_fn(html)
                     except Exception as e:  # чужой HTML бывает любым
                         self.log(f"«{name}»: замаскировать не вышло ({e}), "
                                  f"оставляю как есть.")
                         continue
-                    if not n_in:
-                        self.log(f"«{name}»: скриптов с кодом нет, оставляю.")
+                    if not (n_in or n_ext):
+                        self.log(f"«{name}»: нет <script>, оставляю.")
                         continue
                     data = masked.encode("utf-8")
                     self._masked_html[info.filename] = data
                     result.htmls.append(_api.Change(
                         kind="html", theme_name=name, price=0,
                         before=f"html, {_api.fmt_size(info.file_size)}",
-                        after=f"base64 (лёгкий), {_api.fmt_size(len(data))}",
+                        after=f"base64 ({mode_label}), {_api.fmt_size(len(data))}",
                         title=info.filename,
                         order=result.questions + result.heavy_images
                         + len(result.audios) + len(result.videos)
                         + len(result.htmls)))
         except (OSError, _api.zipfile.BadZipFile) as e:
             raise _api.UpgradeError(f"Файл не читается как .siq: {e}") from e
-        self.log(f"HTML замаскировано в base64 (лёгкий режим): "
+        self.log(f"HTML замаскировано в base64 ({mode_label} режим): "
                  f"{len(result.htmls)} из {len(entries)}.")
 
     # ── запись ────────────────────────────────────────────────────────────
@@ -1461,7 +1464,7 @@ def example_lines(result: _api.UpgradeResult, limit: int = 3) -> list[str]:
 
     htmls = list(getattr(result, "htmls", []))
     if htmls:
-        lines.append(f"HTML замаскировано в base64 (лёгкий режим): {len(htmls)}.")
+        lines.append(f"HTML замаскировано в base64: {len(htmls)}.")
         for change in htmls[:limit]:
             lines.append(f"  • {_api._shorten(change.theme_name)}: {change.before} → "
                          f"{change.after}")

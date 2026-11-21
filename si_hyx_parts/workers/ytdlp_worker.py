@@ -2,11 +2,14 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """YtdlpWorker. Public namespace: workers."""
+import codecs
 from urllib.parse import urlsplit
 
 import workers as _api
-from .download_network import is_network_error, network_hint
-from .download_process import stop_process
+from .download_network import is_network_error, is_ssl_error, network_hint
+from .download_process import (
+    copy_cookies_for_job, remove_temp_cookie, stop_process, stop_process_async,
+)
 from . import doh_proxy
 from .vk_direct import (
     USER_AGENT as VK_USER_AGENT, VkResolveError, best_mp4, is_vk_video_url,
@@ -20,7 +23,7 @@ from si_hyx_parts.workers.download_result import verified_download
 class YtdlpWorker(_api.QThread):
     log_sig = _api.pyqtSignal(str)
     progress_sig = _api.pyqtSignal(str, float, str)
-    finished_sig = _api.pyqtSignal(str, str, str, str)
+    finished_sig = _api.pyqtSignal(str, str, str, str, object)
     error_sig = _api.pyqtSignal(str, str)
     thumb_sig = _api.pyqtSignal(str, str)
 
@@ -82,7 +85,7 @@ class YtdlpWorker(_api.QThread):
 
     def stop(self):
         self.is_running = False
-        stop_process(self._proc)
+        stop_process_async(self._proc)
 
     def _sleep_interruptible(self, seconds):
         """Пауза, прерываемая кнопкой СТОП: спим мелкими квантами и выходим, как
@@ -91,7 +94,18 @@ class YtdlpWorker(_api.QThread):
         while self.is_running and _api.time.time() < end:
             _api.time.sleep(0.1)
 
-    # ─── ДОБАВИТЬ В YtdlpWorker ───────────────────────────────────────────────────
+    @staticmethod
+    def _media_info_summary(path: str) -> dict:
+        """Собирает краткие сведения о файле в потоке воркера (не в GUI)."""
+        try:
+            _dur, br_str, size, a_br, _a_codec = _api.get_media_info(path)
+            return {"size": size, "br_str": br_str, "a_br": a_br}
+        except Exception:
+            try:
+                size = _api.os.path.getsize(path)
+            except OSError:
+                size = 0
+            return {"size": size, "br_str": "-", "a_br": "-"}
 
     @staticmethod
     def _iter_stream_lines(stream):
@@ -100,23 +114,41 @@ class YtdlpWorker(_api.QThread):
         Обычный `for line in stream` режет только по '\\n'. Но ffmpeg (которым
         yt-dlp качает отрезок через --download-sections) печатает прогресс
         «frame=… time=… speed=…» через ВОЗВРАТ КАРЕТКИ '\\r' без перевода строки.
-        При построчной итерации такие обновления копятся в одном буфере и не
-        доставляются до конца процесса — из-за чего % нарезки не показывался, а
-        строка висела на watchdog-тикере «Скачивание… mm:ss». Читаем посимвольно
-        (объём вывода загрузки небольшой) и отдаём кусок на каждом '\\r'/'\\n'."""
-        buf = []
+        Читаем чанками через read1() на бинарном буфере (без блокировки в ожидании
+        заполнения буфера) и делим на строки по '\\r'/'\\n'."""
+        raw = getattr(stream, "buffer", None)
+        use_raw = raw is not None and hasattr(raw, "read1")
+        decoder = (codecs.getincrementaldecoder(getattr(stream, "encoding", None) or "utf-8")(
+            getattr(stream, "errors", None) or "replace") if use_raw else None)
+        pending = ""
         while True:
-            ch = stream.read(1)
-            if not ch:
-                if buf:
-                    yield "".join(buf)
-                return
-            if ch in ("\r", "\n"):
-                if buf:
-                    yield "".join(buf)
-                    buf = []
+            if use_raw:
+                data = raw.read1(4096)
+                if not data:
+                    chunk = decoder.decode(b"", final=True)
+                    pending += chunk
+                    if pending:
+                        for part in _api.re.split(r"[\r\n]+", pending):
+                            if part:
+                                yield part
+                    return
+                chunk = decoder.decode(data)
             else:
-                buf.append(ch)
+                chunk = stream.read(4096)
+                if not chunk:
+                    if pending:
+                        for part in _api.re.split(r"[\r\n]+", pending):
+                            if part:
+                                yield part
+                    return
+            if not chunk:
+                continue
+            pending += chunk
+            parts = _api.re.split(r"[\r\n]+", pending)
+            pending = parts.pop()
+            for part in parts:
+                if part:
+                    yield part
 
     def _exec_ytdlp(self, cmd: list, iid: str, is_audio_only: bool):
         """
@@ -220,6 +252,15 @@ class YtdlpWorker(_api.QThread):
         return self._proc.returncode, out_fullpath, clean_res_str, list(tail)
 
     @staticmethod
+    def _insert_before_url(cmd: list, extra: list) -> list:
+        """Вставляет дополнительные флаги yt-dlp перед URL (и перед '--', если он есть)."""
+        if not cmd:
+            return list(extra)
+        if len(cmd) >= 2 and cmd[-2] == "--":
+            return list(cmd[:-2]) + list(extra) + list(cmd[-2:])
+        return list(cmd[:-1]) + list(extra) + [cmd[-1]]
+
+    @staticmethod
     def _inject_tiktok_headers(cmd: list, ua: str, header_values) -> list:
         """Копия cmd с добавленным Desktop-UA (Chrome 125) и браузерными
         заголовками TikTok, вставленными ПЕРЕД URL (последний элемент cmd).
@@ -232,9 +273,7 @@ class YtdlpWorker(_api.QThread):
         extra = ["--user-agent", ua]
         for h in header_values:
             extra += ["--add-header", h]
-        if not cmd:
-            return list(extra)
-        return list(cmd[:-1]) + extra + [cmd[-1]]
+        return YtdlpWorker._insert_before_url(cmd, extra)
 
     @staticmethod
     def _height_from_fmt(fmt: str) -> int:
@@ -282,10 +321,12 @@ class YtdlpWorker(_api.QThread):
             "-progress", "pipe:1", "-y",
             "-user_agent", VK_USER_AGENT,
             "-headers", "Referer: https://vkvideo.ru/\r\n",
-            "-i", media_url,
         ]
+        # -ss ПЕРЕД -i (input seeking): ffmpeg делает Range-запрос сразу к точке
+        # старта, не выкачивая поток с начала ролика.
         if start:
             cmd += ["-ss", str(start)]
+        cmd += ["-i", media_url]
         if end:
             cmd += ["-t", str(end - start)]
         if is_audio_only:
@@ -293,10 +334,14 @@ class YtdlpWorker(_api.QThread):
         else:
             cmd += ["-c", "copy", "-movflags", "+faststart", tmp_path]
 
+        if not self.is_running:
+            raise Exception("остановлена пользователем")
         self._proc = _api.subprocess.Popen(
             cmd, stdout=_api.subprocess.PIPE, stderr=_api.subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             creationflags=_api.CREATE_NO_WINDOW, bufsize=1, env=_api.subprocess_env())
+        if not self.is_running:
+            stop_process(self._proc)
         _api.threading.Thread(target=self._watchdog, args=(self._proc,), daemon=True).start()
 
         tail = _api.deque(maxlen=20)
@@ -369,17 +414,24 @@ class YtdlpWorker(_api.QThread):
         # пришёл (mtime-порог переживает повторы).
         self._job_start_ts = _api.time.time()
         self.progress_sig.emit(iid, 0.0, "Подготовка...")
+        cookie_job_path, cookie_is_temp = "", False
         try:
-            raw_url = self.c.get('url', '')
+            raw_url = (self.c.get('url') or '').strip()
+            if not _api.re.match(r'^https?://\S+', raw_url, _api.re.I):
+                raise Exception("Некорректный URL: поддерживаются только ссылки http:// и https://")
 
             # Прямые CDN-ссылки (Instagram fbcdn.net и др.) — по RAW URL, до clean_url
             if _api.is_direct_cdn_video(raw_url):
                 out_dir = self.c.get('outdir', '.') or '.'
                 self.log_sig.emit("Определена прямая CDN-ссылка, скачиваю без yt-dlp...")
                 self.progress_sig.emit(iid, 1.0, "Загрузка CDN...")
-                out_path = _api.download_cdn_direct(raw_url, out_dir, log_fn=self.log_sig.emit)
+                out_path = _api.download_cdn_direct(
+                    raw_url, out_dir, log_fn=self.log_sig.emit,
+                    progress_fn=lambda pct, msg: self.progress_sig.emit(iid, pct, msg),
+                    is_running=lambda: self.is_running)
+                media_summary = self._media_info_summary(out_path)
                 self.progress_sig.emit(iid, 100.0, "Готово")
-                self.finished_sig.emit(iid, "Готово", "", out_path)
+                self.finished_sig.emit(iid, "Готово", "", out_path, media_summary)
                 return
 
             base = _api.ytdlp_base_cmd()
@@ -475,7 +527,7 @@ class YtdlpWorker(_api.QThread):
                 # cp1251 и путь из @@PATH@@ приходит кракозябрами.
                 "--encoding", "utf-8",
                 "--newline", "--no-playlist", "--no-mtime", "--progress",
-                "--socket-timeout", "30", "--no-check-certificate", "--windows-filenames",
+                "--socket-timeout", "30", "--windows-filenames",
                 # Устойчивость к обрывам соединения (DPI/блокировки провайдера, ошибка 10054)
                 "--retries", "10", "--fragment-retries", "20",
                 "--extractor-retries", "5", "--retry-sleep", "3",
@@ -536,20 +588,40 @@ class YtdlpWorker(_api.QThread):
                 # числа потоков.
                 cmd += ["--concurrent-fragments", "32"]
 
+            audio_lang = (self.c.get('audio') or '').strip()
+            if (audio_lang == 'Original'
+                    or not _api.re.fullmatch(r'[A-Za-z0-9_-]+', audio_lang)):
+                audio_lang = ''
+
             if is_audio_only:
                 # ТОЛЬКО аудио: берём ЧИСТЫЙ аудиопоток (vcodec=none) — иначе на сайтах
                 # без отдельной аудиодорожки fallback `best` тащит ВИДЕО. `--audio-format
                 # best` сохраняет исходный кодек (m4a→m4a, opus→opus идут БЕЗ
                 # перекодирования: быстрее, без потерь, меньше размер) и не упирается в
                 # баг самоперемещения 'X.m4a'->'X.m4a' при совпадении форматов.
-                cmd += ["-f", "bestaudio[vcodec=none]/bestaudio/best",
+                audio_fmt = (
+                    f"bestaudio[vcodec=none][language={audio_lang}]/"
+                    f"bestaudio[language={audio_lang}]/"
+                    "bestaudio[vcodec=none]/bestaudio/best"
+                    if audio_lang else "bestaudio[vcodec=none]/bestaudio/best"
+                )
+                cmd += ["-f", audio_fmt,
                         "-x", "--audio-format", "best", "--audio-quality", "0"]
             elif kodik:
                 # одиночный m3u8 — берём лучшее из манифеста (качество уже выбрано)
                 cmd += ["-f", "best", "--merge-output-format", merge]
             else:
-                cmd += ["-f", self.c.get('fmt') or "bestvideo+bestaudio/best",
-                        "--merge-output-format", merge]
+                base_fmt = self.c.get('fmt') or "bestvideo+bestaudio/best"
+                if audio_lang:
+                    if "+bestaudio" in base_fmt:
+                        pref = base_fmt.split("/", 1)[0].replace(
+                            "+bestaudio", f"+bestaudio[language={audio_lang}]", 1)
+                        fmt_arg = f"{pref}/{base_fmt}"
+                    else:
+                        fmt_arg = f"bestvideo+bestaudio[language={audio_lang}]/{base_fmt}"
+                else:
+                    fmt_arg = base_fmt
+                cmd += ["-f", fmt_arg, "--merge-output-format", merge]
 
             # Константы заданы здесь, чтобы _inject_tiktok_headers знал, какой UA и
             # какие заголовки добавлять в запасном Desktop-режиме (см. ниже).
@@ -608,7 +680,8 @@ class YtdlpWorker(_api.QThread):
                 chosen_cookie = _api.COOKIE_PATHS['default']
                 self.log_sig.emit(f"OK: Используем общие cookies: {_api.COOKIE_PATHS['default']}")
             if chosen_cookie:
-                cmd += ["--cookies", chosen_cookie]
+                cookie_job_path, cookie_is_temp = copy_cookies_for_job(chosen_cookie)
+                cmd += ["--cookies", cookie_job_path]
 
             # ── VK: прямой путь через API нового веб-плеера ──────────────────
             # yt-dlp-экстрактор VK упирается в «нужен вход»: старый al_video.php
@@ -622,6 +695,8 @@ class YtdlpWorker(_api.QThread):
                                              log_fn=self.log_sig.emit)
                 except VkResolveError as e:
                     self.log_sig.emit(f"VK: {e} — пробую yt-dlp")
+                if not self.is_running:
+                    raise Exception("Загрузка остановлена пользователем")
                 if media:
                     try:
                         vk_path = self._download_vk_direct(
@@ -634,8 +709,9 @@ class YtdlpWorker(_api.QThread):
                     if vk_path:
                         res = (f"{media['width']}x{media['height']}"
                                if media.get("width") and media.get("height") else "")
+                        media_summary = self._media_info_summary(vk_path)
                         self.progress_sig.emit(iid, 100.0, "Готово")
-                        self.finished_sig.emit(iid, "Готово", res, vk_path)
+                        self.finished_sig.emit(iid, "Готово", res, vk_path, media_summary)
                         return
 
             if self.c.get('sub_lang') and self.c['sub_lang'] != 'Выкл':
@@ -655,7 +731,7 @@ class YtdlpWorker(_api.QThread):
                 if not is_audio_only and self.c.get('force_kf'):
                     cmd += ["--force-keyframes-at-cuts"]
 
-            cmd += [url]
+            cmd += ["--", url]
 
             rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(cmd, iid, is_audio_only)
 
@@ -682,15 +758,12 @@ class YtdlpWorker(_api.QThread):
                         or "jsondecodeerror" in j or "expecting value" in j)
 
             def _resolved():
-                """Готовый файл этой загрузки: путь из @@PATH@@, иначе свежий
-                медиафайл задания (если @@PATH@@ не пришёл, но файл реально скачан).
-                Поиск скоупится по mtime ≥ старта задания — чужой .siq не подхватится."""
+                """Готовый файл этой загрузки: путь из after_move (@@PATH@@)
+                или строки 'has already been downloaded'."""
                 if rc not in (0, None):
                     return ""
-                if out_fullpath and _api.os.path.exists(out_fullpath):
+                if out_fullpath and _api.os.path.isfile(out_fullpath):
                     return out_fullpath
-                if rc in (0, None):
-                    return self._find_recent_output(out_dir)
                 return ""
 
             TT_MAX = 20
@@ -728,6 +801,17 @@ class YtdlpWorker(_api.QThread):
                 rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(
                     cmd_fallback, iid, is_audio_only)
 
+            # Ошибка проверки TLS-сертификата: повторяем с --no-check-certificate
+            # только после явной SSL-ошибки и с предупреждением в лог.
+            if (self.is_running and "--no-check-certificate" not in cmd
+                    and not _resolved() and is_ssl_error(" ".join(tail))):
+                self.log_sig.emit(
+                    "ВНИМАНИЕ: ошибка проверки TLS-сертификата — повтор без проверки "
+                    "(--no-check-certificate)…")
+                cmd = self._insert_before_url(cmd, ["--no-check-certificate"])
+                rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(
+                    cmd, iid, is_audio_only)
+
             # DNS провайдера не отдал адрес (подмена/блокировка: getaddrinfo
             # 11001/11003), хотя сам сайт доступен. Повторяем через локальный
             # прокси, который резолвит хосты по DNS-over-HTTPS.
@@ -737,18 +821,18 @@ class YtdlpWorker(_api.QThread):
                 self.log_sig.emit(f"DNS провайдера не отдаёт адрес {host} — "
                                   "повтор через DNS-over-HTTPS (1.1.1.1)…")
                 doh_proxy.remember_host(host)
-                cmd = cmd[:-1] + ["--proxy", doh_proxy.proxy_url(), cmd[-1]]
+                cmd = self._insert_before_url(cmd, ["--proxy", doh_proxy.proxy_url()])
                 rc, out_fullpath, clean_res_str, tail = self._exec_ytdlp(
                     cmd, iid, is_audio_only)
 
-            out_fullpath, clean_res_str = verified_download(
+            out_fullpath, clean_res_str, media_summary = verified_download(
                 self, cmd, iid, is_audio_only,
                 (rc, out_fullpath, clean_res_str, tail))
 
             try: self._cleanup_partials(out_dir, out_fullpath)
             except Exception: pass
             self.progress_sig.emit(iid, 100.0, "Готово")
-            self.finished_sig.emit(iid, "Готово", clean_res_str or "", out_fullpath)
+            self.finished_sig.emit(iid, "Готово", clean_res_str or "", out_fullpath, media_summary)
 
         except Exception as e:
             err_msg = str(e)
@@ -759,16 +843,21 @@ class YtdlpWorker(_api.QThread):
                 self.error_sig.emit(iid, err_msg[:200])
                 self.log_sig.emit(f"Ошибка: {err_msg}")
             self._emit_hints(err_msg)
+        finally:
+            remove_temp_cookie(cookie_job_path, cookie_is_temp)
 
     def _cleanup_partials(self, out_dir, final_path):
         """Удаляет осиротевшие промежуточные файлы (.part/.ytdl/.fdash/.fhls) от
         неудачных попыток формата (напр. DASH-таймаут на VK), чтобы рядом с
-        итоговым видео не оставался .part. Скоупится по префиксу имени файла."""
+        итоговым видео не оставался .part. Скоупится строго по полному stem
+        итогового файла (+ '.'), чтобы не задеть параллельные загрузки с общим
+        началом названия."""
         try:
             final = _api.os.path.basename(final_path)
-            prefix = (final.split(" [")[0] or final)[:24]
-            if not prefix:
+            stem, _ = _api.os.path.splitext(final)
+            if not stem:
                 return
+            prefix = stem + "."
             for name in _api.os.listdir(out_dir):
                 if name == final:
                     continue

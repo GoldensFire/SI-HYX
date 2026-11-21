@@ -2,6 +2,8 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """Обработка: аргументы ffmpeg — кадрирование, фильтры, кодеки и подбор CRF по метрике."""
+import queue
+
 import hdr_tonemap
 
 import workers as _api
@@ -60,7 +62,8 @@ class ProcessFiltersMixin:
         return w, h, x0, y0
 
     @classmethod
-    def _detect_crop(cls, path: str, dur: float = 0.0, start: float = 0.0):
+    def _detect_crop(cls, path: str, dur: float = 0.0, start: float = 0.0,
+                     stop_check=None, timeout: float = 60.0):
         """Рамка видео без чёрных полос: строка 'w:h:x:y' для фильтра crop или
         None, если полос нет.
 
@@ -127,10 +130,41 @@ class ProcessFiltersMixin:
                 "-frames:v", str(frames), "-an", "-sn",
                 "-f", "rawvideo", "-pix_fmt", "gray", "-",
             ]
-            p = _api.subprocess.run(cmd, stdout=_api.subprocess.PIPE,
-                               stderr=_api.subprocess.DEVNULL,
-                               creationflags=_api.CREATE_NO_WINDOW)
-            buf, size = p.stdout or b"", iw * ih
+            if stop_check is not None and stop_check():
+                return None
+            p = _api.subprocess.Popen(cmd, stdout=_api.subprocess.PIPE,
+                                      stderr=_api.subprocess.DEVNULL,
+                                      creationflags=_api.CREATE_NO_WINDOW)
+            chunks = []
+            def _read_stdout():
+                try:
+                    data = p.stdout.read()
+                    if data:
+                        chunks.append(data)
+                except Exception:
+                    pass
+            rt = _api.threading.Thread(target=_read_stdout, daemon=True)
+            rt.start()
+            deadline = _api.time.monotonic() + max(5.0, float(timeout or 60.0))
+            while True:
+                if (stop_check is not None and stop_check()) or _api.time.monotonic() > deadline:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    try:
+                        p.wait(timeout=3)
+                    except Exception:
+                        pass
+                    rt.join(timeout=1.0)
+                    return None
+                try:
+                    p.wait(timeout=0.25)
+                    break
+                except _api.subprocess.TimeoutExpired:
+                    continue
+            rt.join(timeout=2.0)
+            buf, size = b"".join(chunks), iw * ih
             n = len(buf) // size
             if n == 0:
                 return None
@@ -335,15 +369,30 @@ class ProcessFiltersMixin:
         stop_flag/cancel_check подхватываются в пределах poll секунд, а не
         только когда сам процесс (может идти минутами на медленном preset)
         завершится сам. Возвращает True при успешном (returncode 0) завершении,
-        False при ошибке/отмене."""
+        False при ошибке/отмене. Хвост stderr сохраняется в self._last_killable_stderr."""
+        self._last_killable_stderr = ""
         si = _api.subprocess.STARTUPINFO() if _api.IS_WIN else None
         if _api.IS_WIN and si is not None: si.dwFlags |= _api.subprocess.STARTF_USESHOWWINDOW
         try:
-            p = _api.subprocess.Popen(cmd, stdout=_api.subprocess.DEVNULL, stderr=_api.subprocess.DEVNULL,
-                                 creationflags=_api.CREATE_NO_WINDOW | getattr(self, '_priority_flag', 0),
-                                 startupinfo=si)
-        except Exception:
+            p = _api.subprocess.Popen(cmd, stdout=_api.subprocess.DEVNULL,
+                                      stderr=_api.subprocess.PIPE,
+                                      text=True, encoding="utf-8", errors="replace",
+                                      creationflags=_api.CREATE_NO_WINDOW | getattr(self, '_priority_flag', 0),
+                                      startupinfo=si)
+        except Exception as e:
+            self._last_killable_stderr = str(e)
             return False
+        err_buf = _api.deque(maxlen=80)
+        def _drain_err():
+            try:
+                for ln in p.stderr:
+                    s = ln.strip()
+                    if s and not s.startswith(("frame=", "size=")):
+                        err_buf.append(s)
+            except Exception:
+                pass
+        rt = _api.threading.Thread(target=_drain_err, daemon=True)
+        rt.start()
         last_tick = _api.time.time()
         while True:
             if self.stop_flag or (cancel_check is not None and cancel_check()):
@@ -351,9 +400,13 @@ class ProcessFiltersMixin:
                 except Exception: pass
                 try: p.wait(timeout=3)
                 except Exception: pass
+                rt.join(timeout=1.0)
                 return False
             try:
                 p.wait(timeout=poll)
+                rt.join(timeout=2.0)
+                if p.returncode != 0 and err_buf:
+                    self._last_killable_stderr = " | ".join(list(err_buf)[-4:])
                 return p.returncode == 0
             except _api.subprocess.TimeoutExpired:
                 now = _api.time.time()
@@ -417,7 +470,11 @@ class ProcessFiltersMixin:
                 try:
                     if _api.os.path.exists(tmp_out): _api.os.remove(tmp_out)
                 except Exception: pass
-                return None, ("отменено" if _cancelled() else "ошибка пробного кодирования")
+                if _cancelled():
+                    return None, "отменено"
+                detail = getattr(self, '_last_killable_stderr', '') or ''
+                msg = f"ошибка пробного кодирования: {detail}" if detail else "ошибка пробного кодирования"
+                return None, msg
             score = (self._measure_metric(sample_path, tmp_out, metric, ",".join(vf_list or []))
                      if _api.os.path.exists(tmp_out) else None)
             try:
@@ -446,7 +503,8 @@ class ProcessFiltersMixin:
             score, err = _trial(mid)
             tries += 1
             if err is not None:
-                break
+                _cleanup_sample()
+                return None, err
             if score >= target:
                 best_crf, best_info = mid, f"{score:.2f}"
                 lo = mid
@@ -467,6 +525,8 @@ class ProcessFiltersMixin:
         try:
             p = _api.subprocess.Popen(cmd, stderr=_api.subprocess.PIPE, stdout=_api.subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=_api.CREATE_NO_WINDOW | getattr(self, '_priority_flag', 0), startupinfo=si,
                                       stdin=_api.subprocess.PIPE if feeder is not None else None)
+            import process_guard
+            process_guard.assign_to_job(p)
         except Exception as e:
             raise Exception(f"Не удалось запустить ffmpeg: {e}")
         if feeder is not None:
@@ -478,6 +538,20 @@ class ProcessFiltersMixin:
         last_emit_t = 0.0        # когда последний раз слали колбэк
         last_frame = None        # последний разобранный номер кадра ffmpeg
         total_frames = getattr(eta_calc, 'total_frames', 0) if eta_calc is not None else 0
+        line_q = queue.Queue()
+
+        def _stderr_reader():
+            try:
+                for raw_line in iter(p.stderr.readline, ''):
+                    line_q.put(raw_line)
+            except Exception:
+                pass
+            finally:
+                line_q.put(None)
+
+        reader_t = _api.threading.Thread(target=_stderr_reader, daemon=True)
+        reader_t.start()
+        eof = False
         try:
             while True:
                 # cancel_check: файл убрали из очереди во время обработки (см.
@@ -488,11 +562,26 @@ class ProcessFiltersMixin:
                     if feeder is not None:
                         feeder.stop()
                     try:
-                        tail = p.stderr.read() or ""
-                        for L in tail.splitlines(): buf.append(L + "\n")
-                    except Exception: pass
+                        p.wait(timeout=3)
+                    except Exception:
+                        pass
+                    reader_t.join(timeout=1.0)
+                    while not line_q.empty():
+                        try:
+                            rem_ln = line_q.get_nowait()
+                            if rem_ln:
+                                buf.append(rem_ln)
+                        except queue.Empty:
+                            break
                     raise Exception("StoppedByUser")
-                line = p.stderr.readline()
+                try:
+                    line = line_q.get(timeout=0.25)
+                except queue.Empty:
+                    line = ""
+                else:
+                    if line is None:
+                        eof = True
+                        line = ""
                 if line: buf.append(line)
                 now = _api.time.time()
                 elapsed = now - start
@@ -554,13 +643,15 @@ class ProcessFiltersMixin:
                                 pass
                     except Exception:
                         pass
-                if not line and p.poll() is not None: break
+                if eof and p.poll() is not None:
+                    break
         except Exception:
             try: p.kill()
             except Exception: pass
             if feeder is not None:
                 feeder.stop()
             raise
+        reader_t.join(timeout=2.0)
         if feeder is not None:
             feeder.join()
             if feeder.error:
@@ -755,7 +846,11 @@ class ProcessFiltersMixin:
             try:
                 w_str, h_str = res_sel.split('x', 1)
                 w = int(w_str); h = int(h_str)
-                return (f"scale=w='min(iw,{w})':h='min(ih,{h})'"
+                long_s, short_s = max(w, h), min(w, h)
+                # Для вертикального видео (ih > iw) переставляем рамку, чтобы
+                # «1280x720» давал 720×1280, а не 406×720.
+                return (f"scale=w='if(gte(iw,ih),min(iw,{long_s}),min(iw,{short_s}))'"
+                        f":h='if(gte(iw,ih),min(ih,{short_s}),min(ih,{long_s}))'"
                         f":force_original_aspect_ratio=decrease"
                         f":force_divisible_by=2")
             except Exception:
@@ -841,8 +936,15 @@ class ProcessFiltersMixin:
         vf_list += fx_before
 
         if sv.get('crop_black'):
-            crop = self._detect_crop(current_input, item.get('dur') or 0.0,
-                                      start=(trim[0] if trim else 0.0))
+            iid = item.get('iid') if isinstance(item, dict) else None
+            _stop = lambda: bool(getattr(self, 'stop_flag', False)
+                                 or (iid is not None and iid in getattr(self, 'removed_ids', ())))
+            crop = self._detect_crop(
+                current_input, item.get('dur') or 0.0,
+                start=(trim[0] if trim else 0.0),
+                stop_check=_stop)
+            if _stop():
+                raise Exception("StoppedByUser")
             if crop:
                 vf_list.append(f"crop={crop}")
                 self.log.emit(f"✂ Обрезка чёрных полос: crop={crop}")
@@ -1041,6 +1143,9 @@ class ProcessFiltersMixin:
                 try: xpsnr_score = float(info)
                 except (TypeError, ValueError): xpsnr_score = None
             else:
+                iid = item.get('iid') if isinstance(item, dict) else None
+                if getattr(self, 'stop_flag', False) or (iid is not None and iid in getattr(self, 'removed_ids', ())):
+                    raise Exception("StoppedByUser")
                 self.log.emit(f"⚠ подбор CRF не удался: {info} → использован ручной CRF {crf}")
 
         if xpsnr_score is None and self._wants_metric_score(sv):

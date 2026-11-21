@@ -61,17 +61,35 @@ def is_vk_video_url(url: str) -> bool:
     return bool(_RE_VIDEO_PATH.match(path))
 
 
+def _parse_cookie_line(line: str):
+    """Разбирает строку Netscape cookies.txt, включая префикс #HttpOnly_.
+    Возвращает (fields, http_only) или None для комментариев и пустых строк."""
+    raw = line.rstrip("\r\n")
+    if not raw.strip():
+        return None
+    http_only = False
+    if raw.startswith("#HttpOnly_"):
+        http_only = True
+        raw = raw[len("#HttpOnly_"):]
+    elif raw.startswith("#"):
+        return None
+    fields = raw.split("\t")
+    if len(fields) != 7:
+        return None
+    return fields, http_only
+
+
 def has_vk_login(cookies_path: str) -> bool:
     """Есть ли в cookies.txt сессионная кука VK (гостевой файл не подходит)."""
     try:
         with open(cookies_path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                if line.startswith("#") or not line.strip():
+                parsed = _parse_cookie_line(line)
+                if not parsed:
                     continue
-                fields = line.rstrip("\n").split("\t")
-                if len(fields) == 7 and fields[5] in ("remixsid", "remixstid"):
-                    if fields[6].strip():
-                        return True
+                fields, _ = parsed
+                if fields[5] in ("remixsid", "remixstid") and fields[6].strip():
+                    return True
     except Exception:
         return False
     return False
@@ -82,19 +100,22 @@ def _load_cookies(cookies_path: str) -> list:
     out = []
     with open(cookies_path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
-            if line.startswith("#") or not line.strip():
+            parsed = _parse_cookie_line(line)
+            if not parsed:
                 continue
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) != 7:
-                continue
+            fields, http_only = parsed
             domain, _flag, cpath, secure, expires, name, value = fields
+            # В Netscape cookies.txt expires=0 означает сессионную куку;
+            # в Playwright 0 трактуется как истёкшая (1970), для сессионной нужен -1.
+            exp_val = float(expires) if (expires.isdigit() and int(expires) > 0) else -1
             out.append({
                 "name": name,
                 "value": value,
                 "domain": domain,
                 "path": cpath or "/",
                 "secure": secure.upper() == "TRUE",
-                "expires": float(expires) if expires.isdigit() else -1,
+                "httpOnly": http_only,
+                "expires": exp_val,
             })
     return out
 

@@ -8,11 +8,66 @@ from .download_validation import (
 )
 
 
+def _media_summary_from_probe(info: dict, path: str) -> dict:
+    """Извлекает (size, br_str, a_br) из уже выполненного вывода ffprobe —
+    чтобы GUI-поток не запускал ffprobe повторно."""
+    size = 0
+    try:
+        size = _api.os.path.getsize(path)
+    except OSError:
+        size = 0
+    fmt = info.get("format") or {}
+    try:
+        dur = float(fmt.get("duration", 0) or 0)
+    except (ValueError, TypeError):
+        dur = 0.0
+    br_str = "-"
+    a_br = "-"
+    fmt_br = 0
+    try:
+        fmt_br = int(fmt.get("bit_rate", 0) or 0)
+        if fmt_br > 0:
+            br_str = f"{fmt_br // 1000} кбит/с"
+    except (ValueError, TypeError):
+        pass
+    audio_streams = [s for s in (info.get("streams") or [])
+                     if isinstance(s, dict) and s.get("codec_type") == "audio"]
+    if audio_streams:
+        s0 = audio_streams[0]
+        try:
+            abr = int(s0.get("bit_rate", 0) or 0)
+            if abr > 0:
+                a_br = f"{abr // 1000} кбит/с"
+                br_str = a_br
+        except (ValueError, TypeError):
+            pass
+        if a_br == "-":
+            try:
+                sr = int(s0.get("sample_rate", 0) or 0)
+                ch = int(s0.get("channels", 0) or 0)
+                bps = int(s0.get("bits_per_sample", 0) or 0)
+                if sr > 0 and ch > 0 and bps > 0:
+                    a_br = f"{(sr * ch * bps) // 1000} кбит/с"
+                    br_str = a_br
+            except (ValueError, TypeError):
+                pass
+        if a_br == "-" and fmt_br > 0:
+            a_br = f"{fmt_br // 1000} кбит/с"
+            br_str = a_br
+    if br_str == "-" and dur > 0 and size > 0:
+        est = int(size * 8 / dur)
+        br_str = f"{est // 1000} кбит/с"
+        if a_br == "-":
+            a_br = br_str
+    return {"size": size, "br_str": br_str, "a_br": a_br}
+
+
 def probe_download(worker, path, audio_only):
     try:
         result = _api.subprocess.run(
             [_api.FFPROBE, "-v", "error", "-show_entries",
-             "format=duration:stream=codec_type,duration,duration_ts,time_base:"
+             "format=duration,bit_rate:stream=codec_type,duration,duration_ts,time_base,"
+             "bit_rate,sample_rate,channels,bits_per_sample,codec_name:"
              "stream_tags=DURATION:stream_disposition=attached_pic",
              "-of", "json", path],
             stdout=_api.subprocess.PIPE, stderr=_api.subprocess.PIPE,
@@ -34,6 +89,7 @@ def probe_download(worker, path, audio_only):
         info, audio_only=audio_only,
         expect_audio=getattr(worker, "_expected_audio", audio_only),
         duration=expected_duration(source, worker.c.get("start_s"), worker.c.get("end_s")))
+    return _media_summary_from_probe(info, path)
 
 
 def preserve_incomplete(worker, path):
@@ -62,11 +118,6 @@ def verified_download(worker, cmd, iid, audio_only, result):
                 message = failure + "\n" + message
             retryable = is_network_error(message)
         else:
-            if not path or not _api.os.path.isfile(path):
-                # Путь из вывода yt-dlp может не совпасть с реальным (кодировка,
-                # «уже скачано» без @@PATH@@) — ищем свежий файл в папке.
-                path = worker._find_recent_output(
-                    worker.c.get("outdir", ".") or ".") or path
             if failure:
                 message = "Загрузка оборвалась: " + failure
                 retryable = is_network_error(detail + failure)
@@ -78,10 +129,10 @@ def verified_download(worker, cmd, iid, audio_only, result):
                 retryable = True
             else:
                 try:
-                    probe_download(worker, path, audio_only)
+                    media_summary = probe_download(worker, path, audio_only)
                     if not worker.is_running:
                         raise RuntimeError("Загрузка остановлена пользователем")
-                    return path, clean_info
+                    return path, clean_info, media_summary
                 except DownloadValidationError as exc:
                     message, retryable = str(exc), exc.incomplete
                     incomplete = exc.incomplete

@@ -124,8 +124,11 @@ class _ImgRunnable(_api.QRunnable):
     def run(self):
         try:
             self.worker._process_item(self.item, False, self.start)
-        except Exception:
-            pass
+        except Exception as e:
+            try:
+                self.worker.log.emit(f"Внутренняя ошибка потока изображения: {e}")
+            except Exception:
+                pass
 
 _ImgRunnable.__module__ = _api.__name__
 _api._ImgRunnable = _ImgRunnable
@@ -169,6 +172,37 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
         self._out_lock = _api.threading.Lock()
         self._reserved_outs = set()
         self._priority_flag = self._priority_creationflag(settings.get('priority', 'normal'))
+        # Бюджет пикселей для параллельного пула картинок (32 Мп): не даём
+        # нескольким 24+ Мп файлам одновременно занять всю память и ЦП.
+        self._pixel_budget = 32_000_000
+        self._pixel_used = 0
+        self._pixel_cond = _api.threading.Condition()
+        self._img_aom_threads = 0
+
+    def _is_cancelled(self, iid=None) -> bool:
+        return bool(self.stop_flag or (iid is not None and iid in self.removed_ids))
+
+    def _check_cancelled(self, iid=None):
+        if self._is_cancelled(iid):
+            raise Exception("StoppedByUser")
+
+    def _acquire_pixel_budget(self, pixels: int, iid=None) -> int:
+        """Резервирует долю бюджета пикселей (минимум 1 картинка всегда проходит)."""
+        px = max(1, int(pixels or 1))
+        with self._pixel_cond:
+            while self._pixel_used > 0 and self._pixel_used + px > self._pixel_budget:
+                if self._is_cancelled(iid):
+                    raise Exception("StoppedByUser")
+                self._pixel_cond.wait(timeout=0.2)
+            self._pixel_used += px
+        return px
+
+    def _release_pixel_budget(self, pixels: int):
+        if not pixels:
+            return
+        with self._pixel_cond:
+            self._pixel_used = max(0, self._pixel_used - int(pixels))
+            self._pixel_cond.notify_all()
 
     _AI_BRANDS = ('gemini', 'chatgpt')
     _RAND_CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789'
@@ -180,7 +214,13 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
             return ''.join(_api.random.choices(_api.ProcessWorker._RAND_CHARS, k=6))
         return name
 
-    def stop(self): self.stop_flag = True
+    def stop(self):
+        self.stop_flag = True
+        try:
+            with self._pixel_cond:
+                self._pixel_cond.notify_all()
+        except Exception:
+            pass
 
     def measure_loudness(self, path, start=None, dur=None):
         return _api.measure_loudness(path, should_stop=lambda: self.stop_flag, start=start, dur=dur)
@@ -225,7 +265,7 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
 
     @staticmethod
     def _source_has_alpha(path: str) -> bool:
-        """True только если в изображении есть пиксели с реальной прозрачностью."""
+        """True только если в изображении/видео есть реальная прозрачность."""
         ext = _api.os.path.splitext(path)[1].lower()
         if ext in {'.png', '.gif', '.tiff', '.tif', '.webp', '.bmp',
                    '.ico', '.avif', '.heic', '.heif'}:
@@ -236,28 +276,23 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                         if im.mode == 'P' and 'transparency' in im.info:
                             return True
                         # LA / RGBa — всегда с альфой
-                        if im.mode in ('LA', 'RGBa'):
+                        if im.mode in ('LA', 'La', 'PA', 'RGBa'):
                             return True
-                        # RGBA — проверяем реальные пиксели
+                        # RGBA — проверяем реальные пиксели альфа-канала без split()
                         if im.mode == 'RGBA':
-                            r, g, b, a = im.split()
-                            return a.getextrema()[0] < 255  # есть хоть один непрозрачный пиксель
+                            return im.getchannel('A').getextrema()[0] < 255  # есть хоть один прозрачный/полупрозрачный пиксель
                         return False
                 except Exception:
                     pass
-        # Видео — ffprobe
+        # Видео — кэшированный ffprobe + белый список форматов с альфой
+        # (проверка `'a' in fmt` ложно срабатывала на `pal8` и `gray10le/12le/16le`).
         try:
-            p = _api.subprocess.run(
-                [_api.FFPROBE, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=pix_fmt",
-                 "-of", "default=noprint_wrappers=1:nokey=1", path],
-                stdout=_api.subprocess.PIPE, stderr=_api.subprocess.DEVNULL,
-                text=True, encoding="utf-8", errors="replace", creationflags=_api.CREATE_NO_WINDOW,
+            fmt = _api.get_pix_fmt(path)
+            _ALPHA_PREFIXES = (
+                'yuva', 'gbrap', 'rgba', 'bgra', 'argb', 'abgr',
+                'ya8', 'ya16', 'ayuv', 'vuya',
             )
-            fmt = p.stdout.strip().lower()
-            _NO_ALPHA = {'gray', 'grayf32le', 'grayf32be', 'rgb24', 'bgr24',
-                         'rgb48le', 'rgb48be', 'bgr48le', 'bgr48be'}
-            return 'a' in fmt and fmt not in _NO_ALPHA
+            return fmt.startswith(_ALPHA_PREFIXES)
         except Exception:
             return False
 
@@ -275,14 +310,14 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
         обычных SDR-рипов) — то есть только ДОБАВЛЯЕМ то, что и так верно, а не
         переопределяем реально другое цветовое пространство."""
         try:
-            p = _api.subprocess.run(
-                [_api.FFPROBE, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=color_primaries,color_transfer,color_space",
-                 "-of", "default=noprint_wrappers=1:nokey=1", path],
-                stdout=_api.subprocess.PIPE, stderr=_api.subprocess.DEVNULL,
-                text=True, encoding="utf-8", errors="replace", creationflags=_api.CREATE_NO_WINDOW, timeout=15,
-            )
-            vals = [v.strip().lower() for v in (p.stdout or "").splitlines()]
+            streams = _api.probe_media(path).get("streams") or []
+            st = next((s for s in streams if s.get("codec_type") == "video"), None)
+            if not st:
+                return []
+            vals = [
+                str(st.get(k) or "").strip().lower()
+                for k in ("color_primaries", "color_transfer", "color_space")
+            ]
         except Exception:
             return []
         _SAFE = {"", "unknown", "unspecified", "n/a", "bt709", "bt470bg", "smpte170m"}
@@ -719,16 +754,31 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                             self, out_dir, out_name, suffix, ".webm", path,
                             fallback_tag="_out")
                         out = attempted_out
+                        # WebM принимает только Opus/Vorbis: копировать AAC/PCM/MP3
+                        # нельзя — перекодируем в libopus.
+                        if not remove_audio and step2_audio == ["-c:a", "copy"]:
+                            try:
+                                _, _, _, _, src_acodec = _api.get_media_info(current_input)
+                            except Exception:
+                                src_acodec = None
+                            if (src_acodec or "").lower() not in ("opus", "vorbis"):
+                                step2_audio = [
+                                    "-af", self._af_arg([], trim_tail=False),
+                                    "-c:a", audio_codec, "-b:a", audio_bitrate,
+                                ]
+                        vp9_cpu = max(0, min(5, int(sv.get('pre', 2))))
                         cmd_step2 += ["-c:v", "libvpx-vp9",
                                       "-crf", str(crf), "-b:v", "0",
+                                      "-deadline", "good", "-cpu-used", str(vp9_cpu),
+                                      "-row-mt", "1", "-tile-columns", "2",
                                       "-pix_fmt", "yuva420p"]
                     elif has_alpha:
                         self.log.emit("⚠ libvpx-vp9 недоступен — альфа будет потеряна (SVT-AV1 alpha не поддерживает)")
                         cmd_step2 += color_args
-                        cmd_step2 += self._av1_encoder_args(crf, max(0, min(8, sv.get('pre', 8))), self._choose_pix_fmt(False), video_tune)
+                        cmd_step2 += self._av1_encoder_args(crf, max(0, min(13, sv.get('pre', 8))), self._choose_pix_fmt(False), video_tune)
                     else:
                         cmd_step2 += color_args
-                        cmd_step2 += self._av1_encoder_args(crf, max(0, min(8, sv.get('pre', 8))), pix_fmt, video_tune)
+                        cmd_step2 += self._av1_encoder_args(crf, max(0, min(13, sv.get('pre', 8))), pix_fmt, video_tune)
 
                     if vf_arg: cmd_step2 += ["-vf", vf_arg]
                     cmd_step2 += ["-threads", "0"] + step2_audio + dur_cap
@@ -896,21 +946,29 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
                 item['out_path'] = guessed
         except Exception: pass
 
-    def _overwrite_source_if_needed(self, item, out_path):
-        """Если включено «Перезаписывать исходник» — удаляет оригинальный файл,
-        оставляя только сжатую версию. При совпадении путей (тот же формат)
-        файл уже перезаписан на месте — удалять нечего."""
-        av = self.settings.get('avif', {})
-        if not av.get('overwrite_src'):
+    def _overwrite_source_if_needed(self, item, out_path, overwrite_src=None):
+        """Если при старте файла было включено «Перезаписывать исходник» —
+        отправляет оригинальный файл в Корзину, предварительно проверив, что
+        результат существует и не пуст. При совпадении путей (тот же формат)
+        файл уже безопасно подменён через os.replace — удалять нечего."""
+        if item.get('_skipped_anim'):
+            return
+        if overwrite_src is None:
+            overwrite_src = bool(self.settings.get('avif', {}).get('overwrite_src'))
+        if not overwrite_src:
             return
         src = item.get('path')
         if not (out_path and src):
             return
         try:
-            if (_api.os.path.exists(out_path) and _api.os.path.exists(src)
+            if (_api.os.path.exists(out_path)
+                    and _api.os.path.getsize(out_path) > 0
+                    and _api.os.path.exists(src)
                     and not _same_path(out_path, src)):
-                _api.os.remove(src)
-                self.log.emit(f"Исходник удалён (перезапись): {_api.os.path.basename(src)}")
+                if _api.move_to_trash(src):
+                    self.log.emit(f"Исходник отправлен в Корзину (перезапись): {_api.os.path.basename(src)}")
+                else:
+                    self.log.emit(f"⚠ Не удалось отправить исходник в Корзину (файл сохранён): {_api.os.path.basename(src)}")
         except Exception as e:
             self.log.emit(f"Не удалось удалить исходник: {e}")
 
@@ -949,9 +1007,13 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
         завершения (изображения идут параллельно через QThreadPool).
         weight — вклад в счётчик «занятых потоков ЦП»: видео = все ядра
         (один ffmpeg/SVT-AV1 грузит весь ЦП), изображение = 1."""
-        if self.stop_flag:
-            return
         iid = item['iid']; path = item['path']
+        if self.stop_flag or iid in getattr(self, 'removed_ids', ()):
+            return
+        # Снимок флага «Перезаписывать исходник» на момент старта файла, чтобы
+        # переключение галочки во время обработки не затронуло уже запущенные файлы.
+        overwrite_snapshot = bool(self.settings.get('avif', {}).get('overwrite_src'))
+        item['_overwrite_src'] = overwrite_snapshot
         self.status.emit(iid, "Обработка.", "proc")
         self._inc_active(weight)
         max_frac_seen = [0.0]
@@ -1005,7 +1067,7 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
             out_path = None
             if item.get('type') == 'IMG':
                 out_path = self.process_avif(item, item_prog)
-                self._overwrite_source_if_needed(item, out_path)
+                self._overwrite_source_if_needed(item, out_path, overwrite_src=overwrite_snapshot)
             elif item.get('project'):
                 # Проект «Монтажа»: склейка и «Обработка» одним кодированием.
                 out_path = self.process_project(item, item_prog)
@@ -1052,76 +1114,90 @@ class ProcessWorker(ProcessFiltersMixin, ProcessImagesMixin, ProcessProjectMixin
         self._logged_cpu_msg = False
 
         cpu = max(1, _api.cpu_thread_count())
+        img_workers = max(1, min(cpu, max(2, cpu // 2), 6))
+        self._img_aom_threads = max(1, cpu // img_workers)
 
-        # Обрабатываем очередь по схеме «продюсер-потребитель»: постоянно
-        # заглядываем в живой список self.queue, поэтому файлы, доброшенные во
-        # время обработки, тут же уходят в работу. Картинки кодируются параллельно
-        # в ОБЩЕМ пуле (cpu потоков) и НЕ блокируют диспетчеризацию через
-        # waitForDone — доброшенные картинки сразу занимают свободные потоки
-        # (просьба пользователя), не дожидаясь конца текущей пачки.
-        while not self.stop_flag:
-            pending = [it for it in list(self.queue)
-                       if not it.get('is_done', False)
-                       and it.get('iid') not in self._processed_ids]
-            images = [it for it in pending if it.get('type') == 'IMG']
-            others = [it for it in pending if it.get('type') != 'IMG']
+        try:
+            # Обрабатываем очередь по схеме «продюсер-потребитель»: постоянно
+            # заглядываем в живой список self.queue, поэтому файлы, доброшенные во
+            # время обработки, тут же уходят в работу. Картинки кодируются параллельно
+            # в ОБЩЕМ пуле (с ограничением потоков и бюджетом пикселей) и НЕ блокируют
+            # диспетчеризацию через waitForDone — доброшенные картинки сразу занимают
+            # свободные потоки, не дожидаясь конца текущей пачки.
+            while not self.stop_flag:
+                pending = [it for it in list(self.queue)
+                           if not it.get('is_done', False)
+                           and it.get('iid') not in self._processed_ids
+                           and it.get('iid') not in self.removed_ids]
+                images = [it for it in pending if it.get('type') == 'IMG']
+                others = [it for it in pending if it.get('type') != 'IMG']
 
-            # Видео/аудио идут по одному файлу, но кодировщик SVT-AV1 сам нагружает
-            # ВСЕ логические ядра ЦП → счётчик показывает занятые потоки ЦП. Перед
-            # видео дожидаемся ранее запущенных картинок, иначе они дрались бы за ЦП.
-            if others:
+                # Видео/аудио идут по одному файлу, но кодировщик SVT-AV1 сам нагружает
+                # ВСЕ логические ядра ЦП → счётчик показывает занятые потоки ЦП. Перед
+                # видео дожидаемся ранее запущенных картинок, иначе они дрались бы за ЦП.
+                if others:
+                    if (self._img_pool is not None
+                            and self._img_pool.activeThreadCount() > 0):
+                        self._img_pool.waitForDone()
+                    self._max_threads = cpu
+                    if not self._logged_cpu_msg:
+                        self.log.emit("Кодирование видео/аудио: SVT-AV1.")
+                        self._logged_cpu_msg = True
+                    for it in others:
+                        if self.stop_flag:
+                            break
+                        if it.get('iid') in self.removed_ids:
+                            continue
+                        self._processed_ids.add(it.get('iid'))
+                        self._process_item(it, True, start, weight=cpu)
+                    continue
+
+                if images:
+                    if self._img_pool is None:
+                        self._img_pool = _api.QThreadPool()
+                        self._img_pool.setMaxThreadCount(img_workers)
+                        if img_workers > 1:
+                            self.log.emit(
+                                f"Параллельная обработка изображений: до {img_workers} задач "
+                                f"({self._img_aom_threads} потоков на задачу)")
+                    self._max_threads = img_workers
+                    for itm in images:
+                        if self.stop_flag:
+                            break
+                        if itm.get('iid') in self.removed_ids:
+                            continue
+                        self._processed_ids.add(itm.get('iid'))
+                        self._img_pool.start(_api._ImgRunnable(self, itm, start))
+                    # НЕ ждём waitForDone — короткая пауза, чтобы подхватить доброшенные
+                    # файлы и занять ими свободные потоки, не крутя цикл вхолостую.
+                    _api.time.sleep(0.08)
+                    continue
+
+                # Новых задач нет. Если картинки ещё кодируются — ждём и снова
+                # перечитываем очередь (вдруг доросли новые); иначе очередь пуста.
                 if (self._img_pool is not None
                         and self._img_pool.activeThreadCount() > 0):
+                    _api.time.sleep(0.1)
+                    continue
+                break
+        except Exception as e:
+            self.log.emit(f"Критическая ошибка диспетчера обработки: {e}")
+        finally:
+            if self._img_pool is not None:
+                try:
                     self._img_pool.waitForDone()
-                self._max_threads = cpu
-                if not self._logged_cpu_msg:
-                    self.log.emit("Кодирование видео/аудио: SVT-AV1.")
-                    self._logged_cpu_msg = True
-                for it in others:
-                    if self.stop_flag:
-                        break
-                    self._processed_ids.add(it.get('iid'))
-                    self._process_item(it, True, start, weight=cpu)
-                continue
+                except Exception:
+                    pass
+            if self._meta_lama:
+                try:
+                    self._meta_lama.unload()
+                except Exception:
+                    pass
+            self._meta_lama = None
 
-            if images:
-                # Одиночный кадр CPU не насыщает → шлём картинки в общий пул на cpu
-                # потоков. Знаменатель счётчика — всегда ВСЕ логические потоки ЦП
-                # машины (cpu), чтобы «занято/всего» не скакало по ходу обработки.
-                if self._img_pool is None:
-                    self._img_pool = _api.QThreadPool()
-                    self._img_pool.setMaxThreadCount(cpu)
-                    if cpu > 1:
-                        self.log.emit(
-                            f"Параллельная обработка изображений: до {cpu} потоков")
-                self._max_threads = cpu
-                for itm in images:
-                    if self.stop_flag:
-                        break
-                    self._processed_ids.add(itm.get('iid'))
-                    self._img_pool.start(_api._ImgRunnable(self, itm, start))
-                # НЕ ждём waitForDone — короткая пауза, чтобы подхватить доброшенные
-                # файлы и занять ими свободные потоки, не крутя цикл вхолостую.
-                _api.time.sleep(0.08)
-                continue
-
-            # Новых задач нет. Если картинки ещё кодируются — ждём и снова
-            # перечитываем очередь (вдруг доросли новые); иначе очередь пуста.
-            if (self._img_pool is not None
-                    and self._img_pool.activeThreadCount() > 0):
-                _api.time.sleep(0.1)
-                continue
-            break
-
-        if self._img_pool is not None:
-            self._img_pool.waitForDone()
-        if self._meta_lama:
-            self._meta_lama.unload()
-        self._meta_lama = None
-
-        self.active_threads.emit(0, 0)
-        self.finished_all.emit()
-        self.global_progress.emit(100, "Готово")
+            self.active_threads.emit(0, 0)
+            self.finished_all.emit()
+            self.global_progress.emit(100, "Остановлено" if self.stop_flag else "Готово")
 
 
 ProcessWorker.__module__ = _api.__name__

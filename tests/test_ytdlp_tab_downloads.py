@@ -13,7 +13,7 @@ class FakeWorker(QObject):
     finished = pyqtSignal()
     log_sig = pyqtSignal(str)
     progress_sig = pyqtSignal(str, float, str)
-    finished_sig = pyqtSignal(str, str, str, str)
+    finished_sig = pyqtSignal(str, str, str, str, object)
     error_sig = pyqtSignal(str, str)
     thumb_sig = pyqtSignal(str, str)
 
@@ -42,9 +42,11 @@ class FakeInfoWorker(QObject):
     success = pyqtSignal(int, str, list, list)
     error = pyqtSignal(str)
 
-    def __init__(self, url, proxy=""):
+    def __init__(self, url, proxy="", cookie_path=""):
         super().__init__()
         self.url = url
+        self.proxy = proxy
+        self.cookie_path = cookie_path
         self.cancelled = False
         self.running = False
 

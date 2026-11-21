@@ -122,18 +122,21 @@ class TestGetMediaInfo:
 # ── get_fps_float / get_video_codec ──────────────────────────────────────────
 class TestFpsCodec:
     def test_fps_fraction(self, monkeypatch):
+        data = {"streams": [{"codec_type": "video", "r_frame_rate": "30000/1001"}]}
         monkeypatch.setattr(utils.subprocess, "run",
-                            lambda *a, **k: _Proc(stdout="30000/1001\n"))
+                            lambda *a, **k: _Proc(stdout=json.dumps(data)))
         assert utils.get_fps_float("v.mp4") == pytest.approx(29.97, abs=0.01)
 
     def test_fps_plain(self, monkeypatch):
+        data = {"streams": [{"codec_type": "video", "r_frame_rate": "25"}]}
         monkeypatch.setattr(utils.subprocess, "run",
-                            lambda *a, **k: _Proc(stdout="25\n"))
+                            lambda *a, **k: _Proc(stdout=json.dumps(data)))
         assert utils.get_fps_float("v.mp4") == 25.0
 
     def test_fps_zero_denominator(self, monkeypatch):
+        data = {"streams": [{"codec_type": "video", "r_frame_rate": "0/0"}]}
         monkeypatch.setattr(utils.subprocess, "run",
-                            lambda *a, **k: _Proc(stdout="0/0"))
+                            lambda *a, **k: _Proc(stdout=json.dumps(data)))
         assert utils.get_fps_float("v.mp4") == 0.0
 
     def test_fps_error(self, monkeypatch):
@@ -143,18 +146,20 @@ class TestFpsCodec:
         assert utils.get_fps_float("v.mp4") == 0.0
 
     def test_codec(self, monkeypatch):
+        data = {"streams": [{"codec_type": "video", "codec_name": "H264"}]}
         monkeypatch.setattr(utils.subprocess, "run",
-                            lambda *a, **k: _Proc(stdout="H264\n"))
+                            lambda *a, **k: _Proc(stdout=json.dumps(data)))
         assert utils.get_video_codec("v.mp4") == "h264"
 
     def test_codec_empty(self, monkeypatch):
         monkeypatch.setattr(utils.subprocess, "run",
-                            lambda *a, **k: _Proc(stdout="\n"))
+                            lambda *a, **k: _Proc(stdout="{}"))
         assert utils.get_video_codec("v.mp4") is None
 
     def test_codec_label_combined(self, monkeypatch):
+        data = {"streams": [{"codec_type": "video", "codec_name": "av1"}]}
         monkeypatch.setattr(utils.subprocess, "run",
-                            lambda *a, **k: _Proc(stdout="av1\n"))
+                            lambda *a, **k: _Proc(stdout=json.dumps(data)))
         assert utils.get_video_codec_label("v.mp4") == "AV1"
 
     def test_codec_label_none(self, monkeypatch):

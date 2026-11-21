@@ -199,18 +199,23 @@ class UnifiedWindowSettingsMixin:
                     # ── /download — скачать видео/аудио ──────────────────────
                     url = (data.get("url") or "").strip()
                     audio = bool(data.get("audio", False))
-                    if url:
+                    if not url:
+                        self.send_response(400)
+                        self._send_cors()
+                        self.end_headers()
+                        self.wfile.write(b'{"ok":false,"error":"empty url"}')
+                    elif not _api.re.match(r'^https?://\S+', url, _api.re.I):
+                        self.send_response(400)
+                        self._send_cors()
+                        self.end_headers()
+                        self.wfile.write(b'{"ok":false,"error":"only http(s) urls allowed"}')
+                    else:
                         win.url_from_browser.emit(url, audio)
                         self.send_response(200)
                         self._send_cors()
                         self.send_header("Content-Type", "application/json")
                         self.end_headers()
                         self.wfile.write(b'{"ok":true}')
-                    else:
-                        self.send_response(400)
-                        self._send_cors()
-                        self.end_headers()
-                        self.wfile.write(b'{"ok":false,"error":"empty url"}')
                 except Exception as ex:
                     try:
                         self.send_response(500)
@@ -1001,7 +1006,7 @@ class UnifiedWindowSettingsMixin:
                 tm.ck_norm, tm.ck_fade, tm.ck_fade_in, tm.ck_deg, tm.ck_u8,
                 tm.chk_enable_video, tm.btn_mode_dark,
                 tm.ck_overwrite_src, tm.ck_gemini_wm,
-                tm.ck_lim, tm.ck_dim,
+                tm.ck_lim, tm.ck_dim, tm.ck_width, tm.ck_height,
                 tm.ck_vfade_in, tm.ck_vfade_out, tm.ck_crop_black,
                 ty.chk_k,
             ]
@@ -1010,12 +1015,12 @@ class UnifiedWindowSettingsMixin:
                 tm.s_tgt, tm.s_lra, tm.s_tp, tm.s_fade, tm.s_fade_in,
                 tm.s_hz, tm.s_lp, tm.s_hp, tm.s_deg_gain,
                 tm.s_spd, tm.s_crf, tm.s_pre,
-                tm.s_lim, tm.s_dim, tm.sl_aspd, tm.s_cq, tm.s_passes,
+                tm.s_lim, tm.s_dim, tm.s_width, tm.s_height, tm.sl_aspd, tm.s_cq, tm.s_passes,
                 tm.s_vfade_in, tm.s_vfade_out,
             ]
             # Виджеты с сигналом currentTextChanged (QComboBox)
             combo_widgets = [
-                tm.c_abitrate, tm.c_res, tm.c_fps, tm.c_tune, tm.c_img_fmt, tm.c_priority,
+                tm.c_abitrate, tm.c_res, tm.c_fps, tm.c_tune, tm.c_img_fmt, tm.c_chroma, tm.c_priority,
                 ty.c_q, ty.c_c, ty.c_s, ty.c_a,
             ]
             # Виджет с сигналом textChanged (QLineEdit)

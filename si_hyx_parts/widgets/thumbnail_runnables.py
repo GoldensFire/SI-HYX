@@ -57,8 +57,8 @@ class RemoteThumbnailRunnable(_api.QRunnable):
         super().__init__(); self.url = url; self.iid = iid; self.signal = signal
     def run(self):
         if not self.url: return
+        tmp = _api.os.path.join(_api.TEMP_DIR, f"yt_thumb_{self.iid}.tmp")
         try:
-            tmp = _api.os.path.join(_api.TEMP_DIR, f"yt_thumb_{self.iid}.tmp")
             with _api.http_get(self.url, headers={'User-Agent': _api.USER_AGENT}, timeout=20) as r, open(tmp, 'wb') as f:
                 f.write(r.read())
 
@@ -72,9 +72,14 @@ class RemoteThumbnailRunnable(_api.QRunnable):
                     data = f.read()
                 pix = _api.QPixmap()
                 if pix.loadFromData(data): self.signal.emit(self.iid, _api.QIcon(pix))
-            try: _api.os.remove(tmp)
-            except Exception: pass
-        except Exception: pass
+        except Exception:
+            pass
+        finally:
+            try:
+                if _api.os.path.exists(tmp):
+                    _api.os.remove(tmp)
+            except Exception:
+                pass
 
 RemoteThumbnailRunnable.__module__ = _api.__name__
 _api.RemoteThumbnailRunnable = RemoteThumbnailRunnable

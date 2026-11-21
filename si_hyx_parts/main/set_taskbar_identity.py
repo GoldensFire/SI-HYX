@@ -157,6 +157,9 @@ def main():
     if _api.APP_ICON:
         app.setWindowIcon(_api.QIcon(_api.APP_ICON))
 
+    import process_guard
+    process_guard.start_stale_temp_cleanup()
+
     w = _api.UnifiedWindow()
 
     # Если файлы переданы аргументами и IPC не сработал — добавляем напрямую

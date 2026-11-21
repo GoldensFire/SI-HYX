@@ -123,32 +123,41 @@ def _search(template, high, x0, y0):
     return best
 
 
-def find_watermark(rgb, hint=False):
+def find_watermark(rgb, hint=False, search_all=False):
     """Ищет вотермарку Meta AI на картинке rgb (H×W×3/4, uint8).
 
     hint=True — имя файла уже говорит, что это Meta AI: порог чуть мягче.
+    search_all=True — искать по всему переданному фрагменту (когда вызывающий
+    уже вырезал правый нижний угол).
     Возвращает словарь {x, y, w, h, score, scale} или None."""
     if cv2 is None or rgb is None or rgb.ndim != 3 or min(rgb.shape[:2]) < 120:
         return None
-    img = rgb[..., :3]
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    h, w = rgb.shape[:2]
+    # Знак стоит у правого нижнего угла; область с запасом под масштаб.
+    if search_all:
+        x0, y0 = 0, 0
+    else:
+        x0 = max(0, w - max(400, int(w * 0.45)))
+        y0 = max(0, h - max(120, int(h * 0.28)))
+    # Считаем medianBlur только по области поиска (+16 px запас под ядро 31×31),
+    # не обрабатывая всю картинку целиком.
+    pad = 16
+    rx0, ry0 = max(0, x0 - pad), max(0, y0 - pad)
+    roi = rgb[ry0:, rx0:, :3]
+    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY).astype(np.float32)
     # Светлый знак на фоне: убираем плавную яркость, оставляем локальный подъём.
     # Белое наложение поднимает яркость на α·(255 − фон): на белой ткани это
     # единицы, на тёмной коже — сотни, и знак наполовину на светлом не
     # совпадал с эталоном (0.46). Доля подъёма до белого ≈ α на любом фоне.
     bg = cv2.medianBlur(gray.astype(np.uint8), 31).astype(np.float32)
     high = np.clip((gray - bg) / np.maximum(255.0 - bg, 24.0), 0.0, 1.0)
-    h, w = gray.shape[:2]
-    # Знак стоит у правого нижнего угла; область с запасом под масштаб.
-    x0 = max(0, w - max(400, int(w * 0.45)))
-    y0 = max(0, h - max(120, int(h * 0.28)))
-    best = _search(_template(), high, x0, y0)
+    best = _search(_template(), high, x0 - rx0, y0 - ry0)
     if best is None:
         return None
-    score, scale, x, y, tw, th = best
+    score, scale, lx, ly, tw, th = best
     if score < (_SCORE_MIN_HINT if hint else _SCORE_MIN):
         return None
-    return {'x': int(x), 'y': int(y), 'w': int(tw), 'h': int(th),
+    return {'x': int(lx + rx0), 'y': int(ly + ry0), 'w': int(tw), 'h': int(th),
             'score': score, 'scale': scale}
 
 

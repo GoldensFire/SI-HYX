@@ -168,7 +168,7 @@ class DraggableTreeWidget(_api.QTreeWidget):
 
         urls = []
         for item in items:
-            path = item.toolTip(0)  # tooltip хранит полный путь
+            path = item.data(0, _api.ITEM_PATH_ROLE) or item.toolTip(0)
             if path and _api.os.path.isfile(path):
                 urls.append(QUrl.fromLocalFile(path))
 

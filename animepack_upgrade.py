@@ -84,8 +84,8 @@ from animepack import (CREATE_NO_WINDOW, FFMPEG, FFPROBE, IMAGE_FIT_PASSES,
 # Общая с генератором кладовая обложек: постер, скачанный там, здесь уже не
 # качается (и наоборот), а запасной источник — TMDB — у них один на двоих.
 import poster_cache
-# Лёгкая маскировка HTML под VK — та же, что во вкладке Base64.
-from utils import mask_html_js_lite
+# Маскировка HTML под VK (обычный и лёгкий режимы) — та же, что во вкладке Base64.
+from utils import mask_html_js, mask_html_js_lite
 
 # Имена файла content.xml, какие встречаются в живых паках.
 _CONTENT_CANDIDATES = ("content.xml", "Content.xml")

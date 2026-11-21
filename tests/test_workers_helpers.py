@@ -286,11 +286,18 @@ class TestBt709ColorArgs:
 
     def _mock_probe(self, monkeypatch, stdout_lines):
         calls = []
+        vals = list(stdout_lines) + ["", "", ""]
+        stream = {
+            "codec_type": "video",
+            "color_primaries": vals[0],
+            "color_transfer": vals[1],
+            "color_space": vals[2],
+        }
 
-        def fake_run(cmd, **kw):
-            calls.append(cmd)
-            return _FakeProbeResult("\n".join(stdout_lines))
-        monkeypatch.setattr(workers.subprocess, "run", fake_run)
+        def fake_probe(path):
+            calls.append(path)
+            return {"streams": [stream]}
+        monkeypatch.setattr(workers, "probe_media", fake_probe)
         return calls
 
     def test_untagged_source_gets_bt709(self, monkeypatch):
@@ -323,9 +330,9 @@ class TestBt709ColorArgs:
         assert args == []
 
     def test_probe_failure_returns_empty(self, monkeypatch):
-        def boom(cmd, **kw):
+        def boom(path):
             raise OSError("no ffprobe")
-        monkeypatch.setattr(workers.subprocess, "run", boom)
+        monkeypatch.setattr(workers, "probe_media", boom)
         assert ProcessWorker._bt709_color_args("x.mp4") == []
 
 class TestMeasureAtCrf:
@@ -744,7 +751,8 @@ class TestScaleVf:
 
     def test_wxh_builds_fitted_scale(self):
         vf = ProcessWorker._scale_vf("1280x720")
-        assert vf == ("scale=w='min(iw,1280)':h='min(ih,720)'"
+        assert vf == ("scale=w='if(gte(iw,ih),min(iw,1280),min(iw,720))'"
+                      ":h='if(gte(iw,ih),min(ih,720),min(ih,1280))'"
                       ":force_original_aspect_ratio=decrease:force_divisible_by=2")
 
     def test_bad_wxh_falls_back(self):

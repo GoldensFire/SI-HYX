@@ -25,7 +25,7 @@ from pathlib import Path
 from config import (
     ALLOWED_AUDIO, ALLOWED_IMG, ALLOWED_MEDIA, AUDIO_BITRATES,
     CREATE_NO_WINDOW, DEFAULT_TAG, FFMPEG, FORMAT_OPTIONS, IS_WIN,
-    ITEM_AUDIO_ROLE, ITEM_COMPARE_ROLE, ITEM_STATUS_ROLE, Image, ImageOps,
+    ITEM_AUDIO_ROLE, ITEM_COMPARE_ROLE, ITEM_PATH_ROLE, ITEM_STATUS_ROLE, Image, ImageOps,
     MERGE_OPTIONS, QAbstractItemView, QAbstractSpinBox, QAction,
     QApplication, QByteArray, QCheckBox, QComboBox, QDoubleSpinBox,
     QFileDialog, QFont, QFormLayout, QFrame, QGroupBox, QHBoxLayout,

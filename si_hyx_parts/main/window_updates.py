@@ -39,7 +39,10 @@ class UnifiedWindowUpdatesMixin:
                 for ln in (p.stdout or "").splitlines():
                     if ln.strip():
                         self.log_signal.emit(ln.strip())
-                self.log_signal.emit("Готово (обновление yt-dlp).")
+                if p.returncode == 0:
+                    self.log_signal.emit("Готово (обновление yt-dlp).")
+                else:
+                    self.log_signal.emit(f"Ошибка обновления yt-dlp (код {p.returncode}).")
             except Exception as e:
                 self.log_signal.emit(f"Ошибка обновления yt-dlp: {e}")
 

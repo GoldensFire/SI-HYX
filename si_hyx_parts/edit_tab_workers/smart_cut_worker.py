@@ -57,6 +57,8 @@ class SmartCutWorker(_api.QThread):
             p = _api.subprocess.Popen(cmd, stdout=_api.subprocess.DEVNULL,
                                  stderr=_api.subprocess.DEVNULL,
                                  creationflags=_api.CREATE_NO_WINDOW)
+            import process_guard
+            process_guard.assign_to_job(p)
         except Exception:
             return 1
         self._procs.append(p)

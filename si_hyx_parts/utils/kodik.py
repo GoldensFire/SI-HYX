@@ -28,8 +28,26 @@ _api._kodik_decode = _kodik_decode
 def is_embed_candidate(url: str) -> bool:
     """True, если для URL имеет смысл пробовать Kodik-резолвер
     (это http(s)-страница не из списка напрямую поддерживаемых сайтов)."""
-    u = (url or "").lower()
-    return u.startswith("http") and not any(d in u for d in _api.KNOWN_DIRECT_SITES)
+    from urllib.parse import urlsplit
+    raw = (url or "").strip()
+    if not raw:
+        return False
+    try:
+        pu = urlsplit(raw)
+    except Exception:
+        return False
+    if pu.scheme.lower() not in ("http", "https"):
+        return False
+    host = (pu.hostname or "").lower()
+    if not host:
+        return False
+    exact_domains = [d for d in _api.KNOWN_DIRECT_SITES if not d.endswith(".")]
+    if exact_domains and _api.host_matches(raw, *exact_domains):
+        return False
+    for prefix in _api.KNOWN_DIRECT_SITES:
+        if prefix.endswith(".") and (host.startswith(prefix) or ("." + prefix) in host):
+            return False
+    return True
 
 is_embed_candidate.__module__ = _api.__name__
 _api.is_embed_candidate = is_embed_candidate
@@ -129,7 +147,8 @@ _api._selected_option = _selected_option
 # ──────────────────────────────────────────────────────────────────────────
 def _is_animego(url: str) -> bool:
     """True для animego.* (animego.me/.org/.online/.one и т.п.)."""
-    return 'animego.' in (url or '').lower()
+    host = _api.url_host(url or '')
+    return host.startswith('animego.') or '.animego.' in host
 
 _is_animego.__module__ = _api.__name__
 _api._is_animego = _is_animego
@@ -242,16 +261,23 @@ def _animego_resolve_kodik_url(page_url: str, episode=None, translation: str = "
         return ""
     base = _api._animego_base(page_url)
     eps, players = _api._animego_parse(_api._animego_player_content(s, base, aid, page_url))
-    if episode and eps:
+    if episode is not None:
         try:
             epn = int(episode)
         except Exception:
             epn = None
-        if epn and epn in eps:
-            c2 = _api._animego_player_content(s, base, aid, page_url, episode_dataid=eps[epn])
-            if c2:
-                _, players = _api._animego_parse(c2)
-                if log_fn: log_fn(f"animego: серия {epn}")
+        if not eps or not epn or epn not in eps:
+            if log_fn:
+                avail = f"{min(eps)}–{max(eps)}" if eps else "нет"
+                log_fn(f"animego: серия {episode} не найдена (доступно: {avail}).")
+            return ""
+        c2 = _api._animego_player_content(s, base, aid, page_url, episode_dataid=eps[epn])
+        if not c2:
+            if log_fn:
+                log_fn(f"animego: не удалось загрузить плеер для серии {epn}.")
+            return ""
+        _, players = _api._animego_parse(c2)
+        if log_fn: log_fn(f"animego: серия {epn}")
     kod = _api._animego_kodik_players(players)
     if not kod:
         if log_fn: log_fn("animego: для этой серии нет Kodik-плеера (доступен только AniBoom/др. — они не поддержаны).")
@@ -442,7 +468,7 @@ def resolve_kodik(page_url: str, want_height: int = 720, proxy: str = "",
 
     heights = sorted(qmap)
     fitting = [hh for hh in heights if hh <= want_height]
-    chosen = max(fitting) if fitting else max(heights)
+    chosen = max(fitting) if fitting else min(heights)
     if log_fn:
         log_fn(f"Kodik: качества {heights}, выбрано {chosen}p")
     return {"url": qmap[chosen], "referer": referer, "height": chosen}

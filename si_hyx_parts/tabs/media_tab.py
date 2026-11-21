@@ -335,7 +335,12 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
 
     def open_file_location(self, item):
         try:
-            path = item.toolTip(0) or item.data(0, _api.Qt.ItemDataRole.ToolTipRole)
+            iid = item.data(0, _api.Qt.ItemDataRole.UserRole)
+            entry = self._item_data_map.get(iid, {})
+            path = (item.data(0, _api.ITEM_PATH_ROLE)
+                    or entry.get('path')
+                    or item.toolTip(0)
+                    or item.data(0, _api.Qt.ItemDataRole.ToolTipRole))
             if not path: return
             from utils import reveal_in_explorer
             reveal_in_explorer(path)
@@ -379,9 +384,26 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
             _api.os.path.normcase(_api.os.path.abspath(it['path']))
             for it in self.items if it.get('path')
         }
+        # Раскрываем папки рекурсивно, сохраняя порядок обхода.
+        expanded = []
         for p in paths:
             try:
-                if not _api.os.path.exists(p): continue
+                if _api.os.path.isdir(p):
+                    for root, _dirs, files in _api.os.walk(p):
+                        for fn in sorted(files):
+                            expanded.append(_api.os.path.join(root, fn))
+                else:
+                    expanded.append(p)
+            except Exception as e:
+                self.main.log(f"add_paths walk error: {e}")
+
+        added = []
+        skipped_ext = 0
+        skipped_done = 0
+
+        for p in expanded:
+            try:
+                if not _api.os.path.isfile(p): continue
 
                 norm_p = _api.os.path.normcase(_api.os.path.abspath(p))
                 if norm_p in existing:
@@ -390,13 +412,17 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
                 # Не добавляем файлы, которые сами являются результатом обработки
                 stem = _api.Path(p).stem
                 if stem.endswith("_Сжатый") or stem.endswith("_Compressed"):
+                    skipped_done += 1
                     continue
 
                 ext = _api.Path(p).suffix.lower()
                 if ext in _api.ALLOWED_MEDIA: ft = "MEDIA"
                 elif ext in _api.ALLOWED_IMG: ft = "IMG"
-                else: continue
+                else:
+                    skipped_ext += 1
+                    continue
                 existing.add(norm_p)
+                added.append(p)
 
                 iid = _api.uuid.uuid4().hex
                 # Только быстрый getsize — ffprobe уйдёт в фоновый поток
@@ -411,10 +437,9 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
                 name = _api.os.path.basename(p)
                 # Колонка 0 (Превью): миниатюра + имя файла под ней (рисует
                 # PreviewNameDelegate, длинное имя обрезается многоточием).
-                # Полное имя — в тултипе.
+                # Полный путь хранится отдельно в ITEM_PATH_ROLE (не в tooltip).
                 it.setText(0, name)
-                # Тултип превью — только путь; полное имя показывается при
-                # наведении на строку имени под превью (см. DraggableTreeWidget).
+                it.setData(0, _api.ITEM_PATH_ROLE, p)
                 it.setToolTip(0, p)
                 # Колонка 1: метки Было/Стало. 2 строки [было, стало] —
                 # центрируются по высоте строки как имя файла и статус (пустая
@@ -475,6 +500,15 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
 
             except Exception as e:
                 self.main.log(f"add_paths error: {e}")
+
+        if skipped_ext or skipped_done:
+            reasons = []
+            if skipped_ext:
+                reasons.append(f"неподдерживаемый формат: {skipped_ext}")
+            if skipped_done:
+                reasons.append(f"уже обработаны (_Сжатый/_Compressed): {skipped_done}")
+            self.main.log(f"Пропущено файлов — {', '.join(reasons)}")
+        return added
 
     def set_thumb(self, iid, icon):
         try:
@@ -539,7 +573,8 @@ class MediaTab(MediaTabSettingsMixin, _api.QWidget):
                 is_video = entry and entry.get('type') == 'MEDIA' and _api.Path(entry.get('path', '')).suffix.lower() not in _api.ALLOWED_AUDIO
                 if entry and (entry.get('type') == 'IMG' or is_video):
                     item.setData(0, _api.ITEM_COMPARE_ROLE, True)
-                    item.setToolTip(0, (item.toolTip(0) or "")
+                    base_tip = entry.get('path') or item.data(0, _api.ITEM_PATH_ROLE) or ""
+                    item.setToolTip(0, base_tip
                                     + "\n\nЗначок в углу превью — сравнить исходник и результат.")
                 self.tree.viewport().update()
         except Exception: pass

@@ -156,7 +156,7 @@ def run_ffprobe(path):
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, check=True,
                                encoding="utf-8", errors="replace",
-                               creationflags=CREATE_NO_WINDOW)
+                               creationflags=CREATE_NO_WINDOW, timeout=20)
         except Exception:
             return None
         text = p.stdout

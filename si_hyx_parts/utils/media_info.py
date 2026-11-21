@@ -2,7 +2,82 @@
 # SI-HYX — Copyright (C) 2026 GoldensFire; GNU GPL v3 or later.
 # See LICENSE and the public module for attribution and API.
 """Сведения о медиа: ffprobe, кодеки, fps, битрейт и размер. Public namespace: utils."""
+from collections import OrderedDict
+import threading
+
 import utils as _api
+
+_PROBE_CACHE_MAX = 256
+_PROBE_CACHE: OrderedDict = OrderedDict()
+_PROBE_CACHE_LOCK = threading.Lock()
+
+
+def _probe_cache_key(path):
+    """Ключ кэша ffprobe: (нормализованный путь, mtime_ns, размер) или None."""
+    try:
+        st = _api.os.stat(path)
+        return (_api.os.path.normcase(_api.os.path.abspath(str(path))),
+                st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def probe_media(path):
+    """Один вызов ffprobe (-show_streams -show_format -of json) с кэшем по
+    (path, mtime, size). Возвращает словарь JSON или {} при ошибке."""
+    if not path:
+        return {}
+    key = _probe_cache_key(path)
+    if key is not None:
+        with _PROBE_CACHE_LOCK:
+            cached = _PROBE_CACHE.get(key)
+            if cached is not None:
+                _PROBE_CACHE.move_to_end(key)
+                return cached
+    try:
+        p = _api.subprocess.run(
+            [_api.FFPROBE, "-v", "error",
+             "-show_streams", "-show_format",
+             "-of", "json", str(path)],
+            stdout=_api.subprocess.PIPE, stderr=_api.subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=_api.CREATE_NO_WINDOW, timeout=30,
+        )
+        data = _api.json.loads(p.stdout or "{}")
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        return {}
+    if key is not None and data:
+        with _PROBE_CACHE_LOCK:
+            _PROBE_CACHE[key] = data
+            _PROBE_CACHE.move_to_end(key)
+            while len(_PROBE_CACHE) > _PROBE_CACHE_MAX:
+                _PROBE_CACHE.popitem(last=False)
+    return data
+
+probe_media.__module__ = _api.__name__
+_api.probe_media = probe_media
+
+
+def _first_audio_stream(streams):
+    for s in streams:
+        if s.get("codec_type") == "audio":
+            return s
+    # Совместимость с моками в тестах, где codec_type не указан.
+    if streams and all("codec_type" not in s for s in streams):
+        return streams[0]
+    return None
+
+
+def _first_video_stream(streams, skip_attached_pic=False):
+    for s in streams:
+        if s.get("codec_type") != "video":
+            continue
+        if skip_attached_pic and (s.get("disposition") or {}).get("attached_pic"):
+            continue
+        return s
+    return None
 
 
 def human_size(n):
@@ -63,7 +138,7 @@ _api.fmt_bitrate_with_codec = fmt_bitrate_with_codec
 
 def get_media_info(path):
     """Возвращает (duration, bitrate_str, size, audio_bitrate_str, audio_codec).
-    Один вызов ffprobe с JSON-выводом — поля именованные, порядок не важен.
+    Берёт данные из кэшированного probe_media (один ffprobe на файл).
     """
     dur = 0.0
     size = 0
@@ -75,24 +150,14 @@ def get_media_info(path):
     except Exception:
         size = 0
     try:
-        p = _api.subprocess.run(
-            [_api.FFPROBE, "-v", "error",
-             "-show_entries",
-             "format=duration,bit_rate:stream=bit_rate,sample_rate,channels,bits_per_sample,codec_name",
-             "-select_streams", "a:0",
-             "-of", "json",
-             path],
-            stdout=_api.subprocess.PIPE, stderr=_api.subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-            creationflags=_api.CREATE_NO_WINDOW,
-        )
-        data = _api.json.loads(p.stdout or "{}")
+        data = probe_media(path)
 
         fmt = data.get("format", {})
         try:
             dur = float(fmt.get("duration", 0) or 0)
         except Exception:
             dur = 0.0
+        fmt_br = 0
         try:
             fmt_br = int(fmt.get("bit_rate", 0) or 0)
             if fmt_br > 0:
@@ -101,8 +166,8 @@ def get_media_info(path):
             pass
 
         streams = data.get("streams", [])
-        if streams:
-            s0 = streams[0]
+        s0 = _first_audio_stream(streams)
+        if s0:
             a_codec = s0.get("codec_name") or None
             try:
                 abr = int(s0.get("bit_rate", 0) or 0)
@@ -133,7 +198,7 @@ def get_media_info(path):
                          "-show_entries", "packet=size", "-of", "csv=p=0", path],
                         stdout=_api.subprocess.PIPE, stderr=_api.subprocess.PIPE,
                         text=True, encoding="utf-8", errors="replace",
-                        creationflags=_api.CREATE_NO_WINDOW)
+                        creationflags=_api.CREATE_NO_WINDOW, timeout=30)
                     total = sum(int(x) for x in pk.stdout.replace(",", " ").split() if x.isdigit())
                     if total > 0:
                         kbps = int(round(total * 8 / dur / 1000))
@@ -166,13 +231,10 @@ _api.get_media_info = get_media_info
 def audio_stream_count(path):
     """Число аудиодорожек файла; 0 — их нет или ffprobe файл не прочитал."""
     try:
-        p = _api.subprocess.run(
-            [_api.FFPROBE, "-v", "error", "-select_streams", "a",
-             "-show_entries", "stream=index", "-of", "json", path],
-            stdout=_api.subprocess.PIPE, stderr=_api.subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace",
-            creationflags=_api.CREATE_NO_WINDOW, timeout=30)
-        return len(_api.json.loads(p.stdout or "{}").get("streams") or [])
+        streams = probe_media(path).get("streams") or []
+        if streams and all("codec_type" not in s for s in streams):
+            return len(streams)
+        return sum(1 for s in streams if s.get("codec_type") == "audio")
     except Exception:
         return 0
 
@@ -210,9 +272,12 @@ _api.csv_first = csv_first
 
 def get_fps_float(path):
     try:
-        cmd = [_api.FFPROBE, "-v", "0", "-of", "csv=p=0", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate", path]
-        p = _api.subprocess.run(cmd, stdout=_api.subprocess.PIPE, stderr=_api.subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=_api.CREATE_NO_WINDOW)
-        val = _api.csv_first(p.stdout)
+        st = _first_video_stream(probe_media(path).get("streams") or [])
+        if not st:
+            return 0.0
+        val = str(st.get("r_frame_rate") or st.get("avg_frame_rate") or "").strip()
+        if not val:
+            return 0.0
         if '/' in val:
             num, den = val.split('/', 1)
             return float(num) / float(den)
@@ -227,15 +292,15 @@ _api.get_fps_float = get_fps_float
 def get_video_codec(path):
     """Кодек видеодорожки файла (None — видеоряда нет).
 
-    Поток выбираем как `V:0`, а не `v:0`: заглавная V отсеивает ОБЛОЖКИ
-    (attached_pic). Иначе mp3 с картинкой альбома выглядел как «видеофайл
-    mjpeg 1000×1000», и «Обработка» гнала обложку в AV1-кодирование вместо
-    аудио-ветки (а имя результата — .mp4 с crf-суффиксом — потом не находилось:
-    на диске лежал .opus)."""
+    Отсеивает обложки (disposition.attached_pic) так же, как `-select_streams V:0`:
+    иначе mp3 с картинкой альбома выглядел как «видеофайл mjpeg 1000×1000», и
+    «Обработка» гнала обложку в AV1-кодирование вместо аудио-ветки."""
     try:
-        p = _api.subprocess.run([_api.FFPROBE, "-v", "error", "-select_streams", "V:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", path],
-                           stdout=_api.subprocess.PIPE, stderr=_api.subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=_api.CREATE_NO_WINDOW)
-        return p.stdout.strip().lower() or None
+        st = _first_video_stream(probe_media(path).get("streams") or [],
+                                 skip_attached_pic=True)
+        if not st:
+            return None
+        return (st.get("codec_name") or "").strip().lower() or None
     except Exception:
         return None
 
@@ -270,14 +335,10 @@ def get_pix_fmt(path):
     Нужен там, где фильтрграф обязан назвать формат явно: см.
     overlay_chroma_format."""
     try:
-        p = _api.subprocess.run(
-            [_api.FFPROBE, "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=pix_fmt",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-            stdout=_api.subprocess.PIPE, stderr=_api.subprocess.DEVNULL, text=True,
-            encoding="utf-8", errors="replace", creationflags=_api.CREATE_NO_WINDOW,
-            timeout=15)
-        return (p.stdout or "").strip().lower()
+        st = _first_video_stream(probe_media(path).get("streams") or [])
+        if not st:
+            return ""
+        return (st.get("pix_fmt") or "").strip().lower()
     except Exception:
         return ""
 

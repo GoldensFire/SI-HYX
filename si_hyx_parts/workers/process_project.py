@@ -151,7 +151,10 @@ class ProcessProjectMixin:
             sample = self._project_sample(proj, temp_files, tonemap)
         vf_list = []
         if crop_black:
-            crop = self._detect_crop(sample) if sample else None
+            crop = (self._detect_crop(sample, stop_check=lambda: self._is_cancelled(item.get('iid')))
+                    if sample else None)
+            if self._is_cancelled(item.get('iid')):
+                raise Exception("StoppedByUser")
             if crop:
                 vf_list.append(f"crop={crop}")
                 self.log.emit(f"✂ Обрезка чёрных полос: crop={crop}")
@@ -186,7 +189,7 @@ class ProcessProjectMixin:
                                     video_tune, vf_list, cb)
         else:
             self.xpsnr_sig.emit(item['iid'], None)
-        preset = max(0, min(13, sv.get('pre', 0))) if is_dark else max(0, min(8, sv.get('pre', 8)))
+        preset = max(0, min(13, sv.get('pre', 0 if is_dark else 8)))
         if is_dark:
             self.log.emit("🌑 Тёмные сцены: кодирование (AV1 10-бит, CRF)...")
         return (fps_args + color + self._av1_encoder_args(crf, preset, pix_fmt, video_tune)

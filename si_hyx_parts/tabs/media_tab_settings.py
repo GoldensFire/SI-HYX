@@ -16,8 +16,8 @@ class MediaTabSettingsMixin:
         # --- Переключатель профиля: две кнопки-тогглы ---
         self.btn_mode_std  = _api.QPushButton("Стандарт");       self.btn_mode_std.setCheckable(True);  self.btn_mode_std.setChecked(True)
         self.btn_mode_dark = _api._icon_btn("Тёмные сцены", 'fa5s.moon'); self.btn_mode_dark.setCheckable(True); self.btn_mode_dark.setChecked(False)
-        self.btn_mode_std.setToolTip("yuv420p, 1-pass")
-        self.btn_mode_dark.setToolTip("10-бит (yuv420p10le), tune=0, 2-pass AV1\nCRF, preset и разрешение — без изменений")
+        self.btn_mode_std.setToolTip("10-бит (yuv420p10le), 1-pass CRF AV1")
+        self.btn_mode_dark.setToolTip("10-бит (yuv420p10le), 1-pass CRF AV1 — профиль для тёмных сцен\nCRF, preset и разрешение — без изменений")
         self.btn_mode_std.clicked.connect(lambda: self._set_preset_mode("std"))
         self.btn_mode_dark.clicked.connect(lambda: self._set_preset_mode("dark"))
         mode_h = _api.QHBoxLayout(); mode_h.addWidget(self.btn_mode_std); mode_h.addWidget(self.btn_mode_dark)
@@ -103,11 +103,11 @@ class MediaTabSettingsMixin:
         def _on_metric_toggled(checked):
             self.s_target_metric.setEnabled(checked)
             self.lbl_target_metric.setEnabled(checked)
-            try: self.main._save_settings_now()
+            try: self.main._save_settings_soon()
             except Exception: pass
         def _on_target_changed(v):
             self.lbl_target_metric.setText(f"{v} дБ")
-            try: self.main._save_settings_now()
+            try: self.main._save_settings_soon()
             except Exception: pass
         self.ck_metric_xpsnr.toggled.connect(_on_metric_toggled)
         self.s_target_metric.valueChanged.connect(_on_target_changed)

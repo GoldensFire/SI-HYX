@@ -135,24 +135,39 @@ class EditTabProjectLinkMixin:
         self._project_replace(_mp.Project.from_dict(state))
 
     # ── Запись в связанный файл ──────────────────────────────────────────────
-    def _link_write_back(self):
-        """Из _project_save: связанный проект — и в его файл. Файл, изменённый
-        снаружи после нашего чтения, не затирается: его перечитает _link_poll."""
+    def _link_prepare_write_back(self, payload):
+        """Проверяет на GUI-потоке, нужно ли обновить связанный файл проекта.
+        Возвращает (path, json_str) или None (если связи нет, проект не
+        менялся или файл изменили снаружи — тогда его перечитает _link_poll)."""
         path = self._proj_link
         if not path:
-            return
-        data = json.dumps(self.project.to_dict(), ensure_ascii=False, sort_keys=True)
+            return None
+        data = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         if data == self._proj_link_saved:
-            return
+            return None
         if self._proj_link_stamp is not None and _file_stamp(path) != self._proj_link_stamp:
+            return None
+        return path, data
+
+    def _link_finish_write_back(self, path, data, stamp):
+        """Фиксирует успешную запись в связанный файл (если связь не сменилась)."""
+        if _same_path(path, self._proj_link):
+            self._proj_link_saved = data
+            self._proj_link_stamp = stamp
+
+    def _link_write_back(self, *, fsync=True):
+        """Синхронная запись связанного проекта в его файл."""
+        payload = self.project.to_dict()
+        req = self._link_prepare_write_back(payload)
+        if req is None:
             return
+        path, data = req
         try:
-            _mp.save_project(self.project, path)
+            _mp.save_project(payload, path, fsync=fsync)
         except OSError as e:
             self._proj_status(f"проект не сохранён в {path}: {e}")
             return
-        self._proj_link_saved = data
-        self._proj_link_stamp = _file_stamp(path)
+        self._link_finish_write_back(path, data, _file_stamp(path))
 
     # ── Открытие и сохранение ────────────────────────────────────────────────
     def project_open_dialog(self):
@@ -176,8 +191,20 @@ class EditTabProjectLinkMixin:
         except Exception as e:
             _api.msgbox_warning(self, "Проект", f"Проект не открылся:\n{path}\n\n{e}")
             return False
+        dropped = list(getattr(p, "dropped_clips", []) or [])
+        dropped_copy = ""
+        if dropped and _api.os.path.isfile(path):
+            aside = f"{path}.dropped-{_api.time.strftime('%Y%m%d-%H%M%S')}"
+            try:
+                _api.shutil.copy2(path, aside)
+                dropped_copy = aside
+            except OSError:
+                dropped_copy = ""
         if p.is_empty() and not p.texts:
-            _api.msgbox_warning(self, "Проект", f"В проекте нет клипов:\n{path}")
+            extra = (f"\n\nПропущено невалидных клипов: {len(dropped)}"
+                     + (f"\nКопия исходника: {dropped_copy}" if dropped_copy else "")
+                     if dropped else "")
+            _api.msgbox_warning(self, "Проект", f"В проекте нет клипов:\n{path}{extra}")
             return False
         self._project_leave()
         self._project_snapshot()
@@ -188,6 +215,10 @@ class EditTabProjectLinkMixin:
         msg = note or f"открыт проект {_api.os.path.basename(path)}"
         if p.is_empty():
             msg += "; клипов в нём нет — только текст, играть нечего"
+        if dropped:
+            msg += f"; пропущено {len(dropped)} клипов"
+            if dropped_copy:
+                msg += f" (копия: {_api.os.path.basename(dropped_copy)})"
         if missing:
             msg += f"; не найдено файлов: {len(missing)} ({missing[0]})"
         self._proj_status(msg + " — Ctrl+Z вернёт прежний")

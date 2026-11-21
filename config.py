@@ -30,6 +30,9 @@ import shutil
 import json
 
 
+import logging
+
+
 import functools
 
 
@@ -231,10 +234,11 @@ class _Resp:
         try: self._r.close()
         except Exception: pass
 
-def http_get(url, headers=None, timeout=30, stream=True, allow_insecure=True):
+def http_get(url, headers=None, timeout=30, stream=True, allow_insecure=True, log_fn=None):
     """GET через requests с проверкой сертификата.
-    allow_insecure=True: при SSL-ошибке повторяет без проверки (verify=False) —
-    нужно для превью/картинок на машинах без системных CA.
+    allow_insecure=True: при SSL-ошибке повторяет без проверки (verify=False)
+    с записью предупреждения в лог — нужно для превью/картинок на машинах без
+    системных CA.
     allow_insecure=False: повтора НЕТ, нужен валидный сертификат. Критично для
     автообновления: иначе MITM мог бы подсунуть вредоносный .exe (повтор без
     проверки = установка непроверенного кода = RCE).
@@ -245,9 +249,16 @@ def http_get(url, headers=None, timeout=30, stream=True, allow_insecure=True):
         r = requests.get(url, headers=h, timeout=timeout, stream=stream)
         r.raise_for_status()
         return _Resp(r)
-    except requests.exceptions.SSLError:
+    except requests.exceptions.SSLError as exc:
         if not allow_insecure:
             raise
+        msg = f"ВНИМАНИЕ: ошибка проверки TLS для {url} ({exc}) — повтор без проверки сертификата."
+        logging.getLogger("si_hyx.http").warning(msg)
+        if log_fn:
+            try:
+                log_fn(msg)
+            except Exception:
+                pass
         r = requests.get(url, headers=h, timeout=timeout, stream=stream, verify=False)
         r.raise_for_status()
         return _Resp(r)
@@ -480,6 +491,9 @@ COLOR_DONE = QColor(46, 204, 113, 210)   # Зелёный — готово
 COLOR_ERR  = QColor(231, 76,  60,  210)  # Красный — ошибка
 
 
+COLOR_STOP = QColor(180, 130, 50,  200)  # Янтарный — остановлено пользователем
+
+
 # Кастомная роль для хранения статуса строки
 ITEM_STATUS_ROLE = Qt.ItemDataRole.UserRole + 10
 # Кастомная роль: на странице обработки помечает обработанную картинку, у которой
@@ -488,9 +502,15 @@ ITEM_COMPARE_ROLE = Qt.ItemDataRole.UserRole + 11
 # Кастомная роль: помечает строку как аудио (без видеоряда) — для неё в колонке
 # «Превью» не резервируется место под миниатюру, строка компактнее, имя по центру.
 ITEM_AUDIO_ROLE = Qt.ItemDataRole.UserRole + 12
+# Кастомная роль: полный путь к исходному файлу (хранится отдельно от tooltip,
+# чтобы подсказки в tooltip не ломали «Перейти к файлу» и drag&drop).
+ITEM_PATH_ROLE = Qt.ItemDataRole.UserRole + 13
 
 
-ALLOWED_IMG = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp', '.gif', '.avif'}
+ALLOWED_IMG = {
+    '.png', '.jpg', '.jpeg', '.jfif', '.bmp', '.tif', '.tiff',
+    '.webp', '.gif', '.avif', '.heic', '.heif', '.ico',
+}
 
 
 # Изображения для ленты последних файлов (сверху). SVG показываем в ленте
@@ -499,12 +519,18 @@ ALLOWED_IMG = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.webp', '.gif', '.avif
 RIBBON_IMG = ALLOWED_IMG | {'.svg'}
 
 
-ALLOWED_MEDIA = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.mp3', '.wav', '.aac', '.m4a', '.flac', '.ogg', '.opus', '.wma'}
-
-
 # Аудио-форматы (подмножество ALLOWED_MEDIA без видеоряда) — у них в очереди
 # обработки нет превью-кадра, строку рисуем компактнее (см. PreviewNameDelegate).
-ALLOWED_AUDIO = {'.mp3', '.wav', '.aac', '.m4a', '.flac', '.ogg', '.opus', '.wma'}
+ALLOWED_AUDIO = {
+    '.mp3', '.wav', '.aac', '.m4a', '.flac', '.ogg', '.opus', '.wma',
+    '.mka', '.aiff', '.aif', '.ac3',
+}
+
+
+ALLOWED_MEDIA = {
+    '.mp4', '.m4v', '.mkv', '.avi', '.mov', '.webm', '.flv',
+    '.mpg', '.mpeg', '.ts', '.m2ts', '.wmv', '.3gp', '.ogv',
+} | ALLOWED_AUDIO
 
 
 FORMAT_OPTIONS = {

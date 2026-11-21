@@ -864,6 +864,18 @@ def curve_length(clip):
     return sum(_seg_time(a[0], a[1], b[0], b[1], b[0]) for a, b in zip(pts, pts[1:]))
 
 
+def curve_time_at(clip, s):
+    """Время в клипе (с) для позиции в куске исходника s (0…out_s−in_s)."""
+    pts = curve_points(clip)
+    s = max(0.0, min(pts[-1][0], float(s)))
+    acc = 0.0
+    for (s0, v0), (s1, v1) in zip(pts, pts[1:]):
+        if s <= s1:
+            return acc + _seg_time(s0, v0, s1, v1, s)
+        acc += _seg_time(s0, v0, s1, v1, s1)
+    return acc
+
+
 def curve_source_offset(clip, tau):
     """Позиция в куске исходника (с) для времени клипа tau (обратная τ)."""
     pts = curve_points(clip)
@@ -945,3 +957,22 @@ def split_fx(left, right, t_local, cut_src):
         rs = span - cut
         right.speed_curve = sanitize_curve([{"at": (s - cut) / rs if rs > 0 else 0.0, "speed": v}
                                             for s, v in rpart])
+
+
+def trim_curve(clip, new_in, new_out):
+    """Подгоняет кривую скорости clip.speed_curve под новый отрезок исходника
+    [new_in, new_out] так, чтобы скорость в каждой точке исходника сохранилась."""
+    if not clip.speed_curve:
+        return
+    pts = curve_points(clip)
+    a = new_in - clip.in_s
+    b = new_out - clip.in_s
+    span = b - a
+    if span <= 1e-9:
+        return
+    va = curve_speed_at(pts, max(0.0, min(pts[-1][0], a)))
+    vb = curve_speed_at(pts, max(0.0, min(pts[-1][0], b)))
+    mid = [(s, v) for s, v in pts if a < s < b]
+    sub = [(a, va)] + mid + [(b, vb)]
+    clip.speed_curve = sanitize_curve(
+        [{"at": (s - a) / span, "speed": v} for s, v in sub])

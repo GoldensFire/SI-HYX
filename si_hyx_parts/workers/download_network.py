@@ -14,6 +14,16 @@ def is_network_error(detail):
     ))
 
 
+def is_ssl_error(detail):
+    low = str(detail).lower()
+    return any(token in low for token in (
+        "certificate_verify_failed", "certificate verify failed",
+        "sslcertverificationerror", "ssl: cert", "sslerror",
+        "self-signed certificate", "self signed certificate",
+        "unable to get local issuer certificate",
+    ))
+
+
 def terminal_ffmpeg_error(line):
     """A failed demuxer cannot recover; individual reconnect warnings can."""
     low = line.lower()

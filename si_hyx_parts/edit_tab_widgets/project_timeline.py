@@ -780,6 +780,11 @@ class ProjectTimeline(_api.QWidget):
                     menu.addAction("Отделить звук",
                                    lambda: self.actionRequested.emit('detach_audio', clip.id))
             if not clip.is_image:
+                if not clip.frozen:
+                    act = menu.addAction("Реверс",
+                                         lambda: self.actionRequested.emit('reverse', clip.id))
+                    act.setCheckable(True)
+                    act.setChecked(bool(clip.reverse))
                 sub = menu.addMenu("Скорость")
                 for val in (0.25, 0.5, 1.0, 1.5, 2.0, 4.0):
                     act = sub.addAction(_fmt_speed(val))
@@ -832,7 +837,7 @@ class ProjectTimeline(_api.QWidget):
         и сам виджет, и вкладка — поэтому сверяем сами клипы), перетаскивание
         и номер invalidate()."""
         proj = self.project
-        clips = tuple((c.id, c.track, c.start, c.in_s, c.out_s, c.speed, c.muted, c.volume)
+        clips = tuple((c.id, c.track, c.start, c.in_s, c.out_s, c.speed, c.muted, c.volume, c.reverse)
                       for c in proj.clips)
         tracks = tuple((t.kind, t.enabled, t.muted) for t in proj.tracks)
         markers = getattr(proj, "markers", [])
@@ -1026,6 +1031,8 @@ class ProjectTimeline(_api.QWidget):
             label = "без звука · " + label
         elif c.audio_path and c.volume != 1.0:
             label = f"{int(round(c.volume * 100))}% " + label
+        if c.reverse:
+            label = "реверс · " + label
         left = max(body.left(), float(self.HEADER_W)) + 6
         avail = int(body.right() - left - 6)
         if avail < 18:
@@ -1075,7 +1082,8 @@ class ProjectTimeline(_api.QWidget):
         if dim:
             p.setOpacity(0.4)
         for k in range(k0, k1 + 1):
-            t = c.in_s + (k + 0.5) * tile_s * speed
+            t = (c.out_s - (k + 0.5) * tile_s * speed if c.reverse
+                 else c.in_s + (k + 0.5) * tile_s * speed)
             t = min(max(c.in_s, round(t / step) * step), last)
             pm = self.thumb_provider(c, t, height)
             if pm is None or pm.isNull():
@@ -1136,8 +1144,12 @@ class ProjectTimeline(_api.QWidget):
         per_s = n / dur
         speed = max(0.01, c.speed)
         for x in range(x0, x1 + 1):
-            t0 = c.in_s + (x - band.left()) / self.pps * speed
-            t1 = t0 + 1.0 / self.pps * speed
+            if c.reverse:
+                t1 = c.out_s - (x - band.left()) / self.pps * speed
+                t0 = t1 - 1.0 / self.pps * speed
+            else:
+                t0 = c.in_s + (x - band.left()) / self.pps * speed
+                t1 = t0 + 1.0 / self.pps * speed
             i0 = max(0, min(n - 1, int(t0 * per_s)))
             i1 = max(i0 + 1, min(n, int(t1 * per_s) + 1))
             v = max(samples[i0:i1])

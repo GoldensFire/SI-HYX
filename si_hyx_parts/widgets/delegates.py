@@ -11,7 +11,7 @@ class StatusColorDelegate(_api.QStyledItemDelegate):
     Стилшит: ::item:selected и ::item:hover — transparent.
     Все фоны рисуем здесь вручную, чтобы цвет статуса всегда был виден.
     """
-    _colors  = {'proc': _api.COLOR_PROC, 'done': _api.COLOR_DONE, 'err': _api.COLOR_ERR}
+    _colors  = {'proc': _api.COLOR_PROC, 'done': _api.COLOR_DONE, 'err': _api.COLOR_ERR, 'stop': _api.COLOR_STOP}
     _SEL_BG  = _api.QColor(0x45, 0x47, 0x5a)   # обычное выделение (#45475a)
     _HOV_BG  = _api.QColor(0x31, 0x32, 0x44)   # hover (#313244)
 

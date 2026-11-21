@@ -756,8 +756,9 @@ class UnifiedWindow(
             if files:
                 self.raise_(); self.activateWindow()
                 self.tabs.setCurrentWidget(self.tab_media)
-                self.tab_media.add_paths(files)
-                self.log(f"Добавлено через контекстное меню: {', '.join(_api.os.path.basename(f) for f in files)}")
+                added = self.tab_media.add_paths(files)
+                if added:
+                    self.log(f"Добавлено через контекстное меню: {', '.join(_api.os.path.basename(f) for f in added)}")
         except Exception: pass
 
     # ------------------------------------------------------------------
@@ -854,7 +855,8 @@ class UnifiedWindow(
             mr = getattr(self.tab_media, "worker", None)
             if mr and mr.isRunning():
                 self._stop_worker(mr)
-            for w in list(getattr(self.tab_ytdlp, "active_workers", [])):
+            aw = getattr(self.tab_ytdlp, "active_workers", None)
+            for w in (list(aw.values()) if isinstance(aw, dict) else list(aw or [])):
                 self._stop_worker(w)
             try:
                 te = getattr(self, "tab_edit", None)

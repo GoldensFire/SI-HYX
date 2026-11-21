@@ -113,10 +113,24 @@ is_direct_cdn_video.__module__ = _api.__name__
 _api.is_direct_cdn_video = is_direct_cdn_video
 
 
-def download_cdn_direct(url: str, out_dir: str, log_fn=None) -> str:
+def _cdn_referer(url: str) -> str:
+    """Подбирает Referer по хосту CDN-ссылки."""
+    if _api.host_matches(url, 'cdntiktok.com', 'tiktokcdn.com', 'tiktok.com'):
+        return "https://www.tiktok.com/"
+    if _api.host_matches(url, 'fbcdn.net', 'cdninstagram.com', 'instagram.com'):
+        return "https://www.instagram.com/"
+    from urllib.parse import urlsplit
+    pu = urlsplit(url)
+    return f"{pu.scheme}://{pu.netloc}/" if pu.scheme and pu.netloc else ""
+
+
+def download_cdn_direct(url: str, out_dir: str, log_fn=None,
+                        progress_fn=None, is_running=None) -> str:
     """Скачивает прямую CDN-ссылку через requests с нужными заголовками.
+    Пишет во временный .part-файл и атомарно заменяет итоговое имя.
     Возвращает путь к сохранённому файлу или бросает исключение.
     """
+    import time
     from pathlib import Path
     from urllib.parse import urlparse, unquote
     from filenames import safe_filename, unique_path
@@ -130,28 +144,54 @@ def download_cdn_direct(url: str, out_dir: str, log_fn=None) -> str:
         safe_name += '.mp4'
 
     out_path = str(unique_path(Path(out_dir) / safe_name))
+    tmp_path = out_path + ".part"
 
     headers = {
         "User-Agent": _api.USER_AGENT,
-        "Referer":    "https://www.instagram.com/",
         "Accept":     "*/*",
         "Accept-Language": "en-US,en;q=0.9",
     }
+    referer = _cdn_referer(url)
+    if referer:
+        headers["Referer"] = referer
     if log_fn: log_fn(f"Прямое скачивание CDN: {url[:60]}...")
-    with _api.http_get(url, headers=headers, timeout=60) as resp:
-        total = int(resp.headers.get("Content-Length", 0) or 0)
-        downloaded = 0
-        with open(out_path, "wb") as f:
-            while True:
-                chunk = resp.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
-                if log_fn and total:
-                    pct = downloaded * 100 // total
-                    log_fn(f"CDN загрузка: {pct}%")
-    if log_fn: log_fn(f"CDN загрузка завершена: {out_path}")
+    if is_running is not None and not is_running():
+        raise RuntimeError("Загрузка остановлена пользователем")
+    try:
+        with _api.http_get(url, headers=headers, timeout=60, log_fn=log_fn) as resp:
+            total = int(resp.headers.get("Content-Length", 0) or 0)
+            downloaded = 0
+            last_pct = -1
+            last_ts = 0.0
+            with open(tmp_path, "wb") as f:
+                while True:
+                    if is_running is not None and not is_running():
+                        raise RuntimeError("Загрузка остановлена пользователем")
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_fn:
+                        now = time.monotonic()
+                        if total > 0:
+                            pct = min(99.9, downloaded * 100.0 / total)
+                            if int(pct) != last_pct or (now - last_ts) >= 0.25:
+                                last_pct = int(pct)
+                                last_ts = now
+                                progress_fn(pct, f"Загрузка CDN… {pct:.0f}%")
+                        elif (now - last_ts) >= 0.25:
+                            last_ts = now
+                            progress_fn(-1.0, f"Загрузка CDN ({_api.human_size(downloaded)})")
+        _api.os.replace(tmp_path, out_path)
+    except Exception:
+        try:
+            if _api.os.path.exists(tmp_path):
+                _api.os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    if log_fn: log_fn(f"CDN загрузка завершена (100%): {out_path}")
     return out_path
 
 download_cdn_direct.__module__ = _api.__name__

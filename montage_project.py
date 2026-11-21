@@ -354,6 +354,7 @@ class Project:
         self.settings = ProjectSettings()
         self.markers = []             # Marker по времени
         self.texts = []               # TextItem по времени
+        self.dropped_clips = []       # причины клипов, отброшенных при from_dict
 
     # ── Дорожки ──────────────────────────────────────────────────────────────
     @property
@@ -473,26 +474,34 @@ class Project:
         if c.fps and not c.is_image and not c.frozen:
             cut = snap_to_frame(cut, c.fps)
         speed = c.play_speed
-        if ((cut - c.in_s) / speed < MIN_CLIP_S - _EPS
-                or (c.out_s - cut) / speed < MIN_CLIP_S - _EPS):
+        if c.reverse:
+            left_len = (c.out_s - cut) / speed
+            right_len = (cut - c.in_s) / speed
+        elif c.speed_curve:
+            left_len = curve_time_at(c, cut - c.in_s)
+            right_len = c.length - left_len
+        else:
+            left_len = (cut - c.in_s) / speed
+            right_len = (c.out_s - cut) / speed
+        if left_len < MIN_CLIP_S - _EPS or right_len < MIN_CLIP_S - _EPS:
             return None
         right = Clip(**{f.name: getattr(c, f.name) for f in fields(Clip)})
         right.id = uuid.uuid4().hex[:12]
         # Переход и нарастание звука — у начала клипа, затухание — у конца.
         right.transition, right.transition_s, right.fade_in = '', 0.0, 0.0
         c.fade_out = 0.0
-        t_local = t - c.start
+        t_local = left_len
         if c.reverse:
             # Реверс: слева на шкале — конец куска исходника [cut, out_s).
             right.out_s = cut
-            right.start = c.start + (c.out_s - cut) / speed
+            right.start = c.start + left_len
+            if c.keyframes:
+                split_fx(c, right, t_local, cut)
             c.in_s = cut
         else:
             right.in_s = cut
-            right.start = c.start + (cut - c.in_s) / speed
-            if c.speed_curve:
-                split_fx(c, right, t_local, cut)    # своя кривая у каждой половины
-            elif c.keyframes:
+            right.start = c.start + left_len
+            if c.speed_curve or c.keyframes:
                 split_fx(c, right, t_local, cut)
             c.out_s = cut
         self.clips.insert(self.clips.index(c) + 1, right)
@@ -665,6 +674,8 @@ class Project:
         others = [o for o in self.clips_on(c.track) if o is not c] if free else []
         if c.reverse:
             self._trim_reversed(c, edge, t, limit, others, free)
+        elif c.speed_curve:
+            self._trim_curved(c, edge, t, limit, others, free)
         elif edge == 'left':
             new_in = c.in_s + (t - c.start) * speed
             if c.fps and not c.is_image:
@@ -690,6 +701,50 @@ class Project:
             c.out_s = max(c.in_s + min_src, min(high, new_out))
         self.pack()
         return True
+
+    @staticmethod
+    def _trim_curved(c, edge, t, limit, others, free):
+        """Подрезка клипа с кривой скорости: считаем точку исходника и сдвиг
+        по самой кривой (а не по средней скорости) и подрезаем кривую под новый
+        отрезок исходника."""
+        pts = curve_points(c)
+        v0, v1 = pts[0][1], pts[-1][1]
+        if edge == 'left':
+            if t >= c.start:
+                new_in = c.source_time(t)
+            else:
+                new_in = c.in_s + (t - c.start) * v0
+            if c.fps and not c.is_image:
+                new_in = snap_to_frame(new_in, c.fps)
+            low = 0.0
+            if free:
+                prev_end = max((o.end for o in others if o.end <= c.start + _EPS), default=0.0)
+                low = max(low, c.in_s - (c.start - prev_end) * v0)
+            max_in = c.source_time(c.end - MIN_CLIP_S) if c.length > MIN_CLIP_S else c.in_s
+            new_in = min(max(low, new_in), max_in)
+            shift = (curve_time_at(c, new_in - c.in_s) if new_in >= c.in_s
+                     else (new_in - c.in_s) / v0)
+            trim_curve(c, new_in, c.out_s)
+            c.in_s = new_in
+            if free:
+                c.start = max(0.0, c.start + shift)
+        else:
+            if t <= c.end:
+                new_out = c.source_time(t)
+            else:
+                new_out = c.out_s + (t - c.end) * v1
+            if c.fps and not c.is_image:
+                new_out = snap_to_frame(new_out, c.fps)
+            high = limit
+            if free:
+                next_start = min((o.start for o in others if o.start >= c.end - _EPS),
+                                 default=float("inf"))
+                if next_start < float("inf"):
+                    high = min(high, c.out_s + max(0.0, next_start - c.end) * v1)
+            min_out = c.source_time(c.start + MIN_CLIP_S) if c.length > MIN_CLIP_S else c.out_s
+            new_out = max(min_out, min(high, new_out))
+            trim_curve(c, c.in_s, new_out)
+            c.out_s = new_out
 
     @staticmethod
     def _trim_reversed(c, edge, t, limit, others, free):
@@ -907,18 +962,30 @@ class Project:
         if any(t.kind == 'video' for t in tracks):
             p.tracks = tracks
         names = {f.name for f in fields(Clip)}
-        for raw in raw_clips if isinstance(raw_clips, list) else []:
+        seen_ids = set()
+        for idx, raw in enumerate(raw_clips if isinstance(raw_clips, list) else []):
             if not isinstance(raw, dict):
+                p.dropped_clips.append(f"клип #{idx}: не объект")
                 continue
             try:
                 # Типы и пределы (скорость) приводит Clip.__post_init__.
                 c = Clip(**{k: v for k, v in raw.items() if k in names})
-            except (TypeError, ValueError):
+            except (TypeError, ValueError) as e:
+                p.dropped_clips.append(f"клип #{idx}: {e}")
                 continue                 # нет обязательных полей или они не числа
-            if not (0 <= c.track < len(p.tracks)) or c.length <= _EPS:
+            if not (0 <= c.track < len(p.tracks)):
+                p.dropped_clips.append(f"клип #{idx}: нет дорожки {c.track}")
+                continue
+            if c.length <= _EPS:
+                p.dropped_clips.append(f"клип #{idx}: нулевая длина")
                 continue
             if p.tracks[c.track].kind != ('video' if c.has_video else 'audio'):
+                p.dropped_clips.append(f"клип #{idx}: неверный тип дорожки {c.track}")
                 continue                 # видеоклип на звуковой дорожке и наоборот
+            if not c.id or c.id in seen_ids:
+                while not c.id or c.id in seen_ids:
+                    c.id = uuid.uuid4().hex[:12]
+            seen_ids.add(c.id)
             p.clips.append(c)
         p.pack()
         return p
@@ -1090,17 +1157,20 @@ def is_project_file(path):
     return low.endswith(".json") or low.endswith(PROJECT_SUFFIX + ".bak")
 
 
-def save_project(project, path):
+def save_project(project, path, *, fsync=True):
     """Атомарная запись проекта, как у пресетов субтитров
-    (edit_tab_base._save_subtitle_presets): tmp на диск с fsync, прежний
-    файл — в backup_path, затем tmp на место. Сбой между двумя переносами
-    оставляет прежнюю версию — её подхватит load_project."""
+    (edit_tab_base._save_subtitle_presets): tmp на диск (с fsync для
+    финальных сохранений и закрытия), прежний файл — в backup_path, затем
+    tmp на место. Сбой между двумя переносами оставляет прежнюю версию — её
+    подхватит load_project. project — Project или готовый dict (to_dict)."""
     path = str(path)
+    data = project if isinstance(project, dict) else project.to_dict()
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(project.to_dict(), f, ensure_ascii=False, indent=1)
+        json.dump(data, f, ensure_ascii=False, indent=1)
         f.flush()
-        os.fsync(f.fileno())
+        if fsync:
+            os.fsync(f.fileno())
     if os.path.exists(path):
         os.replace(path, backup_path(path))
     os.replace(tmp, path)
@@ -1134,8 +1204,8 @@ from si_hyx_parts.montage_project.schema import (  # noqa: E402
     describe_schema, migrate_project_data, parse_markers, parse_settings, parse_texts, validate)
 from si_hyx_parts.montage_project.effects import (  # noqa: E402,F401
     EASES, EFFECT_KEYS, EFFECT_LIMITS, EFFECT_TYPES, CURVES_PRESETS, FINISH_TYPES, KEYFRAME_PROPS,
-    curve_length, curve_source_offset, has_fx, keyframe_value, sanitize_curve, sanitize_effect,
-    sanitize_effects, sanitize_keyframes, split_fx)
+    curve_length, curve_points, curve_source_offset, curve_time_at, has_fx, keyframe_value,
+    sanitize_curve, sanitize_effect, sanitize_effects, sanitize_keyframes, split_fx, trim_curve)
 from si_hyx_parts.montage_project.layers import (  # noqa: E402,F401
     BLEND_MODES, MASK_SHAPES, MATTE_MODELS, SHADOW_FIELDS, STROKE_STYLES, matte_path,
     matte_source, matte_span, matte_wanted, sanitize_blend, sanitize_box, sanitize_crop,

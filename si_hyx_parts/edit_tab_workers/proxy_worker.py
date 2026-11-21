@@ -45,6 +45,8 @@ class ProxyWorker(_api.QThread):
             stdout=_api.subprocess.PIPE, stderr=_api.subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
             creationflags=_api.CREATE_NO_WINDOW)
+        import process_guard
+        process_guard.assign_to_job(self.proc)
         if feed_path:
             _api.start_share_delete_feeder(
                 feed_path, self.proc.stdin, stop_flag=lambda: self._stopped)

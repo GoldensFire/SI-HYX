@@ -36,7 +36,7 @@ from utils import (
     require_svt, resolve_dreamerscast, resolve_kodik
 )
 from utils import _cookie_matches_domain, _RE_DIGITS
-from utils import escape_filter_path, get_pix_fmt, overlay_chroma_format, overlay_filter_graph
+from utils import escape_filter_path, get_pix_fmt, move_to_trash, overlay_chroma_format, overlay_filter_graph, probe_media
 from utils import csv_fields
 from avif_fit import (avif_encode_cmd, avif_pix_fmt, downscale_side,
                       strip_allintra)

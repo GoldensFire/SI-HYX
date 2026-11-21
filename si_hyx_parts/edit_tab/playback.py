@@ -42,7 +42,9 @@ class EditTabPlaybackMixin:
             pass
         # Воркер волны + его временный wav.
         if self.audio_worker and self.audio_worker.isRunning():
-            self.audio_worker.stop(); self.audio_worker.wait()
+            self.audio_worker.stop()
+            if not self.audio_worker.wait(3000):
+                self.audio_worker.terminate(); self.audio_worker.wait(1000)
         if self.audio_worker:
             try:
                 if self.audio_worker.tmp_wav and _api.os.path.exists(self.audio_worker.tmp_wav):
@@ -52,7 +54,9 @@ class EditTabPlaybackMixin:
             self.audio_worker = None
         # Воркер быстрого предпросмотра волны выделения (см. _start_waveform).
         if self._audio_partial_worker and self._audio_partial_worker.isRunning():
-            self._audio_partial_worker.stop(); self._audio_partial_worker.wait()
+            self._audio_partial_worker.stop()
+            if not self._audio_partial_worker.wait(3000):
+                self._audio_partial_worker.terminate(); self._audio_partial_worker.wait(1000)
         if self._audio_partial_worker:
             try:
                 if self._audio_partial_worker.tmp_wav and _api.os.path.exists(self._audio_partial_worker.tmp_wav):
@@ -62,7 +66,9 @@ class EditTabPlaybackMixin:
             self._audio_partial_worker = None
         # Proxy-воркер + его временный файл.
         if self.proxy_thread and self.proxy_thread.isRunning():
-            self.proxy_thread.stop(); self.proxy_thread.wait()
+            self.proxy_thread.stop()
+            if not self.proxy_thread.wait(3000):
+                self.proxy_thread.terminate(); self.proxy_thread.wait(1000)
         self.proxy_thread = None
         if self.tmp_proxy_file and _api.os.path.exists(self.tmp_proxy_file):
             try:
@@ -209,7 +215,9 @@ class EditTabPlaybackMixin:
             return
         # Останавливаем воркер волны и подчищаем его временный wav (баг #7).
         if self.audio_worker and self.audio_worker.isRunning():
-            self.audio_worker.stop(); self.audio_worker.wait()
+            self.audio_worker.stop()
+            if not self.audio_worker.wait(3000):
+                self.audio_worker.terminate(); self.audio_worker.wait(1000)
         if self.audio_worker:
             try:
                 if self.audio_worker.tmp_wav and _api.os.path.exists(self.audio_worker.tmp_wav):
@@ -218,7 +226,9 @@ class EditTabPlaybackMixin:
                 pass
             self.audio_worker = None
         if self._audio_partial_worker and self._audio_partial_worker.isRunning():
-            self._audio_partial_worker.stop(); self._audio_partial_worker.wait()
+            self._audio_partial_worker.stop()
+            if not self._audio_partial_worker.wait(3000):
+                self._audio_partial_worker.terminate(); self._audio_partial_worker.wait(1000)
         if self._audio_partial_worker:
             try:
                 if self._audio_partial_worker.tmp_wav and _api.os.path.exists(self._audio_partial_worker.tmp_wav):
@@ -229,7 +239,9 @@ class EditTabPlaybackMixin:
 
         # Останавливаем фоновый proxy-воркер ДО удаления его файла (баг #2).
         if self.proxy_thread and self.proxy_thread.isRunning():
-            self.proxy_thread.stop(); self.proxy_thread.wait()
+            self.proxy_thread.stop()
+            if not self.proxy_thread.wait(3000):
+                self.proxy_thread.terminate(); self.proxy_thread.wait(1000)
         self.proxy_thread = None
 
         if self.tmp_proxy_file and _api.os.path.exists(self.tmp_proxy_file):

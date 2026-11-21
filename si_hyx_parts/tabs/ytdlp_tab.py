@@ -6,8 +6,10 @@ import tabs as _api
 
 
 class YtdlpTab(_api.QWidget):
+    MAX_CONCURRENT_DOWNLOADS = 3
     thumb_sig = _api.pyqtSignal(str, _api.QIcon)
     kodik_info_sig = _api.pyqtSignal(object, int, str, int)  # (озвучки, число серий, тек.озвучка, тек.серия)
+    kodik_err_sig = _api.pyqtSignal(str, str)  # (url, error_msg)
 
     def __init__(self, main_win):
         super().__init__()
@@ -15,6 +17,7 @@ class YtdlpTab(_api.QWidget):
         self.items = {}
         self.pool = _api.QThreadPool()
         self.active_workers: dict = {}  # iid → YtdlpWorker, O(1) поиск
+        self._dl_queue: list = []       # очередь конфигов, ожидающих слот загрузки
         self._dl_pct: dict = {}         # iid → последний % загрузки (для прогресса в таскбаре)
         self._kodik_last_url = ""       # для какой ссылки уже подгружены списки
 
@@ -30,6 +33,7 @@ class YtdlpTab(_api.QWidget):
         self._url_start_s = None    # тайминг из ?t=/&t= ссылки (None — не задан)
         self.setup_ui()
         self.kodik_info_sig.connect(self._populate_kodik)
+        self.kodik_err_sig.connect(self._on_kodik_error)
 
     def setup_ui(self):
         root = _api.QHBoxLayout(self)
@@ -258,7 +262,7 @@ class YtdlpTab(_api.QWidget):
 
         hb = _api.QHBoxLayout()
         b_del = _api._icon_btn("Удалить", 'fa5s.times'); b_del.clicked.connect(self.delete_sel)
-        b_clr = _api._icon_btn("Очистить", 'fa5s.trash'); b_clr.clicked.connect(self.tree.clear)
+        b_clr = _api._icon_btn("Очистить", 'fa5s.trash'); b_clr.clicked.connect(self.clear_all)
         hb.addWidget(b_del); hb.addWidget(b_clr); hb.addStretch(); left.addLayout(hb)
 
     def _spin_to_sliders(self):
@@ -325,9 +329,13 @@ class YtdlpTab(_api.QWidget):
                 self.slider_end.setValue(self.slider_end.maximum())
             self.main.log(f"Ссылка содержит тайминг: качаю с {ts} сек.")
 
+    @staticmethod
+    def _is_http_url(url: str) -> bool:
+        return bool(_api.re.match(r'^https?://\S+', (url or "").strip(), _api.re.I))
+
     def _start_fetch(self):
         url = self.url_edit.text().strip()
-        if not url: return
+        if not self._is_http_url(url): return
         self.main.log(f"Запрос метаданных для: {url[:30]}...")
 
         # Для Kodik-сайтов (animego и т.п.) — подгружаем списки озвучек и серий
@@ -343,8 +351,10 @@ class YtdlpTab(_api.QWidget):
                             tr, int(info.get("episodes", 0)),
                             info.get("cur_translation", "") or "",
                             int(info.get("cur_episode", 0) or 0))
-                except Exception:
-                    pass
+                    elif _api.is_animego_site(u):
+                        self.kodik_err_sig.emit(u, "не удалось получить списки озвучек и серий")
+                except Exception as exc:
+                    self.kodik_err_sig.emit(u, str(exc))
             _api.threading.Thread(target=_kinfo, daemon=True).start()
         # Stop the subprocess, retaining the QThread until its finished signal.
         if self.info_worker and self.info_worker.isRunning():
@@ -354,7 +364,9 @@ class YtdlpTab(_api.QWidget):
             except Exception: pass
             try: self.info_worker.error.disconnect()
             except Exception: pass
-        self.info_worker = _api.InfoWorker(url, proxy=self.proxy_edit.text().strip())
+        self.info_worker = _api.InfoWorker(
+            url, proxy=self.proxy_edit.text().strip(),
+            cookie_path=self.cookie_edit.text().strip())
         worker = self.info_worker
         self._info_workers.add(worker)
         worker.finished.connect(lambda w=worker: self._info_workers.discard(w))
@@ -396,6 +408,11 @@ class YtdlpTab(_api.QWidget):
                           f"озвучка «{self.kodik_trans.currentText()}».")
         except Exception as e:
             self.main.log(f"_populate_kodik error: {e}")
+
+    def _on_kodik_error(self, url: str, err_msg: str):
+        if self._kodik_last_url == url:
+            self._kodik_last_url = ""
+        self.main.log(f"Kodik: ошибка загрузки списков ({err_msg})")
 
     def _on_info_success(self, duration, thumb_url, sub_langs=None, audio_langs=None):
         self.main.log(f"Длительность получена: {duration} сек.")
@@ -458,21 +475,53 @@ class YtdlpTab(_api.QWidget):
         m.addAction(_api.QAction("Вставить", self, triggered=self.url_edit.paste))
         m.exec(self.url_edit.mapToGlobal(pos))
 
+    def _mark_item_stopped(self, iid: str):
+        entry = self.items.get(iid)
+        if not entry:
+            return
+        item = entry.get('item')
+        if item:
+            try:
+                item.setText(3, "Остановлено")
+                item.setToolTip(3, "Загрузка остановлена пользователем")
+                item.setData(0, _api.ITEM_STATUS_ROLE, 'stop')
+                self.tree.viewport().update()
+            except RuntimeError:
+                pass
+
     def stop_all_dl(self):
         for entry in self.items.values():
             entry.pop('restart_config', None)
+        queued = list(self._dl_queue)
+        self._dl_queue.clear()
+        for cfg in queued:
+            self._mark_item_stopped(cfg.get('iid', ''))
         for w in list(self.active_workers.values()):
             try: w.stop()
             except Exception: pass
+        self._update_stop_btn()
 
     def stop_sel_dl(self):
+        selected_iids = set()
         for it in self.tree.selectedItems():
             iid = it.data(0, _api.Qt.ItemDataRole.UserRole)
+            if not iid:
+                continue
+            selected_iids.add(iid)
             self.items.get(iid, {}).pop('restart_config', None)
             w = self.active_workers.get(iid)
             if w:
                 try: w.stop()
                 except Exception: pass
+        if selected_iids and self._dl_queue:
+            remaining = []
+            for cfg in self._dl_queue:
+                if cfg.get('iid') in selected_iids:
+                    self._mark_item_stopped(cfg.get('iid', ''))
+                else:
+                    remaining.append(cfg)
+            self._dl_queue = remaining
+        self._update_stop_btn()
 
     def ctx(self, pos):
         m = _api.QMenu()
@@ -491,7 +540,7 @@ class YtdlpTab(_api.QWidget):
             a_cba.triggered.connect(lambda checked=False, cbv=cb: (self.url_edit.setText(cbv), self.add_dl(True)))
             m.addAction(a_cb); m.addAction(a_cba); m.addSeparator()
         m.addAction(_api.QAction('Удалить', self, triggered=self.delete_sel))
-        m.addAction(_api.QAction('Очистить', self, triggered=self.tree.clear))
+        m.addAction(_api.QAction('Очистить', self, triggered=self.clear_all))
         m.exec(self.tree.mapToGlobal(pos))
 
     def _choose_cookie(self):
@@ -517,32 +566,47 @@ class YtdlpTab(_api.QWidget):
             # и индикатор в панели задач после ошибки/остановки.
             if self.active_workers.get(iid_) is not w:
                 return
-            item = self.items.get(iid_, {}).get('item')
+            entry = self.items.get(iid_)
+            if not entry:
+                return
+            item = entry.get('item')
             if item:
-                # p <= 0 — индикатор активности без реального % (подготовка/повторы
-                # извлечения/тихий ffmpeg); реальный процент показываем от >0.
-                item.setText(1, "…" if p <= 0 else f"{p:.1f}%"); item.setText(3, t)
+                try:
+                    # p <= 0 — индикатор активности без реального % (подготовка/повторы
+                    # извлечения/тихий ffmpeg); реальный процент показываем от >0.
+                    item.setText(1, "…" if p <= 0 else f"{p:.1f}%"); item.setText(3, t)
+                except RuntimeError:
+                    return  # QTreeWidgetItem уже удалён пользователем
             self._dl_pct[iid_] = p
             self._update_dl_taskbar()
 
-        def on_done(iid_, status, clean_info, file_path):
+        def on_done(iid_, status, clean_info, file_path, media_info=None):
             if self.active_workers.get(iid_) is not w:
                 return
             self._dl_pct.pop(iid_, None); self._update_dl_taskbar()
-            item = self.items.get(iid_, {}).get('item')
+            entry = self.items.get(iid_)
+            if not entry:
+                return
+            item = entry.get('item')
             if item:
-                item.setText(3, status)
-                # Зелёная подсветка строки — как на странице обработки (делегат
-                # StatusColorDelegate рисует фон по статусу из 0-й колонки).
-                item.setData(0, _api.ITEM_STATUS_ROLE, 'done')
-                self.tree.viewport().update()
-                if file_path and _api.os.path.exists(file_path):
-                    try:
-                        dur, br_str, size, a_br, _a_codec = _api.get_media_info(file_path)
+                try:
+                    item.setText(3, status)
+                    # Зелёная подсветка строки — как на странице обработки (делегат
+                    # StatusColorDelegate рисует фон по статусу из 0-й колонки).
+                    item.setData(0, _api.ITEM_STATUS_ROLE, 'done')
+                    self.tree.viewport().update()
+                    if isinstance(media_info, dict):
+                        size = media_info.get('size', 0)
+                        br_str = media_info.get('br_str', '-')
+                        a_br = media_info.get('a_br', '-')
                         item.setText(1, _api.human_size(size))
                         item.setText(2, clean_info if clean_info and clean_info != "Unknown" else br_str)
-                        self.main.log(f"Загружено: {file_path} ({_api.human_size(size)}, {a_br})")
-                    except Exception: pass
+                        if file_path:
+                            self.main.log(f"Загружено: {file_path} ({_api.human_size(size)}, {a_br})")
+                    elif clean_info and clean_info != "Unknown":
+                        item.setText(2, clean_info)
+                except RuntimeError:
+                    pass  # QTreeWidgetItem уже удалён пользователем
 
         def on_err(iid_, msg):
             if self.active_workers.get(iid_) is not w:
@@ -551,9 +615,14 @@ class YtdlpTab(_api.QWidget):
             try:
                 item = self.items.get(iid_, {}).get('item')
                 if not item: return
-                item.setText(3, "Ошибка"); item.setToolTip(3, msg)
-                # Красная подсветка строки — как на странице обработки.
-                item.setData(0, _api.ITEM_STATUS_ROLE, 'err')
+                if msg == "Остановлено":
+                    item.setText(3, "Остановлено")
+                    item.setToolTip(3, "Загрузка остановлена пользователем")
+                    item.setData(0, _api.ITEM_STATUS_ROLE, 'stop')
+                else:
+                    item.setText(3, "Ошибка"); item.setToolTip(3, msg)
+                    # Красная подсветка строки — как на странице обработки.
+                    item.setData(0, _api.ITEM_STATUS_ROLE, 'err')
                 self.tree.viewport().update()
             except RuntimeError:
                 pass  # QTreeWidgetItem уже удалён пользователем
@@ -572,7 +641,11 @@ class YtdlpTab(_api.QWidget):
         с прогрессом и миниатюрой появлялся именно здесь.
         """
         try:
+            url = (url or "").strip()
             if not url: return
+            if not self._is_http_url(url):
+                self.main.log(f"Отклонена некорректная ссылка (нужен http/https): {url[:60]}")
+                return
             if not outdir:
                 outdir = self.out.text()
             if not outdir or not _api.os.path.exists(outdir):
@@ -604,6 +677,9 @@ class YtdlpTab(_api.QWidget):
         try:
             url = self.url_edit.text().strip()
             if not url: return
+            if not self._is_http_url(url):
+                self.main.log(f"Отклонена некорректная ссылка (нужен http/https): {url[:60]}")
+                return
             iid = _api.uuid.uuid4().hex
             config = self._dl_config(iid, url, audio_only)
             self.url_edit.clear()
@@ -617,8 +693,8 @@ class YtdlpTab(_api.QWidget):
             self.main.log(f"add_dl error: {e}")
 
     def _update_stop_btn(self):
-        """Кнопка СТОП активна только когда есть хотя бы одна активная загрузка."""
-        active = bool(self.active_workers)
+        """Кнопка СТОП активна, пока есть активные или стоящие в очереди загрузки."""
+        active = bool(self.active_workers or self._dl_queue)
         try: self.btn_stop.setEnabled(active)
         except Exception: pass
         # Зеркалим состояние на кнопку СТОП в строке «Быстрая загрузка»
@@ -654,6 +730,7 @@ class YtdlpTab(_api.QWidget):
         # загрузки, хотя по факту ошибка). Снимаем элемент из прогресса здесь —
         # это гарантированно убирает индикатор после ошибочной/прерванной загрузки.
         self._dl_pct.pop(iid, None)
+        self._drain_queue()
         self._update_dl_taskbar()
         self._update_stop_btn()
 
@@ -677,15 +754,31 @@ class YtdlpTab(_api.QWidget):
             'kodik_translation': (lambda t: "" if t in ("", "—") else t)(self.kodik_trans.currentText().strip()),
         }
 
-    def _start_download(self, config):
+    def _launch_download(self, config):
         iid = config['iid']
-        self.items[iid]['config'] = dict(config)
         worker = _api.YtdlpWorker(config)
         self.active_workers[iid] = worker
         worker.finished.connect(lambda i=iid, w=worker: self._remove_worker(i, w))
         self._connect_worker_signals(worker, iid)
         worker.start()
         self._update_stop_btn()
+
+    def _drain_queue(self):
+        while self._dl_queue and len(self.active_workers) < self.MAX_CONCURRENT_DOWNLOADS:
+            cfg = self._dl_queue.pop(0)
+            iid = cfg.get('iid', '')
+            if iid in self.items and iid not in self.active_workers:
+                self._launch_download(cfg)
+
+    def _start_download(self, config):
+        iid = config['iid']
+        self.items[iid]['config'] = dict(config)
+        self._dl_queue = [c for c in self._dl_queue if c.get('iid') != iid]
+        if len(self.active_workers) >= self.MAX_CONCURRENT_DOWNLOADS:
+            self._dl_queue.append(config)
+            self._update_stop_btn()
+            return
+        self._launch_download(config)
 
     def redownload_sel(self):
         """Скачать выбранные заново В ТОЙ ЖЕ строке — без дубля в списке.
@@ -732,16 +825,32 @@ class YtdlpTab(_api.QWidget):
             except Exception as e:
                 self.main.log(f"redownload error: {e}")
 
+    def clear_all(self):
+        """Останавливает активные загрузки и очищает список без краша от
+        запоздалых сигналов удалённых QTreeWidgetItem."""
+        self.stop_all_dl()
+        self.items.clear()
+        self._dl_pct.clear()
+        self.tree.clear()
+        self._update_dl_taskbar()
+        self._update_stop_btn()
+
     def delete_sel(self):
         try:
+            removed = set()
             for it in list(self.tree.selectedItems()):
                 iid = it.data(0, _api.Qt.ItemDataRole.UserRole)
                 if iid:
+                    removed.add(iid)
                     worker = self.active_workers.get(iid)
                     if worker:
                         worker.stop()
                     self.items.pop(iid, None)
+                    self._dl_pct.pop(iid, None)
                 self.tree.invisibleRootItem().removeChild(it)
+            if removed and self._dl_queue:
+                self._dl_queue = [c for c in self._dl_queue if c.get('iid') not in removed]
+            self._update_dl_taskbar()
             self._update_stop_btn()
         except Exception: pass
 

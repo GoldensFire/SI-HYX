@@ -140,16 +140,29 @@ class RevealFeed:
         self.error = None
         self._dec = None
         self._thread = None
+        self._err_thread = None
+        self._dec_stderr = _api.deque(maxlen=40)
         self._stopped = False
 
     def start(self, stdin):
         """Запуск декодера и потока, который кормит stdin кодировщика."""
         kw = {'creationflags': _api.CREATE_NO_WINDOW} if _api.IS_WIN else {}
         self._dec = _api.subprocess.Popen(self.decode_cmd, stdout=_api.subprocess.PIPE,
-                                          stderr=_api.subprocess.DEVNULL,
+                                          stderr=_api.subprocess.PIPE,
                                           stdin=_api.subprocess.DEVNULL, **kw)
+        self._err_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._err_thread.start()
         self._thread = threading.Thread(target=self._pump, args=(stdin,), daemon=True)
         self._thread.start()
+
+    def _drain_stderr(self):
+        try:
+            for raw in iter(self._dec.stderr.readline, b''):
+                s = raw.decode('utf-8', errors='replace').strip()
+                if s:
+                    self._dec_stderr.append(s)
+        except Exception:
+            pass
 
     def _pump(self, stdin):
         from frame_reveal_video import VideoReveal
@@ -187,3 +200,16 @@ class RevealFeed:
                 self._dec.wait(timeout=30)
             except Exception:
                 self.stop()
+        if self._err_thread is not None:
+            self._err_thread.join(timeout=2.0)
+        if self._dec is not None and not self._stopped:
+            rc = self._dec.returncode
+            tail = " | ".join(list(self._dec_stderr)[-4:])
+            if rc not in (0, None):
+                if not self.error:
+                    self.error = (f"декодер завершился с кодом {rc}: {tail}"
+                                  if tail else f"декодер завершился с кодом {rc}")
+                elif tail and tail not in self.error:
+                    self.error = f"{self.error} ({tail})"
+            elif self.error and tail and tail not in self.error:
+                self.error = f"{self.error} ({tail})"

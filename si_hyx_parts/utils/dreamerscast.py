@@ -130,7 +130,7 @@ def _pick_hls_variant(session, master_url: str, referer: str, want_height: int, 
     if not heights:
         return variants[0][1], 0
     fitting = [h for h in heights if h <= want_height]
-    chosen_height = max(fitting) if fitting else max(heights)
+    chosen_height = max(fitting) if fitting else min(heights)
     chosen_url = next(url for h, url in variants if h == chosen_height)
     return chosen_url, chosen_height
 
@@ -141,7 +141,7 @@ def _height_from_url(url: str, want_height: int) -> int:
     if not heights:
         return max(0, int(want_height or 0))
     fitting = [h for h in heights if h <= want_height]
-    return max(fitting) if fitting else max(heights)
+    return max(fitting) if fitting else min(heights)
 
 
 def resolve_dreamerscast(page_url: str, want_height: int = 720, proxy: str = "",

@@ -1486,7 +1486,7 @@ class EditTabTracksMixin:
         except Exception:
             pass
 
-    def _subtitles_vf(self, src, ext_sub=None, burn_idx=-1, streams=None):
+    def _subtitles_vf(self, src, ext_sub=None, burn_idx=-1, streams=None, sub_style_choice=None):
         """Фильтр ffmpeg `subtitles=…` для вшивания выбранной дорожки, или None.
         streams — дорожки субтитров src, если это не открытый файл (кусок
         проекта из другого файла); burn_idx — номер среди них.
@@ -1518,7 +1518,7 @@ class EditTabTracksMixin:
             except Exception:
                 sub_codec = ''
         native_styled = sub_codec in ('ass', 'ssa')
-        apply_prog_style = self._sub_prog_style(sub_codec)
+        apply_prog_style = self._sub_prog_style(sub_codec, choice=sub_style_choice)
         if not apply_prog_style and not ext_sub and sub_codec == 'mov_text':
             # Оригинальный mov_text: его шрифт задан в пикселях кадра, а ffmpeg
             # сам ставит холст 384×288 — выходили субтитры в полэкрана. Вшиваем
@@ -1546,7 +1546,7 @@ class EditTabTracksMixin:
             vf += f":fontsdir={fesc}"
         return vf
 
-    def _sub_prog_style(self, codec):
+    def _sub_prog_style(self, codec, choice=None):
         """Рисовать ли дорожку с кодеком codec стилем программы — одно правило
         на превью и вшивание. Выбор «Стиль вшитых субтитров» (cmb_sub_style):
           0 Авто      — стиль программы для SRT/VTT/mov_text, у ASS/SSA свой;
@@ -1554,10 +1554,13 @@ class EditTabTracksMixin:
           2 Оригинал  — свой стиль у ASS/SSA/mov_text. У SRT/VTT своего стиля
                         нет вовсе — им стиль программы.
         Стиль программы — как у караоке в генерации паков (prog_sub_force_style)."""
-        try:
-            choice = int(self.cmb_sub_style.currentIndex())
-        except Exception:
-            choice = 0
+        if choice is None:
+            try:
+                choice = int(self.cmb_sub_style.currentIndex())
+            except Exception:
+                choice = 0
+        else:
+            choice = int(choice)
         codec = (codec or '').lower()
         if choice == 1:
             return True

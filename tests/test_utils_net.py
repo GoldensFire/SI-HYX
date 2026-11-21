@@ -155,8 +155,8 @@ class TestResolveKodik:
         s = self._make_session()
         monkeypatch.setattr(utils.requests, "Session", lambda: s)
         res = utils.resolve_kodik("https://site.ru/anime/1", want_height=144)
-        # ничего не влезает под 144 → берётся max из доступных
-        assert res["height"] == 720
+        # ничего не влезает под 144 → берётся минимальное доступное (ближайшее выше)
+        assert res["height"] == 360
 
     def test_direct_links_passthrough(self, monkeypatch):
         # если src уже содержит '//' — декодирование не применяется

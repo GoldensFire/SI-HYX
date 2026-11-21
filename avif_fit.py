@@ -72,7 +72,7 @@ def aom_tile_log2(width: int, height: int) -> tuple[int, int]:
 
 
 def avif_encode_cmd(src, tmp_out, crf_val, scale_vf, has_alpha, pix_fmt, aspd,
-                    size=None):
+                    size=None, threads: int = 0):
     """Команда ffmpeg для одного кодирования картинки в AVIF (libaom-av1).
 
     size — (ширина, высота) исходника; без него размер читается из src. По нему
@@ -114,6 +114,7 @@ def avif_encode_cmd(src, tmp_out, crf_val, scale_vf, has_alpha, pix_fmt, aspd,
                   "-aom-params", "tune=iq",
                   "-tile-columns", str(tile_cols), "-tile-rows", str(tile_rows),
                   "-row-mt", "1"]
+    thr = str(max(0, int(threads or 0)))
     if has_alpha:
         if scale_vf:
             fc = (f"[0:v]format=yuva420p10le,split[c][a];"
@@ -123,13 +124,13 @@ def avif_encode_cmd(src, tmp_out, crf_val, scale_vf, has_alpha, pix_fmt, aspd,
         return [FFMPEG, "-y", "-i", src, "-filter_complex", fc,
                 "-map", "[main]", "-map", "[alf]", "-map_metadata", "-1",
                 "-c:v", "libaom-av1", "-crf", str(crf_val)] + aom_common + \
-               ["-still-picture", "1", "-threads", "0", tmp_out]
+               ["-still-picture", "1", "-threads", thr, tmp_out]
     cmd = [FFMPEG, "-y", "-i", src]
     if scale_vf:
         cmd += ["-vf", scale_vf]
     return cmd + ["-frames:v", "1", "-map_metadata", "-1", "-c:v", "libaom-av1",
                   "-crf", str(crf_val)] + aom_common + \
-                 ["-pix_fmt", pix_fmt, "-threads", "0", tmp_out]
+                 ["-pix_fmt", pix_fmt, "-threads", thr, tmp_out]
 
 
 def downscale_side(orig_w, orig_h, baseline_kb, limit_kb) -> int:
@@ -297,7 +298,7 @@ def fit_to_limit(src: str, out: str, limit_kb: int = 150, *, speed: int = 5,
     pre_vf = ""
     if max_side and w0 and h0 and max(w0, h0) > int(max_side):
         side = int(max_side)
-        pre_vf = (f"scale=if(gt(iw\\,ih)\\,{side}\\,-2)"
+        pre_vf = (f"scale=if(gte(iw\\,ih)\\,{side}\\,-2)"
                   f":if(gt(ih\\,iw)\\,{side}\\,-2)")
         k = float(side) / max(w0, h0)
         w0, h0 = max(1, int(w0 * k)), max(1, int(h0 * k))
@@ -378,7 +379,7 @@ def fit_to_limit(src: str, out: str, limit_kb: int = 150, *, speed: int = 5,
             if w and h:
                 side = downscale_side(w, h, size_worst, limit_kb)
                 for _ in range(5):
-                    vf = (f"scale=if(gt(iw\\,ih)\\,{side}\\,-2)"
+                    vf = (f"scale=if(gte(iw\\,ih)\\,{side}\\,-2)"
                           f":if(gt(ih\\,iw)\\,{side}\\,-2)")
                     tmp, size = _probe(CQ_WORST, scale_vf=vf)
                     if tmp is None:
